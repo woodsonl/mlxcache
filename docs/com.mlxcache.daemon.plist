@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mlxcache.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>cargo</string>
+    <string>run</string>
+    <string>--release</string>
+    <string>-p</string>
+    <string>mlxcache-daemon</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/lance/Repos/mlxcache</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MLXCACHE_ADDR</key>
+    <string>127.0.0.1:8420</string>
+    <key>MLXCACHE_MODELS</key>
+    <string></string>
+    <key>MLXCACHE_SIDECAR_URL</key>
+    <string></string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/mlxcache-daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/mlxcache-daemon.err</string>
+</dict>
+</plist>

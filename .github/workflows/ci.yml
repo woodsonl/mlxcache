@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [init, main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  python:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install deps
+        run: uv sync --group dev
+      - name: Lint
+        run: uv run ruff check sidecar/
+      - name: Test
+        run: uv run pytest sidecar/tests/ -v

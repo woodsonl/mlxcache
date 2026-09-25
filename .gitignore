@@ -1,0 +1,20 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Design review scratch dirs (process artifacts, not repo content)
+*.review.*
+
+# macOS
+.DS_Store
+
+# Local env
+.env
