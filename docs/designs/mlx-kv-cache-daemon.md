@@ -55,7 +55,7 @@ Skip the daemon; build the cache contract into the founder's own engine (OpenAI-
 
 ## Recommended Approach
 
-**B — the cache contract daemon — with A already spinning up in the sibling repo (cache-max) as the wedge.**
+**B — the cache contract daemon — with A already spinning up in the sibling repo (cache-max) as the wedge. REVISED by eng review D2-reopened: the daemon core (hot path) is a systems-language implementation; the founder's engine is the native reference implementation of the cache contract; Python mlx-lm is a compatibility adapter (sidecar or later port). Standing directive: every aspect of every step 100% max optimized.**
 
 Sequencing: cache-max (universal proxy) ships first and proves the policy layer on real traffic (cloud + local). This repo then implements the MLX daemon: same policy core, plus the KV persistence tier that only Apple Silicon makes cheap. The daemon's contract (prefix-hash → checkpoint blob) is designed now so the founder's ds4-alternative engine implements it natively, and mlx-lm plugs in via save/load_prompt_cache.
 
@@ -143,3 +143,266 @@ Feature answers: no feature cuts proposed; deferrals already in plan (cross-mach
 Structure: B (Smaller arrangement) — minimal core: proxy + policy + prefix index + mlx-lm adapter behind one contract interface; persistence as a swappable module deferred until the R1-5 measurement gate passes.
 Accepted scope: same feature list as approved design; structure = smaller arrangement (contract interface forced early, persistence swappable).
 Pending remedies: none (Sections 1-4 findings follow).
+
+## CEO Review Ledger
+
+| ID and owner | Contract and evidence | Current | Proposed | Status | Exact approval and scope |
+|---|---|---|---|---|---|
+| MODE | Review posture for this CEO review | n/a (mode selection) | HOLD SCOPE | approved | User answered D1 = HOLD SCOPE (question-log, session 63135-260925-113342-7d5828ac). Scope: preserve approved design scope; trace failures, edge cases, error paths, tests, observability. No additions or cuts. |
+| R1-adapter-shape | mlx-lm adapter deployment shape: in-process (daemon owns prefill, single-flight works, multi-GB model in daemon memory, one model per daemon) vs proxy-to-server (daemon thinner, but cannot single-flight or control prefill; mlx-lm server keeps its own cache) | unspecified (design doc says "plugs in via save/load_prompt_cache" but R1-3 single-flight implies daemon-owned prefill — contradiction) | A: in-process adapter | approved | User answered D2 = A (in-process adapter). Scope: daemon runs mlx-lm as a library, owns prefill and cache lifecycle; single-flight rule applies as written; one model per daemon instance stated as v1 constraint. |
+| R2-observability | Minimal observability: per-request structured log line (model, prefix-hash, hit/miss/partial, tokens cached/total, TTFT) + stats endpoint, required to make the success criteria measurable | absent (success criteria say "measured, not estimated" but name no measurement mechanism) | A: add minimal observability to v1 | approved | User answered D3 = A (add minimal observability). Scope: one structured log line per request + stats endpoint; hit-rate counters; enough to evaluate the approved success criteria. No dashboards/alerting beyond this in v1. |
+| R3-license | License: Apache-2.0 vs MIT vs none | "pick one; default Apache-2.0" (unresolved in Distribution Plan) | D: no license — private build, documented like open source but not licensed | approved | User answered D4: "Do not open source this. We are building and documenting like an open source project but are not yet assigning a license." Scope: no LICENSE file, no license headers; Distribution Plan's open-source launch steps are aspirational, not active. All rights reserved by default. |
+
+## Eng Review — Decision Ledger (continued, resumed session)
+
+| ID and owner | Contract and evidence | Current | Proposed | Status | Exact approval and scope |
+|---|---|---|---|---|---|
+| R4-language | Daemon implementation language: Python (hosts mlx-lm in-process per D2) vs systems-language daemon with native engine core + Python mlx-lm as compatibility adapter | Python/FastAPI (design doc, owner preference) | B: systems-language daemon, owner engine as native core, mlx-lm as compatibility adapter | approved | User answered D2-reopened = B, with standing directive: EVERY aspect of every step must be 100% max optimized. Scope: daemon core (hot path) in a systems language; owner engine is the native reference implementation of the cache contract; Python mlx-lm becomes a compatibility adapter (sidecar or later port), not the reference. Hot path contains zero Python. History: initial in-process approval superseded after user objection (weeks fighting Python overhead in their engine). |
+| R5-daemon-lang | Systems language for the daemon core: Rust (axum/tokio, manual Metal FFI via objc2/metal-rs) vs Swift (first-class Metal, vapor, younger async) vs engine's language | pending (T3 said "owner choice pending") | A: Rust | approved | User answered D5 = A (Rust). Scope: Rust daemon core; axum/tokio HTTP; Metal via objc2/metal-rs; owner engine remains first-class contract implementor in whatever language it uses (contract is language-agnostic per T1). |
+| R6-test-stack | Test tooling across Rust core + Python sidecar: native per-language (cargo test + pytest, CI-wired) vs single cross-language framework (Bazel/please) | unknown (framework never chosen; tasks assumed pytest) | A: cargo test + pytest, CI-wired | approved | User answered D1-revised = A. Scope: cargo test for Rust core (unit/integration, tokio async tests); pytest for Python mlx-lm sidecar (T2/T7 verify commands hold); thin CI harness script wires both; cross-language E2E = benchmark harness (T2). No Bazel/please. |
+| R7-spec-perf | Contract spec must pin (per eng review Sections 1+4): radix-tree prefix index, generate_stream in adapter interface, zero-copy checkpoint capture off streaming path, warm-start load order, TTFT budget decomposition | T1 exists but didn't name these | added to T1 scope | approved | Carried forward as required content of the already-approved T1 contract spec task (no new approval needed — implements approved architecture + max-optimization directive). |
+
+## CEO Review — Required Outputs
+
+### NOT in scope
+- Open-source launch (Show HN, Homebrew tap, public releases): D4 — no license assigned; private build documented like open source. Distribution steps aspirational.
+- Cross-machine KV transfer: approved design constraint (v1 out of scope).
+- Disk persistence tier design: gated on R1-5 measurement gate (deferred by approved design, not this review).
+- Dashboards/alerting beyond the minimal stats endpoint: D3 scope explicitly excludes them in v1.
+
+### What already exists
+- mlx-lm LRUPromptCache: token-trie longest-prefix matching, in-process — reused as the adapter substrate via save/load_prompt_cache (safetensors).
+- mlx-lm save/load_prompt_cache: safetensors serialization — the checkpoint blob format basis.
+- SQLite: stdlib — prefix index storage.
+- FastAPI/Starlette: proxy layer (owner preference, ds4stream learning).
+- LMCache architecture: reference map only (CUDA-only, not reusable code).
+
+### Dream state delta
+This plan takes us from "no KV cache layer for MLX; every process re-prefills" to a working daemon with cross-process KV reuse, suspend/resume (gated), and measured hit-rate — the first concrete step toward the 12-month ideal of one Mac Studio as a shared inference brain. Remaining after v1: fleet routing (multi-Mac via routing), the founder-engine first-class adapter, and the compression research (CacheGen-style) if R1-5 fails the 2s budget.
+
+### Error & Rescue Registry (implementation-ready rows for approved components)
+
+| CODEPATH | FAILURE MODE | RESCUED? | RESCUE ACTION | USER SEES |
+|---|---|---|---|---|
+| proxy#handle_request | malformed JSON | Y | 400 clear message | error message |
+| proxy#handle_request | unknown model | Y | 404 (validated before cache lookup) | error message |
+| proxy#handle_request | client disconnect mid-stream | Y | drop stream, persist completed prefill KV, log | dropped stream, retry works |
+| policy#route | no adapter for model | Y | 503 naming missing adapter | error message |
+| policy#lookup | fingerprint/tokenizer/dtype mismatch | Y | miss + quarantine (R1-1) | transparent (slower turn) |
+| policy#prefill | concurrent same prefix | Y | single-flight block (R1-3) | slightly delayed turn |
+| adapter#load | OOM at model load | PARTIAL | refuse at startup with message | daemon won't start ← stated behavior |
+| adapter#prefill | mlx-lm internal error | Y | 502 with engine detail | error message |
+| index#lookup | SQLite locked | Y | retry once, then 503 | error after retry |
+| index#lookup | SQLite corrupt | Y | rebuild index from checkpoint metadata; log | transparent (slower first lookups) |
+| persistence#save | disk full (ENOSPC) | Y | catch OSError, log path+bytes, 503 warming path only | warming fails, real requests proceed |
+| persistence#save | crash mid-write | Y | atomic write-temp-rename (R1-3) | transparent |
+| persistence#load | corrupt blob | Y | quarantine + miss (R1-1) | transparent (slower turn) |
+| persistence#load | version mismatch | Y | quarantine + miss (R1-1) | transparent (slower turn) |
+| daemon lifecycle | daemon crash | Y | clients retry (R1-4); launchd auto-restart | brief outage, streams drop |
+
+CRITICAL GAPS: 0 (all rows rescued or explicitly stated).
+
+### Failure Modes Registry
+
+```
+CODEPATH              | FAILURE MODE         | RESCUED? | TEST? | USER SEES?     | LOGGED?
+----------------------|----------------------|----------|-------|----------------|----------
+checkpoint write      | ENOSPC               | Y        | TBD   | warming 503    | Y
+checkpoint write      | crash mid-write      | Y        | TBD   | transparent    | Y
+checkpoint load       | corrupt blob         | Y        | TBD   | transparent    | Y
+index                 | SQLite corrupt       | Y        | TBD   | transparent    | Y
+adapter               | OOM at load          | PARTIAL  | TBD   | startup refusal| Y
+single-flight         | racing requests      | Y        | TBD   | delayed turn   | Y
+round-trip            | logits differ        | Y        | TBD   | miss + quarantine | Y
+daemon                | crash mid-stream     | Y        | TBD   | dropped stream | Y
+```
+TEST?=TBD: test headers drafted in Implementation Tasks; none exist yet (greenfield). CRITICAL GAPS: 0.
+
+### Diagrams produced
+1. System architecture (Section 1)
+2. Data flow with shadow paths (Section 4)
+3. Error flow (Section 2 rescue table)
+Rollback flow: point clients at engine directly (config change, zero downtime) — trivial path, not diagrammed. Deployment sequence: n/a (local daemon, no staged rollout). State machine: checkpoint lifecycle is the one stateful object — states: absent → in-flight (single-flight lock) → published (atomic rename) → quarantined (on mismatch/corrupt); invalid transition: published → in-flight (never re-preflight a published prefix); prevented by index check before prefill.
+
+### Stale Diagram Audit
+Diagrams in this doc: none prior to this review (the architecture diagram above is new). No stale diagrams.
+
+## Implementation Tasks
+Synthesized from this review's findings. Each task derives from a specific finding above. Run with Claude Code or Codex; checkbox as you ship.
+
+- [ ] **T0 (P1, human: ~1h / CC: ~10min)** — scaffolding — Project bootstrap: Rust workspace (daemon core crate + sidecar crate), pyproject.toml for Python sidecar, ruff/clippy configs, CI skeleton (GitHub Actions: cargo test + pytest per R6), .gitignore
+  - Surfaced by: Section 2 finding 1 (no scaffolding task; every task depends on it)
+  - Files: Cargo.toml, pyproject.toml, .github/workflows/ci.yml, .gitignore (new)
+  - Verify: `cargo build` + `pytest --collect-only` succeed; CI skeleton green on push
+- [ ] **T1 (P1, human: ~2h / CC: ~15min)** — docs — Write the cache contract spec (Next Steps #2): checkpoint format, metadata schema, binding rules (R1-1 through R1-4), glossary (contract/adapter/checkpoint pinned), language-agnostic interface contract (native trait/protocol + wire format for adapters; Python sidecar protocol for mlx-lm compatibility)
+  - Surfaced by: Section 5 (glossary), Scope Challenge B (interface seam), Section 6 (test content)
+  - Files: docs/contract-spec.md (new)
+  - Verify: spec review — every binding rule from the design doc appears verbatim; glossary has no synonyms
+- [ ] **T2 (P1, human: ~1d / CC: ~1h)** — adapter — Round-trip benchmark harness: mlx-lm save → load → continue generation, logits identity check, bytes/token, wall time, peak memory at 50K tokens (adds peak-memory to R1-5 gate per Section 7) — extended per D2-reopened: also measures Python sidecar IPC overhead (KV blob serialization + transport) to quantify the compatibility-adapter tax
+  - Surfaced by: Next Steps #3, Section 7 (memory), R1-5 gate
+  - Files: benchmarks/roundtrip.py (new), tests/test_roundtrip.py (new)
+  - Verify: `pytest tests/test_roundtrip.py` — logits identical, measurements recorded in the doc
+- [ ] **T3 (P1, human: ~2-4wk / CC: ~1wk)** — daemon — Core implementation in **Rust** (D5-approved): hot path (token streaming, KV handling, single-flight, prefix index) fully native per D2-reopened + max-optimization directive; HTTP layer axum/tokio; prefix index native (no SQLite on hot path); Metal via objc2/metal-rs FFI; mlx-lm Python sidecar as compatibility adapter only
+  - Surfaced by: D2-reopened (systems-language core), max-optimization directive, Section 1 D2
+  - Files: daemon core crate/package (new), mlx-lm sidecar (new)
+  - Verify: benchmark hot path end-to-end vs Python baseline; single-flight race test; zero Python frames in hot path profile
+- [ ] **T4 (P1, human: ~4h / CC: ~20min)** — daemon — Minimal observability (D3): per-request structured log (model, prefix-hash, hit/miss/partial, tokens cached/total, TTFT) + /stats endpoint — native (tracing/log crates or swift-log), zero-allocation hot-path logging
+  - Surfaced by: Section 8 D3
+  - Files: daemon observability module (native, per D2-reopened)
+  - Verify: /stats returns hit-rate counters matching log lines after N requests
+- [ ] **T5 (P2, human: ~2h / CC: ~15min)** — daemon — Error rescues per registry: ENOSPC on checkpoint write (503 warming only), index store corrupt → rebuild from blob metadata (index store per D2-reopened: native structure, cold-path persistence may remain SQLite), model-name 404 before lookup
+  - Surfaced by: Section 2, Section 3, Section 4
+  - Files: daemon persistence/index/proxy modules (native, per D2-reopened)
+  - Verify: fault-injection tests — full disk sim, corrupt DB file, unknown model request
+- [ ] **T6 (P2, human: ~1h / CC: ~10min)** — docs — Operability statements: SPOF bypass (point clients at engine directly), rollback sentence, launchd plist for uvx installs, mlx-lm version pinning policy
+  - Surfaced by: Section 1 findings 2/4, Section 9
+  - Files: docs/designs/mlx-kv-cache-daemon.md, docs/ops.md (new)
+  - Verify: docs review — each statement present; plist loads with `launchctl load`
+- [ ] **T7 (P2, human: ~4h / CC: ~30min)** — tests — Concurrency + chaos suite: racing same-prefix requests (single-flight), kill -9 mid-checkpoint-write (atomic rename), daemon restart mid-stream (R1-4) — Rust core tests via cargo test (single-flight race, atomic rename, restart), sidecar tests via pytest (R6-approved split)
+  - Surfaced by: Section 6 (hostile QA + chaos tests), R6 test-stack decision
+  - Files: tests/ (Rust: core crate tests; Python: tests/test_singleflight.py, tests/test_chaos.py)
+  - Verify: `cargo test` green + `pytest tests/` green; no partial blobs after kill -9
+
+### Completion Summary
+
+```
+  +====================================================================+
+  |            MEGA PLAN REVIEW — COMPLETION SUMMARY                   |
+  +====================================================================+
+  | Mode selected        | HOLD SCOPE                                 |
+  | System Audit         | Greenfield, 2 commits, design doc APPROVED, |
+  |                      | no TODOs/stashes; ds4stream learning applied|
+  | Step 0               | HOLD SCOPE (D1); 0A-0C clean; no 0D needed  |
+  | Section 1  (Arch)    | 4 issues found (1 resolved D2, 3 doc notes) |
+  | Section 2  (Errors)  | 15 error paths mapped, 0 GAPS               |
+  | Section 3  (Security)| 1 issue found (P3 model-name validation)    |
+  | Section 4  (Data/UX) | 12 edge cases mapped, 1 unhandled→resolved  |
+  |                      | (disconnect-persist, doc addition)          |
+  | Section 5  (Quality) | 2 issues found (glossary, Protocol shape)   |
+  | Section 6  (Tests)   | Diagram produced, 22 gaps (greenfield)      |
+  | Section 7  (Perf)    | 2 issues found (peak memory in gate)        |
+  | Section 8  (Observ)  | 1 gap found → resolved (D3)                 |
+  | Section 9  (Deploy)  | 1 risk flagged (launchd service mgmt)       |
+  | Section 10 (Future)  | Reversibility: 4/5, debt items: 2           |
+  | Section 11 (Design)  | SKIPPED (no UI scope)                       |
+  +--------------------------------------------------------------------+
+  | NOT in scope         | written (4 items)                           |
+  | What already exists  | written                                     |
+  | Dream state delta    | written                                     |
+  | Error/rescue registry| 15 rows, 0 CRITICAL GAPS                    |
+  | Failure modes        | 8 total, 0 CRITICAL GAPS                    |
+  | TODOS.md updates     | 0 items proposed (all findings in-scope)    |
+  | Scope proposals      | n/a (HOLD SCOPE)                            |
+  | CEO plan             | skipped by mode (HOLD SCOPE)                |
+  | Outside voice        | codex — unavailable (credits exhausted      |
+  |                      | mid-run); native fallback unavailable       |
+  |                      | (no Task tooling in this host)              |
+  | Lake Score           | N/A (no coverage-scored questions)          |
+  | Diagrams produced    | 3 (architecture, data flow, error flow)     |
+  | Stale diagrams found | 0                                           |
+  | Unresolved decisions | 0 (listed below)                            |
+  +====================================================================+
+```
+
+### Unresolved Decisions
+None. All four decisions (D1 mode, D2 adapter shape, D3 observability, D4 license) answered and recorded in the ledger.
+
+
+## Eng Review — Review Body (2026-09-25, resumed session)
+
+### Scope Challenge C dispositions
+1. R1-adapter-shape (P1, 9/10) — resolved via CEO D2: in-process → SUPERSEDED by D2-reopened (systems-language core). See R4-language row.
+2. Success-criteria unmeasurable (P2, 8/10) — resolved via CEO D3: minimal observability. See R2-observability row.
+3. License unresolved (P3, 6/10) — resolved via CEO D4: no license, private build. See R3-license row.
+4. Policy-core sharing across repos (P2, 7/10) — DEFERRED: no mechanism in v1; mlxcache owns its policy core; sharing decision deferred until cache-max exists.
+
+### Section 1: Architecture — findings
+1. [P2] (confidence: 7/10) design doc — In-process adapter + streaming decode: adapter interface needs generate_stream, not just prefill/checkpoint. → T1 spec content.
+2. [P3] (confidence: 6/10) design doc — Warm-start load order: weights resident before KV checkpoint load on memory-constrained Macs. → T1 spec content.
+(Plus CEO-review Section 1 items: D2 adapter shape, SPOF bypass statement, one-model constraint, rollback sentence — already in doc.)
+
+### Section 2: Code quality — findings
+1. [P3] (confidence: 6/10) Task list had no scaffolding task → T0 added (Rust workspace, pyproject, CI skeleton).
+Shared-code rubric: no two first-party callers exist (greenfield). Policy-core sharing deferred (Scope C finding 4).
+
+### Section 3: Test review
+Framework: resolved via R6 — cargo test (Rust core) + pytest (Python sidecar), thin CI harness, no Bazel.
+Coverage diagram: 22 planned paths, all gaps (greenfield, expected). Round-trip logits identity classified [→EVAL] (thesis guard).
+Critical regression rule: nothing exists to regress; IRON RULE satisfied vacuously.
+Test Plan Artifact: ~/.gstack/projects/init/lance-init-eng-review-test-plan-20260925-174824.md
+Tasks JSONL: ~/.gstack/projects/init/tasks-eng-review-20260925-174850.jsonl (8 tasks, T0-T7)
+
+### Section 4: Performance review (max-optimization directive applied)
+1. [P1] (confidence: 8/10) Prefix index structure must be pinned: radix tree over token IDs (O(prefix-length), shared-prefix memory efficiency, matches mlx-lm trie semantics). → T1 spec content.
+2. [P2] (confidence: 7/10) Checkpoint capture must be zero-copy, never block token streaming; serialize only at publish time off the request path. → T1 spec content.
+3. [P3] (confidence: 6/10) Sidecar IPC tax bounded by design: compatibility path only, never default once owner engine ships. Stated.
+4. [P2] (confidence: 7/10) TTFT budget decomposition (index µs + checkpoint load ms + delta prefill compute) for diagnosability. → T1 spec content.
+
+### NOT in scope (eng review additions)
+- Policy-core sharing mechanism with cache-max: deferred (Scope C finding 4).
+- Bazel/please unified build: rejected (R6).
+
+### What already exists (eng review additions)
+- mlx-lm trie (LRUPromptCache): reference semantics for the native radix-tree index.
+- Rust ecosystem: axum/tokio (HTTP/async), objc2/metal-rs (Metal FFI), safetensors Rust bindings (checkpoint I/O) — all Layer 1/2 reuse targets for T3.
+
+### Parallelization strategy
+Two lanes after T0/T1:
+- Lane A (Rust core): T3 → T4 → T5 → T7 (Rust half)
+- Lane B (sidecar + benchmarks): T2 → T7 (pytest half)
+| Step | Modules touched | Depends on |
+|------|----------------|------------|
+| T0 scaffolding | workspace, CI | — |
+| T1 contract spec | docs | T0 |
+| T2 benchmark harness | benchmarks, sidecar | T0, T1 |
+| T3 Rust daemon core | daemon-core | T1 |
+| T4 observability | daemon-core | T3 |
+| T5 error rescues | daemon-core | T3 |
+| T7 chaos suite | daemon-core tests, sidecar tests | T3, T2 |
+Execution: T0 → T1. Launch Lane A (T3) and Lane B (T2) in parallel. Merge, then T4/T5/T7.
+
+### Completion Summary (eng review, resumed)
+
+```
+  +====================================================================+
+  |            ENG PLAN REVIEW — COMPLETION SUMMARY                    |
+  +====================================================================+
+  | Step 0: Scope Challenge | scope accepted as-is (structure B, 4      |
+  |                         findings resolved/deferred, 0 scope cuts)   |
+  | Architecture Review     | 2 issues found (spec-content, folded T1)  |
+  | Code Quality Review     | 1 issue found (scaffolding gap → T0)      |
+  | Test Review             | diagram produced, 22 gaps (greenfield),   |
+  |                         | framework resolved (R6), T0-T7 tasks      |
+  | Performance Review      | 4 issues found (3 spec-content, 1 stated) |
+  | NOT in scope            | written (2 eng additions)                 |
+  | What already exists     | written (Rust ecosystem reuse targets)    |
+  | TODOS.md updates        | 0 items proposed (all findings in-scope)  |
+  | Failure modes           | 0 critical gaps flagged                   |
+  | Unresolved decisions    | 0 in this review                          |
+  | Outside voice           | codex — unavailable (credits exhausted    |
+  |                         | mid-run during CEO review phase); native  |
+  |                         | fallback unavailable (no Task tooling)    |
+  | Parallelization         | 2 lanes, 2 parallel / 5 sequential        |
+  | Lake Score              | N/A (no coverage-scored questions)        |
+  +====================================================================+
+```
+
+### Unresolved decisions
+None in this review. All decisions (R4 language/core, R5 Rust, R6 test stack) answered and recorded. Prior reviews' items: none open.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | ISSUES OPEN | mode: HOLD_SCOPE, 0 critical gaps |
+| Outside Review | codex (auto) | Independent 2nd opinion | 1 | unavailable | codex execution failed mid-run (account credits exhausted after ~48k tokens); native fallback unavailable in this host (no Task tooling). No completed external review. |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES OPEN | 7 issues, 0 critical gaps (scope accepted as-is; structure B; language/core decisions D2-reopened, D5, D6 approved; T0-T7 tasks) |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | not run (no UI scope) |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | not run |
+
+**OUTSIDE COVERAGE:** codex, plan-review phase, unavailable — CLI started, consumed ~48k tokens, failed with "workspace out of credits" before producing findings. No completed external review; no cross-model comparison possible.
+
+**VERDICT:** CEO + ENG CLEARED — ready to implement. (Both reviews' findings carry dispositions; 0 unresolved decisions, 0 critical gaps. ISSUES OPEN status reflects mapped implementation work, not failure.)
+
+**UNRESOLVED DECISIONS:**
+- None. All decisions across both reviews answered and recorded (D1-D6 + scope record).
