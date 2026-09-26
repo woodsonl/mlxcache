@@ -49,6 +49,24 @@ _SAFETENSORS_DTYPE_BYTES = {
 }
 
 
+def _reject_json_constant(name: str) -> None:
+    """Reject NaN/Infinity: the JSON spec forbids them and MLX's parser does too,
+    but Python's json accepts them by default."""
+    raise ValueError(f"non-standard JSON constant: {name}")
+
+
+def _has_lone_surrogate(obj: object) -> bool:
+    """True if any string anywhere in the parsed JSON contains a lone surrogate
+    (U+D800-U+DFFF), which is not valid UTF-8 and which MLX rejects."""
+    if isinstance(obj, str):
+        return any("\ud800" <= c <= "\udfff" for c in obj)
+    if isinstance(obj, dict):
+        return any(_has_lone_surrogate(k) or _has_lone_surrogate(v) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_has_lone_surrogate(v) for v in obj)
+    return False
+
+
 def _valid_safetensors(payload: bytes) -> bool:
     """Structural check of a safetensors blob: an 8-byte little-endian header
     length, then that many bytes of JSON object, then each tensor's dtype, shape,
@@ -61,10 +79,20 @@ def _valid_safetensors(payload: bytes) -> bool:
     if n == 0 or 8 + n > len(payload):
         return False
     try:
-        header = json.loads(payload[8 : 8 + n])
+        # Match MLX's strict parser, not Python's lenient one. Python accepts
+        # UTF-16 headers, lone surrogates, and NaN/Infinity; MLX rejects all
+        # three with a RuntimeError we would misread as transient. Decode as
+        # strict UTF-8 and forbid the non-standard numeric constants.
+        text = payload[8 : 8 + n].decode("utf-8")
+        header = json.loads(text, parse_constant=_reject_json_constant)
     except (ValueError, TypeError, RecursionError):
         return False
     if not isinstance(header, dict):
+        return False
+    # A lone surrogate (a \uD800-\uDFFF escape) parses fine in Python but is not
+    # valid UTF-8; MLX rejects it. The strict decode above catches raw bytes;
+    # this catches escaped surrogates in keys and values.
+    if _has_lone_surrogate(header):
         return False
     data_len = len(payload) - 8 - n
     for name, spec in header.items():

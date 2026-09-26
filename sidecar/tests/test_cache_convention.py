@@ -436,6 +436,37 @@ def test_deeply_nested_header_is_rejected_not_500(monkeypatch, tmp_path):
         eng._load_cache_delta(tokens, path)
 
 
+@pytest.mark.parametrize(
+    "raw_header",
+    [
+        '{"a":1}'.encode("utf-16"),  # UTF-16, not UTF-8
+        b'{"x":NaN}',  # non-standard constant
+        b'{"x":Infinity}',  # non-standard constant
+        b'{"x":"\\ud800"}',  # lone surrogate escape
+    ],
+)
+def test_lenient_json_headers_rejected_like_native(monkeypatch, tmp_path, raw_header):
+    # Regression (Codex pass 13): Python's json accepts UTF-16, NaN/Infinity, and
+    # lone surrogates; MLX's strict parser rejects them with RuntimeError. All
+    # must be a 422, not a 500 that leaves the entry selectable.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    payload = len(raw_header).to_bytes(8, "little") + raw_header
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "lenient.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
 def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
     # adopted: resuming from the wrong KV generates silently wrong output. It is
