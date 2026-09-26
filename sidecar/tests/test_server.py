@@ -74,7 +74,7 @@ def test_prefill_returns_raw_payload(sidecar_url):
 def test_generate_continuation(sidecar_url):
     r = httpx.post(
         f"{sidecar_url}/generate",
-        json={"tokens": [1, 2, 3], "prefill_from": 0, "max_tokens": 5},
+        json={"tokens": [1, 2, 3], "max_tokens": 5},
     ).json()
     assert len(r["tokens"]) == 5
 
