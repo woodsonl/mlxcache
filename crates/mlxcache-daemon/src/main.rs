@@ -25,20 +25,18 @@ async fn main() -> Result<()> {
         ))
         .ok()
     });
+    let blob_dir = std::env::var("MLXCACHE_BLOBS").unwrap_or_else(|_| "/tmp/mlxcache-blobs".into());
+    let persistence = mlxcache_daemon::persistence::Persistence::new(blob_dir).map_err(|e| {
+        // adapter#load rescue row: refuse at startup with a clear message.
+        anyhow::anyhow!("blob dir init failed: {e}")
+    })?;
     let state = Arc::new(mlxcache_daemon::http::AppState {
         orchestrator: mlxcache_daemon::orchestrator::Orchestrator::new(),
         singleflight: mlxcache_core::singleflight::SingleFlight::new(),
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
         served_models,
         sidecar,
-        persistence: mlxcache_daemon::persistence::Persistence::new(
-            std::env::var("MLXCACHE_BLOBS").unwrap_or_else(|_| "/tmp/mlxcache-blobs".into()),
-        )
-        .map_err(|e| {
-            eprintln!("fatal: blob dir init failed: {e}");
-            std::process::exit(1);
-        })
-        .unwrap_or_else(|_| unreachable!()),
+        persistence,
     });
     let app = mlxcache_daemon::http::router(state);
     let addr = std::env::var("MLXCACHE_ADDR").unwrap_or_else(|_| "127.0.0.1:8420".into());
