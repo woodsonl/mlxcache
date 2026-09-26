@@ -17,6 +17,13 @@ description = "mlx-lm compatibility sidecar for the mlxcache daemon"
 requires-python = ">=3.12"
 license = { text = "UNLICENSED" }
 
+[project.optional-dependencies]
+# Real-engine adapter (Apple Silicon only). Pinned per docs/ops.md policy:
+# a version bump requires the R1-5 round-trip gate to pass again.
+mlx = [
+    "mlx-lm==0.31.3",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8",
