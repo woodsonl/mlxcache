@@ -111,7 +111,6 @@ impl SidecarClient {
     pub async fn generate(
         &self,
         tokens: &[u32],
-        prefill_from: usize,
         max_tokens: usize,
         blob_path: Option<&str>,
     ) -> Result<Vec<u32>, SidecarError> {
@@ -121,7 +120,6 @@ impl SidecarClient {
             .post(&url)
             .json(&serde_json::json!({
                 "tokens": tokens,
-                "prefill_from": prefill_from,
                 "max_tokens": max_tokens,
                 "blob_path": blob_path,
             }))
@@ -154,7 +152,6 @@ impl SidecarClient {
     pub async fn generate_stream(
         &self,
         tokens: &[u32],
-        prefill_from: usize,
         max_tokens: usize,
         blob_path: Option<&str>,
     ) -> Result<reqwest::Response, SidecarError> {
@@ -164,7 +161,6 @@ impl SidecarClient {
             .post(&url)
             .json(&serde_json::json!({
                 "tokens": tokens,
-                "prefill_from": prefill_from,
                 "max_tokens": max_tokens,
                 "blob_path": blob_path,
                 "stream": true,
