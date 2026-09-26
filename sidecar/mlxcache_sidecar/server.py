@@ -378,7 +378,8 @@ class Handler(BaseHTTPRequestHandler):
 
         n = 0
         try:
-            if first is not None:
+            # max_tokens <= 0 yields nothing: priming must not force one token.
+            if first is not None and max_tokens > 0:
                 token, text = first
                 self.wfile.write((json.dumps({"token": token, "text": text}) + "\n").encode())
                 self.wfile.flush()
@@ -395,6 +396,16 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             # Client went away mid-stream (R1-4 semantics): stop cleanly.
+            self.close_connection = True
+        except Exception:  # noqa: BLE001 — after headers, never emit a 2nd response
+            # A mid-stream engine failure (OOM, decode error) must not fall
+            # through to do_POST's 500 writer: that would append a JSON error
+            # body to a live 200 stream, which the daemon reads as a token frame.
+            # Truncate the stream by closing; the daemon terminates the SSE on
+            # upstream EOF. Log for the operator; the checkpoint (if any) stays
+            # selectable, matching the pre-existing behavior for generation
+            # failures that occur after a successful load.
+            traceback.print_exc()
             self.close_connection = True
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API

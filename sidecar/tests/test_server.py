@@ -188,3 +188,43 @@ def test_stream_corrupt_blob_is_500_not_truncated_200(sidecar_url, tmp_path, mon
         assert r.headers.get("content-type", "").startswith("application/json")
     finally:
         server.Handler.engine = server.make_engine("test-model")
+
+
+def test_stream_midstream_error_does_not_inject_error_frame(sidecar_url, monkeypatch):
+    # Regression (Codex adversarial F2): once headers are sent, a generator
+    # failure must truncate the stream, not fall through to do_POST's 500 writer,
+    # which would append a JSON error body to a live 200 and be read by the daemon
+    # as a token frame. Assert no `{"error":...}` payload and no crash.
+    class FailsMidStream:
+        name = "fails-mid-stream"
+        tokenizer_hash = "synthetic"
+        kv_dtype = "synthetic"
+        prefill_count = 0
+
+        def stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+            yield 1, "a"  # load succeeded; the first token is emitted
+            raise RuntimeError("decode blew up mid-stream")
+
+    monkeypatch.setattr(server.Handler, "engine", FailsMidStream())
+    try:
+        r = httpx.post(
+            f"{sidecar_url}/generate",
+            json={"tokens": [1, 2], "max_tokens": 4, "stream": True},
+        )
+        assert r.status_code == 200, "headers were already committed"
+        assert '"error"' not in r.text, "a mid-stream error must not inject an error frame"
+    finally:
+        server.Handler.engine = server.make_engine("test-model")
+
+
+def test_stream_zero_max_tokens_yields_no_tokens(sidecar_url):
+    # Regression (Codex adversarial F3): priming the generator must not force a
+    # token when max_tokens <= 0.
+    r = httpx.post(
+        f"{sidecar_url}/generate",
+        json={"tokens": [1, 2], "max_tokens": 0, "stream": True},
+    )
+    assert r.status_code == 200
+    token_lines = [ln for ln in r.text.splitlines() if '"token"' in ln]
+    assert token_lines == [], f"max_tokens=0 emitted tokens: {r.text}"
+    assert '"done": true' in r.text or '"done":true' in r.text

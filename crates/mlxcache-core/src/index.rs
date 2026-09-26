@@ -102,10 +102,40 @@ impl PrefixIndex {
     }
 
     /// Quarantine an entry (R1-1): keep it visible for diagnostics but never serve it.
+    ///
+    /// Marks the deepest Published entry along `tokens` — the one `lookup` would
+    /// return — not the node at the request's terminal token. On a partial match
+    /// the entry ends at a shorter prefix than the request, so walking to the end
+    /// would miss it and leave the poison entry Published (still served forever).
+    /// Returns true if an entry was quarantined.
     pub fn quarantine(&self, tokens: &[u32]) -> bool {
+        // First walk (immutable): find the depth of the deepest Published entry.
         let mut root = self.write_lock();
+        let mut best_depth: Option<usize> = None;
+        {
+            let mut probe: &Node = &root;
+            for (i, t) in tokens.iter().enumerate() {
+                match probe.children.get(t) {
+                    Some(child) => {
+                        probe = child;
+                        if probe
+                            .entry
+                            .as_ref()
+                            .is_some_and(|e| e.state == CheckpointState::Published)
+                        {
+                            best_depth = Some(i + 1);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        let Some(depth) = best_depth else {
+            return false;
+        };
+        // Second walk (mutable): descend exactly `depth` tokens and quarantine it.
         let mut node: &mut Node = &mut root;
-        for t in tokens {
+        for t in &tokens[..depth] {
             match node.children.get_mut(t) {
                 Some(child) => node = child,
                 None => return false,
@@ -206,6 +236,46 @@ mod tests {
         assert!(index.quarantine(&tokens));
         assert!(index.lookup(&tokens).is_none());
         assert_eq!(index.published_count(), 0);
+    }
+
+    #[test]
+    fn quarantine_on_partial_request_marks_the_matched_entry() {
+        // Regression: a partial hit's entry ends at a SHORTER prefix than the
+        // request. Quarantine must mark the matched entry, not walk past it to
+        // the request terminal (where there is no entry), or a poison blob stays
+        // Published and is served forever.
+        let index = PrefixIndex::new();
+        index.publish(&[1, 2], meta(), "short".into());
+        // Request extends the published prefix; lookup matches at depth 2.
+        let request = [1, 2, 3, 4];
+        let (_, matched) = index.lookup(&request).unwrap();
+        assert_eq!(matched, 2);
+        assert!(
+            index.quarantine(&request),
+            "quarantine must mark the matched entry on a partial request"
+        );
+        assert!(
+            index.lookup(&request).is_none(),
+            "the poison entry must no longer be served"
+        );
+        assert_eq!(index.published_count(), 0);
+    }
+
+    #[test]
+    fn quarantine_marks_deepest_of_nested_entries() {
+        // With nested entries [1,2] and [1,2,3,4], a request [1,2,3,4,5]
+        // matches the deepest, [1,2,3,4]; quarantine that one, not the ancestor.
+        let index = PrefixIndex::new();
+        index.publish(&[1, 2], meta(), "ancestor".into());
+        index.publish(&[1, 2, 3, 4], meta(), "deep".into());
+        assert!(index.quarantine(&[1, 2, 3, 4, 5]));
+        assert!(
+            index.lookup(&[1, 2, 3, 4, 5]).is_some(),
+            "the shallower ancestor is still published"
+        );
+        let (entry, matched) = index.lookup(&[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(matched, 2);
+        assert_eq!(entry.blob_path, "ancestor");
     }
 
     #[test]
