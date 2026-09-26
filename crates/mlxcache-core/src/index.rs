@@ -40,10 +40,22 @@ impl PrefixIndex {
         Self::default()
     }
 
+    /// Recover a poisoned lock instead of panicking: the index is a cache, and
+    /// a poisoned lock must not take down every later request. A recovered read
+    /// may observe a torn write only if a panic interrupted one, which the
+    /// short, allocation-only critical sections here make unlikely.
+    fn read_lock(&self) -> std::sync::RwLockReadGuard<'_, Node> {
+        self.root.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_lock(&self) -> std::sync::RwLockWriteGuard<'_, Node> {
+        self.root.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Longest published prefix match for `tokens`. Returns the entry and the
     /// number of tokens matched.
     pub fn lookup(&self, tokens: &[u32]) -> Option<(IndexEntry, usize)> {
-        let root = self.root.read().expect("index lock poisoned");
+        let root = self.read_lock();
         let mut node: &Node = &root;
         let mut best: Option<(IndexEntry, usize)> = None;
         for (i, t) in tokens.iter().enumerate() {
@@ -65,7 +77,7 @@ impl PrefixIndex {
     /// Publish an entry. Only callable for a prefix whose ancestors are consistent;
     /// the atomic blob rename must have completed BEFORE this call (R1-3).
     pub fn publish(&self, tokens: &[u32], meta: CheckpointMeta, blob_path: String) {
-        let mut root = self.root.write().expect("index lock poisoned");
+        let mut root = self.write_lock();
         let mut node: &mut Node = &mut root;
         for t in tokens {
             node = node.children.entry(*t).or_default();
@@ -79,7 +91,7 @@ impl PrefixIndex {
 
     /// Quarantine an entry (R1-1): keep it visible for diagnostics but never serve it.
     pub fn quarantine(&self, tokens: &[u32]) -> bool {
-        let mut root = self.root.write().expect("index lock poisoned");
+        let mut root = self.write_lock();
         let mut node: &mut Node = &mut root;
         for t in tokens {
             match node.children.get_mut(t) {
@@ -110,7 +122,7 @@ impl PrefixIndex {
             }
             n
         }
-        let root = self.root.read().expect("index lock poisoned");
+        let root = self.read_lock();
         walk(&root)
     }
 }
@@ -192,5 +204,30 @@ mod tests {
         let (_, matched) = index.lookup(&[1, 2, 3]).unwrap();
         assert_eq!(matched, 2);
         assert!(matched <= 3);
+    }
+
+    #[test]
+    fn poisoned_lock_is_recovered_not_panicked() {
+        // A panic while holding the index lock poisons it. Later requests must
+        // still be served, not abort the daemon.
+        use std::sync::Arc;
+        let index = Arc::new(PrefixIndex::new());
+        index.publish(&[1, 2, 3], meta(), "b".into());
+
+        let idx = index.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = idx.root.write().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+
+        assert!(index.root.is_poisoned(), "lock should be poisoned");
+        // Must not panic, and the pre-existing entry is still readable.
+        let (entry, matched) = index.lookup(&[1, 2, 3]).expect("recovered lookup");
+        assert_eq!(matched, 3);
+        assert_eq!(entry.blob_path, "b");
+        // Writes still work too.
+        index.publish(&[4], meta(), "c".into());
+        assert_eq!(index.published_count(), 2);
     }
 }
