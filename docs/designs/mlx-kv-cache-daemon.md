@@ -217,6 +217,7 @@ This plan takes us from "no KV cache layer for MLX; every process re-prefills" t
 | persistence#save | crash mid-write | Y | atomic write-temp-rename (R1-3) | transparent |
 | persistence#load | corrupt blob | Y | quarantine + miss (R1-1) | transparent (slower turn) |
 | persistence#load | version mismatch | Y | quarantine + miss (R1-1) | transparent (slower turn) |
+| adapter#generate | published blob unreadable at request time (deleted/truncated/disk fault) | Y | quarantine entry, retry from scratch (stream + non-stream) | transparent (slower turn) |
 | daemon lifecycle | daemon crash | Y | clients retry (R1-4); launchd auto-restart | brief outage, streams drop |
 
 CRITICAL GAPS: 0 (all rows rescued or explicitly stated).

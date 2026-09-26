@@ -125,6 +125,24 @@ impl PrefixIndex {
         let root = self.read_lock();
         walk(&root)
     }
+
+    /// Count of quarantined entries (for /stats and tests).
+    pub fn quarantined_count(&self) -> usize {
+        fn walk(node: &Node) -> usize {
+            let mut n = usize::from(
+                node.entry
+                    .as_ref()
+                    .map(|e| e.state == CheckpointState::Quarantined)
+                    .unwrap_or(false),
+            );
+            for child in node.children.values() {
+                n += walk(child);
+            }
+            n
+        }
+        let root = self.read_lock();
+        walk(&root)
+    }
 }
 
 #[cfg(test)]

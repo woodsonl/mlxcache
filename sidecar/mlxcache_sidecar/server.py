@@ -361,6 +361,14 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/generate":
                 req = self._read_json()
                 tokens = self._require(req, "tokens")
+                # Real engines fail to load a missing/unreadable blob. Reject a
+                # non-empty blob_path whose file is absent, so the daemon's
+                # quarantine-and-retry path is exercised hermetically (the test
+                # deletes the blob between the miss and the repeat request).
+                blob_path = req.get("blob_path")
+                if blob_path and not os.path.exists(blob_path):
+                    self._json(500, {"error": f"blob unreadable: {blob_path}"})
+                    return
                 if req.get("stream"):
                     self._stream_ndjson(tokens, req.get("blob_path"), req.get("max_tokens", 64))
                 else:

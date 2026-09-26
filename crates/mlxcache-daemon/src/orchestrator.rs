@@ -85,6 +85,23 @@ impl Orchestrator {
         self.index.publish(tokens, meta, blob_path);
     }
 
+    /// Mark a checkpoint unusable (R1-1): a blob that failed to load at request
+    /// time is quarantined so identical requests stop hitting it and fall back to
+    /// scratch instead of erroring forever. Returns true if an entry was marked.
+    pub fn quarantine_checkpoint(&self, tokens: &[u32]) -> bool {
+        self.index.quarantine(tokens)
+    }
+
+    /// Count of quarantined checkpoints (observability/tests).
+    pub fn quarantined_count(&self) -> usize {
+        self.index.quarantined_count()
+    }
+
+    /// Count of published checkpoints (observability).
+    pub fn published_count(&self) -> usize {
+        self.index.published_count()
+    }
+
     /// Rebuild the index from persisted checkpoints at startup (R1-4: persisted
     /// checkpoints survive a restart). Each blob's header carries its own token
     /// prefix, so the radix index can be reconstructed without a request. Blobs

@@ -301,31 +301,60 @@ async fn chat_completions(
 
     // Generate: full context tokens, continuation from the request length.
     // The adapter opens the blob directly, so it needs the absolute path.
+    let mut retired_blob = false;
     let generated = match client
         .generate(&tokens, outcome.prefill_from, 64, blob_arg)
         .await
     {
         Ok(t) => t,
         Err(e) => {
-            return Err(err(
-                StatusCode::BAD_GATEWAY,
-                &e.to_string(),
-                "adapter_error",
-            ))
+            // If this request leaned on a blob and the adapter could not use it,
+            // the checkpoint is bad (deleted, truncated, disk fault). Quarantine
+            // it (R1-1) so identical requests stop 502ing, then retry from
+            // scratch. A scratch failure is a genuine adapter error.
+            if let Some(name) = outcome.blob_path.clone() {
+                state.orchestrator.quarantine_checkpoint(&tokens);
+                retired_blob = true;
+                tracing::warn!(blob = %name, error = %e, "blob unusable; quarantined, retrying from scratch");
+                match client.generate(&tokens, 0, 64, None).await {
+                    Ok(t) => t,
+                    Err(e2) => {
+                        return Err(err(
+                            StatusCode::BAD_GATEWAY,
+                            &e2.to_string(),
+                            "adapter_error",
+                        ))
+                    }
+                }
+            } else {
+                return Err(err(
+                    StatusCode::BAD_GATEWAY,
+                    &e.to_string(),
+                    "adapter_error",
+                ));
+            }
         }
     };
 
     let total_ms = started.elapsed().as_millis() as u64;
     let body = serde_json::json!({
         "mlxcache": {
-            "verdict": match outcome.decision.verdict {
-                CacheVerdict::Hit => "hit",
-                CacheVerdict::Partial => "partial",
-                CacheVerdict::Miss => "miss",
+            "verdict": if retired_blob {
+                "miss"
+            } else {
+                match outcome.decision.verdict {
+                    CacheVerdict::Hit => "hit",
+                    CacheVerdict::Partial => "partial",
+                    CacheVerdict::Miss => "miss",
+                }
             },
-            "tokens_cached": outcome.decision.matched_tokens,
+            "tokens_cached": if retired_blob {
+                0
+            } else {
+                outcome.decision.matched_tokens
+            },
             "tokens_total": outcome.decision.request_tokens,
-            "prefill_from": outcome.prefill_from,
+            "prefill_from": if retired_blob { 0 } else { outcome.prefill_from },
             // Time to the cache decision (prefill+publish on a miss). The
             // non-streaming path has no first-token hook, so the full round trip
             // is reported separately as total_ms.
@@ -415,7 +444,7 @@ fn push_frame(frames: &mut Vec<Result<Vec<u8>, std::io::Error>>, raw: &[u8]) {
 /// Each sidecar line `{"token":..,"text":..}` becomes an OpenAI-style
 /// `data: {...}` chunk; the terminal `{"done":true}` closes with `[DONE]`.
 async fn stream_response(
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     client: &SidecarClient,
     tokens: Vec<u32>,
     outcome: crate::orchestrator::RouteOutcome,
@@ -428,25 +457,61 @@ async fn stream_response(
     // token exists. The true TTFT (first generated token) is only known once the
     // sidecar emits it, so it is reported in the terminal frame, not here.
     let lookup_ms = started.elapsed().as_millis() as u64;
-    let verdict = match outcome.decision.verdict {
-        CacheVerdict::Hit => "hit",
-        CacheVerdict::Partial => "partial",
-        CacheVerdict::Miss => "miss",
+
+    let mut blob_for_open = outcome.blob_path.clone();
+    let mut prefill_from = outcome.prefill_from;
+    let retired_blob = std::cell::Cell::new(false);
+    let upstream = match client
+        .generate_stream(&tokens, prefill_from, 64, blob_arg)
+        .await
+    {
+        Ok(u) => u,
+        Err(e) if blob_for_open.is_some() => {
+            // The blob could not be opened (deleted/truncated/disk fault).
+            // Quarantine it and retry from scratch so the stream still starts.
+            if let Some(name) = blob_for_open.take() {
+                state.orchestrator.quarantine_checkpoint(&tokens);
+                tracing::warn!(blob = %name, error = %e, "blob unusable; quarantined, retrying stream from scratch");
+            }
+            prefill_from = 0;
+            retired_blob.set(true);
+            client
+                .generate_stream(&tokens, 0, 64, None)
+                .await
+                .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?
+        }
+        Err(e) => {
+            return Err(err(
+                StatusCode::BAD_GATEWAY,
+                &e.to_string(),
+                "adapter_error",
+            ))
+        }
+    };
+
+    // The meta frame reflects what this stream actually did: if the blob was
+    // retired, it is a scratch run (miss), not the original hit/partial.
+    let (verdict, effective_cached) = if retired_blob.get() {
+        ("miss", 0)
+    } else {
+        (
+            match outcome.decision.verdict {
+                CacheVerdict::Hit => "hit",
+                CacheVerdict::Partial => "partial",
+                CacheVerdict::Miss => "miss",
+            },
+            outcome.decision.matched_tokens,
+        )
     };
     let meta_line = serde_json::json!({
         "mlxcache": {
             "verdict": verdict,
-            "tokens_cached": outcome.decision.matched_tokens,
+            "tokens_cached": effective_cached,
             "tokens_total": outcome.decision.request_tokens,
-            "prefill_from": outcome.prefill_from,
+            "prefill_from": prefill_from,
             "lookup_ms": lookup_ms,
         }
     });
-
-    let upstream = client
-        .generate_stream(&tokens, outcome.prefill_from, 64, blob_arg)
-        .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?;
 
     // Split the upstream byte stream on newlines, then map each NDJSON line to
     // an SSE frame. A tiny state machine keeps partial lines across chunks, and
@@ -574,6 +639,8 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         } else {
             0.0
         },
+        "checkpoints_published": state.orchestrator.published_count(),
+        "checkpoints_quarantined": state.orchestrator.quarantined_count(),
     }))
 }
 
