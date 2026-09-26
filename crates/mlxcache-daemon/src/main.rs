@@ -18,13 +18,21 @@ async fn main() -> Result<()> {
         .map(|s| s.trim().to_string())
         .collect();
     let sidecar_base = std::env::var("MLXCACHE_SIDECAR_URL").ok();
-    let sidecar = sidecar_base.and_then(|url| {
-        let model = served_models.first().cloned().unwrap_or_default();
-        mlxcache_daemon::sidecar::SidecarClient::new(mlxcache_daemon::sidecar::SidecarConfig::new(
-            url, model,
-        ))
-        .ok()
-    });
+    let sidecar = match sidecar_base {
+        Some(url) => {
+            let model = served_models.first().cloned().unwrap_or_default();
+            Some(
+                mlxcache_daemon::sidecar::SidecarClient::new(
+                    mlxcache_daemon::sidecar::SidecarConfig::new(url, model),
+                )
+                .map_err(|e| anyhow::anyhow!("sidecar client init failed: {e}"))?,
+            )
+        }
+        None => None,
+    };
+    if served_models.is_empty() {
+        tracing::warn!("MLXCACHE_MODELS is empty: every request will 404");
+    }
     let blob_dir = std::env::var("MLXCACHE_BLOBS").unwrap_or_else(|_| "/tmp/mlxcache-blobs".into());
     let persistence = mlxcache_daemon::persistence::Persistence::new(blob_dir).map_err(|e| {
         // adapter#load rescue row: refuse at startup with a clear message.

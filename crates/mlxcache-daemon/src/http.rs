@@ -393,6 +393,12 @@ async fn stream_response(
                         } else {
                             frames.push(Ok(format!("data: {v}\n\n").into_bytes()));
                         }
+                    } else {
+                        // A non-JSON upstream line is a protocol violation; surfacing
+                        // it beats silently dropping a token (output would lie).
+                        frames.push(Err(std::io::Error::other(
+                            "sidecar emitted a non-JSON stream line",
+                        )));
                     }
                 }
             }

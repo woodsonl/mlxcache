@@ -50,7 +50,15 @@ pub struct SidecarClient {
 
 impl SidecarClient {
     pub fn new(config: SidecarConfig) -> Result<Self, SidecarError> {
+        // A hung sidecar must not wedge the daemon (and, via single-flight, every
+        // follower). Default: generous enough for a 50K-token prefill on the
+        // measured slowest model (~10s), overridable via MLXCACHE_SIDECAR_TIMEOUT_S.
+        let timeout_s: u64 = std::env::var("MLXCACHE_SIDECAR_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
         let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_s))
             .build()
             .map_err(|_e| SidecarError::Protocol("client build failed".into()))?;
         Ok(Self { config, http })
@@ -196,5 +204,28 @@ mod tests {
     fn config_shapes() {
         let c = SidecarConfig::new("http://127.0.0.1:8421".into(), "m".into());
         assert_eq!(c.base_url, "http://127.0.0.1:8421");
+    }
+
+    #[tokio::test]
+    async fn client_times_out_against_a_black_hole() {
+        // A hung/unroutable sidecar must return an error rather than wedging the
+        // daemon (regression: the builder previously had no timeout at all).
+        // 203.0.113.0/24 (TEST-NET-3) is non-routable, so a connect never
+        // completes; the client must give up within its configured timeout.
+        std::env::set_var("MLXCACHE_SIDECAR_TIMEOUT_S", "1");
+        let c = SidecarClient::new(SidecarConfig::new(
+            "http://203.0.113.1:9".into(),
+            "m".into(),
+        ))
+        .expect("client builds");
+        let start = std::time::Instant::now();
+        let res = c.tokenize("x").await;
+        assert!(res.is_err(), "black-hole sidecar must error, not hang");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "must respect the configured timeout, took {:?}",
+            start.elapsed()
+        );
+        std::env::remove_var("MLXCACHE_SIDECAR_TIMEOUT_S");
     }
 }

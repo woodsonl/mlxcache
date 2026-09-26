@@ -59,3 +59,64 @@ def test_prefill_large_tokens_no_overflow(sidecar_url):
     tokens = [2**31 - 1, 2**31 - 2, 0]
     payload = httpx.post(f"{sidecar_url}/prefill", json={"tokens": tokens}).content
     assert len(payload) == 3 * 1024
+
+
+def _raw_post(url: str, path: str, content_length: str, body: bytes = b"") -> tuple[int, str]:
+    """Send a hand-built request so we can control a malformed Content-Length."""
+    import socket
+    from urllib.parse import urlparse
+
+    u = urlparse(url)
+    s = socket.create_connection((u.hostname, u.port), timeout=3)
+    head = (
+        f"POST {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+        f"Content-Length: {content_length}\r\n\r\n"
+    )
+    s.sendall(head.encode() + body)
+    data = b""
+    try:
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except TimeoutError:
+        pass
+    s.close()
+    status_line = data.split(b"\r\n", 1)[0].decode(errors="replace")
+    code = int(status_line.split()[1])
+    return code, data.split(b"\r\n\r\n", 1)[-1].decode(errors="replace")
+
+
+def test_non_numeric_content_length_is_400(sidecar_url):
+    # A malformed Content-Length must be a clean 400, not a 500 leaking the
+    # internal ValueError text.
+    code, body = _raw_post(sidecar_url, "/tokenize", "abc")
+    assert code == 400
+    assert "invalid Content-Length" in body
+    assert "ValueError" not in body
+
+
+def test_negative_content_length_is_400(sidecar_url):
+    # read(-1) would block until EOF, pinning a worker thread (DoS).
+    code, _ = _raw_post(sidecar_url, "/tokenize", "-1")
+    assert code == 400
+
+
+def test_oversized_content_length_is_400(sidecar_url):
+    # A declared huge length with a tiny body must not block the worker.
+    code, body = _raw_post(sidecar_url, "/tokenize", "999999999", b"{}")
+    assert code == 400
+    assert "out of range" in body
+
+
+def test_missing_required_field_is_400(sidecar_url):
+    code, body = _raw_post(sidecar_url, "/prefill", "2", b"{}")
+    assert code == 400
+    assert "missing required field" in body
+
+
+def test_malformed_json_is_400(sidecar_url):
+    code, body = _raw_post(sidecar_url, "/prefill", "3", b"{x}")
+    assert code == 400
+    assert "malformed JSON" in body
