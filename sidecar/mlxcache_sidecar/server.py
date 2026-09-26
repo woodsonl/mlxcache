@@ -93,8 +93,8 @@ class SyntheticEngine:
     def prepare_stream(self, tokens: list[int], blob_path: str | None):
         """Load any checkpoint and return (prompt, cache) BEFORE streaming.
 
-        Split from generation so the handler can surface a corrupt checkpoint as
-        a clean 500 (which the daemon quarantines) rather than a mid-stream
+        Split from generation so the handler can surface a rejected checkpoint as
+        a clean 422 (which the daemon quarantines) rather than a mid-stream
         failure. The synthetic engine has no cache; returns the prompt as-is.
         """
         return tokens, None
@@ -224,7 +224,7 @@ class MlxLmEngine:
     def prepare_stream(self, tokens: list[int], blob_path: str | None):
         """Load the checkpoint (may raise for a corrupt blob) and return
         (prompt, cache). Done before headers are sent so a load failure is a
-        clean 500, not a truncated stream. First-token decode happens later, in
+        clean 422, not a truncated stream. First-token decode happens later, in
         stream_prepared, so a decode error does not look like blob corruption."""
         cache = None
         prompt = tokens
