@@ -143,9 +143,9 @@ async fn chat_completions(
     })?;
 
     // Tokenize via adapter (R1-2). Sidecar unavailable → 503 naming it.
-    let (tokens, tokenizer_hash) = match &state.sidecar {
+    let (tokens, tokenizer_hash, kv_dtype) = match &state.sidecar {
         Some(client) => match client.tokenize(&prompt).await {
-            Ok(r) => (r.tokens, r.tokenizer_hash),
+            Ok(r) => (r.tokens, r.tokenizer_hash, r.kv_dtype),
             Err(SidecarError::Unreachable { url, .. }) => {
                 return Err(err(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -187,7 +187,7 @@ async fn chat_completions(
     let fingerprint = ModelFingerprint {
         model_id: req.model.clone(),
         tokenizer_hash,
-        kv_dtype: "f16".into(),
+        kv_dtype,
         kv_layout_version: 1,
     };
     let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
