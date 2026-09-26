@@ -230,3 +230,61 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
     );
     assert_eq!(ext.prefill_from, 3);
 }
+
+#[cfg(unix)]
+#[test]
+fn sigterm_triggers_graceful_shutdown() {
+    // The daemon must drain and exit 0 on SIGTERM, not die abruptly. A clean
+    // shutdown logs the drain line. (Publishes are atomic, so this is about not
+    // dropping in-flight requests, not data safety.)
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let port = portpicker::pick_unused_port().expect("pick port");
+    let addr = format!("127.0.0.1:{port}");
+    let blobs = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mlxcache-daemon"))
+        .env("MLXCACHE_ADDR", &addr)
+        .env("MLXCACHE_BLOBS", blobs.path())
+        .env("MLXCACHE_MODELS", "e2e-model")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+
+    // Wait until the port answers, so SIGTERM lands after handlers are installed.
+    let ready = (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::net::TcpStream::connect(&addr).is_ok()
+    });
+    assert!(ready, "daemon never started listening on {addr}");
+
+    let pid = child.id();
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+
+    // Bounded wait: graceful shutdown must complete, not hang.
+    let status = child.wait().expect("wait daemon");
+    assert!(status.success(), "daemon must exit 0 on SIGTERM: {status}");
+
+    let mut out = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    let mut out2 = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out2)
+        .unwrap();
+    let combined = format!("{out}{out2}");
+    assert!(
+        combined.contains("SIGTERM"),
+        "shutdown should log the signal, got: {combined}"
+    );
+}

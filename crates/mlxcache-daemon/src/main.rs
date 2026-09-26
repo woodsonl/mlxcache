@@ -69,6 +69,38 @@ async fn main() -> Result<()> {
     let addr = std::env::var("MLXCACHE_ADDR").unwrap_or_else(|_| "127.0.0.1:8420".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, "mlxcache daemon listening");
-    axum::serve(listener, app).await?;
+    // Drain in-flight requests on SIGINT/SIGTERM instead of dropping them.
+    // axum closes idle keep-alive connections immediately and waits only for
+    // active requests, each of which is already bounded by the sidecar client
+    // timeout. Publishes are atomic, so nothing is lost if the process is killed.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    tracing::info!("mlxcache daemon stopped");
     Ok(())
+}
+
+/// Resolve on SIGINT or SIGTERM. Logs which signal so operators can tell an
+/// intentional stop from a crash.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install SIGINT handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => tracing::info!("received SIGINT; draining"),
+        () = terminate => tracing::info!("received SIGTERM; draining"),
+    }
 }

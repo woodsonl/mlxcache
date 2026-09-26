@@ -624,6 +624,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "http-body-util",
+ "libc",
  "mlxcache-core",
  "portpicker",
  "reqwest",
