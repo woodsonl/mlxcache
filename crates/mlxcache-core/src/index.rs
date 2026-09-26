@@ -91,25 +91,28 @@ impl PrefixIndex {
     /// boundary, and a non-conforming adapter could return a non-empty payload
     /// for a 1-token prompt. A short prefix is silently not published, matching
     /// the caller's "empty blob means nothing cached" convention; never panic, so
-    /// a hostile adapter cannot crash the daemon.
-    pub fn publish(&self, tokens: &[u32], meta: CheckpointMeta, blob_path: String) {
+    /// a hostile adapter cannot crash the daemon. Returns the publication
+    /// generation (0 if not published).
+    pub fn publish(&self, tokens: &[u32], meta: CheckpointMeta, blob_path: String) -> u64 {
         if tokens.len() < 2 {
-            return;
+            return 0;
         }
         let mut root = self.write_lock();
         let mut node: &mut Node = &mut root;
         for t in tokens {
             node = node.children.entry(*t).or_default();
         }
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         node.entry = Some(IndexEntry {
             meta,
             blob_path,
-            generation: self
-                .next_generation
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1,
+            generation,
             state: CheckpointState::Published,
         });
+        generation
     }
 
     /// Quarantine the entry that points at `blob_path` (R1-1): keep it visible
@@ -311,6 +314,22 @@ mod tests {
             index.lookup(&[1, 2, 3]).is_none(),
             "the retired entry is no longer served"
         );
+    }
+
+    #[test]
+    fn publish_returns_the_generation_that_retires_it() {
+        // The leader records the generation `publish` returns so a later
+        // rejection of its own blob retires it. If publish returned 0 (or the
+        // caller kept None), quarantine would match nothing and leave poison
+        // Published. Pin the round trip.
+        let index = PrefixIndex::new();
+        let generation = index.publish(&[1, 2, 3], meta(), "leader-blob".into());
+        assert_ne!(generation, 0, "a real publish has a non-zero generation");
+        assert!(
+            index.quarantine_blob("leader-blob", generation),
+            "the generation publish returned must retire the entry"
+        );
+        assert!(index.lookup(&[1, 2, 3]).is_none());
     }
 
     #[test]

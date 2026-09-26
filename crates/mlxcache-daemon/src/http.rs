@@ -283,7 +283,7 @@ async fn chat_completions(
                                 lead.complete(Err(e.to_string()));
                             }
                             Ok(_) => {
-                                state.orchestrator.publish_checkpoint(
+                                let generation = state.orchestrator.publish_checkpoint(
                                     &tokens,
                                     meta,
                                     blob_name.clone(),
@@ -302,6 +302,7 @@ async fn chat_completions(
                                 };
                                 outcome.prefill_from = 0;
                                 outcome.blob_path = Some(blob_name.clone());
+                                outcome.blob_generation = Some(generation);
                                 lead.complete(Ok(blob_name));
                             }
                         }

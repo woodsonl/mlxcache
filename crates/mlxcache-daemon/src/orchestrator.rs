@@ -91,9 +91,16 @@ impl Orchestrator {
     }
 
     /// Register a completed prefill: capture metadata and publish atomically.
-    /// The blob rename must already be done (R1-3 ordering).
-    pub fn publish_checkpoint(&self, tokens: &[u32], meta: CheckpointMeta, blob_path: String) {
-        self.index.publish(tokens, meta, blob_path);
+    /// The blob rename must already be done (R1-3 ordering). Returns the
+    /// publication generation so the caller can retire exactly this publication
+    /// if the adapter later rejects the blob.
+    pub fn publish_checkpoint(
+        &self,
+        tokens: &[u32],
+        meta: CheckpointMeta,
+        blob_path: String,
+    ) -> u64 {
+        self.index.publish(tokens, meta, blob_path)
     }
 
     /// Mark a checkpoint unusable (R1-1): a blob that failed to load at request
