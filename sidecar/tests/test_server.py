@@ -28,6 +28,20 @@ def test_tokenize_deterministic(sidecar_url):
     assert all(0 <= t < 2**31 for t in r1["tokens"])
 
 
+def test_tokenize_reports_kv_dtype(sidecar_url):
+    # The daemon pins kv_dtype in the fingerprint. It must come from the engine,
+    # not a daemon-side constant: a bf16 model's checkpoint is unsafe to serve
+    # to an f16 request with the same model id and tokenizer.
+    r = httpx.post(f"{sidecar_url}/tokenize", json={"prompt": "x"}).json()
+    assert r["kv_dtype"] == "synthetic"
+    server.Handler.engine.kv_dtype = "bfloat16"
+    try:
+        r2 = httpx.post(f"{sidecar_url}/tokenize", json={"prompt": "x"}).json()
+        assert r2["kv_dtype"] == "bfloat16"
+    finally:
+        server.Handler.engine.kv_dtype = "synthetic"
+
+
 def test_tokenize_returns_engine_hash_not_a_constant(sidecar_url):
     # R1-2: the daemon pins THIS hash. A constant would let checkpoints from
     # different tokenizers collide on fingerprint and be served wrongly.
