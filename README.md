@@ -109,6 +109,7 @@ curl -N -X POST http://127.0.0.1:8420/v1/chat/completions \
 | `MLXCACHE_MODELS` | (empty) | comma-separated served models; others 404 before any cache lookup |
 | `MLXCACHE_SIDECAR_URL` | (unset) | sidecar base URL; unset = no adapter, requests 503 |
 | `MLXCACHE_BLOBS` | `/tmp/mlxcache-blobs` | where KV checkpoints are written |
+| `MLXCACHE_SIDECAR_TIMEOUT_S` | `120` | per-request sidecar timeout; must exceed the slowest prefill |
 | `MLXCACHE_ENGINE` | `synthetic` | sidecar engine: `synthetic` or `mlx-lm` |
 | `MLXCACHE_MODEL` | `synthetic-model` | model the sidecar loads |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
@@ -135,9 +136,10 @@ adapter has become lossy and checkpoints are not being trusted correctly.
 ## Measured
 
 Qwen2-0.5B-Instruct, mlx-lm 0.31.3, Apple Silicon: 12,288 bytes/token,
-serialize 20 ms, deserialize <1 ms at 8K tokens — the 2 s TTFT resume budget
-holds with margin. Full numbers and caveats in the
-[design doc](docs/designs/mlx-kv-cache-daemon.md) (R1-5).
+serialize 20 ms, deserialize <1 ms. Qwen2.5-7B-Instruct-4bit: 57,344 bytes/token,
+serialize 526 ms, deserialize <1 ms, prefill 10.2 s. A hit eliminates that
+prefill, and the 2 s TTFT resume budget holds with margin at both sizes. Full
+numbers and caveats in the [design doc](docs/designs/mlx-kv-cache-daemon.md) (R1-5).
 
 ## Operating it
 
@@ -147,6 +149,7 @@ launchd service, and the mlx-lm version-pinning policy.
 ## Status
 
 Early. Working end to end (cache, persistence, single-flight, streaming, error
-rescues, chaos tests). Not yet done: the R1-5 gate has only been run on a small
-model; the engine-agnostic contract has one adapter (mlx-lm). No license assigned
-— private build, all rights reserved.
+rescues, chaos tests). The R1-5 gate has run on Qwen2-0.5B and
+Qwen2.5-7B-Instruct-4bit; the named representative (32B-4bit) is pending a
+download. The engine-agnostic contract has one adapter (mlx-lm). No license
+assigned — private build, all rights reserved.
