@@ -190,11 +190,18 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
     .to_string();
 
     const N: usize = 6;
+    // Release all requests together so they enter single-flight within the
+    // prefill window. Without a barrier the assertion depends on scheduler
+    // timing and a slow CI runner can start a second leader after the first
+    // prefill completes (observed: prefill_count 2).
+    let barrier = Arc::new(tokio::sync::Barrier::new(N));
     let mut handles = Vec::new();
     for _ in 0..N {
         let app = router(state.clone());
         let body = body.clone();
+        let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
+            barrier.wait().await;
             let res = app
                 .oneshot(
                     axum::http::Request::builder()

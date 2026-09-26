@@ -9,6 +9,7 @@ output than a scratch run.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import types
 
@@ -197,10 +198,10 @@ def test_truncated_multi_token_blob_raises_for_quarantine(monkeypatch, tmp_path)
     path = str(tmp_path / "truncated.ckpt")
     with open(path, "wb") as fh:
         fh.write(blob.encode(meta, b""))  # header valid, KV missing
-    try:
+    # A real empty safetensors raises; the daemon quarantines. Here the fake
+    # loader records the attempt, which is the behavior under test.
+    with contextlib.suppress(Exception):
         eng._load_cache_delta(tokens, path)
-    except Exception:
-        pass  # a real empty safetensors raises; the daemon quarantines
     assert loaded, "a truncated multi-token blob must reach the loader, not be swallowed"
 
 
