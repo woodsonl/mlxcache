@@ -143,9 +143,9 @@ async fn chat_completions(
     })?;
 
     // Tokenize via adapter (R1-2). Sidecar unavailable → 503 naming it.
-    let tokens = match &state.sidecar {
+    let (tokens, tokenizer_hash) = match &state.sidecar {
         Some(client) => match client.tokenize(&prompt).await {
-            Ok(r) => r.tokens,
+            Ok(r) => (r.tokens, r.tokenizer_hash),
             Err(SidecarError::Unreachable { url, .. }) => {
                 return Err(err(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -170,10 +170,12 @@ async fn chat_completions(
         }
     };
 
-    // Route + classify (R1-1 fingerprint check inside classify).
+    // Route + classify (R1-1 fingerprint check inside classify). The tokenizer
+    // hash comes from the adapter (R1-2): a constant here would let checkpoints
+    // from different tokenizers share a fingerprint and be served wrongly.
     let fingerprint = ModelFingerprint {
         model_id: req.model.clone(),
-        tokenizer_hash: "sidecar".into(), // real hash arrives with the sidecar's tokenize response
+        tokenizer_hash,
         kv_dtype: "f16".into(),
         kv_layout_version: 1,
     };
@@ -314,14 +316,12 @@ async fn chat_completions(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
-/// Stable blob key for a token prefix. 128 bits from two FNV-1a passes with
-/// genuinely independent seeds and different primes: a filename collision would
-/// alias two distinct KV states, so 64 bits is too thin as the store grows.
-/// (The index itself is exact, keyed by token ids; this only names the blob.)
+/// Stable blob key for a token prefix: 128 bits from two FNV-1a passes with
+/// different seeds and different primes, so a collision in one lane does not
+/// correlate with the other. 64 bits is too thin as the store grows; a filename
+/// collision would alias two distinct KV states. (The index is exact and keyed
+/// by token ids; this only names the blob on disk.)
 fn prefix_hash(tokens: &[u32]) -> u128 {
-    // Two different multi-word mixers so a collision in one lane cannot be
-    // correlated with a collision in the other. FNV-1a basis and another
-    // well-mixed odd constant; distinct primes per lane.
     fn fnv1a(seed: u64, prime: u64, tokens: &[u32]) -> u64 {
         let mut h = seed;
         for t in tokens {
@@ -330,8 +330,11 @@ fn prefix_hash(tokens: &[u32]) -> u128 {
         }
         h
     }
+    // Lane 1: FNV-1a 64 (basis 0xcbf29ce484222325, prime 0x100000001b3).
+    // Lane 2: FNV-1 (no final fold) with the golden-ratio seed and the FNV-1
+    // alternate prime 0x880355f21e6d1965, so the two lanes use different mixers.
     let lo = fnv1a(0xcbf29ce484222325, 0x00000100000001b3, tokens);
-    let hi = fnv1a(0x9e3779b97f4a7c15, 0x00000100000001b3, tokens);
+    let hi = fnv1a(0x9e3779b97f4a7c15, 0x880355f21e6d1965, tokens);
     ((hi as u128) << 64) | lo as u128
 }
 

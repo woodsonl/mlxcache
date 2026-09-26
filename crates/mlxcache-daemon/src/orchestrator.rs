@@ -212,6 +212,29 @@ mod tests {
     }
 
     #[test]
+    fn tokenizer_hash_difference_is_a_miss() {
+        // R1-2: same model, different tokenizer artifact must not share a
+        // checkpoint. A hardcoded tokenizer_hash in the daemon would break this.
+        let orch = Orchestrator::new();
+        let tokens = vec![1, 2, 3];
+        let mut a = fp("m");
+        a.tokenizer_hash = "tok-a".into();
+        let mut b = fp("m");
+        b.tokenizer_hash = "tok-b".into();
+
+        let mut meta_a = meta("m", 3);
+        meta_a.fingerprint = a.clone();
+        orch.publish_checkpoint(&tokens, meta_a, "blob-a".into());
+        assert_eq!(orch.route(&tokens, &a).decision.verdict, CacheVerdict::Hit);
+        let out = orch.route(&tokens, &b);
+        assert_eq!(out.decision.verdict, CacheVerdict::Miss);
+        assert!(
+            out.blob_path.is_none(),
+            "must not reuse the other tokenizer's blob"
+        );
+    }
+
+    #[test]
     fn sidecar_config_accessible() {
         // Wiring smoke: sidecar config constructs and is distinct from the
         // native path. The sidecar is never the hot-path default (R4).
