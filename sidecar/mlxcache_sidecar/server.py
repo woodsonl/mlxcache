@@ -34,6 +34,7 @@ class SyntheticEngine:
         self.model_id = model_id
         self.prefill_count = 0
         self.tokenizer_hash = "synthetic"
+        self.kv_dtype = "synthetic"
 
     def tokenize(self, prompt: str) -> list[int]:
         # Deterministic token stream derived from the prompt hash. Not a real
@@ -87,6 +88,29 @@ class MlxLmEngine:
         # artifact, and two different tokenizers can share a name_or_path-free
         # identity. The vocab is deterministic and artifact-derived.
         self.tokenizer_hash = self._hash_vocab()
+        self.kv_dtype = self._kv_dtype()
+
+    def _kv_dtype(self) -> str:
+        """The KV/compute dtype this model will cache in (bf16 vs f16 changes the
+        persisted bytes and makes a checkpoint from the other dtype unsafe to
+        serve). Derived from a real model parameter, not a constant."""
+        try:
+
+            def flatten(node):
+                if hasattr(node, "dtype"):
+                    yield node
+                elif isinstance(node, dict):
+                    for v in node.values():
+                        yield from flatten(v)
+                elif isinstance(node, (list, tuple)):
+                    for v in node:
+                        yield from flatten(v)
+
+            for p in flatten(self.model.parameters()):
+                return str(p.dtype).replace("mlx.core.", "")
+        except Exception:  # noqa: BLE001 — best-effort identity, never fatal
+            pass
+        return "unknown"
 
     def _hash_vocab(self) -> str:
         vocab = getattr(self.tokenizer, "get_vocab", None)
@@ -325,6 +349,7 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         "tokens": tokens,
                         "tokenizer_hash": getattr(self.engine, "tokenizer_hash", "synthetic"),
+                        "kv_dtype": getattr(self.engine, "kv_dtype", "unknown"),
                     },
                 )
             elif self.path == "/prefill":

@@ -29,6 +29,15 @@ pub struct TokenizeResponse {
     pub tokens: Vec<u32>,
     /// Hash of the tokenizer artifact the sidecar used.
     pub tokenizer_hash: String,
+    /// KV/compute dtype the engine caches in (e.g. "float16", "bfloat16"). Pin
+    /// it in the fingerprint: a checkpoint from a different dtype holds
+    /// different bytes and must not be served to this request.
+    #[serde(default = "default_kv_dtype")]
+    pub kv_dtype: String,
+}
+
+fn default_kv_dtype() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Debug, thiserror::Error)]
