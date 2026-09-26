@@ -6,6 +6,7 @@
 //! can never evict an in-flight leader.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 
@@ -17,6 +18,10 @@ struct InFlightEntry {
     /// publishes; the sender is dropped when the leader's guard drops, which
     /// wakes followers that were still waiting.
     done: watch::Sender<Option<PrefillResult>>,
+    /// Followers currently attached to this in-flight prefill. Used to observe
+    /// coalescing (and by tests to know followers have registered before the
+    /// leader completes). Decremented when a follower guard drops.
+    waiters: Arc<AtomicUsize>,
 }
 
 /// Leader token. Only the leader holds one, so only the leader removes the
@@ -25,6 +30,7 @@ pub struct Leadership {
     key: Vec<u32>,
     map: Arc<Mutex<HashMap<Vec<u32>, InFlightEntry>>>,
     done: watch::Sender<Option<PrefillResult>>,
+    waiters: Arc<AtomicUsize>,
 }
 
 impl Leadership {
@@ -32,6 +38,11 @@ impl Leadership {
     pub fn complete(&self, result: PrefillResult) {
         // Ignore send errors: no followers is not a failure.
         let _ = self.done.send(Some(result));
+    }
+
+    /// Followers currently attached to this prefill.
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.load(Ordering::SeqCst)
     }
 }
 
@@ -71,12 +82,32 @@ impl Default for SingleFlight {
     }
 }
 
+/// A follower's subscription to an in-flight prefill. Dropping it decrements
+/// the leader's waiter count (so coalescing can be observed).
+pub struct Follower {
+    rx: watch::Receiver<Option<PrefillResult>>,
+    waiters: Arc<AtomicUsize>,
+}
+
+impl Follower {
+    /// The receiver to await the leader's result on.
+    pub fn receiver(&mut self) -> &mut watch::Receiver<Option<PrefillResult>> {
+        &mut self.rx
+    }
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// What the caller becomes for a key.
 pub enum Role {
     /// This caller runs the prefill; call `complete()` with the result.
     Leader(Leadership),
     /// Another prefill is in flight; await its result.
-    Follower(watch::Receiver<Option<PrefillResult>>),
+    Follower(Follower),
 }
 
 impl SingleFlight {
@@ -90,21 +121,43 @@ impl SingleFlight {
     pub async fn enter(&self, key: Vec<u32>) -> Role {
         let mut map = self.map.lock().await;
         if let Some(entry) = map.get(&key) {
-            return Role::Follower(entry.done.subscribe());
+            entry.waiters.fetch_add(1, Ordering::SeqCst);
+            return Role::Follower(Follower {
+                rx: entry.done.subscribe(),
+                waiters: Arc::clone(&entry.waiters),
+            });
         }
         let (tx, _rx) = watch::channel(None);
-        map.insert(key.clone(), InFlightEntry { done: tx.clone() });
+        let waiters = Arc::new(AtomicUsize::new(0));
+        map.insert(
+            key.clone(),
+            InFlightEntry {
+                done: tx.clone(),
+                waiters: Arc::clone(&waiters),
+            },
+        );
         Role::Leader(Leadership {
             key,
             map: Arc::clone(&self.map),
             done: tx,
+            waiters,
         })
+    }
+
+    /// Followers currently attached to an in-flight prefill for `key`, or 0 if
+    /// no prefill is in flight. Test/observability hook for coalescing.
+    pub async fn waiter_count(&self, key: &[u32]) -> usize {
+        let map = self.map.lock().await;
+        map.get(key)
+            .map(|e| e.waiters.load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 }
 
 /// Await a follower's result. Returns `None` if the leader vanished without
 /// publishing (sender dropped) — the caller should fall back to its own path.
-pub async fn await_result(mut rx: watch::Receiver<Option<PrefillResult>>) -> Option<PrefillResult> {
+pub async fn await_result(follower: &mut Follower) -> Option<PrefillResult> {
+    let rx = follower.receiver();
     loop {
         // Already published?
         if let Some(result) = rx.borrow().clone() {
@@ -135,14 +188,15 @@ mod tests {
         let mut followers = Vec::new();
         for _ in 0..4 {
             match sf.enter(key.clone()).await {
-                Role::Follower(rx) => followers.push(rx),
+                Role::Follower(f) => followers.push(f),
                 Role::Leader(_) => panic!("only one leader allowed"),
             }
         }
+        assert_eq!(leader.waiter_count(), 4, "followers must be counted");
 
         leader.complete(Ok("blob-abc".into()));
-        for rx in followers {
-            let got = await_result(rx).await;
+        for mut f in followers.drain(..) {
+            let got = await_result(&mut f).await;
             assert_eq!(got, Some(Ok("blob-abc".to_string())));
         }
     }
@@ -155,13 +209,13 @@ mod tests {
             Role::Leader(l) => l,
             Role::Follower(_) => panic!(),
         };
-        let follower = match sf.enter(key).await {
-            Role::Follower(rx) => rx,
+        let mut follower = match sf.enter(key).await {
+            Role::Follower(f) => f,
             Role::Leader(_) => panic!(),
         };
         leader.complete(Err("prefill blew up".into()));
         assert_eq!(
-            await_result(follower).await,
+            await_result(&mut follower).await,
             Some(Err("prefill blew up".to_string()))
         );
     }
@@ -198,19 +252,19 @@ mod tests {
     async fn follower_hanging_when_leader_drops_without_complete() {
         let sf = SingleFlight::new();
         let key = vec![7];
-        let follower = {
+        let mut follower = {
             let leader = match sf.enter(key.clone()).await {
                 Role::Leader(l) => l,
                 Role::Follower(_) => panic!(),
             };
-            let rx = match sf.enter(key).await {
-                Role::Follower(rx) => rx,
+            let follower = match sf.enter(key).await {
+                Role::Follower(f) => f,
                 Role::Leader(_) => panic!(),
             };
             drop(leader); // leader vanishes without completing
-            rx
+            follower
         };
         // Must NOT hang: returns None so the caller can fall back.
-        assert_eq!(await_result(follower).await, None);
+        assert_eq!(await_result(&mut follower).await, None);
     }
 }

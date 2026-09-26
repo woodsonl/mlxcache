@@ -536,7 +536,7 @@ async fn concurrent_identical_requests_share_one_prefill() {
     // task be scheduled past the leader's completion and legitimately become a
     // second leader (observed as extra "miss" verdicts on CI).
     let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "5.0")]).await
+        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "2.0")]).await
     else {
         eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
         return;
@@ -597,13 +597,10 @@ async fn concurrent_identical_requests_share_one_prefill() {
         }));
     }
 
-    // Wait for the leader to be prefilling, then release the followers. The
-    // leader holds its prefill for MLXCACHE_PREFILL_DELAY (5s), far longer than
-    // this bounded poll, so it is provably still in flight when followers enter
-    // single-flight (otherwise a slow poll could release them after the leader
-    // finished and they would just hit normally, not coalesce). If the leader
-    // never starts within the bound, fail loudly rather than release unlocked
-    // (which would re-elect a follower as leader and mask the setup failure).
+    // Wait for the leader to begin prefilling, then release the followers, so
+    // the requests genuinely overlap (with the leader held open by
+    // MLXCACHE_PREFILL_DELAY). If the leader never starts, fail loudly rather
+    // than release unlocked, which would re-elect a follower and mask the fault.
     let mut leader_started = false;
     for _ in 0..200 {
         let stats: serde_json::Value =
@@ -633,6 +630,14 @@ async fn concurrent_identical_requests_share_one_prefill() {
     );
     start_followers_tx.send_replace(true);
 
+    // The user-visible contract: N identical uncached requests trigger one
+    // prefill, and every request is served. Whether a follower takes the
+    // internal Role::Follower path or adopts the blob after the leader publishes
+    // is a scheduling detail (see the singleflight unit tests, which exercise
+    // the follower path directly with a waiter-count assertion). Here we hold
+    // the leader open so the requests genuinely overlap, then assert the outcome.
+    start_followers_tx.send_replace(true);
+
     let mut verdicts = Vec::new();
     for h in handles {
         verdicts.push(h.await.unwrap());
@@ -651,8 +656,8 @@ async fn concurrent_identical_requests_share_one_prefill() {
         "N={N} identical requests must coalesce to exactly 1 prefill; got {stats}"
     );
 
-    // Exactly one request (the leader) experienced a miss — it ran the prefill.
-    // Every follower adopted the leader's published checkpoint (hit/partial).
+    // Exactly one request (the leader) ran the prefill; the rest were served
+    // from its published checkpoint (hit/partial), so none re-prefilled.
     let misses = verdicts.iter().filter(|v| *v == "miss").count();
     assert_eq!(
         misses, 1,
