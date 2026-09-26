@@ -157,6 +157,16 @@ class MlxLmEngine:
             return
         yield from self.stream_with_cache(prompt, cache)
 
+    def _generate_with_cache(self, tokens: list[int], max_tokens: int, cache) -> list[int]:
+        """Collect a bounded generation from the streaming path, so the
+        non-streaming /generate mode reuses the identical decode logic."""
+        out: list[int] = []
+        for token, _text in self.stream_with_cache(tokens, cache):
+            out.append(token)
+            if len(out) >= max_tokens:
+                break
+        return out
+
     def _load_cache_delta(self, tokens: list[int], blob_path: str):
         """Returns (cache, delta_prompt) or (None, tokens). See generate_from_blob."""
         from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415

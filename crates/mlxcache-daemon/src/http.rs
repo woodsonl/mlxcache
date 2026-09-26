@@ -74,8 +74,14 @@ pub struct StatsInner {
 }
 
 impl Stats {
+    /// Recover a poisoned lock instead of panicking: counters are diagnostic,
+    /// never worth failing a request over (error-registry principle).
+    fn lock(&self) -> std::sync::MutexGuard<'_, StatsInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn record(&self, d: &PolicyDecision) {
-        let mut s = self.inner.lock().unwrap();
+        let mut s = self.lock();
         s.requests += 1;
         match d.verdict {
             CacheVerdict::Hit => s.hits += 1,
@@ -173,7 +179,13 @@ async fn chat_completions(
 
     // Prefill on miss/partial (single-flight, R1-3), then persist. On hit the
     // published blob path is passed to the adapter. Shared by both modes.
-    let client = state.sidecar.as_ref().expect("checked above");
+    let Some(client) = state.sidecar.as_ref() else {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no adapter configured",
+            "adapter_unavailable",
+        ));
+    };
     if outcome.decision.verdict != CacheVerdict::Hit {
         let (guard, follower) = state.singleflight.try_lead(tokens.clone()).await;
         match follower {
@@ -192,7 +204,7 @@ async fn chat_completions(
                         } else {
                             state
                                 .orchestrator
-                                .publish_checkpoint(&tokens, meta, format!("{:016x}.ckpt", hash));
+                                .publish_checkpoint(&tokens, meta, format!("{:032x}.ckpt", hash));
                         }
                         drop(guard);
                     }
@@ -230,10 +242,8 @@ async fn chat_completions(
     }
 
     // Generate: full context tokens, continuation from the request length.
-    let generated = match client
-        .generate(&tokens, outcome.prefill_from, 64, outcome.blob_path.as_deref())
-        .await
-    {
+    // The adapter opens the blob directly, so it needs the absolute path.
+    let generated = match client.generate(&tokens, outcome.prefill_from, 64, blob_arg).await {
         Ok(t) => t,
         Err(e) => return Err(err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error")),
     };
@@ -256,14 +266,22 @@ async fn chat_completions(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
-/// FNV-1a over token ids — stable blob key for a token prefix.
-fn prefix_hash(tokens: &[u32]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for t in tokens {
-        h ^= *t as u64;
-        h = h.wrapping_mul(0x100000001b3);
+/// Stable blob key for a token prefix. 128 bits from two independent FNV-1a
+/// passes with different seeds: a filename collision would alias two distinct
+/// KV states, so 64 bits is too thin as the store grows. (The index itself is
+/// exact, keyed by token ids; this only names the blob on disk.)
+fn prefix_hash(tokens: &[u32]) -> u128 {
+    fn fnv1a(seed: u64, tokens: &[u32]) -> u64 {
+        let mut h = seed;
+        for t in tokens {
+            h ^= *t as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
     }
-    h
+    let lo = fnv1a(0xcbf29ce484222325, tokens);
+    let hi = fnv1a(0x84222325cbf29ce4, tokens);
+    ((hi as u128) << 64) | lo as u128
 }
 
 /// Open the sidecar's NDJSON generation stream and re-emit it as SSE.
@@ -345,7 +363,7 @@ async fn stream_response(
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let s = state.stats.inner.lock().unwrap();
+    let s = state.stats.lock();
     Json(serde_json::json!({
         "requests": s.requests,
         "hits": s.hits,
@@ -421,6 +439,21 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn prefix_hash_distinguishes_similar_prefixes() {
+        // A collision aliases two KV states; verify the hash separates
+        // prefixes that differ only at the tail or by one token.
+        let a = vec![1, 2, 3, 4];
+        let b = vec![1, 2, 3, 5];
+        let c = vec![1, 2, 3];
+        assert_ne!(prefix_hash(&a), prefix_hash(&b), "tail difference aliased");
+        assert_ne!(prefix_hash(&a), prefix_hash(&c), "length difference aliased");
+        // Deterministic: same input, same key.
+        assert_eq!(prefix_hash(&a), prefix_hash(&[1, 2, 3, 4]));
+        // Must exceed 64 bits (the 128-bit widening).
+        assert!(prefix_hash(&a) > u64::MAX as u128);
     }
 
     #[tokio::test]

@@ -35,12 +35,12 @@ impl Persistence {
     /// leaves only the temp file, never a partial final blob (R1-3).
     pub fn publish_atomic(
         &self,
-        prefix_hash: u64,
+        prefix_hash: u128,
         meta: &CheckpointMeta,
         payload: &[u8],
     ) -> Result<PathBuf, PersistError> {
-        let final_path = self.blob_dir.join(format!("{:016x}.ckpt", prefix_hash));
-        let tmp_path = self.blob_dir.join(format!("{:016x}.ckpt.tmp", prefix_hash));
+        let final_path = self.blob_dir.join(format!("{:032x}.ckpt", prefix_hash));
+        let tmp_path = self.blob_dir.join(format!("{:032x}.ckpt.tmp", prefix_hash));
 
         let header = serde_json::to_vec(meta)
             .map_err(|e| PersistError::Corrupt {
