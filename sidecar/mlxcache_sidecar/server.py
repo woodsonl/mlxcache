@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -63,7 +64,11 @@ class SyntheticEngine:
 
 
 class MlxLmEngine:
-    """Real mlx-lm engine. Lazy import; requires a downloaded model."""
+    """Real mlx-lm engine. Lazy import; requires a downloaded model.
+
+    KV checkpoints are real mlx-lm prompt caches (safetensors). The blob is the
+    sidecar/daemon wire format: u32 header length + JSON meta + safetensors bytes.
+    """
 
     name = "mlx-lm"
 
@@ -72,21 +77,45 @@ class MlxLmEngine:
 
         self.model_id = model_id
         self.model, self.tokenizer = load(model_id)
+        self.tokenizer_hash = hashlib.sha256(
+            getattr(self.tokenizer, "name_or_path", model_id).encode()
+        ).hexdigest()[:16]
 
     def tokenize(self, prompt: str) -> list[int]:
         return self.tokenizer.encode(prompt)
 
+    def _prefill_cache(self, tokens: list[int]):
+        """Run tokens through the model filling a fresh prompt cache. Returns
+        (cache, last_logits) with the KV state resident and evaluated."""
+        import mlx.core as mx  # noqa: PLC0415
+        from mlx_lm.models.cache import make_prompt_cache  # noqa: PLC0415
+
+        cache = make_prompt_cache(self.model)
+        inp = mx.array(tokens)[None]
+        logits = self.model(inp, cache=cache)
+        mx.eval([c.state for c in cache], logits)
+        return cache, logits
+
     def prefill(self, tokens: list[int]) -> bytes:
-        # Real KV capture lands with the mlx-lm cache export path; synthetic
-        # blob shape is kept so the daemon contract holds end to end.
-        payload = b"".join(
-            ((t * 31 + i) & 0xFFFFFFFF).to_bytes(4, "little") * 256
-            for i, t in enumerate(tokens)
-        )
+        import mlx.core as mx  # noqa: PLC0415
+        from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
+
+        cache, _ = self._prefill_cache(tokens)
+        # safetensors needs a real file; write to a temp, then read the bytes.
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
+            tmp = fh.name
+        try:
+            save_prompt_cache(tmp, cache)
+            with open(tmp, "rb") as fh:
+                payload = fh.read()
+        finally:
+            os.unlink(tmp)
+        mx.clear_cache()
+
         meta = CheckpointMeta(
             fingerprint=Fingerprint(
                 model_id=self.model_id,
-                tokenizer_hash=hashlib.sha256(self.model_id.encode()).hexdigest()[:16],
+                tokenizer_hash=self.tokenizer_hash,
                 kv_dtype="f16",
                 kv_layout_version=1,
             ),
@@ -95,15 +124,57 @@ class MlxLmEngine:
         return encode(meta, payload)
 
     def generate(self, tokens: list[int], prefill_from: int, max_tokens: int) -> list[int]:
-        from mlx_lm import generate  # noqa: PLC0415
+        """Generate continuing from `prefill_from` cached tokens.
 
-        prompt_ids = tokens
-        out = []
-        for chunk in generate(
-            self.model, self.tokenizer, prompt=prompt_ids, max_tokens=max_tokens
+        When prefill_from == len(tokens) (a full hit), the KV cache is loaded
+        from the blob the daemon passes; otherwise the delta is prefilled. The
+        daemon supplies the blob via MLXCACHE_* — see the /generate handler.
+        """
+        return self._generate_with_cache(tokens, max_tokens, cache=None)
+
+    def _generate_with_cache(self, tokens: list[int], max_tokens: int, cache):
+        import mlx.core as mx  # noqa: PLC0415
+        from mlx_lm import stream_generate  # noqa: PLC0415
+
+        out: list[int] = []
+        for resp in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt=mx.array(tokens),
+            max_tokens=max_tokens,
+            prompt_cache=cache,
         ):
-            out.extend(self.tokenizer.encode(chunk))
+            out.append(resp.token)
         return out
+
+    def generate_from_blob(self, tokens: list[int], blob_path: str, max_tokens: int) -> list[int]:
+        """Resume generation from a persisted wire-format checkpoint (a cache
+        hit): strip the daemon header, load the prompt cache, generate.
+
+        The checkpoint holds KV for a token prefix; the delta (uncached tail)
+        is what the model still needs to see. We pass the tail so the cache
+        supplies the cached prefix and generation continues identically to a
+        scratch run over the full prompt (thesis guard, T2)."""
+        from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
+
+        from .blob import decode  # noqa: PLC0415
+
+        with open(blob_path, "rb") as fh:
+            meta, payload = decode(fh.read())
+        cached = meta.token_count
+        if cached <= 0 or cached > len(tokens):
+            # Unexpectable cache size for this request: fall back to scratch.
+            return self._generate_with_cache(tokens, max_tokens, cache=None)
+        delta = tokens[cached - 1 :]  # last cached token + uncached tail
+        # load_prompt_cache needs a safetensors file: materialize the payload.
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
+            tmp = fh.name
+            fh.write(payload)
+        try:
+            cache = load_prompt_cache(tmp)
+            return self._generate_with_cache(delta, max_tokens, cache)
+        finally:
+            os.unlink(tmp)
 
 
 def make_engine(model_id: str) -> SyntheticEngine | MlxLmEngine:
@@ -149,9 +220,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._binary(200, blob)
             elif self.path == "/generate":
                 req = self._read_json()
-                out = self.engine.generate(
-                    req["tokens"], req.get("prefill_from", 0), req.get("max_tokens", 64)
-                )
+                blob_path = req.get("blob_path")
+                if blob_path and hasattr(self.engine, "generate_from_blob"):
+                    out = self.engine.generate_from_blob(
+                        req["tokens"], blob_path, req.get("max_tokens", 64)
+                    )
+                else:
+                    out = self.engine.generate(
+                        req["tokens"], req.get("prefill_from", 0), req.get("max_tokens", 64)
+                    )
                 self._json(200, {"tokens": out})
             else:
                 self._json(404, {"error": f"unknown path {self.path}"})
