@@ -121,9 +121,13 @@ impl SingleFlight {
     pub async fn enter(&self, key: Vec<u32>) -> Role {
         let mut map = self.map.lock().await;
         if let Some(entry) = map.get(&key) {
+            // Subscribe BEFORE counting: a leader that observes waiter_count
+            // must know the receiver already exists, or it could publish before
+            // we subscribe and the send would find no receiver.
+            let rx = entry.done.subscribe();
             entry.waiters.fetch_add(1, Ordering::SeqCst);
             return Role::Follower(Follower {
-                rx: entry.done.subscribe(),
+                rx,
                 waiters: Arc::clone(&entry.waiters),
             });
         }
