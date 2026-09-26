@@ -6,8 +6,3 @@ so existing mlx-lm users get daemon benefits.
 """
 
 from __future__ import annotations
-
-
-def placeholder() -> int:
-    """Placeholder until the sidecar protocol is wired (T2 lane)."""
-    return 0
