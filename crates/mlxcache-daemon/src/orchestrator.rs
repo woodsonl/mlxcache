@@ -15,6 +15,9 @@ pub struct RouteOutcome {
     pub decision: PolicyDecision,
     /// Token count to prefill as delta (0 for full miss = everything).
     pub prefill_from: usize,
+    /// Published blob to resume from (None on a full miss). The daemon hands
+    /// this to the adapter so the engine loads cached KV instead of re-prefilling.
+    pub blob_path: Option<String>,
 }
 
 pub struct Orchestrator {
@@ -45,11 +48,20 @@ impl Orchestrator {
         request_fingerprint: &ModelFingerprint,
     ) -> RouteOutcome {
         let lookup = self.index.lookup(tokens);
-        let (matched_tokens, matched_fp) = match &lookup {
-            Some((entry, n)) => (Some(*n), Some(&entry.meta.fingerprint)),
-            None => (None, None),
+        let (matched_tokens, matched_fp, blob_path) = match &lookup {
+            Some((entry, n)) => (
+                Some(*n),
+                Some(&entry.meta.fingerprint),
+                Some(entry.blob_path.clone()),
+            ),
+            None => (None, None, None),
         };
         let verdict = classify(matched_tokens, tokens.len(), matched_fp, request_fingerprint);
+        // A fingerprint mismatch classifies as Miss and must not reuse the blob.
+        let blob_path = match verdict {
+            CacheVerdict::Miss => None,
+            _ => blob_path,
+        };
         let prefill_from = match verdict {
             CacheVerdict::Hit => tokens.len(), // nothing to prefill
             CacheVerdict::Partial => matched_tokens.unwrap_or(0),
@@ -62,6 +74,7 @@ impl Orchestrator {
                 request_tokens: tokens.len(),
             },
             prefill_from,
+            blob_path,
         }
     }
 
