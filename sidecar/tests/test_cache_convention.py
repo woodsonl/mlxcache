@@ -467,6 +467,34 @@ def test_lenient_json_headers_rejected_like_native(monkeypatch, tmp_path, raw_he
         eng._load_cache_delta(tokens, path)
 
 
+def test_overlapping_tensor_ranges_rejected(monkeypatch, tmp_path):
+    # Regression (pre-landing review): safetensors forbids overlapping tensor
+    # ranges. Two tensors claiming the same bytes must be a 422, not passed to
+    # MLX (which raises RuntimeError -> misread as transient 500).
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    header = json.dumps(
+        {
+            "a": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]},
+            "b": {"dtype": "F16", "shape": [2], "data_offsets": [2, 6]},
+        }
+    ).encode()
+    payload = len(header).to_bytes(8, "little") + header + b"\x00" * 8
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "overlap.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
 def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
     # adopted: resuming from the wrong KV generates silently wrong output. It is

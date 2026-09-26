@@ -130,7 +130,16 @@ impl Orchestrator {
     }
 
     /// Reserve a publication generation for the next checkpoint write.
+    ///
+    /// Must not be called before the startup rebuild has seeded the floor:
+    /// main.rs runs `rebuild_from_disk` before binding the listener, so no
+    /// request can race the seed. The assert catches a future caller that
+    /// reserves while a failed scan still has the floor unknown.
     pub fn reserve_generation(&self) -> u64 {
+        debug_assert!(
+            self.can_publish(),
+            "reserve_generation before the generation floor is known"
+        );
         self.index.reserve_generation()
     }
 

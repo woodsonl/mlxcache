@@ -225,9 +225,10 @@ async fn chat_completions(
         kv_layout_version: 1,
     };
     let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
-    // Compute the prefix key once: reused by the log line and (on miss) the
-    // blob filename. Hashing a long prefix twice is wasted hot-path work.
-    let hash = prefix_hash(&tokens);
+    // The token-only prefix hash for the request log line. The blob filename
+    // uses a DIFFERENT key (blob_key = fingerprint + tokens), computed in the
+    // leader branch where the fingerprint is in scope; the two are not equal.
+    let prefix_hash = prefix_hash(&tokens);
 
     // Prefill on miss/partial. Single-flight (R1-3): one leader runs the
     // prefill and publishes; followers await its result and re-route so they
@@ -277,7 +278,7 @@ async fn chat_completions(
                             tokens: tokens.clone(),
                             format_version: 1,
                         };
-                        let hash = blob_key(&fingerprint, &tokens);
+                        let key = blob_key(&fingerprint, &tokens);
                         // Refuse before writing if the generation floor is unknown
                         // (a failed startup scan): writing first would leak an
                         // unindexed file on every request. Serve from scratch.
@@ -301,10 +302,10 @@ async fn chat_completions(
                             // a delayed retirement cannot delete a healthy
                             // replacement.
                             let generation = state.orchestrator.reserve_generation();
-                            let blob_name = format!("{:032x}-{:016x}.ckpt", hash, generation);
+                            let blob_name = format!("{:032x}-{:016x}.ckpt", key, generation);
                             match state
                                 .persistence
-                                .publish_atomic(hash, generation, &meta, &blob)
+                                .publish_atomic(key, generation, &meta, &blob)
                             {
                                 // ENOSPC rescue (registry): log and continue uncached.
                                 Err(e) => {
@@ -393,7 +394,7 @@ async fn chat_completions(
     // prefilled), a coalesced follower the hit/partial it adopted. Recording
     // after single-flight keeps stats truthful.
     state.stats.record(&outcome.decision);
-    log_request(&req.model, hash, &outcome.decision, lookup_ms);
+    log_request(&req.model, prefix_hash, &outcome.decision, lookup_ms);
 
     // The adapter needs an absolute path to open the blob directly.
     let blob_abs = match &outcome.blob {
@@ -669,6 +670,12 @@ async fn stream_response(
     // forbids retiring a healthy checkpoint on a transient decode failure. If a
     // blob proves persistently undecodable, add a consecutive-failure counter
     // that retires after K and re-emit a corrected terminal frame.
+    //
+    // /stats semantics on truncation: the checkpoint DID load and its covered KV
+    // WAS reused, so `hits`/`tokens_cached` are NOT corrected — they measure KV
+    // reuse (a trend metric), while `upstream_error` frames measure requests that
+    // completed. The two are distinct on purpose; do not "fix" one to match the
+    // other without changing the documented meaning of the metric.
     let verdict = if blob_unused.get() {
         "miss"
     } else {

@@ -95,6 +95,7 @@ def _valid_safetensors(payload: bytes) -> bool:
     if _has_lone_surrogate(header):
         return False
     data_len = len(payload) - 8 - n
+    ranges: list[tuple[int, int]] = []
     for name, spec in header.items():
         if name == "__metadata__":
             # Metadata is a string->string map; anything else, MLX rejects with a
@@ -128,7 +129,12 @@ def _valid_safetensors(payload: bytes) -> bool:
         expected = elements * _SAFETENSORS_DTYPE_BYTES[dtype]
         if start < 0 or end < start or end > data_len or end - start != expected:
             return False
-    return True
+        ranges.append((start, end))
+    # Safetensors forbids overlapping tensor ranges; the native loader rejects
+    # them. Two tensors claiming the same bytes would otherwise pass here and
+    # raise a RuntimeError we misread as transient.
+    ranges.sort()
+    return all(ranges[i][0] >= ranges[i - 1][1] for i in range(1, len(ranges)))
 
 
 class SyntheticEngine:
