@@ -78,6 +78,13 @@ Sequencing: cache-max (universal proxy) ships first and proves the policy layer 
 
 Before committing to checkpoint persistence: measure bytes/token for one representative model (e.g. Qwen3-32B-4bit), measured serialize + deserialize wall time on the target disk, and derive whether the 2s TTFT resume budget holds. If the round-trip fails the budget, v1 ships memory-resident only and the disk tier waits for compression (fp8/quantized KV, CacheGen-style) — the suspend/resume criterion defers with it.
 
+**R1-5 MEASURED (2026-09-25, Qwen2-0.5B-Instruct, mlx-lm 0.31.3, Apple Silicon):**
+- bytes/token: **12,288** (12 KB/token; 8K tokens = 98 MB → 50K tokens ≈ 615 MB for this 24-layer model; larger models scale with layer count × hidden size)
+- serialize: **20 ms**; deserialize: **<1 ms** (memory-mapped safetensors) at 8K tokens; prefill 697 ms
+- **2s TTFT resume budget: HOLDS with margin** — deserialize is negligible against the budget; the dominant resume cost is delta prefill compute, not I/O
+- **Thesis guard PASSED:** generation resumed from a saved-then-loaded prompt cache is token-for-token identical to scratch generation (`sidecar/tests/test_roundtrip_real.py::test_roundtrip_logits_identical`, `MLXCACHE_BENCH_REAL=1`). Disk tier is viable; suspend/resume criterion is NOT deferred.
+- Caveat: single small-model measurement. Re-run on the representative target model (Qwen3-32B-4bit) before treating the absolute byte figures as final; the identity result and sub-ms deserialize are structural and expected to hold.
+
 ### Success-criteria gating (R1-6, R1-7)
 
 Criteria 1-2 hold only if the adapter round-trip benchmark (Next Steps #3) demonstrates adoption at the required speed — record the benchmark result before treating them as targets. Criterion 3's ≥80% target assumes adapter-based cross-process reuse works (which is what clears Approach A's ~60-80% proxy-only ceiling); if the mlx-lm adapter proves too lossy, the v1 target drops to the proxy-layer ceiling and 80% becomes the stretch goal.
