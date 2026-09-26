@@ -13,6 +13,7 @@ mlxcache-core = { path = "../mlxcache-core" }
 tokio = { workspace = true }
 axum = { workspace = true }
 futures-util = "0.3"
+bytes = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
