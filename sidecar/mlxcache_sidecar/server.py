@@ -245,12 +245,14 @@ class MlxLmEngine:
 
         with open(blob_path, "rb") as fh:
             meta, payload = decode(fh.read())
-        # The checkpoint prefix is meta.tokens when recorded (self-describing);
-        # old blobs fall back to the request's own prefix of length token_count.
-        # The prefix LENGTH is validated numerically, not by slicing: a bad
-        # token_count (0, negative, or larger than the request) must fall back to
-        # scratch, and Python slicing would silently clamp an oversized value.
-        prefix_len = len(meta.tokens) if meta.tokens else meta.token_count
+        # The checkpoint prefix must be self-describing: only meta.tokens tells
+        # us which prefix the KV actually covers. A legacy blob with no recorded
+        # tokens cannot be verified against this request, so adopting it would
+        # mean trusting it covers tokens[:token_count] by construction. Refuse:
+        # resuming from the wrong KV generates silently wrong output.
+        if not meta.tokens:
+            return None, tokens
+        prefix_len = len(meta.tokens)
         if prefix_len < 2 or prefix_len > len(tokens):
             # A prefix shorter than 2 caches nothing. This also rejects legacy
             # one-token checkpoints whose nonempty KV already holds that token:
@@ -260,17 +262,11 @@ class MlxLmEngine:
         # write), not uncacheable: return it to the loader so the failure
         # propagates and the daemon quarantines the entry. Only an uncacheable
         # prefix (<2 tokens, above) legitimately has an empty payload.
-        prefix = meta.tokens if meta.tokens else tokens[:prefix_len]
+        prefix = meta.tokens
         # The adapter is a trust boundary: verify the blob really covers this
         # request's prefix. If the recorded prefix disagrees with the request,
         # the blob belongs to a different prefix and resuming from it would
         # generate silently wrong output. Fall back to scratch.
-        # ponytail: when meta.tokens is absent this check is self-satisfying, so a
-        # legacy blob is trusted via the daemon's index. That is safe on the
-        # deployed path: the daemon only ever hands a blob_path it indexed, and
-        # rebuild_from_disk index only blobs with a recorded tokens prefix. A
-        # direct adapter call against an unindexed legacy blob is trusted by
-        # construction; require a recorded prefix here if that becomes reachable.
         if prefix != tokens[:prefix_len]:
             return None, tokens
         covered = prefix_len - 1
