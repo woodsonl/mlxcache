@@ -84,6 +84,59 @@ impl Orchestrator {
     pub fn publish_checkpoint(&self, tokens: &[u32], meta: CheckpointMeta, blob_path: String) {
         self.index.publish(tokens, meta, blob_path);
     }
+
+    /// Rebuild the index from persisted checkpoints at startup (R1-4: persisted
+    /// checkpoints survive a restart). Each blob's header carries its own token
+    /// prefix, so the radix index can be reconstructed without a request. Blobs
+    /// that fail to load are skipped (quarantine-by-omission): a corrupt blob
+    /// must never prevent the daemon from starting or serving other checkpoints.
+    pub fn rebuild_from_disk(
+        &self,
+        persistence: &crate::persistence::Persistence,
+    ) -> RebuildReport {
+        let mut report = RebuildReport::default();
+        let blobs = match persistence.list_blobs() {
+            Ok(b) => b,
+            Err(e) => {
+                report.errors.push(format!("list_blobs: {e}"));
+                return report;
+            }
+        };
+        for blob in blobs {
+            match persistence.load(&blob) {
+                Ok((meta, _payload)) => {
+                    if meta.tokens.len() as u64 != meta.token_count || meta.tokens.is_empty() {
+                        // A blob with no recoverable prefix cannot be indexed;
+                        // skip it rather than publish a mis-keyed entry.
+                        report.skipped += 1;
+                        continue;
+                    }
+                    // Key by the persisted token prefix, not the on-disk hash
+                    // name, so lookups match real requests.
+                    let name = blob
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| blob.to_string_lossy().into_owned());
+                    let tokens = meta.tokens.clone();
+                    self.publish_checkpoint(&tokens, meta, name);
+                    report.rebuilt += 1;
+                }
+                Err(e) => {
+                    report.skipped += 1;
+                    report.errors.push(format!("{}: {e}", blob.display()));
+                }
+            }
+        }
+        report
+    }
+}
+
+/// Outcome of a startup index rebuild (surfaced in logs / /stats).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RebuildReport {
+    pub rebuilt: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
 }
 
 pub mod test_support {
@@ -117,6 +170,7 @@ mod tests {
         CheckpointMeta {
             fingerprint: fp(id),
             token_count: n,
+            tokens: vec![1, 2, 3, 4, 5, 6],
             format_version: 1,
         }
     }

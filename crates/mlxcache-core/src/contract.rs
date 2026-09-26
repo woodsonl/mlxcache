@@ -24,6 +24,12 @@ pub struct CheckpointMeta {
     pub fingerprint: ModelFingerprint,
     /// Number of tokens the KV state covers.
     pub token_count: u64,
+    /// The exact token-ID prefix this checkpoint covers. Persisted so a daemon
+    /// restart can rebuild the radix index from disk alone (R1-4: persisted
+    /// checkpoints survive). Without this the index is keyed by tokens the blob
+    /// does not record, and no persisted checkpoint could ever be found again.
+    #[serde(default)]
+    pub tokens: Vec<u32>,
     /// Format version of the checkpoint blob itself.
     pub format_version: u32,
 }

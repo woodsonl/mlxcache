@@ -204,6 +204,7 @@ async fn chat_completions(
                         let meta = mlxcache_core::contract::CheckpointMeta {
                             fingerprint: fingerprint.clone(),
                             token_count: tokens.len() as u64,
+                            tokens: tokens.clone(),
                             format_version: 1,
                         };
                         let blob_name = format!("{:032x}.ckpt", hash);

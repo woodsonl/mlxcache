@@ -112,8 +112,9 @@ impl Persistence {
     }
 
     /// Rebuild support (index corruption rescue): list all published blobs.
-    /// The index is rebuilt from blob metadata (token prefixes are re-derived
-    /// by the adapter on next use; blobs are the source of truth).
+    /// Each blob's header carries its own token prefix (CheckpointMeta.tokens),
+    /// so the index is rebuilt from blob metadata alone — blobs are the source
+    /// of truth (see Orchestrator::rebuild_from_disk).
     pub fn list_blobs(&self) -> Result<Vec<PathBuf>, PersistError> {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.blob_dir)? {
@@ -136,6 +137,7 @@ mod tests {
         CheckpointMeta {
             fingerprint: fp("m"),
             token_count: n,
+            tokens: vec![1, 2, 3],
             format_version: 1,
         }
     }
@@ -172,6 +174,7 @@ mod tests {
         let m = CheckpointMeta {
             fingerprint: fp("m"),
             token_count: 1,
+            tokens: vec![9],
             format_version: 99,
         };
         let path = p.publish_atomic(0x2, &m, b"x").unwrap();

@@ -267,6 +267,83 @@ async fn concurrent_identical_requests_share_one_prefill() {
 }
 
 #[tokio::test]
+async fn end_to_end_restart_resumes_from_disk() {
+    // R1-4 across the REAL HTTP path: request 1 publishes a checkpoint; a fresh
+    // daemon (new AppState + rebuild_from_disk on the same blob dir) must
+    // serve request 2 as a hit without re-prefilling.
+    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let make_state = || {
+        let state = Arc::new(AppState {
+            orchestrator: Orchestrator::new(),
+            singleflight: SingleFlight::new(),
+            stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+            served_models: vec!["e2e-model".into()],
+            sidecar: Some(
+                SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                    .unwrap(),
+            ),
+            persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        });
+        state.orchestrator.rebuild_from_disk(&state.persistence);
+        state
+    };
+
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "survive the restart"}],
+        "stream": false,
+    })
+    .to_string();
+
+    // Daemon instance 1: miss -> prefill -> publish.
+    let state1 = make_state();
+    let res = router(state1.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "miss");
+    drop(state1); // "process exit"
+
+    // Daemon instance 2: fresh index, rebuilt from the persisted blob.
+    let state2 = make_state();
+    let res = router(state2.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v["mlxcache"]["verdict"], "hit",
+        "a restart must resume the persisted checkpoint (R1-4)"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
 async fn end_to_end_streaming_sse() {
     let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
         eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
