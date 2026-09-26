@@ -69,63 +69,72 @@ async fn main() -> Result<()> {
     let addr = std::env::var("MLXCACHE_ADDR").unwrap_or_else(|_| "127.0.0.1:8420".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, "mlxcache daemon listening");
-    // Drain in-flight requests on SIGINT/SIGTERM, but bound the drain. axum waits
-    // for active responses; a streaming (SSE) response only completes when its
-    // upstream sidecar stream ends (sidecar client timeout, 120s default), and a
-    // blocking checkpoint write can stall the runtime. Both exceed a supervisor's
-    // ~90s SIGKILL grace. Enforce the deadline on a dedicated OS thread so a
-    // blocked runtime cannot delay it: once the signal fires, the watchdog exits
-    // the process after MLXCACHE_SHUTDOWN_GRACE_S (default 30s). Publishes are
-    // atomic, so a forced exit loses nothing.
+    // Drain in-flight requests on SIGINT/SIGTERM, bounded by
+    // MLXCACHE_SHUTDOWN_GRACE_S (default 30s). The signal is received and the
+    // deadline enforced on a dedicated OS thread, NOT the async runtime: a
+    // blocked checkpoint write or a stalled log collector can stall the runtime
+    // (and its signal future), which would let the process outlive a supervisor's
+    // ~90s SIGKILL grace. The watchdog exits with libc::_exit (no logging, no
+    // allocator). Publishes are atomic, so a forced exit loses nothing.
     let grace_s: u64 = std::env::var("MLXCACHE_SHUTDOWN_GRACE_S")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
-    let (signal_tx, signal_rx) = std::sync::mpsc::channel::<()>();
+    let drain_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    spawn_signal_watchdog(grace_s, Arc::clone(&drain_done), signal_tx);
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        let _ = signal_tx.send(());
-    });
-    // Watchdog: bounded exit independent of the async runtime.
-    std::thread::spawn(move || {
-        if signal_rx.recv().is_ok() {
-            tracing::info!(grace_s, "draining in-flight requests");
-            std::thread::sleep(std::time::Duration::from_secs(grace_s));
-            tracing::warn!(grace_s, "shutdown grace elapsed; forcing exit");
-            std::process::exit(0);
-        }
+        // Resolve when the watchdog has seen the signal.
+        let _ = signal_rx.await;
+        tracing::info!("draining in-flight requests");
     });
     serve.await?;
+    // Tell the watchdog the drain finished so it exits instead of forcing.
+    drain_done.store(true, std::sync::atomic::Ordering::SeqCst);
     tracing::info!("mlxcache daemon stopped");
     Ok(())
 }
 
-/// Resolve on SIGINT or SIGTERM. Logs which signal so operators can tell an
-/// intentional stop from a crash. A failed handler install is fatal-logged and
-/// treated as a shutdown trigger rather than a panic.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => tracing::info!("received SIGINT; draining"),
-            Err(e) => tracing::error!(error = %e, "SIGINT handler failed; draining"),
-        }
-    };
-
+/// Receive SIGINT/SIGTERM and enforce the shutdown deadline off the async
+/// runtime. On the first signal, notify the async drain via `signal_tx`, then
+/// wait up to `grace_s` for `drain_done`; if the drain has not finished, force
+/// exit with `libc::_exit` (async-signal-safe: no logging, no allocation).
+fn spawn_signal_watchdog(
+    grace_s: u64,
+    drain_done: Arc<std::sync::atomic::AtomicBool>,
+    signal_tx: tokio::sync::oneshot::Sender<()>,
+) {
+    use std::sync::atomic::Ordering;
     #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-                tracing::info!("received SIGTERM; draining");
+    {
+        let mut signals = match signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+        ]) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install signal handlers");
+                return;
             }
-            Err(e) => tracing::error!(error = %e, "SIGTERM handler failed; draining"),
-        }
-    };
+        };
+        std::thread::spawn(move || {
+            if signals.forever().next().is_none() {
+                return;
+            }
+            // Wake the async graceful-shutdown future.
+            let _ = signal_tx.send(());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(grace_s);
+            while !drain_done.load(Ordering::SeqCst) {
+                if std::time::Instant::now() >= deadline {
+                    // Force exit without touching logging or the allocator.
+                    unsafe { libc::_exit(0) };
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+    }
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
+    {
+        let _ = (grace_s, drain_done, signal_tx);
     }
 }

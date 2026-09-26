@@ -21,10 +21,12 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# Runtime-independent signal handling for graceful shutdown (see main.rs).
+signal-hook = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 portpicker = "0.1"
-libc = "0.2"
