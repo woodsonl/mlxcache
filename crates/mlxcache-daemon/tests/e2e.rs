@@ -14,44 +14,6 @@ use mlxcache_daemon::http::{router, AppState};
 use mlxcache_daemon::orchestrator::Orchestrator;
 use mlxcache_daemon::sidecar::{SidecarClient, SidecarConfig};
 
-/// Spawn the real sidecar server (synthetic engine) on an ephemeral port.
-/// Returns None when `uv` or the sidecar package is unavailable, so the test
-/// suite degrades to a skip instead of failing in environments without Python.
-// The child is reaped by the test's kill+wait on success; the panic path
-// (sidecar never ready) intentionally leaks it — test process exit cleans up.
-#[allow(clippy::zombie_processes)]
-async fn spawn_sidecar() -> Option<(String, std::process::Child)> {
-    let port = portpicker::pick_unused_port().expect("free port");
-    let script = format!(
-        "import sys; sys.path.insert(0, {root:?}); \
-         from mlxcache_sidecar import server; \
-         server.Handler.engine = server.make_engine('e2e-model'); \
-         server.ThreadingHTTPServer(('127.0.0.1', {port}), server.Handler).serve_forever()",
-        root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
-        port = port
-    );
-    let child = match std::process::Command::new("uv")
-        .args(["run", "python", "-c", &script])
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return None, // uv not installed: skip
-    };
-    let url = format!("http://127.0.0.1:{port}");
-    // Wait for readiness (uv may sync deps on first run).
-    for _ in 0..100 {
-        if reqwest::get(format!("{url}/health")).await.is_ok() {
-            return Some((url, child));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    // Sidecar never came up (missing deps?). Reap and skip rather than hang.
-    let mut child = child;
-    let _ = child.kill();
-    let _ = child.wait();
-    None
-}
-
 #[tokio::test]
 async fn end_to_end_miss_then_hit() {
     let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
@@ -141,10 +103,10 @@ async fn end_to_end_miss_then_hit() {
     child.wait().expect("reap sidecar");
 }
 
-/// Spawn the sidecar with a prefill delay, so concurrent identical requests
-/// race inside the single-flight window rather than completing sequentially.
+/// Spawn the sidecar with extra environment variables (test knobs), e.g. a
+/// prefill delay to widen the single-flight window, or an empty tokenizer.
 #[allow(clippy::zombie_processes)]
-async fn spawn_sidecar_with_prefill_delay(delay_s: &str) -> Option<(String, std::process::Child)> {
+async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> Option<(String, std::process::Child)> {
     let port = portpicker::pick_unused_port().expect("free port");
     let script = format!(
         "import sys; sys.path.insert(0, {root:?}); \
@@ -154,11 +116,12 @@ async fn spawn_sidecar_with_prefill_delay(delay_s: &str) -> Option<(String, std:
         root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
         port = port
     );
-    let child = match std::process::Command::new("uv")
-        .args(["run", "python", "-c", &script])
-        .env("MLXCACHE_PREFILL_DELAY", delay_s)
-        .spawn()
-    {
+    let mut cmd = std::process::Command::new("uv");
+    cmd.args(["run", "python", "-c", &script]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return None,
     };
@@ -175,12 +138,19 @@ async fn spawn_sidecar_with_prefill_delay(delay_s: &str) -> Option<(String, std:
     None
 }
 
+/// One sidecar, immediately ready, no test knobs.
+async fn spawn_sidecar() -> Option<(String, std::process::Child)> {
+    spawn_sidecar_with_env(&[]).await
+}
+
 #[tokio::test]
 async fn concurrent_identical_requests_share_one_prefill() {
     // The core R1-3 promise: N identical uncached requests must trigger ONE
     // prefill, and every follower must still be served (from the leader's
     // freshly published checkpoint), not re-prefill from scratch.
-    let Some((sidecar_url, mut child)) = spawn_sidecar_with_prefill_delay("0.5").await else {
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "0.5")]).await
+    else {
         eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
         return;
     };
@@ -337,6 +307,54 @@ async fn end_to_end_restart_resumes_from_disk() {
     assert_eq!(
         v["mlxcache"]["verdict"], "hit",
         "a restart must resume the persisted checkpoint (R1-4)"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn empty_tokenization_is_rejected() {
+    // A tokenizer that returns no tokens must yield a 400, not a prefill of an
+    // empty cache or a shared zero-token blob.
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_EMPTY", "1")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false,
+    })
+    .to_string();
+    let res = router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        400,
+        "empty tokenization must be a client error"
     );
 
     child.kill().expect("kill sidecar");

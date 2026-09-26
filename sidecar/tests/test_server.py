@@ -42,6 +42,14 @@ def test_tokenize_returns_engine_hash_not_a_constant(sidecar_url):
         server.Handler.engine.tokenizer_hash = "synthetic"
 
 
+def test_tokenize_can_return_zero_tokens(sidecar_url, monkeypatch):
+    # The daemon rejects empty tokenizations; the sidecar must be able to
+    # produce them for that path to be testable (real HF tokenizers do).
+    monkeypatch.setenv("MLXCACHE_TOKENIZE_EMPTY", "1")
+    r = httpx.post(f"{sidecar_url}/tokenize", json={"prompt": ""}).json()
+    assert r["tokens"] == []
+
+
 def test_prefill_returns_raw_payload(sidecar_url):
     # The daemon owns the header; /prefill returns the raw payload bytes.
     tokens = [1, 2, 3, 4]
