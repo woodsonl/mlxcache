@@ -144,6 +144,61 @@ async fn spawn_sidecar() -> Option<(String, std::process::Child)> {
 }
 
 #[tokio::test]
+async fn two_models_same_tokens_do_not_share_a_blob() {
+    // Two served models, same prompt (the synthetic engine derives tokens from
+    // the prompt only, so both produce identical token ids). Their checkpoints
+    // MUST land in separate blob files: sharing one file would let the second
+    // model overwrite the first, whose index entry would then load foreign KV.
+    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["model-a".into(), "model-b".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "model-a".into())).unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+
+    for model in ["model-a", "model-b"] {
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "same prompt"}],
+            "stream": false,
+        })
+        .to_string();
+        let res = router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
+    let ckpts: Vec<_> = std::fs::read_dir(blobs.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".ckpt"))
+        .collect();
+    assert_eq!(ckpts.len(), 2, "each model needs its own blob: {ckpts:?}");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
 async fn concurrent_identical_requests_share_one_prefill() {
     // The core R1-3 promise: N identical uncached requests must trigger ONE
     // prefill, and every follower must still be served (from the leader's
