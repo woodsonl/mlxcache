@@ -69,32 +69,33 @@ async fn main() -> Result<()> {
     let addr = std::env::var("MLXCACHE_ADDR").unwrap_or_else(|_| "127.0.0.1:8420".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, "mlxcache daemon listening");
-    // Drain in-flight requests on SIGINT/SIGTERM instead of dropping them.
-    // Bounded: axum waits for active responses, which for a streaming (SSE)
-    // request means its upstream sidecar stream ends — up to the sidecar client
-    // timeout (120s default), longer than a supervisor's ~90s SIGKILL grace. So
-    // cap the drain at MLXCACHE_SHUTDOWN_GRACE_S (default 30s): once it fires, a
-    // held-open stream cannot delay exit past the supervisor's patience.
-    // Publishes are atomic, so a forced exit loses nothing.
+    // Drain in-flight requests on SIGINT/SIGTERM, but bound the drain. axum waits
+    // for active responses; a streaming (SSE) response only completes when its
+    // upstream sidecar stream ends (sidecar client timeout, 120s default), and a
+    // blocking checkpoint write can stall the runtime. Both exceed a supervisor's
+    // ~90s SIGKILL grace. Enforce the deadline on a dedicated OS thread so a
+    // blocked runtime cannot delay it: once the signal fires, the watchdog exits
+    // the process after MLXCACHE_SHUTDOWN_GRACE_S (default 30s). Publishes are
+    // atomic, so a forced exit loses nothing.
     let grace_s: u64 = std::env::var("MLXCACHE_SHUTDOWN_GRACE_S")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
-    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel::<()>();
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown_signal().await;
         let _ = signal_tx.send(());
     });
-    tokio::select! {
-        result = serve => result?,
-        () = async {
-            let _ = signal_rx.await;
+    // Watchdog: bounded exit independent of the async runtime.
+    std::thread::spawn(move || {
+        if signal_rx.recv().is_ok() {
             tracing::info!(grace_s, "draining in-flight requests");
-            tokio::time::sleep(std::time::Duration::from_secs(grace_s)).await;
-        } => {
+            std::thread::sleep(std::time::Duration::from_secs(grace_s));
             tracing::warn!(grace_s, "shutdown grace elapsed; forcing exit");
+            std::process::exit(0);
         }
-    }
+    });
+    serve.await?;
     tracing::info!("mlxcache daemon stopped");
     Ok(())
 }

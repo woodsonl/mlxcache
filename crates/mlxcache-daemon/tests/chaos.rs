@@ -247,6 +247,9 @@ fn sigterm_triggers_graceful_shutdown() {
         .env("MLXCACHE_ADDR", &addr)
         .env("MLXCACHE_BLOBS", blobs.path())
         .env("MLXCACHE_MODELS", "e2e-model")
+        // Pin the log filter: the test asserts on the INFO signal line, so an
+        // inherited RUST_LOG=error must not suppress it.
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
