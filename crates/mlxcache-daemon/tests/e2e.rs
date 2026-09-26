@@ -141,6 +141,131 @@ async fn end_to_end_miss_then_hit() {
     child.wait().expect("reap sidecar");
 }
 
+/// Spawn the sidecar with a prefill delay, so concurrent identical requests
+/// race inside the single-flight window rather than completing sequentially.
+#[allow(clippy::zombie_processes)]
+async fn spawn_sidecar_with_prefill_delay(delay_s: &str) -> Option<(String, std::process::Child)> {
+    let port = portpicker::pick_unused_port().expect("free port");
+    let script = format!(
+        "import sys; sys.path.insert(0, {root:?}); \
+         from mlxcache_sidecar import server; \
+         server.Handler.engine = server.make_engine('e2e-model'); \
+         server.ThreadingHTTPServer(('127.0.0.1', {port}), server.Handler).serve_forever()",
+        root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
+        port = port
+    );
+    let child = match std::process::Command::new("uv")
+        .args(["run", "python", "-c", &script])
+        .env("MLXCACHE_PREFILL_DELAY", delay_s)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let url = format!("http://127.0.0.1:{port}");
+    for _ in 0..100 {
+        if reqwest::get(format!("{url}/health")).await.is_ok() {
+            return Some((url, child));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let mut child = child;
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+#[tokio::test]
+async fn concurrent_identical_requests_share_one_prefill() {
+    // The core R1-3 promise: N identical uncached requests must trigger ONE
+    // prefill, and every follower must still be served (from the leader's
+    // freshly published checkpoint), not re-prefill from scratch.
+    let Some((sidecar_url, mut child)) = spawn_sidecar_with_prefill_delay("0.5").await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "concurrent hello"}],
+        "stream": false,
+    })
+    .to_string();
+
+    const N: usize = 8;
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let app = router(state.clone());
+        let body = body.clone();
+        handles.push(tokio::spawn(async move {
+            let res = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v["mlxcache"]["verdict"].as_str().unwrap().to_string()
+        }));
+    }
+    let mut verdicts = Vec::new();
+    for h in handles {
+        verdicts.push(h.await.unwrap());
+    }
+
+    // Sidecar must have run the prefill exactly once for all N requests.
+    let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["prefill_count"].as_u64(),
+        Some(1),
+        "N={N} identical requests must coalesce to exactly 1 prefill; got {stats}"
+    );
+
+    // Exactly one request (the leader) experienced a miss — it ran the prefill.
+    // Every follower adopted the leader's published checkpoint (hit/partial).
+    let misses = verdicts.iter().filter(|v| *v == "miss").count();
+    assert_eq!(
+        misses, 1,
+        "exactly one leader should see a miss: {verdicts:?}"
+    );
+    assert!(
+        verdicts
+            .iter()
+            .all(|v| v == "hit" || v == "partial" || v == "miss"),
+        "unexpected verdicts: {verdicts:?}"
+    );
+
+    // One blob on disk, not N.
+    assert_eq!(state.persistence.list_blobs().unwrap().len(), 1);
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
 #[tokio::test]
 async fn end_to_end_streaming_sse() {
     let Some((sidecar_url, mut child)) = spawn_sidecar().await else {

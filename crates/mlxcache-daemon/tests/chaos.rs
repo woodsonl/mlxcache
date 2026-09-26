@@ -8,7 +8,7 @@
 //! - restart mid-stream: streams drop, checkpoints survive (R1-4)
 
 use mlxcache_core::contract::CheckpointMeta;
-use mlxcache_core::singleflight::SingleFlight;
+use mlxcache_core::singleflight::{await_result, Role, SingleFlight};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -22,17 +22,16 @@ async fn singleflight_race_one_winner() {
         let sf = sf.clone();
         let count = prefill_count.clone();
         handles.push(tokio::spawn(async move {
-            let (guard, follower) = sf.try_lead(vec![0xFFFF_0001]).await;
-            match follower {
-                None => {
+            match sf.enter(vec![0xFFFF_0001]).await {
+                Role::Leader(lead) => {
                     // Only the leader runs the prefill.
                     count.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    drop(guard);
+                    lead.complete(Ok("blob".into()));
                 }
-                Some(mut rx) => {
-                    // Followers await the leader's completion signal.
-                    let _ = rx.recv().await;
+                Role::Follower(rx) => {
+                    // Followers await the leader's published result.
+                    let _ = await_result(rx).await;
                 }
             }
         }));
@@ -57,15 +56,14 @@ async fn singleflight_different_keys_run_parallel() {
         let sf = sf.clone();
         let c = completed.clone();
         handles.push(tokio::spawn(async move {
-            let (guard, follower) = sf.try_lead(vec![0xFFFF_0000 + i as u32]).await;
-            match follower {
-                None => {
+            match sf.enter(vec![0xFFFF_0000 + i as u32]).await {
+                Role::Leader(lead) => {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     c.fetch_add(1, Ordering::SeqCst);
-                    drop(guard);
+                    lead.complete(Ok("blob".into()));
                 }
-                Some(mut rx) => {
-                    let _ = rx.recv().await;
+                Role::Follower(rx) => {
+                    let _ = await_result(rx).await;
                 }
             }
         }));

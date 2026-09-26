@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -31,6 +32,7 @@ class SyntheticEngine:
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
+        self.prefill_count = 0
 
     def tokenize(self, prompt: str) -> list[int]:
         # Deterministic token stream derived from the prompt hash. Not a real
@@ -40,6 +42,12 @@ class SyntheticEngine:
 
     def prefill(self, tokens: list[int]) -> bytes:
         # KV payload: 1024 bytes/token, deterministic from token ids.
+        self.prefill_count += 1
+        # Optional delay (test knob): widens the single-flight window so
+        # concurrent identical requests are provably coalesced.
+        delay = float(os.environ.get("MLXCACHE_PREFILL_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
         payload = b"".join(
             ((t * 31 + i) & 0xFFFFFFFF).to_bytes(4, "little") * 256 for i, t in enumerate(tokens)
         )
@@ -282,6 +290,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
         if self.path == "/health":
             self._json(200, {"status": "ok"})
+        elif self.path == "/stats":
+            # Test observability: how many prefills the engine actually ran.
+            # Proves single-flight coalesced concurrent identical requests.
+            self._json(200, {"prefill_count": getattr(self.engine, "prefill_count", None)})
         else:
             self._json(404, {"error": f"unknown path {self.path}"})
 
