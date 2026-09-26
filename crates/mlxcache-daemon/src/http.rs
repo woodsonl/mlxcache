@@ -183,12 +183,11 @@ async fn chat_completions(
     // blob filename. Hashing a long prefix twice is wasted hot-path work.
     let hash = prefix_hash(&tokens);
 
-    // Prefill on miss/partial. Single-flight (R1-3): exactly one leader runs
-    // the prefill and publishes; followers await its result and re-route so
-    // they adopt the leader's freshly published checkpoint instead of
-    // re-prefilling from scratch. The leader keeps its own miss/partial verdict
-    // (it DID run the prefill — that is what the request experienced) but
-    // records the blob it just published so the adapter can resume from it.
+    // Prefill on miss/partial. Single-flight (R1-3): one leader runs the
+    // prefill and publishes; followers await its result and re-route so they
+    // adopt the leader's checkpoint instead of re-prefilling. The leader keeps
+    // its miss/partial verdict because it did run the prefill, but records the
+    // blob it published so the adapter can resume from it.
     let Some(client) = state.sidecar.as_ref() else {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -254,9 +253,9 @@ async fn chat_completions(
         }
     }
 
-    // Record + log the verdict this request actually experienced: the leader a
-    // miss/partial (it prefilled), a coalesced follower the hit/partial it
-    // adopted. recording AFTER single-flight keeps stats truthful.
+    // Record + log the verdict the request saw: the leader a miss/partial (it
+    // prefilled), a coalesced follower the hit/partial it adopted. Recording
+    // after single-flight keeps stats truthful.
     state.stats.record(&outcome.decision);
     log_request(&req.model, hash, &outcome.decision, started_ms);
     let ttft_ms = started_ms;
@@ -535,29 +534,8 @@ mod tests {
 
     #[test]
     fn prefix_hash_halves_are_independent() {
-        // The two 64-bit lanes must decorrelate: with the old byte-rotated
-        // seed, hi was a deterministic function of lo. Verify that equal lo
-        // halves (forceably) do not force equal hi halves across distinct
-        // inputs is impractical to construct, so instead assert the practical
-        // property: the two lanes disagree on ordering/collisions. A cheap,
-        // real check: no input in a broad sweep produces hi == lo (a sign the
-        // seeds/rounding collapsed).
-        let mut same = 0usize;
-        for i in 0..4096u32 {
-            let h = prefix_hash(&[i]);
-            if (h >> 64) as u64 == h as u64 {
-                same += 1;
-            }
-        }
-        // Collision of the two independent lanes should be vanishingly rare;
-        // the old correlated construction did not produce equality either, so
-        // this guards against future constant mistakes, not the old bug shape.
-        assert!(same <= 1, "hash lanes collapsed: {same} identical halves");
-
-        // Different seeds must actually change the low lane's seed influence:
-        // swapping the input order of two distinct seeds yields a different
-        // full hash (trivially true) but also each lane must differ between two
-        // one-token inputs.
+        // Both 64-bit lanes must react to a one-token change, so a collision in
+        // one lane does not imply a collision in the other.
         let x = prefix_hash(&[7]);
         let y = prefix_hash(&[8]);
         assert_ne!(x as u64, y as u64, "low lane ignores input");
@@ -566,6 +544,15 @@ mod tests {
             (y >> 64) as u64,
             "high lane ignores input"
         );
+
+        // The lanes must not collapse to the same value across a broad sweep.
+        let same = (0..4096u32)
+            .filter(|i| {
+                let h = prefix_hash(&[*i]);
+                (h >> 64) as u64 == h as u64
+            })
+            .count();
+        assert!(same <= 1, "hash lanes collapsed: {same} identical halves");
     }
 
     #[tokio::test]
