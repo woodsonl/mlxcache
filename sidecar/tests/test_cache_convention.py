@@ -9,6 +9,7 @@ output than a scratch run.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -287,6 +288,32 @@ def test_invalid_safetensors_rejected_before_native_load(monkeypatch, tmp_path):
         fh.write(blob.encode(meta, b"\x00" * 8))  # header length 0 -> invalid
     with pytest.raises(server.CheckpointRejectedError):
         eng._load_cache_delta(tokens, path)
+
+
+def test_unhashable_dtype_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex pass 7): a safetensors header with "dtype":[] or {}
+    # must be a 422, not a TypeError escaping to a 500. The validator checks the
+    # dtype is a str before the dict membership test.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    for bad_dtype in ([], {}):
+        header = json.dumps(
+            {"w": {"dtype": bad_dtype, "shape": [1], "data_offsets": [0, 2]}}
+        ).encode()
+        payload = len(header).to_bytes(8, "little") + header + b"\x00\x00"
+        meta = blob.CheckpointMeta(
+            fingerprint=blob.Fingerprint(
+                model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+            ),
+            token_count=len(tokens),
+            tokens=tokens,
+        )
+        path = str(tmp_path / "bad-dtype.ckpt")
+        with open(path, "wb") as fh:
+            fh.write(blob.encode(meta, payload))
+        with pytest.raises(server.CheckpointRejectedError):
+            eng._load_cache_delta(tokens, path)
 
 
 def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):

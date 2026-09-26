@@ -168,7 +168,28 @@ impl Orchestrator {
                 return report;
             }
         };
+        // Two passes. Directory order is arbitrary, and files now carry immutable
+        // per-generation names, so processing in order and reclaiming as we go
+        // would let an older corrupt generation delete the newer repair that
+        // replaced it. Instead: load every valid candidate, keep only the highest
+        // generation per token prefix (the latest publication), publish the
+        // winners, then delete the superseded files. Recovery never reclaims a
+        // file it is about to publish.
+        struct Candidate {
+            name: String,
+            generation: u64,
+            // Lowercased hex string prefix per file: {hash:032x}-{gen:016x}.ckpt.
+            tokens: Vec<u32>,
+            meta: mlxcache_core::contract::CheckpointMeta,
+        }
+        let mut best: std::collections::HashMap<(Vec<u32>, String), Candidate> =
+            std::collections::HashMap::new();
+        let mut stale: Vec<String> = Vec::new();
         for blob in blobs {
+            let name = blob
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| blob.to_string_lossy().into_owned());
             match persistence.load(&blob) {
                 Ok((meta, payload)) => {
                     // A prefix shorter than 2 tokens caches nothing (the adapter
@@ -181,24 +202,32 @@ impl Orchestrator {
                     }
                     // A multi-token checkpoint with an empty KV payload is
                     // corrupt (a truncated write the adapter rejected at runtime).
-                    // The on-disk file can outlive its retirement (a repaired
-                    // republish writes a different deterministic name), so
-                    // re-indexing it at startup would resurrect the poison.
                     // Skip it, matching the adapter's own load-time check.
                     if payload.is_empty() {
                         report.skipped += 1;
                         continue;
                     }
-                    // Key by the persisted token prefix, not the on-disk hash
-                    // name, so lookups match real requests.
-                    let name = blob
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| blob.to_string_lossy().into_owned());
-                    let tokens = meta.tokens.clone();
-                    let generation = self.reserve_generation();
-                    self.publish_checkpoint(persistence, &tokens, meta, name, generation);
-                    report.rebuilt += 1;
+                    let generation = parse_generation(&name).unwrap_or(0);
+                    let key = (meta.tokens.clone(), meta.fingerprint.tokenizer_hash.clone());
+                    let cand = Candidate {
+                        name,
+                        generation,
+                        tokens: meta.tokens.clone(),
+                        meta,
+                    };
+                    match best.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if cand.generation > e.get().generation {
+                                stale.push(e.get().name.clone());
+                                e.insert(cand);
+                            } else {
+                                stale.push(cand.name);
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(cand);
+                        }
+                    }
                 }
                 Err(e) => {
                     report.skipped += 1;
@@ -206,8 +235,34 @@ impl Orchestrator {
                 }
             }
         }
+        // Publish the winners, then remove every superseded file. A no-op reclaim
+        // callback: the deletion is explicit and post-publish.
+        for (_, cand) in best {
+            let generation = self.reserve_generation();
+            self.index
+                .publish(&cand.tokens, cand.meta, cand.name, generation, |_| {});
+            report.rebuilt += 1;
+        }
+        for name in stale {
+            if let Err(e) = persistence.remove(&name) {
+                report
+                    .errors
+                    .push(format!("{name}: could not remove stale generation: {e}"));
+            }
+        }
         report
     }
+}
+
+/// Parse the generation embedded in an immutable blob name
+/// (`{hash:032x}-{gen:016x}.ckpt`). None for a legacy/foreign name.
+fn parse_generation(name: &str) -> Option<u64> {
+    let stem = name.strip_suffix(".ckpt")?;
+    let (hash, gen) = stem.rsplit_once('-')?;
+    if hash.len() != 32 || gen.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(gen, 16).ok()
 }
 
 /// Outcome of a startup index rebuild (surfaced in logs / /stats).

@@ -78,7 +78,7 @@ def _valid_safetensors(payload: bytes) -> bool:
         dtype = spec.get("dtype")
         shape = spec.get("shape")
         offs = spec.get("data_offsets")
-        if dtype not in _SAFETENSORS_DTYPE_BYTES:
+        if not isinstance(dtype, str) or dtype not in _SAFETENSORS_DTYPE_BYTES:
             return False
         if not isinstance(shape, list) or not all(
             isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape

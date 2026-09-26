@@ -247,6 +247,47 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
     assert_eq!(ext.prefill_from, 3);
 }
 
+#[tokio::test]
+async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
+    // Regression (Codex pass 7): immutable per-generation names mean a prefix can
+    // have several files on disk. Directory order is arbitrary, so recovery must
+    // pick the LATEST publication (highest generation) per prefix and must not
+    // let an older file overwrite (and delete) the newer repair.
+    let dir = tempfile::tempdir().unwrap();
+    let p = mlxcache_daemon::persistence::Persistence::new(dir.path()).unwrap();
+    let fp = mlxcache_daemon::orchestrator::test_support::fp("m");
+    let meta = CheckpointMeta {
+        fingerprint: fp.clone(),
+        token_count: 4,
+        tokens: vec![1, 2, 3, 4],
+        format_version: 1,
+    };
+    // Same prefix, generations 5 and 17. gen 17 is the repair; it must win.
+    p.publish_atomic(0xabc, 5, &meta, b"old").unwrap();
+    let repair = p.publish_atomic(0xabc, 17, &meta, b"new").unwrap();
+
+    let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let report = orch.rebuild_from_disk(&p);
+    assert_eq!(report.rebuilt, 1, "one entry per prefix");
+    let out = orch.route(&[1, 2, 3, 4], &fp);
+    let name = out.blob.as_ref().map(|(n, _, _)| n.as_str());
+    assert_eq!(
+        name,
+        repair.file_name().map(|n| n.to_string_lossy()).as_deref(),
+        "the highest generation is indexed"
+    );
+    assert!(repair.exists(), "the repair file must survive recovery");
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".ckpt"))
+            .count(),
+        1,
+        "the superseded generation is reclaimed"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_triggers_graceful_shutdown() {
