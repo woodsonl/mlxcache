@@ -26,11 +26,13 @@ mlx = [
 
 [dependency-groups]
 dev = [
-    "pytest>=8",
-    "pytest-asyncio>=0.24",
-    "httpx>=0.27",
-    # Exact pin (like mlx-lm above): a floor admits a newer ruff whose new rules
-    # can fail CI while the lock still resolves the old one.
+    # Exact pins (like mlx-lm above): a floor admits a newer release whose
+    # behavior can differ between local and CI while the lock still resolves the
+    # old one, so a local pass can be a false green. Pins are on direct deps
+    # only; transitive deps are pinned by uv.lock, which CI asserts with --locked.
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "httpx==0.28.1",
     "ruff==0.16.9",
 ]
 
