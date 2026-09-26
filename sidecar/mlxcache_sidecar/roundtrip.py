@@ -29,6 +29,7 @@ from .blob import CheckpointMeta, Fingerprint, decode, encode
 class RoundTripResult:
     tokens: int
     bytes_total: int
+    bytes_payload: int
     serialize_ms: float
     deserialize_ms: float
     peak_memory_mb: float
@@ -39,11 +40,18 @@ class RoundTripResult:
     def bytes_per_token(self) -> float:
         return self.bytes_total / self.tokens
 
+    def payload_bytes_per_token(self) -> float:
+        """KV-only bytes/token: excludes the header (which carries the token id
+        list, not KV). This is the T2 figure the daemon actually pays per token."""
+        return self.bytes_payload / self.tokens
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "tokens": self.tokens,
             "bytes_total": self.bytes_total,
+            "bytes_payload": self.bytes_payload,
             "bytes_per_token": self.bytes_per_token(),
+            "payload_bytes_per_token": self.payload_bytes_per_token(),
             "serialize_ms": self.serialize_ms,
             "deserialize_ms": self.deserialize_ms,
             "peak_memory_mb": self.peak_memory_mb,
@@ -84,8 +92,9 @@ def run_roundtrip(n_tokens: int = 50_000) -> RoundTripResult:
     state = _synthetic_kv_state(n_tokens)
 
     # Use the real wire codec so the harness cannot test a format the daemon and
-    # adapter do not actually speak. Hand-building the header here diverged from
-    # blob.encode (it omitted the tokens field) and made the thesis guard weak.
+    # adapter do not actually speak. The daemon writes the full token list in
+    # CheckpointMeta (http.rs publish), so mirror that: token_count must equal
+    # len(tokens) or the daemon's rebuild_from_disk rejects the blob as mis-keyed.
     meta = CheckpointMeta(
         fingerprint=Fingerprint(
             model_id="synthetic",
@@ -94,8 +103,11 @@ def run_roundtrip(n_tokens: int = 50_000) -> RoundTripResult:
             kv_layout_version=1,
         ),
         token_count=n_tokens,
-        tokens=list(range(min(n_tokens, 8))),
+        tokens=list(range(n_tokens)),
     )
+    # Guard: the daemon skips blobs where len(tokens) != token_count
+    # (orchestrator.rs rebuild_from_disk). Encode only metadata it accepts.
+    assert len(meta.tokens) == meta.token_count, "harness emitted mis-keyed metadata"
     t0 = time.perf_counter()
     blob = encode(meta, state)
     serialize_ms = (time.perf_counter() - t0) * 1000
@@ -116,6 +128,7 @@ def run_roundtrip(n_tokens: int = 50_000) -> RoundTripResult:
     return RoundTripResult(
         tokens=n_tokens,
         bytes_total=len(blob),
+        bytes_payload=len(payload),
         serialize_ms=serialize_ms,
         deserialize_ms=deserialize_ms,
         peak_memory_mb=_measure_peak_memory_mb(),
