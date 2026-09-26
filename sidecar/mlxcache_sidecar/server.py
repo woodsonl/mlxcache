@@ -220,6 +220,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    @staticmethod
+    def _require(req: dict, key: str):
+        if key not in req:
+            raise Handler._BadRequestError(f"missing required field '{key}'")
+        return req[key]
+
     def _binary(self, code: int, body: bytes) -> None:
         self.send_response(code)
         self.send_header("Content-Type", "application/octet-stream")
@@ -227,14 +233,37 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(length)) if length else {}
+    # Hard cap on request bodies (the daemon is the only client; this bounds a
+    # malformed/hostile Content-Length from pinning a worker thread).
+    MAX_BODY = 64 * 1024 * 1024
 
-    def _stream_ndjson(self, req: dict) -> None:
+    class _BadRequestError(Exception):
+        pass
+
+    def _read_json(self) -> dict:
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            return {}
+        try:
+            length = int(raw_len)
+        except (TypeError, ValueError) as exc:
+            raise Handler._BadRequestError("invalid Content-Length") from exc
+        if length < 0 or length > self.MAX_BODY:
+            raise Handler._BadRequestError("Content-Length out of range")
+        if length == 0:
+            return {}
+        body = self.rfile.read(length)
+        try:
+            return json.loads(body)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise Handler._BadRequestError("malformed JSON body") from exc
+
+    def _stream_ndjson(self, tokens: list, blob_path: str | None, max_tokens: int) -> None:
         """Stream generation as newline-delimited JSON: one line per token,
         then a final done line. Framed by connection close (HTTP/1.0-style)
         so reqwest reads until EOF — no hand-rolled chunked encoding."""
+        # Validation happens in do_POST BEFORE any bytes are sent, so a bad
+        # request can still yield a clean 400 rather than a truncated 200.
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Connection", "close")
@@ -243,12 +272,12 @@ class Handler(BaseHTTPRequestHandler):
 
         n = 0
         try:
-            for token, text in self.engine.stream(req["tokens"], req.get("blob_path")):
+            for token, text in self.engine.stream(tokens, blob_path):
                 line = (json.dumps({"token": token, "text": text}) + "\n").encode()
                 self.wfile.write(line)
                 self.wfile.flush()
                 n += 1
-                if n >= req.get("max_tokens", 64):
+                if n >= max_tokens:
                     break
             self.wfile.write((json.dumps({"done": True, "tokens": n}) + "\n").encode())
             self.wfile.flush()
@@ -264,25 +293,29 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"tokens": tokens, "tokenizer_hash": "synthetic"})
             elif self.path == "/prefill":
                 req = self._read_json()
-                blob = self.engine.prefill(req["tokens"])
+                blob = self.engine.prefill(self._require(req, "tokens"))
                 self._binary(200, blob)
             elif self.path == "/generate":
                 req = self._read_json()
+                tokens = self._require(req, "tokens")
                 if req.get("stream"):
-                    self._stream_ndjson(req)
+                    self._stream_ndjson(tokens, req.get("blob_path"), req.get("max_tokens", 64))
                 else:
                     blob_path = req.get("blob_path")
                     if blob_path and hasattr(self.engine, "generate_from_blob"):
                         out = self.engine.generate_from_blob(
-                            req["tokens"], blob_path, req.get("max_tokens", 64)
+                            tokens, blob_path, req.get("max_tokens", 64)
                         )
                     else:
                         out = self.engine.generate(
-                            req["tokens"], req.get("prefill_from", 0), req.get("max_tokens", 64)
+                            tokens, req.get("prefill_from", 0), req.get("max_tokens", 64)
                         )
                     self._json(200, {"tokens": out})
             else:
                 self._json(404, {"error": f"unknown path {self.path}"})
+        except Handler._BadRequestError as exc:
+            # Client error: 400 with a stable message (no internal detail).
+            self._json(400, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001 — map all engine errors to 500 JSON
             traceback.print_exc()
             self._json(500, {"error": str(exc)})
