@@ -529,8 +529,14 @@ async fn concurrent_identical_requests_share_one_prefill() {
     // The core R1-3 promise: N identical uncached requests must trigger ONE
     // prefill, and every follower must still be served (from the leader's
     // freshly published checkpoint), not re-prefill from scratch.
+    //
+    // Coalescing is guaranteed only for requests that overlap in flight. The
+    // leader is held open (MLXCACHE_PREFILL_DELAY) and followers are released
+    // only after /stats confirms it is prefilling; spawning all N at once lets a
+    // task be scheduled past the leader's completion and legitimately become a
+    // second leader (observed as extra "miss" verdicts on CI).
     let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "0.5")]).await
+        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "1.5")]).await
     else {
         eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
         return;
@@ -556,11 +562,23 @@ async fn concurrent_identical_requests_share_one_prefill() {
     .to_string();
 
     const N: usize = 8;
+    // Task 0 is the leader and starts immediately; it sleeps 1.5s in the
+    // sidecar prefill. Followers wait on a watch channel until /stats shows the
+    // leader is in flight, so they enter single-flight deterministically.
+    let (start_followers_tx, start_followers_rx) = tokio::sync::watch::channel(false);
     let mut handles = Vec::new();
-    for _ in 0..N {
+    for i in 0..N {
         let app = router(state.clone());
         let body = body.clone();
+        let mut gate = start_followers_rx.clone();
         handles.push(tokio::spawn(async move {
+            if i != 0 {
+                while !*gate.borrow() {
+                    if gate.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
             let res = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -578,6 +596,22 @@ async fn concurrent_identical_requests_share_one_prefill() {
             v["mlxcache"]["verdict"].as_str().unwrap().to_string()
         }));
     }
+
+    // Wait for the leader to be prefilling, then release the followers.
+    for _ in 0..200 {
+        let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if stats["prefill_count"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    start_followers_tx.send_replace(true);
+
     let mut verdicts = Vec::new();
     for h in handles {
         verdicts.push(h.await.unwrap());
