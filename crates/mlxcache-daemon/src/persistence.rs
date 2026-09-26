@@ -17,7 +17,10 @@ pub struct Persistence {
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
     #[error("disk full or unwritable at {path}: {source}")]
-    DiskFull { path: PathBuf, source: std::io::Error },
+    DiskFull {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("checkpoint corrupt: {reason}")]
     Corrupt { reason: String },
     #[error("io error: {0}")]
@@ -42,10 +45,9 @@ impl Persistence {
         let final_path = self.blob_dir.join(format!("{:032x}.ckpt", prefix_hash));
         let tmp_path = self.blob_dir.join(format!("{:032x}.ckpt.tmp", prefix_hash));
 
-        let header = serde_json::to_vec(meta)
-            .map_err(|e| PersistError::Corrupt {
-                reason: format!("meta serialize: {e}"),
-            })?;
+        let header = serde_json::to_vec(meta).map_err(|e| PersistError::Corrupt {
+            reason: format!("meta serialize: {e}"),
+        })?;
         let header_len = (header.len() as u32).to_le_bytes();
 
         let write_result = (|| -> std::io::Result<()> {
@@ -86,11 +88,12 @@ impl Persistence {
                 reason: "header length exceeds blob".into(),
             });
         }
-        let meta: CheckpointMeta = serde_json::from_slice(&bytes[4..4 + header_len]).map_err(
-            |e| PersistError::Corrupt {
-                reason: format!("meta parse: {e}"),
-            },
-        )?;
+        let meta: CheckpointMeta =
+            serde_json::from_slice(&bytes[4..4 + header_len]).map_err(|e| {
+                PersistError::Corrupt {
+                    reason: format!("meta parse: {e}"),
+                }
+            })?;
         if meta.format_version != 1 {
             return Err(PersistError::Corrupt {
                 reason: format!("format version {}", meta.format_version),
