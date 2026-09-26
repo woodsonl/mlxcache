@@ -252,39 +252,76 @@ fn sigterm_triggers_graceful_shutdown() {
         .spawn()
         .expect("spawn daemon");
 
-    // Wait until the port answers, so SIGTERM lands after handlers are installed.
+    // Read pipes on threads so a verbose failure cannot fill the pipe buffer and
+    // deadlock, and so we can wait with a bound below.
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let out_h = std::thread::spawn(move || {
+        let mut s = String::new();
+        let mut r = stdout;
+        let _ = r.read_to_string(&mut s);
+        s
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut s = String::new();
+        let mut r = stderr;
+        let _ = r.read_to_string(&mut s);
+        s
+    });
+
+    // Ensure we never leak the daemon if an assertion below fails.
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut guard = KillOnDrop(child);
+
+    // Wait until the port accepts connections, then let the serve loop poll the
+    // graceful-shutdown future (installing signal handlers) before signalling.
+    // A connect can succeed right after bind and before that first poll.
     let ready = (0..100).any(|_| {
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::net::TcpStream::connect(&addr).is_ok()
     });
     assert!(ready, "daemon never started listening on {addr}");
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
-    let pid = child.id();
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-    }
+    let pid = guard.0.id();
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0, "SIGTERM delivery failed");
 
-    // Bounded wait: graceful shutdown must complete, not hang.
-    let status = child.wait().expect("wait daemon");
+    // Bounded wait: graceful shutdown must complete promptly, not hang.
+    let status = wait_with_timeout(&mut guard.0, std::time::Duration::from_secs(10))
+        .expect("daemon did not exit within 10s of SIGTERM");
     assert!(status.success(), "daemon must exit 0 on SIGTERM: {status}");
 
-    let mut out = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
-    let mut out2 = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out2)
-        .unwrap();
-    let combined = format!("{out}{out2}");
+    let combined = format!("{}{}", err_h.join().unwrap(), out_h.join().unwrap());
     assert!(
         combined.contains("SIGTERM"),
         "shutdown should log the signal, got: {combined}"
     );
+}
+
+/// Wait for a child with a deadline, killing it if the deadline passes. Returns
+/// None on timeout.
+#[cfg(unix)]
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }

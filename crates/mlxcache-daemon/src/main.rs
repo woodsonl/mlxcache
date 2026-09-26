@@ -70,37 +70,61 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, "mlxcache daemon listening");
     // Drain in-flight requests on SIGINT/SIGTERM instead of dropping them.
-    // axum closes idle keep-alive connections immediately and waits only for
-    // active requests, each of which is already bounded by the sidecar client
-    // timeout. Publishes are atomic, so nothing is lost if the process is killed.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Bounded: axum waits for active responses, which for a streaming (SSE)
+    // request means its upstream sidecar stream ends — up to the sidecar client
+    // timeout (120s default), longer than a supervisor's ~90s SIGKILL grace. So
+    // cap the drain at MLXCACHE_SHUTDOWN_GRACE_S (default 30s): once it fires, a
+    // held-open stream cannot delay exit past the supervisor's patience.
+    // Publishes are atomic, so a forced exit loses nothing.
+    let grace_s: u64 = std::env::var("MLXCACHE_SHUTDOWN_GRACE_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = signal_tx.send(());
+    });
+    tokio::select! {
+        result = serve => result?,
+        () = async {
+            let _ = signal_rx.await;
+            tracing::info!(grace_s, "draining in-flight requests");
+            tokio::time::sleep(std::time::Duration::from_secs(grace_s)).await;
+        } => {
+            tracing::warn!(grace_s, "shutdown grace elapsed; forcing exit");
+        }
+    }
     tracing::info!("mlxcache daemon stopped");
     Ok(())
 }
 
 /// Resolve on SIGINT or SIGTERM. Logs which signal so operators can tell an
-/// intentional stop from a crash.
+/// intentional stop from a crash. A failed handler install is fatal-logged and
+/// treated as a shutdown trigger rather than a panic.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("install SIGINT handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => tracing::info!("received SIGINT; draining"),
+            Err(e) => tracing::error!(error = %e, "SIGINT handler failed; draining"),
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+                tracing::info!("received SIGTERM; draining");
+            }
+            Err(e) => tracing::error!(error = %e, "SIGTERM handler failed; draining"),
+        }
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        () = ctrl_c => tracing::info!("received SIGINT; draining"),
-        () = terminate => tracing::info!("received SIGTERM; draining"),
+        () = ctrl_c => {},
+        () = terminate => {},
     }
 }
