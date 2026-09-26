@@ -346,7 +346,13 @@ async fn chat_completions(
             if let Some(name) = outcome.blob_path.clone() {
                 state.orchestrator.quarantine_checkpoint(&tokens);
                 retired_blob = true;
-                tracing::warn!(blob = %name, error = %e, "blob unusable; quarantined, retrying from scratch");
+                // Correct the decision's claim: no KV was actually reused.
+                tracing::warn!(
+                    blob = %name,
+                    error = %e,
+                    kv_claimed = outcome.prefill_from,
+                    "blob unusable; quarantined, retrying from scratch (effective prefill_from=0)"
+                );
                 match client.generate(&tokens, 64, None).await {
                     Ok(t) => t,
                     Err(e2) => {
@@ -499,7 +505,12 @@ async fn stream_response(
             // Quarantine it and retry from scratch so the stream still starts.
             if let Some(name) = blob_for_open.take() {
                 state.orchestrator.quarantine_checkpoint(&tokens);
-                tracing::warn!(blob = %name, error = %e, "blob unusable; quarantined, retrying stream from scratch");
+                tracing::warn!(
+                    blob = %name,
+                    error = %e,
+                    kv_claimed = prefill_from,
+                    "blob unusable; quarantined, retrying stream from scratch (effective prefill_from=0)"
+                );
             }
             prefill_from = 0;
             retired_blob.set(true);
