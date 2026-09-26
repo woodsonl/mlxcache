@@ -180,7 +180,10 @@ async fn chat_completions(
     let outcome = state.orchestrator.route(&tokens, &fingerprint);
     state.stats.record(&outcome.decision);
     let ttft_ms = started.elapsed().as_millis() as u64;
-    log_request(&req.model, 0, &outcome.decision, ttft_ms);
+    // Compute the prefix key once: reused by the log line and (on miss) the
+    // blob filename. Hashing a long prefix twice is wasted hot-path work.
+    let hash = prefix_hash(&tokens);
+    log_request(&req.model, hash, &outcome.decision, ttft_ms);
 
     // Prefill on miss/partial (single-flight, R1-3), then persist. On hit the
     // published blob path is passed to the adapter. Shared by both modes.
@@ -197,7 +200,6 @@ async fn chat_completions(
             None => {
                 match client.prefill(&tokens).await {
                     Ok(blob) => {
-                        let hash = prefix_hash(&tokens);
                         let meta = mlxcache_core::contract::CheckpointMeta {
                             fingerprint: fingerprint.clone(),
                             token_count: tokens.len() as u64,
