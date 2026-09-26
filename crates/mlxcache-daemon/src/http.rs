@@ -379,23 +379,33 @@ async fn chat_completions(
     let generated = match client.generate(&tokens, 64, blob_arg).await {
         Ok(t) => t,
         Err(e) => {
-            // If this request leaned on a blob and the adapter could not use it,
-            // the checkpoint is bad (deleted, truncated, disk fault). Quarantine
-            // it (R1-1) so identical requests stop 502ing, then retry from
-            // scratch. A scratch failure is a genuine adapter error.
+            // If this request leaned on a blob and the request failed, retry
+            // from scratch. A checkpoint the adapter explicitly rejected (422)
+            // is bad: quarantine it so identical requests stop failing. A mere
+            // transport/decode failure must NOT retire a healthy checkpoint.
             if let Some(name) = outcome.blob_path.clone() {
-                state.orchestrator.quarantine_checkpoint(&name);
-                retired_blob = true;
-                // Correct the aggregate: the covered KV counted at record() was
-                // never in hand.
-                state.stats.correct_retire(&outcome.decision);
-                // Correct the decision's claim: no KV was actually reused.
-                tracing::warn!(
-                    blob = %name,
-                    error = %e,
-                    kv_claimed = outcome.prefill_from,
-                    "blob unusable; quarantined, retrying from scratch (effective prefill_from=0)"
-                );
+                if e.is_checkpoint_rejected() {
+                    state
+                        .orchestrator
+                        .quarantine_checkpoint(&name, outcome.blob_generation.unwrap_or(0));
+                    retired_blob = true;
+                    // Correct the aggregate: the covered KV counted at record()
+                    // was never in hand.
+                    state.stats.correct_retire(&outcome.decision);
+                    // Correct the decision's claim: no KV was actually reused.
+                    tracing::warn!(
+                        blob = %name,
+                        error = %e,
+                        kv_claimed = outcome.prefill_from,
+                        "blob rejected by adapter; quarantined, retrying from scratch (effective prefill_from=0)"
+                    );
+                } else {
+                    tracing::warn!(
+                        blob = %name,
+                        error = %e,
+                        "blob run failed with a non-rejection error; retrying from scratch without quarantine"
+                    );
+                }
                 match client.generate(&tokens, 64, None).await {
                     Ok(t) => t,
                     Err(e2) => {
@@ -535,21 +545,32 @@ async fn stream_response(
     let lookup_ms = started.elapsed().as_millis() as u64;
 
     let mut blob_for_open = outcome.blob_path.clone();
+    let blob_generation = outcome.blob_generation;
     let mut prefill_from = outcome.prefill_from;
     let retired_blob = std::cell::Cell::new(false);
     let upstream = match client.generate_stream(&tokens, 64, blob_arg).await {
         Ok(u) => u,
         Err(e) if blob_for_open.is_some() => {
-            // The blob could not be opened (deleted/truncated/disk fault).
-            // Quarantine it and retry from scratch so the stream still starts.
-            if let Some(name) = blob_for_open.take() {
-                state.orchestrator.quarantine_checkpoint(&name);
-                state.stats.correct_retire(&outcome.decision);
+            // The stream could not be opened. Retry from scratch so the stream
+            // still starts. Quarantine only on an explicit adapter rejection
+            // (422): a transport/decode failure must not retire a healthy blob.
+            if e.is_checkpoint_rejected() {
+                if let Some(name) = blob_for_open.take() {
+                    state
+                        .orchestrator
+                        .quarantine_checkpoint(&name, blob_generation.unwrap_or(0));
+                    state.stats.correct_retire(&outcome.decision);
+                    tracing::warn!(
+                        blob = %name,
+                        error = %e,
+                        kv_claimed = prefill_from,
+                        "blob rejected by adapter; quarantined, retrying stream from scratch (effective prefill_from=0)"
+                    );
+                }
+            } else {
                 tracing::warn!(
-                    blob = %name,
                     error = %e,
-                    kv_claimed = prefill_from,
-                    "blob unusable; quarantined, retrying stream from scratch (effective prefill_from=0)"
+                    "stream open failed with a non-rejection error; retrying from scratch without quarantine"
                 );
             }
             prefill_from = 0;

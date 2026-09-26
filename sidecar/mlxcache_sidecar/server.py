@@ -25,6 +25,14 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+class CheckpointRejectedError(Exception):
+    """A checkpoint the daemon asked us to resume from is bad: corrupt payload,
+    undecodable header, or a recorded prefix that disagrees with the request.
+    Mapped to HTTP 422 so the daemon retires (quarantines) the entry. Distinct
+    from a decode/generation failure, which must NOT retire a healthy
+    checkpoint."""
+
+
 class SyntheticEngine:
     """Hermetic engine: deterministic tokens + KV bytes, no MLX dependency."""
 
@@ -251,6 +259,8 @@ class MlxLmEngine:
     def _generate_with_cache(self, tokens: list[int], max_tokens: int, cache) -> list[int]:
         """Collect a bounded generation from the streaming path, so the
         non-streaming /generate mode reuses the identical decode logic."""
+        if max_tokens <= 0:
+            return []
         out: list[int] = []
         for token, _text in self._stream_with_cache(tokens, cache):
             out.append(token)
@@ -259,7 +269,12 @@ class MlxLmEngine:
         return out
 
     def _load_cache_delta(self, tokens: list[int], blob_path: str):
-        """Returns (cache, delta_prompt) or (None, tokens). See generate_from_blob.
+        """Returns (cache, delta_prompt), or (None, tokens) when the checkpoint
+        is legitimately uncacheable for this request (a prefix shorter than 2
+        tokens, or a legacy blob with no recorded tokens). Raises
+        CheckpointRejectedError when the checkpoint is BAD — corrupt payload, or a
+        recorded prefix that disagrees with the request — so the daemon retires
+        the entry instead of resuming from wrong KV.
 
         The persisted cache covers the checkpoint prefix MINUS its final token
         (see prefill), so the delta is exactly the tokens the cache does not
@@ -269,15 +284,17 @@ class MlxLmEngine:
 
         from .blob import decode  # noqa: PLC0415
 
-        with open(blob_path, "rb") as fh:
-            meta, payload = decode(fh.read())
+        try:
+            with open(blob_path, "rb") as fh:
+                meta, payload = decode(fh.read())
+        except (OSError, ValueError) as exc:
+            # Unreadable file or a header that does not decode: the entry is
+            # bad, retire it rather than 502 forever.
+            raise CheckpointRejectedError(f"checkpoint unreadable: {exc}") from exc
         # The checkpoint prefix must be self-describing: only meta.tokens tells
         # us which prefix the KV actually covers. A legacy blob with no recorded
         # tokens cannot be verified against this request, so adopting it would
-        # mean trusting it covers tokens[:token_count] by construction. Refuse:
-        # resuming from the wrong KV generates silently wrong output.
-        # meta.token_count is advisory only (a length, not an identity): any
-        # prefix of that length would pass, so it must never authorize adoption.
+        # mean trusting it covers tokens[:token_count] by construction. Refuse.
         if not meta.tokens:
             return None, tokens
         prefix_len = len(meta.tokens)
@@ -286,17 +303,17 @@ class MlxLmEngine:
             # one-token checkpoints whose nonempty KV already holds that token:
             # adopting one and feeding the whole prompt would double-feed it.
             return None, tokens
-        # A multi-token checkpoint with no KV payload is CORRUPT (a truncated
-        # write), not uncacheable: return it to the loader so the failure
-        # propagates and the daemon quarantines the entry. Only an uncacheable
-        # prefix (<2 tokens, above) legitimately has an empty payload.
-        prefix = meta.tokens
         # The adapter is a trust boundary: verify the blob really covers this
-        # request's prefix. If the recorded prefix disagrees with the request,
-        # the blob belongs to a different prefix and resuming from it would
-        # generate silently wrong output. Fall back to scratch.
+        # request's prefix. A disagreement means the file does not match the
+        # index entry that pointed at it (mislabeled/corrupt): retire it, do not
+        # silently resume from or ignore wrong KV.
+        prefix = meta.tokens
         if prefix != tokens[:prefix_len]:
-            return None, tokens
+            raise CheckpointRejectedError("checkpoint prefix does not match the request")
+        # A multi-token checkpoint with no KV payload is CORRUPT (a truncated
+        # write), not uncacheable: reject so the daemon quarantines the entry.
+        if not payload:
+            raise CheckpointRejectedError("checkpoint payload is empty")
         covered = prefix_len - 1
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
             tmp = fh.name
@@ -382,11 +399,12 @@ class Handler(BaseHTTPRequestHandler):
         """Stream generation as newline-delimited JSON: one line per token,
         then a final done line. Framed by connection close (HTTP/1.0-style)
         so reqwest reads until EOF — no hand-rolled chunked encoding."""
-        # Load/validate the checkpoint BEFORE sending 200. A corrupt blob raises
-        # here and do_POST maps it to a clean 500, which the daemon quarantines.
-        # Only the load is primed: first-token decode runs after headers, so a
-        # decode error (OOM) truncates the stream without being mistaken for blob
-        # corruption. Once bytes are sent we cannot switch to a 500.
+        # Load/validate the checkpoint BEFORE sending 200. A bad blob raises
+        # CheckpointRejectedError here and do_POST maps it to a clean 422, which the
+        # daemon quarantines. Only the load is primed: first-token decode runs
+        # after headers, so a decode error (OOM) truncates the stream without
+        # being mistaken for blob corruption. Once bytes are sent we cannot
+        # switch to a 422.
         prompt, cache = self.engine.prepare_stream(tokens, blob_path)
 
         self.send_response(200)
@@ -446,7 +464,10 @@ class Handler(BaseHTTPRequestHandler):
                 # deletes the blob between the miss and the repeat request).
                 blob_path = req.get("blob_path")
                 if blob_path and not os.path.exists(blob_path):
-                    self._json(500, {"error": f"blob unreadable: {blob_path}"})
+                    # The checkpoint the daemon asked us to resume from is gone:
+                    # a bad entry, not a request error. 422 so the daemon
+                    # quarantines it and retries from scratch.
+                    self._json(422, {"error": f"blob unreadable: {blob_path}"})
                     return
                 if req.get("stream"):
                     self._stream_ndjson(tokens, req.get("blob_path"), req.get("max_tokens", 64))
@@ -464,6 +485,10 @@ class Handler(BaseHTTPRequestHandler):
         except Handler._BadRequestError as exc:
             # Client error: 400 with a stable message (no internal detail).
             self._json(400, {"error": str(exc)})
+        except CheckpointRejectedError as exc:
+            # 422: the checkpoint is bad, not the request or the engine. The
+            # daemon quarantines the entry on this status and retries scratch.
+            self._json(422, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001 — map all engine errors to 500 JSON
             traceback.print_exc()
             self._json(500, {"error": str(exc)})

@@ -158,12 +158,12 @@ def test_malformed_json_is_400(sidecar_url):
     assert "malformed JSON" in body
 
 
-def test_stream_corrupt_blob_is_500_not_truncated_200(sidecar_url, tmp_path, monkeypatch):
+def test_stream_corrupt_blob_is_422_not_truncated_200(sidecar_url, tmp_path, monkeypatch):
     # Regression (Codex adversarial P1): the real engine loads the checkpoint on
     # the first step of its stream generator. If that raises AFTER 200 is sent,
     # the daemon sees a failed stream but cannot quarantine the checkpoint, and
     # the poison stays selectable forever. The load must run BEFORE headers, so a
-    # corrupt payload yields a clean 500 (which the daemon quarantines on).
+    # rejected checkpoint yields a clean 422 (which the daemon quarantines on).
     class LoadThenStream:
         name = "load-then-stream"
         tokenizer_hash = "synthetic"
@@ -172,7 +172,7 @@ def test_stream_corrupt_blob_is_500_not_truncated_200(sidecar_url, tmp_path, mon
 
         def prepare_stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
             if blob_path:
-                raise ValueError("corrupt safetensors payload")
+                raise server.CheckpointRejectedError("corrupt safetensors payload")
             return tokens, None
 
         def stream_prepared(self, prompt, cache):  # noqa: ANN001, ANN201
@@ -186,8 +186,39 @@ def test_stream_corrupt_blob_is_500_not_truncated_200(sidecar_url, tmp_path, mon
             f"{sidecar_url}/generate",
             json={"tokens": [1, 2], "max_tokens": 1, "blob_path": str(bad), "stream": True},
         )
-        assert r.status_code == 500, f"expected clean 500, got {r.status_code}"
+        assert r.status_code == 422, f"expected clean 422, got {r.status_code}"
         assert r.headers.get("content-type", "").startswith("application/json")
+    finally:
+        server.Handler.engine = server.make_engine("test-model")
+
+
+def test_stream_generic_load_error_is_500_not_quarantine(sidecar_url, tmp_path, monkeypatch):
+    # A non-rejection failure while opening the stream (e.g. OOM) is a 500, not a
+    # 422: the daemon must retry from scratch WITHOUT retiring the checkpoint.
+    # Only CheckpointRejectedError maps to 422.
+    class OomThenStream:
+        name = "oom-then-stream"
+        tokenizer_hash = "synthetic"
+        kv_dtype = "synthetic"
+        prefill_count = 0
+
+        def prepare_stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+            if blob_path:
+                raise MemoryError("out of memory loading cache")
+            return tokens, None
+
+        def stream_prepared(self, prompt, cache):  # noqa: ANN001, ANN201
+            yield 1, "a"
+
+    blob = tmp_path / "healthy.ckpt"
+    blob.write_bytes(b"whatever")
+    monkeypatch.setattr(server.Handler, "engine", OomThenStream())
+    try:
+        r = httpx.post(
+            f"{sidecar_url}/generate",
+            json={"tokens": [1, 2], "max_tokens": 1, "blob_path": str(blob), "stream": True},
+        )
+        assert r.status_code == 500, f"expected 500 (no quarantine), got {r.status_code}"
     finally:
         server.Handler.engine = server.make_engine("test-model")
 

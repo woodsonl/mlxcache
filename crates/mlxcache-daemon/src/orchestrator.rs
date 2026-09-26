@@ -19,6 +19,10 @@ pub struct RouteOutcome {
     /// Published blob to resume from (None on a full miss). The daemon hands
     /// this to the adapter so the engine loads cached KV instead of re-prefilling.
     pub blob_path: Option<String>,
+    /// Publication generation of `blob_path`. Carried so a late failure retires
+    /// only the exact publication this request used, not a fresh republish that
+    /// reused the same deterministic blob name.
+    pub blob_generation: Option<u64>,
 }
 
 pub struct Orchestrator {
@@ -45,13 +49,14 @@ impl Orchestrator {
     /// never re-tokenizes.
     pub fn route(&self, tokens: &[u32], request_fingerprint: &ModelFingerprint) -> RouteOutcome {
         let lookup = self.index.lookup(tokens);
-        let (matched_tokens, matched_fp, blob_path) = match &lookup {
+        let (matched_tokens, matched_fp, blob_path, blob_generation) = match &lookup {
             Some((entry, n)) => (
                 Some(*n),
                 Some(&entry.meta.fingerprint),
                 Some(entry.blob_path.clone()),
+                Some(entry.generation),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         let verdict = classify(
             matched_tokens,
@@ -60,9 +65,9 @@ impl Orchestrator {
             request_fingerprint,
         );
         // A fingerprint mismatch classifies as Miss and must not reuse the blob.
-        let blob_path = match verdict {
-            CacheVerdict::Miss => None,
-            _ => blob_path,
+        let (blob_path, blob_generation) = match verdict {
+            CacheVerdict::Miss => (None, None),
+            _ => (blob_path, blob_generation),
         };
         // `prefill_from` is the client-facing count of tokens already covered by
         // cached KV, i.e. where prefill resumes. A checkpoint published for a
@@ -81,6 +86,7 @@ impl Orchestrator {
             },
             prefill_from,
             blob_path,
+            blob_generation,
         }
     }
 
@@ -92,11 +98,13 @@ impl Orchestrator {
 
     /// Mark a checkpoint unusable (R1-1): a blob that failed to load at request
     /// time is quarantined so identical requests stop hitting it and fall back to
-    /// scratch instead of erroring forever. Keyed by the published blob name, so
-    /// it targets exactly the checkpoint that failed, never a healthy ancestor on
-    /// a partial match. Returns true if an entry was marked.
-    pub fn quarantine_checkpoint(&self, blob_path: &str) -> bool {
-        self.index.quarantine_blob(blob_path)
+    /// scratch instead of erroring forever. Keyed by the published blob name and
+    /// the generation the request used, so it targets exactly the checkpoint that
+    /// failed — never a healthy ancestor on a partial match, and never a fresh
+    /// republish that reused the same deterministic name. Returns true if an
+    /// entry was marked.
+    pub fn quarantine_checkpoint(&self, blob_path: &str, generation: u64) -> bool {
+        self.index.quarantine_blob(blob_path, generation)
     }
 
     /// Count of quarantined checkpoints (observability/tests).

@@ -48,6 +48,36 @@ pub enum SidecarError {
     Http { status: u16, body: String },
     #[error("sidecar protocol violation: {0}")]
     Protocol(String),
+    /// The sidecar rejected the checkpoint we asked it to resume from (HTTP
+    /// 422): corrupt payload, undecodable header, or a prefix that disagrees
+    /// with the request. Only this error retires the entry; a decode or
+    /// transport failure must NOT quarantine a healthy checkpoint.
+    #[error("checkpoint rejected by adapter: {body}")]
+    CheckpointRejected { body: String },
+}
+
+impl SidecarError {
+    /// Whether this error means the checkpoint we passed is bad and must be
+    /// quarantined. True only for the adapter's explicit rejection.
+    pub fn is_checkpoint_rejected(&self) -> bool {
+        matches!(self, SidecarError::CheckpointRejected { .. })
+    }
+}
+
+/// Map a non-success sidecar response to the right error. HTTP 422 is the
+/// adapter's explicit checkpoint rejection; everything else is a plain HTTP
+/// error. Shared so every endpoint classifies identically.
+async fn classify_http_error(resp: reqwest::Response) -> SidecarError {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.as_u16() == 422 {
+        SidecarError::CheckpointRejected { body }
+    } else {
+        SidecarError::Http {
+            status: status.as_u16(),
+            body,
+        }
+    }
 }
 
 /// Minimal async HTTP client for the sidecar. reqwest keeps the connection
@@ -96,11 +126,7 @@ impl SidecarClient {
             })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SidecarError::Http {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(classify_http_error(resp).await);
         }
         resp.bytes()
             .await
@@ -131,11 +157,7 @@ impl SidecarClient {
             })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SidecarError::Http {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(classify_http_error(resp).await);
         }
         #[derive(serde::Deserialize)]
         struct GenResponse {
@@ -173,11 +195,7 @@ impl SidecarClient {
             })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SidecarError::Http {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(classify_http_error(resp).await);
         }
         Ok(resp)
     }
@@ -198,11 +216,7 @@ impl SidecarClient {
             })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SidecarError::Http {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(classify_http_error(resp).await);
         }
         resp.json::<TokenizeResponse>()
             .await

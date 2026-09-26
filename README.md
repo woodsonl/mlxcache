@@ -77,6 +77,14 @@ generation then resumes from the blob it just wrote. The response also carries
 `"tokens_cached"`, the same count, and `"tokens_total"`. `/stats` reports the
 running hit rate.
 
+A checkpoint the adapter cannot use is retired, not retried forever. The adapter
+answers `422` when the blob is gone, corrupt, or its recorded prefix disagrees
+with the request; the daemon quarantines that entry and serves the request from
+scratch. A generic decode or transport failure (`500`) does not retire a healthy
+checkpoint. Retirement is keyed by the publication generation the request used,
+so a late failure cannot quarantine a fresh republish that reused the same
+deterministic blob name.
+
 ## Real inference (mlx-lm)
 
 Install the adapter, then run with the real engine:

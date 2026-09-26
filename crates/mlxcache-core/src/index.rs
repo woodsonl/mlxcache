@@ -21,6 +21,11 @@ pub struct IndexEntry {
     pub meta: CheckpointMeta,
     /// Path of the published blob (post-rename, never a temp path).
     pub blob_path: String,
+    /// Monotonic publication generation for this prefix. A blob name is
+    /// deterministic (fingerprint+tokens), so a repaired checkpoint reuses the
+    /// name; the generation lets a late failure retire only the exact
+    /// publication it used, never a fresh republish that landed meanwhile.
+    pub generation: u64,
     pub state: CheckpointState,
 }
 
@@ -33,6 +38,8 @@ pub enum IndexError {
 #[derive(Debug, Default)]
 pub struct PrefixIndex {
     root: RwLock<Node>,
+    /// Source of `IndexEntry::generation`. Bumped on every publish.
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 impl PrefixIndex {
@@ -97,6 +104,10 @@ impl PrefixIndex {
         node.entry = Some(IndexEntry {
             meta,
             blob_path,
+            generation: self
+                .next_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1,
             state: CheckpointState::Published,
         });
     }
@@ -104,28 +115,52 @@ impl PrefixIndex {
     /// Quarantine the entry that points at `blob_path` (R1-1): keep it visible
     /// for diagnostics but never serve it. Returns true if an entry was marked.
     ///
-    /// Targets the exact checkpoint by its published blob name, so it cannot
-    /// quarantine a healthy ancestor: the request may have matched a shorter
-    /// prefix than its own length, and a token walk from the request would land
-    /// on the wrong node once the matched entry is already gone. Identity by
-    /// blob name is unambiguous even under concurrent failures.
-    pub fn quarantine_blob(&self, blob_path: &str) -> bool {
-        fn walk(node: &mut Node, blob_path: &str) -> bool {
-            if let Some(entry) = node.entry.as_mut() {
-                if entry.blob_path == blob_path && entry.state == CheckpointState::Published {
-                    entry.state = CheckpointState::Quarantined;
-                    return true;
-                }
-            }
-            for child in node.children.values_mut() {
-                if walk(child, blob_path) {
-                    return true;
-                }
-            }
-            false
-        }
+    /// Targets the exact checkpoint by its published blob name AND generation, so
+    /// it cannot quarantine a healthy ancestor: the request may have matched a
+    /// shorter prefix than its own length, and a token walk from the request would
+    /// land on the wrong node once the matched entry is already gone. The
+    /// generation guards against retiring a fresh republish that reused the same
+    /// deterministic blob name after the entry this request used was replaced.
+    pub fn quarantine_blob(&self, blob_path: &str, generation: u64) -> bool {
         let mut root = self.write_lock();
-        walk(&mut root, blob_path)
+        // Pass 1 (immutable): find the token key path to the matching entry with
+        // an explicit stack, so a very long prefix cannot overflow the thread
+        // stack on the failure path.
+        let mut key_path: Option<Vec<u32>> = None;
+        let mut stack: Vec<(Vec<u32>, &Node)> = vec![(Vec::new(), &root)];
+        while let Some((prefix, node)) = stack.pop() {
+            if node.entry.as_ref().is_some_and(|e| {
+                e.blob_path == blob_path
+                    && e.generation == generation
+                    && e.state == CheckpointState::Published
+            }) {
+                key_path = Some(prefix);
+                break;
+            }
+            for (t, child) in &node.children {
+                let mut next = prefix.clone();
+                next.push(*t);
+                stack.push((next, child));
+            }
+        }
+        let Some(key) = key_path else {
+            return false;
+        };
+        // Pass 2 (mutable): descend the recorded key path and quarantine it.
+        let mut node: &mut Node = &mut root;
+        for t in &key {
+            match node.children.get_mut(t) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        match &mut node.entry {
+            Some(entry) => {
+                entry.state = CheckpointState::Quarantined;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Quarantine an entry (R1-1): keep it visible for diagnostics but never serve it.
@@ -179,38 +214,27 @@ impl PrefixIndex {
 
     /// Count of published entries (for /stats).
     pub fn published_count(&self) -> usize {
-        fn walk(node: &Node) -> usize {
-            let mut n = usize::from(
-                node.entry
-                    .as_ref()
-                    .map(|e| e.state == CheckpointState::Published)
-                    .unwrap_or(false),
-            );
-            for child in node.children.values() {
-                n += walk(child);
-            }
-            n
-        }
-        let root = self.read_lock();
-        walk(&root)
+        self.count_in_state(CheckpointState::Published)
     }
 
     /// Count of quarantined entries (for /stats and tests).
     pub fn quarantined_count(&self) -> usize {
-        fn walk(node: &Node) -> usize {
-            let mut n = usize::from(
-                node.entry
-                    .as_ref()
-                    .map(|e| e.state == CheckpointState::Quarantined)
-                    .unwrap_or(false),
-            );
-            for child in node.children.values() {
-                n += walk(child);
-            }
-            n
-        }
+        self.count_in_state(CheckpointState::Quarantined)
+    }
+
+    /// Count entries in `state`. Iterative so a very long prefix cannot overflow
+    /// the thread stack.
+    fn count_in_state(&self, state: CheckpointState) -> usize {
         let root = self.read_lock();
-        walk(&root)
+        let mut n = 0usize;
+        let mut stack: Vec<&Node> = vec![&root];
+        while let Some(node) = stack.pop() {
+            n += usize::from(node.entry.as_ref().is_some_and(|e| e.state == state));
+            for child in node.children.values() {
+                stack.push(child);
+            }
+        }
+        n
     }
 }
 
@@ -303,6 +327,36 @@ mod tests {
         let (entry, matched) = index.lookup(&[1, 2, 3, 4, 5]).unwrap();
         assert_eq!(matched, 2);
         assert_eq!(entry.blob_path, "ancestor");
+    }
+
+    #[test]
+    fn quarantine_blob_retires_only_the_exact_generation() {
+        // A late failure must retire the publication it used, not a fresh
+        // republish that reused the same deterministic blob name. Publish gen 1,
+        // then republish the SAME name (gen 2); retiring gen 1 must be a no-op,
+        // and retiring gen 2 must quarantine.
+        let index = PrefixIndex::new();
+        index.publish(&[1, 2, 3], meta(), "same-name".into());
+        let gen1 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
+        index.publish(&[1, 2, 3], meta(), "same-name".into());
+        let gen2 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
+        assert_ne!(gen1, gen2, "each publish bumps the generation");
+        assert!(
+            !index.quarantine_blob("same-name", gen1),
+            "retiring a superseded generation must not touch the live entry"
+        );
+        assert!(
+            index.lookup(&[1, 2, 3]).is_some(),
+            "the fresh republish is still served"
+        );
+        assert!(
+            index.quarantine_blob("same-name", gen2),
+            "retiring the live generation quarantines it"
+        );
+        assert!(
+            index.lookup(&[1, 2, 3]).is_none(),
+            "the retired entry is no longer served"
+        );
     }
 
     #[test]

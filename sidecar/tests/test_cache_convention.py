@@ -9,12 +9,11 @@ output than a scratch run.
 
 from __future__ import annotations
 
-import contextlib
 import sys
 import types
 
 import pytest
-from mlxcache_sidecar import blob
+from mlxcache_sidecar import blob, server
 
 
 class FakeCache:
@@ -182,10 +181,9 @@ def test_empty_payload_blob_is_not_adopted(monkeypatch, tmp_path):
 def test_truncated_multi_token_blob_raises_for_quarantine(monkeypatch, tmp_path):
     # Regression (structured Codex review): a MULTI-token checkpoint truncated to
     # a valid header and empty payload is corrupt, not uncacheable. The loader
-    # must be attempted so the failure propagates and the daemon quarantines it.
+    # must reject it (CheckpointRejectedError -> 422) so the daemon quarantines it.
     # Swallowing it as scratch would report a hit and recompute forever.
-    loaded = []
-    _install_fake_mlx(monkeypatch, on_load=lambda: loaded.append(True))
+    _install_fake_mlx(monkeypatch)
     eng = _engine()
     tokens = [1, 2, 3]
     meta = blob.CheckpointMeta(
@@ -198,23 +196,20 @@ def test_truncated_multi_token_blob_raises_for_quarantine(monkeypatch, tmp_path)
     path = str(tmp_path / "truncated.ckpt")
     with open(path, "wb") as fh:
         fh.write(blob.encode(meta, b""))  # header valid, KV missing
-    # A real empty safetensors raises; the daemon quarantines. Here the fake
-    # loader records the attempt, which is the behavior under test.
-    with contextlib.suppress(Exception):
+    with pytest.raises(server.CheckpointRejectedError):
         eng._load_cache_delta(tokens, path)
-    assert loaded, "a truncated multi-token blob must reach the loader, not be swallowed"
 
 
-def test_blob_for_a_different_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
+def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
-    # adopted: resuming from the wrong KV generates silently wrong output.
+    # adopted: resuming from the wrong KV generates silently wrong output. It is
+    # bad (mislabeled/corrupt), so reject it for quarantine, not silent scratch.
     _install_fake_mlx(monkeypatch)
     eng = _engine()
     tokens = [1, 2, 3, 4]
     blob_path = _write_blob(str(tmp_path / "b.ckpt"), [9, 9, 9, 9])
-    cache, prompt = eng._load_cache_delta(tokens, blob_path)
-    assert cache is None
-    assert prompt == tokens
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, blob_path)
 
 
 def test_blob_without_recorded_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
