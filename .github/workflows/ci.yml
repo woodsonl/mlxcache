@@ -67,8 +67,8 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-${{ hashFiles('uv.lock') }}-Qwen2-0.5B-Instruct
-      - name: Install deps (with the mlx-lm extra)
-        run: uv sync --group dev --extra mlx-lm --locked
+      - name: Install deps (with the mlx extra)
+        run: uv sync --group dev --extra mlx --locked
       - name: Real round-trip gate
         run: uv run pytest sidecar/tests/test_roundtrip_real.py -v
         env:
