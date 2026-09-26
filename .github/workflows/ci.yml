@@ -14,12 +14,19 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # The e2e test spawns the Python sidecar over HTTP; it needs uv + deps.
+      - uses: astral-sh/setup-uv@v5
+      - name: Install sidecar deps
+        run: uv sync --group dev
       - name: Build
         run: cargo build --workspace
       - name: Test
         run: cargo test --workspace
+        env:
+          # Keep the real-model round-trip gate skipped; it needs a download.
+          MLXCACHE_BENCH_REAL: "0"
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   python:
     runs-on: macos-14
