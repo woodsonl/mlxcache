@@ -37,16 +37,26 @@ impl Leadership {
 
 impl Drop for Leadership {
     fn drop(&mut self) {
-        // The leader alone removes the entry. Use a blocking lock via spawn:
-        // Drop cannot await, so hand the removal to the runtime; if the runtime
-        // is gone the map dies with it. Removal must not be skipped, or later
-        // followers subscribe to a finished entry and block.
+        // The leader alone removes the entry. Removal must not be skipped, or a
+        // later follower subscribes to a finished entry. Drop cannot await, so
+        // hand the removal to the runtime; if there is no runtime (e.g. a test
+        // thread), fall back to a try_lock so the entry does not leak.
         let key = std::mem::take(&mut self.key);
         let map = Arc::clone(&self.map);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                map.lock().await.remove(&key);
-            });
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    map.lock().await.remove(&key);
+                });
+            }
+            Err(_) => {
+                // ponytail: no runtime to spawn on; best-effort try_lock only.
+                // A contended lock here leaks one entry until process exit,
+                // which only affects non-runtime drop paths (tests, teardown).
+                if let Ok(mut m) = map.try_lock() {
+                    m.remove(&key);
+                }
+            }
         }
     }
 }

@@ -102,7 +102,16 @@ class MlxLmEngine:
         import mlx.core as mx  # noqa: PLC0415
         from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
 
-        cache, _ = self._prefill_cache(tokens)
+        # Cache convention (pinned; verified by the R1-5 thesis guard): the saved
+        # cache covers tokens[:-1], NOT all tokens. On resume the adapter feeds
+        # tokens[cached-1:] so the model predicts the final token from KV for the
+        # preceding ones — identical to a scratch run. Caching all tokens here
+        # (the earlier behavior) double-fed the last token and diverged from the
+        # guard's proven semantics on every hit.
+        # A single-token prompt has an empty prefix: cache the one token so the
+        # resume path still has a valid (length-1) cache to feed from.
+        seed = tokens[:-1] if len(tokens) > 1 else tokens
+        cache, _ = self._prefill_cache(seed)
         # safetensors needs a real file; write to a temp, then read the bytes.
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
             tmp = fh.name
