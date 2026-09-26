@@ -13,7 +13,8 @@ use std::sync::Arc;
 /// What the daemon knows about the request after the index step.
 pub struct RouteOutcome {
     pub decision: PolicyDecision,
-    /// Token count to prefill as delta (0 for full miss = everything).
+    /// Covered KV: how many leading tokens the cache already holds, i.e. where
+    /// prefill resumes. `matched_tokens - 1` for hit/partial, 0 for miss.
     pub prefill_from: usize,
     /// Published blob to resume from (None on a full miss). The daemon hands
     /// this to the adapter so the engine loads cached KV instead of re-prefilling.
@@ -67,13 +68,11 @@ impl Orchestrator {
         // cached KV, i.e. where prefill resumes. A checkpoint published for a
         // prefix of length N holds KV for N-1 tokens (the adapter caches
         // tokens[:-1]; see MlxLmEngine.prefill), so a hit or partial at a prefix
-        // of length M reports M-1. Miss reports 0.
-        let prefill_from = match verdict {
-            CacheVerdict::Miss => 0,
-            CacheVerdict::Hit | CacheVerdict::Partial => {
-                matched_tokens.unwrap_or(0).saturating_sub(1)
-            }
-        };
+        // of length M reports M-1. Miss reports 0. This is the same value the
+        // response's `tokens_cached` and the log's `kv_claimed` report, computed
+        // once in `policy::covered_kv_tokens`.
+        let prefill_from =
+            mlxcache_core::policy::covered_kv_tokens(verdict, matched_tokens.unwrap_or(0));
         RouteOutcome {
             decision: PolicyDecision {
                 verdict,

@@ -65,6 +65,17 @@ pub struct PolicyDecision {
     pub request_tokens: usize,
 }
 
+/// Tokens whose KV a decision actually covers: `matched_tokens - 1` for
+/// hit/partial (the adapter caches `tokens[:-1]`), 0 for miss. This is the one
+/// definition of the client-facing `prefill_from` / `tokens_cached` /
+/// `kv_claimed` value, so those fields cannot drift apart by a token.
+pub fn covered_kv_tokens(verdict: CacheVerdict, matched_tokens: usize) -> usize {
+    match verdict {
+        CacheVerdict::Miss => 0,
+        CacheVerdict::Hit | CacheVerdict::Partial => matched_tokens.saturating_sub(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +118,16 @@ mod tests {
         };
         assert_eq!(eviction_score(&anchor), 0);
         assert!(eviction_score(&cold) > 0);
+    }
+
+    #[test]
+    fn covered_kv_is_matched_minus_one() {
+        // The one definition of cached/covered KV: matched-1 for hit/partial
+        // (adapter caches tokens[:-1]), 0 for miss, and never underflows.
+        assert_eq!(covered_kv_tokens(CacheVerdict::Hit, 8), 7);
+        assert_eq!(covered_kv_tokens(CacheVerdict::Partial, 8), 7);
+        assert_eq!(covered_kv_tokens(CacheVerdict::Miss, 8), 0);
+        assert_eq!(covered_kv_tokens(CacheVerdict::Partial, 0), 0);
+        assert_eq!(covered_kv_tokens(CacheVerdict::Hit, 1), 0);
     }
 }

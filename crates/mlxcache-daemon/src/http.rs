@@ -88,7 +88,11 @@ impl Stats {
             CacheVerdict::Miss => s.misses += 1,
             CacheVerdict::Partial => s.partials += 1,
         }
-        s.tokens_cached += d.matched_tokens as u64;
+        // tokens_cached counts KV actually in hand (covered = matched-1), the
+        // same value the response reports as tokens_cached/prefill_from. Counting
+        // matched_tokens here would overstate reuse by one per hit.
+        s.tokens_cached +=
+            mlxcache_core::policy::covered_kv_tokens(d.verdict, d.matched_tokens) as u64;
         s.tokens_total += d.request_tokens as u64;
     }
 }
@@ -385,11 +389,7 @@ async fn chat_completions(
                     CacheVerdict::Miss => "miss",
                 }
             },
-            "tokens_cached": if retired_blob {
-                0
-            } else {
-                outcome.decision.matched_tokens
-            },
+            "tokens_cached": if retired_blob { 0 } else { outcome.prefill_from },
             "tokens_total": outcome.decision.request_tokens,
             "prefill_from": if retired_blob { 0 } else { outcome.prefill_from },
             // Time to the cache decision (prefill+publish on a miss). The
@@ -530,22 +530,21 @@ async fn stream_response(
 
     // The meta frame reflects what this stream actually did: if the blob was
     // retired, it is a scratch run (miss), not the original hit/partial.
-    let (verdict, effective_cached) = if retired_blob.get() {
-        ("miss", 0)
+    // tokens_cached and prefill_from are the same quantity (covered KV), so both
+    // come from the single `prefill_from` value, already zeroed on retire.
+    let verdict = if retired_blob.get() {
+        "miss"
     } else {
-        (
-            match outcome.decision.verdict {
-                CacheVerdict::Hit => "hit",
-                CacheVerdict::Partial => "partial",
-                CacheVerdict::Miss => "miss",
-            },
-            outcome.decision.matched_tokens,
-        )
+        match outcome.decision.verdict {
+            CacheVerdict::Hit => "hit",
+            CacheVerdict::Partial => "partial",
+            CacheVerdict::Miss => "miss",
+        }
     };
     let meta_line = serde_json::json!({
         "mlxcache": {
             "verdict": verdict,
-            "tokens_cached": effective_cached,
+            "tokens_cached": prefill_from,
             "tokens_total": outcome.decision.request_tokens,
             "prefill_from": prefill_from,
             "lookup_ms": lookup_ms,

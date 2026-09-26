@@ -7,13 +7,10 @@ use tracing::info;
 /// hit/partial (the adapter caches tokens[:-1]), 0 for miss. This is the
 /// decision's claim, logged BEFORE the checkpoint is opened; if adoption later
 /// falls back to scratch (quarantine), the response reports prefill_from=0 and a
-/// warn line records the mismatch. Same semantics as the response's
-/// prefill_from when adoption succeeds.
+/// warn line records the mismatch. Same value and same definition as the
+/// response's `prefill_from` and `tokens_cached` (policy::covered_kv_tokens).
 fn kv_claimed(verdict: CacheVerdict, matched_tokens: usize) -> usize {
-    match verdict {
-        CacheVerdict::Miss => 0,
-        CacheVerdict::Hit | CacheVerdict::Partial => matched_tokens.saturating_sub(1),
-    }
+    mlxcache_core::policy::covered_kv_tokens(verdict, matched_tokens)
 }
 
 /// Emit the per-request log line. Fields: model, prefix-hash, verdict, claimed
@@ -26,12 +23,13 @@ pub fn log_request(model: &str, prefix_hash: u128, decision: &PolicyDecision, tt
         CacheVerdict::Miss => "miss",
         CacheVerdict::Partial => "partial",
     };
+    let covered = kv_claimed(decision.verdict, decision.matched_tokens);
     info!(
         model = model,
         prefix_hash = prefix_hash,
         verdict = verdict_str,
-        kv_claimed = kv_claimed(decision.verdict, decision.matched_tokens),
-        tokens_cached = decision.matched_tokens,
+        kv_claimed = covered,
+        tokens_cached = covered,
         tokens_total = decision.request_tokens,
         ttft_ms = ttft_ms,
         "request"
