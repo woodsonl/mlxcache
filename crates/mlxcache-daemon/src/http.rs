@@ -211,44 +211,42 @@ async fn chat_completions(
         match state.singleflight.enter(tokens.clone()).await {
             mlxcache_core::singleflight::Role::Leader(lead) => {
                 match client.prefill(&tokens).await {
+                    // An empty payload means the adapter cached nothing (e.g. a
+                    // one-token prompt). Publishing would index a checkpoint with
+                    // no KV; signal "no blob" (empty name) so followers also run
+                    // from scratch, and generate from scratch here.
+                    Ok(blob) if blob.is_empty() => {
+                        lead.complete(Ok(String::new()));
+                    }
                     Ok(blob) => {
-                        // An empty payload means the adapter cached nothing (e.g. a
-                        // one-token prompt). Publishing would index a checkpoint
-                        // with no KV; signal "no blob" (empty name) so followers
-                        // also run from scratch, and generate from scratch here.
-                        if blob.is_empty() {
-                            lead.complete(Ok(String::new()));
-                        } else {
-                            let meta = mlxcache_core::contract::CheckpointMeta {
-                                fingerprint: fingerprint.clone(),
-                                token_count: tokens.len() as u64,
-                                tokens: tokens.clone(),
-                                format_version: 1,
-                            };
-                            let blob_name =
-                                format!("{:032x}.ckpt", blob_key(&fingerprint, &tokens));
-                            match state.persistence.publish_atomic(
-                                blob_key(&fingerprint, &tokens),
-                                &meta,
-                                &blob,
-                            ) {
-                                // ENOSPC rescue (registry): log and continue uncached.
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
-                                    lead.complete(Err(e.to_string()));
-                                }
-                                Ok(_) => {
-                                    state.orchestrator.publish_checkpoint(
-                                        &tokens,
-                                        meta,
-                                        blob_name.clone(),
-                                    );
-                                    // The leader's own request resumes from the blob
-                                    // it just wrote (avoids re-prefilling the delta).
-                                    outcome.blob_path = Some(blob_name.clone());
-                                    outcome.prefill_from = tokens.len();
-                                    lead.complete(Ok(blob_name));
-                                }
+                        let meta = mlxcache_core::contract::CheckpointMeta {
+                            fingerprint: fingerprint.clone(),
+                            token_count: tokens.len() as u64,
+                            tokens: tokens.clone(),
+                            format_version: 1,
+                        };
+                        let blob_name = format!("{:032x}.ckpt", blob_key(&fingerprint, &tokens));
+                        match state.persistence.publish_atomic(
+                            blob_key(&fingerprint, &tokens),
+                            &meta,
+                            &blob,
+                        ) {
+                            // ENOSPC rescue (registry): log and continue uncached.
+                            Err(e) => {
+                                tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
+                                lead.complete(Err(e.to_string()));
+                            }
+                            Ok(_) => {
+                                state.orchestrator.publish_checkpoint(
+                                    &tokens,
+                                    meta,
+                                    blob_name.clone(),
+                                );
+                                // The leader's own request resumes from the blob it
+                                // just wrote (avoids re-prefilling the delta).
+                                outcome.blob_path = Some(blob_name.clone());
+                                outcome.prefill_from = tokens.len();
+                                lead.complete(Ok(blob_name));
                             }
                         }
                     }
