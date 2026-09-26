@@ -17,7 +17,11 @@ async fn main() -> Result<()> {
         .filter(|s| !s.is_empty())
         .map(|s| s.trim().to_string())
         .collect();
-    let sidecar_base = std::env::var("MLXCACHE_SIDECAR_URL").ok();
+    // Treat an empty MLXCACHE_SIDECAR_URL as unset: an empty value would build
+    // a client with malformed relative URLs. Common launchd misconfiguration.
+    let sidecar_base = std::env::var("MLXCACHE_SIDECAR_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty());
     let sidecar = match sidecar_base {
         Some(url) => {
             let model = served_models.first().cloned().unwrap_or_default();
@@ -33,7 +37,11 @@ async fn main() -> Result<()> {
     if served_models.is_empty() {
         tracing::warn!("MLXCACHE_MODELS is empty: every request will 404");
     }
-    let blob_dir = std::env::var("MLXCACHE_BLOBS").unwrap_or_else(|_| "/tmp/mlxcache-blobs".into());
+    // Empty values fall back to the default rather than failing on an empty path.
+    let blob_dir = std::env::var("MLXCACHE_BLOBS")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| "/tmp/mlxcache-blobs".into());
     let persistence = mlxcache_daemon::persistence::Persistence::new(blob_dir).map_err(|e| {
         // adapter#load rescue row: refuse at startup with a clear message.
         anyhow::anyhow!("blob dir init failed: {e}")
