@@ -137,9 +137,10 @@ adapter has become lossy and checkpoints are not being trusted correctly.
 
 Qwen2-0.5B-Instruct, mlx-lm 0.31.3, Apple Silicon: 12,288 bytes/token,
 serialize 20 ms, deserialize <1 ms. Qwen2.5-7B-Instruct-4bit: 57,344 bytes/token,
-serialize 526 ms, deserialize <1 ms, prefill 10.2 s. A hit eliminates that
-prefill, and the 2 s TTFT resume budget holds with margin at both sizes. Full
-numbers and caveats in the [design doc](docs/designs/mlx-kv-cache-daemon.md) (R1-5).
+serialize 526 ms, deserialize <1 ms, prefill 10.2 s. Qwen3-32B-4bit: 262,150
+bytes/token, serialize 203 ms, deserialize 1 ms, prefill 11.1 s. A hit eliminates
+that prefill, and the 2 s TTFT resume budget holds with margin at every size.
+Full numbers and caveats in the [design doc](docs/designs/mlx-kv-cache-daemon.md) (R1-5).
 
 ## Operating it
 
@@ -149,7 +150,7 @@ launchd service, and the mlx-lm version-pinning policy.
 ## Status
 
 Early. Working end to end (cache, persistence, single-flight, streaming, error
-rescues, chaos tests). The R1-5 gate has run on Qwen2-0.5B and
-Qwen2.5-7B-Instruct-4bit; the named representative (32B-4bit) is pending a
-download. The engine-agnostic contract has one adapter (mlx-lm). No license
-assigned — private build, all rights reserved.
+rescues, chaos tests). The R1-5 gate has run on Qwen2-0.5B,
+Qwen2.5-7B-Instruct-4bit, and the named representative Qwen3-32B-4bit, all
+token-identical to scratch. The engine-agnostic contract has one adapter
+(mlx-lm). No license assigned — private build, all rights reserved.
