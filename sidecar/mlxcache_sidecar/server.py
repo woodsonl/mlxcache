@@ -23,8 +23,6 @@ import tempfile
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .blob import CheckpointMeta, Fingerprint, encode
-
 
 class SyntheticEngine:
     """Hermetic engine: deterministic tokens + KV bytes, no MLX dependency."""
@@ -46,16 +44,8 @@ class SyntheticEngine:
             ((t * 31 + i) & 0xFFFFFFFF).to_bytes(4, "little") * 256
             for i, t in enumerate(tokens)
         )
-        meta = CheckpointMeta(
-            fingerprint=Fingerprint(
-                model_id=self.model_id,
-                tokenizer_hash="synthetic",
-                kv_dtype="f16",
-                kv_layout_version=1,
-            ),
-            token_count=len(tokens),
-        )
-        return encode(meta, payload)
+        # Raw payload only; the daemon writes the checkpoint header.
+        return payload
 
     def generate(self, tokens: list[int], prefill_from: int, max_tokens: int) -> list[int]:
         # Deterministic continuation: token ids derived from context length.
@@ -118,16 +108,10 @@ class MlxLmEngine:
             os.unlink(tmp)
         mx.clear_cache()
 
-        meta = CheckpointMeta(
-            fingerprint=Fingerprint(
-                model_id=self.model_id,
-                tokenizer_hash=self.tokenizer_hash,
-                kv_dtype="f16",
-                kv_layout_version=1,
-            ),
-            token_count=len(tokens),
-        )
-        return encode(meta, payload)
+        # Return the raw safetensors payload. The daemon owns the checkpoint
+        # header (it writes meta via publish_atomic) and the wire format is
+        # header + this payload; encoding one here would double-wrap it.
+        return payload
 
     def generate(self, tokens: list[int], prefill_from: int, max_tokens: int) -> list[int]:
         """Generate continuing from `prefill_from` cached tokens.
@@ -150,18 +134,28 @@ class MlxLmEngine:
         yield from self._stream_with_cache(prompt, cache)
 
     def _stream_with_cache(self, prompt, cache):
-        # SyntheticEngine has no MLX; approximate streaming from its token list.
+        # SyntheticEngine has no MLX stream path; approximate from its tokens.
         if not hasattr(self, "stream_with_cache"):
             for t in self.generate(prompt, 0, 64):
                 yield t, ""
             return
         yield from self.stream_with_cache(prompt, cache)
 
+    def stream_with_cache(self, tokens, cache):
+        """Yield (token_id, text_piece) per decode step from mlx-lm."""
+        import mlx.core as mx  # noqa: PLC0415
+        from mlx_lm import stream_generate  # noqa: PLC0415
+
+        for resp in stream_generate(
+            self.model, self.tokenizer, prompt=mx.array(tokens), prompt_cache=cache
+        ):
+            yield resp.token, resp.text
+
     def _generate_with_cache(self, tokens: list[int], max_tokens: int, cache) -> list[int]:
         """Collect a bounded generation from the streaming path, so the
         non-streaming /generate mode reuses the identical decode logic."""
         out: list[int] = []
-        for token, _text in self.stream_with_cache(tokens, cache):
+        for token, _text in self._stream_with_cache(tokens, cache):
             out.append(token)
             if len(out) >= max_tokens:
                 break
