@@ -67,8 +67,9 @@ curl -s http://127.0.0.1:8420/stats
 ```
 
 The first response carries `"verdict":"miss"`, the second `"verdict":"hit"` with
-`"prefill_from":<n>` — the daemon reused the cached prefix instead of prefilling
-it again. `/stats` reports the running hit rate.
+`"prefill_from":<n>` — `n` is the number of leading tokens whose KV came from the
+cache (prefill resumes at `n`), so the daemon skipped re-prefilling them.
+`/stats` reports the running hit rate.
 
 ## Real inference (mlx-lm)
 
