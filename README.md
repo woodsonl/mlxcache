@@ -67,12 +67,15 @@ curl -s http://127.0.0.1:8420/stats
 ```
 
 The first response carries `"verdict":"miss"`, the second `"verdict":"hit"` with
-`"prefill_from":<n>` — `n` is the number of leading tokens whose KV came from the
-cache (prefill resumes at `n`), so the daemon skipped re-prefilling them. A
-checkpoint caches KV for `tokens[:-1]` (the adapter saves the cache up to the
-last token), so for an `L`-token prompt `prefill_from` is `L-1`. The response
-also carries `"tokens_cached"`, the same covered-KV count (0 on a miss), and
-`"tokens_total"`. `/stats` reports the running hit rate.
+`"prefill_from":<n>` — `n` is the number of leading tokens the adapter resumed
+from a stored checkpoint instead of pre-filling, so the daemon skipped
+re-prefilling them. A checkpoint caches KV for `tokens[:-1]` (the adapter saves
+the cache up to the last token), so for an `L`-token prompt a full hit reports
+`L-1`. A request that has to run its own prefill (a miss, or the single-flight
+leader even on a partial) reports `0`: it reused no prior KV even though
+generation then resumes from the blob it just wrote. The response also carries
+`"tokens_cached"`, the same count, and `"tokens_total"`. `/stats` reports the
+running hit rate.
 
 ## Real inference (mlx-lm)
 

@@ -92,9 +92,11 @@ impl Orchestrator {
 
     /// Mark a checkpoint unusable (R1-1): a blob that failed to load at request
     /// time is quarantined so identical requests stop hitting it and fall back to
-    /// scratch instead of erroring forever. Returns true if an entry was marked.
-    pub fn quarantine_checkpoint(&self, tokens: &[u32]) -> bool {
-        self.index.quarantine(tokens)
+    /// scratch instead of erroring forever. Keyed by the published blob name, so
+    /// it targets exactly the checkpoint that failed, never a healthy ancestor on
+    /// a partial match. Returns true if an entry was marked.
+    pub fn quarantine_checkpoint(&self, blob_path: &str) -> bool {
+        self.index.quarantine_blob(blob_path)
     }
 
     /// Count of quarantined checkpoints (observability/tests).

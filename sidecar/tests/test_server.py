@@ -170,10 +170,12 @@ def test_stream_corrupt_blob_is_500_not_truncated_200(sidecar_url, tmp_path, mon
         kv_dtype = "synthetic"
         prefill_count = 0
 
-        def stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
-            # Mirrors MlxLmEngine.stream: the load happens before the first yield.
+        def prepare_stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
             if blob_path:
                 raise ValueError("corrupt safetensors payload")
+            return tokens, None
+
+        def stream_prepared(self, prompt, cache):  # noqa: ANN001, ANN201
             yield 1, "a"
 
     bad = tmp_path / "corrupt.ckpt"
@@ -192,16 +194,19 @@ def test_stream_corrupt_blob_is_500_not_truncated_200(sidecar_url, tmp_path, mon
 
 def test_stream_midstream_error_does_not_inject_error_frame(sidecar_url, monkeypatch):
     # Regression (Codex adversarial F2): once headers are sent, a generator
-    # failure must truncate the stream, not fall through to do_POST's 500 writer,
-    # which would append a JSON error body to a live 200 and be read by the daemon
-    # as a token frame. Assert no `{"error":...}` payload and no crash.
+    # failure must truncate the stream WITHOUT a done marker (so the daemon can
+    # surface an upstream error), not fall through to do_POST's 500 writer which
+    # would append a JSON error body to a live 200 and be read as a token frame.
     class FailsMidStream:
         name = "fails-mid-stream"
         tokenizer_hash = "synthetic"
         kv_dtype = "synthetic"
         prefill_count = 0
 
-        def stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+        def prepare_stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+            return tokens, None
+
+        def stream_prepared(self, prompt, cache):  # noqa: ANN001, ANN201
             yield 1, "a"  # load succeeded; the first token is emitted
             raise RuntimeError("decode blew up mid-stream")
 
@@ -213,6 +218,7 @@ def test_stream_midstream_error_does_not_inject_error_frame(sidecar_url, monkeyp
         )
         assert r.status_code == 200, "headers were already committed"
         assert '"error"' not in r.text, "a mid-stream error must not inject an error frame"
+        assert '"done"' not in r.text, "truncation must not send a completion marker"
     finally:
         server.Handler.engine = server.make_engine("test-model")
 
@@ -228,3 +234,33 @@ def test_stream_zero_max_tokens_yields_no_tokens(sidecar_url):
     token_lines = [ln for ln in r.text.splitlines() if '"token"' in ln]
     assert token_lines == [], f"max_tokens=0 emitted tokens: {r.text}"
     assert '"done": true' in r.text or '"done":true' in r.text
+
+
+def test_stream_load_error_not_treated_as_decode_error(sidecar_url, monkeypatch):
+    # Regression (Codex adversarial F3): a first-token decode failure must NOT be
+    # reported as blob corruption (500); the checkpoint loaded fine. It surfaces
+    # after headers as a truncated stream, so the daemon does not quarantine a
+    # healthy checkpoint.
+    class DecodeFailsAfterLoad:
+        name = "decode-fails"
+        tokenizer_hash = "synthetic"
+        kv_dtype = "synthetic"
+        prefill_count = 0
+
+        def prepare_stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+            return tokens, None  # load ok
+
+        def stream_prepared(self, prompt, cache):  # noqa: ANN001, ANN201
+            raise MemoryError("first decode OOM")
+            yield 1, "unreachable"  # pragma: no cover
+
+    monkeypatch.setattr(server.Handler, "engine", DecodeFailsAfterLoad())
+    try:
+        r = httpx.post(
+            f"{sidecar_url}/generate",
+            json={"tokens": [1, 2], "max_tokens": 1, "stream": True},
+        )
+        assert r.status_code == 200, "a decode error after load must not be a 500"
+        assert '"done"' not in r.text
+    finally:
+        server.Handler.engine = server.make_engine("test-model")

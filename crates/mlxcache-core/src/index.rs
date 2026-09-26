@@ -101,6 +101,33 @@ impl PrefixIndex {
         });
     }
 
+    /// Quarantine the entry that points at `blob_path` (R1-1): keep it visible
+    /// for diagnostics but never serve it. Returns true if an entry was marked.
+    ///
+    /// Targets the exact checkpoint by its published blob name, so it cannot
+    /// quarantine a healthy ancestor: the request may have matched a shorter
+    /// prefix than its own length, and a token walk from the request would land
+    /// on the wrong node once the matched entry is already gone. Identity by
+    /// blob name is unambiguous even under concurrent failures.
+    pub fn quarantine_blob(&self, blob_path: &str) -> bool {
+        fn walk(node: &mut Node, blob_path: &str) -> bool {
+            if let Some(entry) = node.entry.as_mut() {
+                if entry.blob_path == blob_path && entry.state == CheckpointState::Published {
+                    entry.state = CheckpointState::Quarantined;
+                    return true;
+                }
+            }
+            for child in node.children.values_mut() {
+                if walk(child, blob_path) {
+                    return true;
+                }
+            }
+            false
+        }
+        let mut root = self.write_lock();
+        walk(&mut root, blob_path)
+    }
+
     /// Quarantine an entry (R1-1): keep it visible for diagnostics but never serve it.
     ///
     /// Marks the deepest Published entry along `tokens` — the one `lookup` would

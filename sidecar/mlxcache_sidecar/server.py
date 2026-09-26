@@ -82,6 +82,20 @@ class SyntheticEngine:
         for i, t in enumerate(self.generate(tokens, 64)):
             yield t, f"tok{i} "
 
+    def prepare_stream(self, tokens: list[int], blob_path: str | None):
+        """Load any checkpoint and return (prompt, cache) BEFORE streaming.
+
+        Split from generation so the handler can surface a corrupt checkpoint as
+        a clean 500 (which the daemon quarantines) rather than a mid-stream
+        failure. The synthetic engine has no cache; returns the prompt as-is.
+        """
+        return tokens, None
+
+    def stream_prepared(self, prompt: list[int], cache):
+        """Yield (token_id, text) from an already-prepared prompt/cache."""
+        for i, t in enumerate(self.generate(prompt, 64)):
+            yield t, f"tok{i} "
+
 
 class MlxLmEngine:
     """Real mlx-lm engine. Lazy import; requires a downloaded model.
@@ -196,12 +210,24 @@ class MlxLmEngine:
     def stream(self, tokens: list[int], blob_path: str | None):
         """Yield (token_id, text) for this request, resuming from `blob_path`
         when present. This is the streaming entry the handler drives."""
+        prompt, cache = self.prepare_stream(tokens, blob_path)
+        yield from self.stream_prepared(prompt, cache)
+
+    def prepare_stream(self, tokens: list[int], blob_path: str | None):
+        """Load the checkpoint (may raise for a corrupt blob) and return
+        (prompt, cache). Done before headers are sent so a load failure is a
+        clean 500, not a truncated stream. First-token decode happens later, in
+        stream_prepared, so a decode error does not look like blob corruption."""
         cache = None
         prompt = tokens
         if blob_path:
             cache, prompt = self._load_cache_delta(tokens, blob_path)
             if cache is None:
                 prompt = tokens  # unexpectable cache: scratch
+        return prompt, cache
+
+    def stream_prepared(self, prompt, cache):
+        """Yield (token_id, text) after the checkpoint is already loaded."""
         yield from self._stream_with_cache(prompt, cache)
 
     def _stream_with_cache(self, prompt, cache):
@@ -356,20 +382,13 @@ class Handler(BaseHTTPRequestHandler):
         """Stream generation as newline-delimited JSON: one line per token,
         then a final done line. Framed by connection close (HTTP/1.0-style)
         so reqwest reads until EOF — no hand-rolled chunked encoding."""
-        # Prime the generator BEFORE sending 200. Loading the checkpoint happens
-        # on the first step of the engine's stream generator; if the blob is
-        # corrupt or unreadable, that raises here and do_POST maps it to a clean
-        # 500. Once bytes are sent we can only truncate, and a truncated 200
-        # leaves the daemon's stream path unable to quarantine the bad checkpoint
-        # (it sees success, then a broken stream).
-        gen = self.engine.stream(tokens, blob_path)
-        try:
-            first = next(gen)
-        except StopIteration:
-            first = None
+        # Load/validate the checkpoint BEFORE sending 200. A corrupt blob raises
+        # here and do_POST maps it to a clean 500, which the daemon quarantines.
+        # Only the load is primed: first-token decode runs after headers, so a
+        # decode error (OOM) truncates the stream without being mistaken for blob
+        # corruption. Once bytes are sent we cannot switch to a 500.
+        prompt, cache = self.engine.prepare_stream(tokens, blob_path)
 
-        # Validation happens before any bytes are sent, so a load failure still
-        # yields a clean 500 rather than a truncated 200.
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Connection", "close")
@@ -378,12 +397,7 @@ class Handler(BaseHTTPRequestHandler):
 
         n = 0
         try:
-            # max_tokens <= 0 yields nothing: priming must not force one token.
-            if first is not None and max_tokens > 0:
-                token, text = first
-                self.wfile.write((json.dumps({"token": token, "text": text}) + "\n").encode())
-                self.wfile.flush()
-                n += 1
+            gen = self.engine.stream_prepared(prompt, cache)
             while n < max_tokens:
                 try:
                     token, text = next(gen)
@@ -401,10 +415,8 @@ class Handler(BaseHTTPRequestHandler):
             # A mid-stream engine failure (OOM, decode error) must not fall
             # through to do_POST's 500 writer: that would append a JSON error
             # body to a live 200 stream, which the daemon reads as a token frame.
-            # Truncate the stream by closing; the daemon terminates the SSE on
-            # upstream EOF. Log for the operator; the checkpoint (if any) stays
-            # selectable, matching the pre-existing behavior for generation
-            # failures that occur after a successful load.
+            # Truncate the stream by closing, WITHOUT a `done` line, so the daemon
+            # sees EOF-without-completion and surfaces an upstream error.
             traceback.print_exc()
             self.close_connection = True
 

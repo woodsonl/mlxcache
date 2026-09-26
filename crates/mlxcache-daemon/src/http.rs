@@ -288,14 +288,19 @@ async fn chat_completions(
                                     meta,
                                     blob_name.clone(),
                                 );
-                                // The leader's generation resumes from the blob it
-                                // just wrote (avoids re-prefilling the delta), but
-                                // that is not cross-request cache reuse: the KV was
-                                // built by THIS request, not served from an earlier
-                                // one. Keep the routed covered count (0 on a cold
-                                // miss, matched-1 on a partial) so the response,
-                                // /stats, the log, and README's "0 on a miss" all
-                                // agree. Only blob_path drives generation.
+                                // The leader ran a FRESH prefill over the whole
+                                // prompt (the ancestor blob was not passed to the
+                                // adapter), so no prior-request KV was reused, even
+                                // on a partial. Report a miss with zero covered KV
+                                // so response, /stats, and the log agree on what
+                                // actually happened. Only generation resumes from
+                                // the blob just written; that is not reuse.
+                                outcome.decision = mlxcache_core::policy::PolicyDecision {
+                                    verdict: mlxcache_core::policy::CacheVerdict::Miss,
+                                    matched_tokens: 0,
+                                    request_tokens: tokens.len(),
+                                };
+                                outcome.prefill_from = 0;
                                 outcome.blob_path = Some(blob_name.clone());
                                 lead.complete(Ok(blob_name));
                             }
@@ -379,7 +384,7 @@ async fn chat_completions(
             // it (R1-1) so identical requests stop 502ing, then retry from
             // scratch. A scratch failure is a genuine adapter error.
             if let Some(name) = outcome.blob_path.clone() {
-                state.orchestrator.quarantine_checkpoint(&tokens);
+                state.orchestrator.quarantine_checkpoint(&name);
                 retired_blob = true;
                 // Correct the aggregate: the covered KV counted at record() was
                 // never in hand.
@@ -538,7 +543,7 @@ async fn stream_response(
             // The blob could not be opened (deleted/truncated/disk fault).
             // Quarantine it and retry from scratch so the stream still starts.
             if let Some(name) = blob_for_open.take() {
-                state.orchestrator.quarantine_checkpoint(&tokens);
+                state.orchestrator.quarantine_checkpoint(&name);
                 state.stats.correct_retire(&outcome.decision);
                 tracing::warn!(
                     blob = %name,
@@ -661,7 +666,11 @@ async fn stream_response(
                 }
                 None => {
                     // Upstream ended: flush a trailing line with no newline, then
-                    // terminate with [DONE] unless the sidecar already sent it.
+                    // terminate. A clean end is the sidecar's `{"done":true}` line
+                    // (already mapped to `[DONE]` by push_frame). If EOF arrives
+                    // WITHOUT that marker, the sidecar died mid-stream (decode
+                    // error, OOM, crash): surface an error frame so the client
+                    // does not read a silent truncation as a completed answer.
                     if !st.buf.is_empty() {
                         let line = std::mem::take(&mut st.buf);
                         push_frame(&mut frames, &line);
@@ -672,11 +681,18 @@ async fn stream_response(
                         }
                     }
                     if !st.terminated {
-                        // No [DONE] yet: emit the TTFT stats frame then terminate.
                         if let Some(ttft) = st.ttft_ms {
                             let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
                             frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
                         }
+                        // Truncated upstream: an explicit error, not a success.
+                        let err = serde_json::json!({
+                            "error": {
+                                "message": "upstream stream ended without a completion marker",
+                                "type": "upstream_error",
+                            }
+                        });
+                        frames.push(Ok(format!("data: {err}\n\n").into_bytes()));
                         frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
                     }
                     st.done = true;
