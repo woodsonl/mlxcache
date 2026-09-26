@@ -179,7 +179,7 @@ async fn restart_drops_streams_checkpoints_survive() {
         "checkpoint must survive restart"
     );
     assert_eq!(
-        out.blob_path.as_deref(),
+        out.blob.as_ref().map(|(name, _gen)| name.as_str()),
         Some("00000000000000000000000000000777.ckpt"),
         "rebuilt entry must point at the on-disk blob NAME (not an abs path)"
     );
@@ -211,10 +211,25 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
     };
     p.publish_atomic(0x2, &noprefix, b"kv").unwrap();
 
+    // A multi-token blob with an EMPTY payload: a truncated write the adapter
+    // rejects at runtime. The file can outlive its retirement (a repaired
+    // republish writes a different deterministic name), so rebuild must skip it
+    // rather than resurrect the poison.
+    let empty = CheckpointMeta {
+        fingerprint: fp.clone(),
+        token_count: 3,
+        tokens: vec![7, 7, 7],
+        format_version: 1,
+    };
+    p.publish_atomic(0x3, &empty, b"").unwrap();
+
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report = orch.rebuild_from_disk(&p);
     assert_eq!(report.rebuilt, 1, "only the well-formed blob is indexed");
-    assert_eq!(report.skipped, 2, "corrupt + no-prefix blobs are skipped");
+    assert_eq!(
+        report.skipped, 3,
+        "corrupt, no-prefix, and empty-payload blobs are skipped"
+    );
     assert_eq!(report.errors.len(), 1, "the corrupt blob is reported");
 
     // Exact hit after rebuild.

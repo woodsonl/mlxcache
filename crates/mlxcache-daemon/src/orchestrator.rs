@@ -16,13 +16,13 @@ pub struct RouteOutcome {
     /// Covered KV: how many leading tokens the cache already holds, i.e. where
     /// prefill resumes. `matched_tokens - 1` for hit/partial, 0 for miss.
     pub prefill_from: usize,
-    /// Published blob to resume from (None on a full miss). The daemon hands
-    /// this to the adapter so the engine loads cached KV instead of re-prefilling.
-    pub blob_path: Option<String>,
-    /// Publication generation of `blob_path`. Carried so a late failure retires
-    /// only the exact publication this request used, not a fresh republish that
-    /// reused the same deterministic blob name.
-    pub blob_generation: Option<u64>,
+    /// Published blob to resume from, with its publication generation (None on a
+    /// full miss). The daemon hands the path to the adapter so the engine loads
+    /// cached KV instead of re-prefilling; the generation lets a late failure
+    /// retire exactly this publication, not a fresh republish that reused the
+    /// same deterministic name. Kept as one option so path and generation cannot
+    /// desynchronize.
+    pub blob: Option<(String, u64)>,
 }
 
 pub struct Orchestrator {
@@ -65,9 +65,9 @@ impl Orchestrator {
             request_fingerprint,
         );
         // A fingerprint mismatch classifies as Miss and must not reuse the blob.
-        let (blob_path, blob_generation) = match verdict {
-            CacheVerdict::Miss => (None, None),
-            _ => (blob_path, blob_generation),
+        let blob = match verdict {
+            CacheVerdict::Miss => None,
+            _ => blob_path.zip(blob_generation),
         };
         // `prefill_from` is the client-facing count of tokens already covered by
         // cached KV, i.e. where prefill resumes. A checkpoint published for a
@@ -85,8 +85,7 @@ impl Orchestrator {
                 request_tokens: tokens.len(),
             },
             prefill_from,
-            blob_path,
-            blob_generation,
+            blob,
         }
     }
 
@@ -143,12 +142,22 @@ impl Orchestrator {
         };
         for blob in blobs {
             match persistence.load(&blob) {
-                Ok((meta, _payload)) => {
+                Ok((meta, payload)) => {
                     // A prefix shorter than 2 tokens caches nothing (the adapter
                     // never produces one), and a prefix that disagrees with its
                     // own count cannot be keyed. Skip either rather than publish a
                     // mis-keyed entry the adapter would refuse to serve.
                     if meta.tokens.len() as u64 != meta.token_count || meta.tokens.len() < 2 {
+                        report.skipped += 1;
+                        continue;
+                    }
+                    // A multi-token checkpoint with an empty KV payload is
+                    // corrupt (a truncated write the adapter rejected at runtime).
+                    // The on-disk file can outlive its retirement (a repaired
+                    // republish writes a different deterministic name), so
+                    // re-indexing it at startup would resurrect the poison.
+                    // Skip it, matching the adapter's own load-time check.
+                    if payload.is_empty() {
                         report.skipped += 1;
                         continue;
                     }
@@ -271,7 +280,7 @@ mod tests {
         let out = orch.route(&tokens, &b);
         assert_eq!(out.decision.verdict, CacheVerdict::Miss);
         assert!(
-            out.blob_path.is_none(),
+            out.blob.is_none(),
             "must not reuse the other tokenizer's blob"
         );
     }

@@ -126,27 +126,40 @@ impl PrefixIndex {
     /// deterministic blob name after the entry this request used was replaced.
     pub fn quarantine_blob(&self, blob_path: &str, generation: u64) -> bool {
         let mut root = self.write_lock();
-        // Pass 1 (immutable): find the token key path to the matching entry with
-        // an explicit stack, so a very long prefix cannot overflow the thread
-        // stack on the failure path.
-        let mut key_path: Option<Vec<u32>> = None;
-        let mut stack: Vec<(Vec<u32>, &Node)> = vec![(Vec::new(), &root)];
-        while let Some((prefix, node)) = stack.pop() {
+        // Pass 1: DFS with a shared path stack. Each stack frame is a node plus
+        // an iterator over its children, so the current path is one push/one pop
+        // per edge — O(total entries), never a per-edge Vec clone (which would be
+        // O(depth^2) for a long prefix). Only the found path is copied, once.
+        let mut path: Vec<u32> = Vec::new();
+        let mut found: Option<Vec<u32>> = None;
+        let mut stack: Vec<(&Node, std::collections::hash_map::Iter<'_, u32, Node>)> =
+            vec![(&root, root.children.iter())];
+        while let Some((node, _)) = stack.last() {
             if node.entry.as_ref().is_some_and(|e| {
                 e.blob_path == blob_path
                     && e.generation == generation
                     && e.state == CheckpointState::Published
             }) {
-                key_path = Some(prefix);
+                found = Some(path.clone());
                 break;
             }
-            for (t, child) in &node.children {
-                let mut next = prefix.clone();
-                next.push(*t);
-                stack.push((next, child));
+            // Advance the top frame's iterator; `next_child` borrows only that
+            // frame, so the stack can be mutated after the borrow ends.
+            let next_child = stack
+                .last_mut()
+                .and_then(|(_, iter)| iter.next().map(|(t, child)| (*t, child)));
+            match next_child {
+                Some((t, child)) => {
+                    path.push(t);
+                    stack.push((child, child.children.iter()));
+                }
+                None => {
+                    stack.pop();
+                    path.pop();
+                }
             }
         }
-        let Some(key) = key_path else {
+        let Some(key) = found else {
             return false;
         };
         // Pass 2 (mutable): descend the recorded key path and quarantine it.

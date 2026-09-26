@@ -200,6 +200,24 @@ def test_truncated_multi_token_blob_raises_for_quarantine(monkeypatch, tmp_path)
         eng._load_cache_delta(tokens, path)
 
 
+def test_corrupt_safetensors_load_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex adversarial): a multi-token blob with a nonempty but
+    # corrupt payload makes load_prompt_cache raise. That is a bad checkpoint, so
+    # it must become CheckpointRejectedError (422 -> daemon retires it), not a
+    # generic 500 that leaves the poison Published and retried forever.
+    _install_fake_mlx(monkeypatch)
+
+    def _boom(_path):
+        raise ValueError("invalid safetensors header")
+
+    sys.modules["mlx_lm.models.cache"].load_prompt_cache = _boom
+    eng = _engine()
+    tokens = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "corrupt.ckpt"), tokens)
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
 def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
     # adopted: resuming from the wrong KV generates silently wrong output. It is
@@ -212,11 +230,12 @@ def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
         eng._load_cache_delta(tokens, blob_path)
 
 
-def test_blob_without_recorded_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
-    # A legacy blob with no recorded tokens cannot be verified to cover this
-    # request's prefix, so it must not be adopted. token_count alone is not
-    # identity: any prefix of that length would be trusted. Resuming from the
-    # wrong KV is silent wrong output (the trust boundary).
+def test_blob_without_recorded_prefix_is_rejected(monkeypatch, tmp_path):
+    # The daemon always writes meta.tokens, so a matched blob WITHOUT them is
+    # corrupt: it cannot be verified to cover this request's prefix, and adopting
+    # it would trust token_count alone (any prefix of that length passes).
+    # Silently running scratch while the daemon reports a hit is an accounting
+    # lie, so reject it for retirement.
     _install_fake_mlx(monkeypatch)
     eng = _engine()
     tokens = [1, 2, 3, 4, 5]
@@ -231,9 +250,8 @@ def test_blob_without_recorded_prefix_falls_back_to_scratch(monkeypatch, tmp_pat
         path = str(tmp_path / f"old{count}.ckpt")
         with open(path, "wb") as fh:
             fh.write(blob.encode(meta, b"payload"))
-        cache, prompt = eng._load_cache_delta(tokens, path)
-        assert cache is None, f"no recorded prefix (count={count}) must not be adopted"
-        assert prompt == tokens
+        with pytest.raises(server.CheckpointRejectedError):
+            eng._load_cache_delta(tokens, path)
 
 
 def test_recorded_prefix_wins_over_token_count(monkeypatch, tmp_path):

@@ -69,7 +69,13 @@ pub struct StatsInner {
     pub hits: u64,
     pub misses: u64,
     pub partials: u64,
+    /// Sum of covered KV across requests. On a retire, `correct_retire` subtracts
+    /// the entry's covered count, so this reflects KV actually in hand.
     pub tokens_cached: u64,
+    /// Sum of request lengths. `hit_rate = tokens_cached / tokens_total` is a
+    /// coarse reuse diagnostic, not a true per-request fraction: a retire lowers
+    /// the numerator without lowering this, so the ratio can dip below the
+    /// fraction of requests that hit. Read it as a trend, not an exact rate.
     pub tokens_total: u64,
 }
 
@@ -260,7 +266,7 @@ async fn chat_completions(
                             matched_tokens: 0,
                             request_tokens: tokens.len(),
                         };
-                        outcome.blob_path = None;
+                        outcome.blob = None;
                         outcome.prefill_from = 0;
                         lead.complete(Ok(String::new()));
                     }
@@ -301,8 +307,7 @@ async fn chat_completions(
                                     request_tokens: tokens.len(),
                                 };
                                 outcome.prefill_from = 0;
-                                outcome.blob_path = Some(blob_name.clone());
-                                outcome.blob_generation = Some(generation);
+                                outcome.blob = Some((blob_name.clone(), generation));
                                 lead.complete(Ok(blob_name));
                             }
                         }
@@ -335,7 +340,7 @@ async fn chat_completions(
                             matched_tokens: 0,
                             request_tokens: tokens.len(),
                         };
-                        outcome.blob_path = None;
+                        outcome.blob = None;
                         outcome.prefill_from = 0;
                     }
                     None => {}
@@ -355,8 +360,8 @@ async fn chat_completions(
     log_request(&req.model, hash, &outcome.decision, lookup_ms);
 
     // The adapter needs an absolute path to open the blob directly.
-    let blob_abs = match &outcome.blob_path {
-        Some(name) => state
+    let blob_abs = match &outcome.blob {
+        Some((name, _)) => state
             .persistence
             .blob_dir
             .join(name)
@@ -364,7 +369,7 @@ async fn chat_completions(
             .into_owned(),
         None => String::new(),
     };
-    let blob_arg = if outcome.blob_path.is_some() {
+    let blob_arg = if outcome.blob.is_some() {
         Some(blob_abs.as_str())
     } else {
         None
@@ -376,7 +381,11 @@ async fn chat_completions(
 
     // Generate: full context tokens, continuation from the request length.
     // The adapter opens the blob directly, so it needs the absolute path.
-    let mut retired_blob = false;
+    // True when this request leaned on a blob but ended up not using its KV
+    // (rejected OR a transient failure). The response and aggregate must then
+    // report a scratch run: no prior KV was reused. Quarantine is a separate
+    // decision, taken only on an explicit adapter rejection.
+    let mut blob_unused = false;
     let generated = match client.generate(&tokens, 64, blob_arg).await {
         Ok(t) => t,
         Err(e) => {
@@ -384,16 +393,10 @@ async fn chat_completions(
             // from scratch. A checkpoint the adapter explicitly rejected (422)
             // is bad: quarantine it so identical requests stop failing. A mere
             // transport/decode failure must NOT retire a healthy checkpoint.
-            if let Some(name) = outcome.blob_path.clone() {
+            if let Some((name, generation)) = outcome.blob.clone() {
+                blob_unused = true;
                 if e.is_checkpoint_rejected() {
-                    state
-                        .orchestrator
-                        .quarantine_checkpoint(&name, outcome.blob_generation.unwrap_or(0));
-                    retired_blob = true;
-                    // Correct the aggregate: the covered KV counted at record()
-                    // was never in hand.
-                    state.stats.correct_retire(&outcome.decision);
-                    // Correct the decision's claim: no KV was actually reused.
+                    state.orchestrator.quarantine_checkpoint(&name, generation);
                     tracing::warn!(
                         blob = %name,
                         error = %e,
@@ -404,11 +407,17 @@ async fn chat_completions(
                     tracing::warn!(
                         blob = %name,
                         error = %e,
-                        "blob run failed with a non-rejection error; retrying from scratch without quarantine"
+                        "blob run failed with a non-rejection error; retrying from scratch without quarantine (effective prefill_from=0)"
                     );
                 }
                 match client.generate(&tokens, 64, None).await {
-                    Ok(t) => t,
+                    Ok(t) => {
+                        // Correct the aggregate only after the scratch retry
+                        // succeeds: the covered KV counted at record() was never
+                        // in hand. A 502 must not be counted as a served miss.
+                        state.stats.correct_retire(&outcome.decision);
+                        t
+                    }
                     Err(e2) => {
                         return Err(err(
                             StatusCode::BAD_GATEWAY,
@@ -430,7 +439,7 @@ async fn chat_completions(
     let total_ms = started.elapsed().as_millis() as u64;
     let body = serde_json::json!({
         "mlxcache": {
-            "verdict": if retired_blob {
+            "verdict": if blob_unused {
                 "miss"
             } else {
                 match outcome.decision.verdict {
@@ -439,9 +448,9 @@ async fn chat_completions(
                     CacheVerdict::Miss => "miss",
                 }
             },
-            "tokens_cached": if retired_blob { 0 } else { outcome.prefill_from },
+            "tokens_cached": if blob_unused { 0 } else { outcome.prefill_from },
             "tokens_total": outcome.decision.request_tokens,
-            "prefill_from": if retired_blob { 0 } else { outcome.prefill_from },
+            "prefill_from": if blob_unused { 0 } else { outcome.prefill_from },
             // Time to the cache decision (prefill+publish on a miss). The
             // non-streaming path has no first-token hook, so the full round trip
             // is reported separately as total_ms.
@@ -485,13 +494,20 @@ fn prefix_hash(tokens: &[u32]) -> u128 {
 /// model's still-valid index entry would load foreign KV on its next hit:
 /// silent wrong output. Prepending the fingerprint keeps the two files apart.
 fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u32]) -> u128 {
-    let mut f = fingerprint.model_id.clone();
-    f.push('\u{1f}');
-    f.push_str(&fingerprint.tokenizer_hash);
-    f.push('\u{1f}');
-    f.push_str(&fingerprint.kv_dtype);
-    f.push('\u{1f}');
-    f.push_str(&fingerprint.kv_layout_version.to_string());
+    // Length-prefix each field so no field's bytes can be re-split across the
+    // boundaries: joining with a separator is ambiguous when model_id itself
+    // (request-controlled) contains the separator, which would alias two
+    // fingerprints to one key and one blob file.
+    fn put(out: &mut String, field: &str) {
+        out.push_str(&field.len().to_string());
+        out.push(':');
+        out.push_str(field);
+    }
+    let mut f = String::new();
+    put(&mut f, &fingerprint.model_id);
+    put(&mut f, &fingerprint.tokenizer_hash);
+    put(&mut f, &fingerprint.kv_dtype);
+    put(&mut f, &fingerprint.kv_layout_version.to_string());
     // Fold the fingerprint into the token hash: hash the fingerprint bytes into
     // both lanes first, then continue with the tokens.
     let fp_bytes: Vec<u32> = f
@@ -545,10 +561,12 @@ async fn stream_response(
     // sidecar emits it, so it is reported in the terminal frame, not here.
     let lookup_ms = started.elapsed().as_millis() as u64;
 
-    let mut blob_for_open = outcome.blob_path.clone();
-    let blob_generation = outcome.blob_generation;
+    let mut blob_for_open = outcome.blob.clone();
     let mut prefill_from = outcome.prefill_from;
-    let retired_blob = std::cell::Cell::new(false);
+    // True when the stream leaned on a blob but ran from scratch instead
+    // (rejection OR transient failure): the meta frame and aggregate must then
+    // report a miss. Quarantine stays conditional on an explicit rejection.
+    let blob_unused = std::cell::Cell::new(false);
     let upstream = match client.generate_stream(&tokens, 64, blob_arg).await {
         Ok(u) => u,
         Err(e) if blob_for_open.is_some() => {
@@ -556,11 +574,8 @@ async fn stream_response(
             // still starts. Quarantine only on an explicit adapter rejection
             // (422): a transport/decode failure must not retire a healthy blob.
             if e.is_checkpoint_rejected() {
-                if let Some(name) = blob_for_open.take() {
-                    state
-                        .orchestrator
-                        .quarantine_checkpoint(&name, blob_generation.unwrap_or(0));
-                    state.stats.correct_retire(&outcome.decision);
+                if let Some((name, generation)) = blob_for_open.take() {
+                    state.orchestrator.quarantine_checkpoint(&name, generation);
                     tracing::warn!(
                         blob = %name,
                         error = %e,
@@ -571,15 +586,19 @@ async fn stream_response(
             } else {
                 tracing::warn!(
                     error = %e,
-                    "stream open failed with a non-rejection error; retrying from scratch without quarantine"
+                    "stream open failed with a non-rejection error; retrying from scratch without quarantine (effective prefill_from=0)"
                 );
             }
             prefill_from = 0;
-            retired_blob.set(true);
-            client
+            blob_unused.set(true);
+            let upstream = client
                 .generate_stream(&tokens, 64, None)
                 .await
-                .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?
+                .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?;
+            // Correct the aggregate only after the scratch retry succeeded: a
+            // 502 must not be counted as a served miss.
+            state.stats.correct_retire(&outcome.decision);
+            upstream
         }
         Err(e) => {
             return Err(err(
@@ -594,7 +613,15 @@ async fn stream_response(
     // retired, it is a scratch run (miss), not the original hit/partial.
     // tokens_cached and prefill_from are the same quantity (covered KV), so both
     // come from the single `prefill_from` value, already zeroed on retire.
-    let verdict = if retired_blob.get() {
+    //
+    // ponytail: the meta frame is sent BEFORE the first token so TTFT can be
+    // reported. A mid-stream decode failure after a successful load truncates
+    // the stream (the adapter cannot tell OOM from a corrupt-but-loadable blob)
+    // and is signaled by an `upstream_error` frame, not a retirement: the design
+    // forbids retiring a healthy checkpoint on a transient decode failure. If a
+    // blob proves persistently undecodable, add a consecutive-failure counter
+    // that retires after K and re-emit a corrected terminal frame.
+    let verdict = if blob_unused.get() {
         "miss"
     } else {
         match outcome.decision.verdict {
@@ -908,6 +935,28 @@ mod tests {
         // Deterministic and distinct from the bare token hash.
         assert_eq!(blob_key(&a, &tokens), blob_key(&a, &[10, 20, 30]));
         assert_ne!(blob_key(&a, &tokens), prefix_hash(&tokens));
+    }
+
+    #[test]
+    fn blob_key_folds_fields_unambiguously() {
+        // Length-prefixed fields: model_id is request-controlled and could carry
+        // the old separator, which would let two distinct fingerprints fold to
+        // one key and alias one blob file. With length prefixes the split is
+        // unique, so these two must differ.
+        let tokens = vec![1, 2, 3];
+        let a = mlxcache_core::contract::ModelFingerprint {
+            model_id: "m\u{1f}tok".into(),
+            tokenizer_hash: "x".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+        };
+        let b = mlxcache_core::contract::ModelFingerprint {
+            model_id: "m".into(),
+            tokenizer_hash: "tok\u{1f}x".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+        };
+        assert_ne!(blob_key(&a, &tokens), blob_key(&b, &tokens));
     }
 
     #[test]

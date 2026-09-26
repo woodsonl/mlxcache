@@ -239,11 +239,6 @@ class MlxLmEngine:
         yield from self._stream_with_cache(prompt, cache)
 
     def _stream_with_cache(self, prompt, cache):
-        # SyntheticEngine has no MLX stream path; approximate from its tokens.
-        if not hasattr(self, "stream_with_cache"):
-            for t in self.generate(prompt, 64):
-                yield t, ""
-            return
         yield from self.stream_with_cache(prompt, cache)
 
     def stream_with_cache(self, tokens, cache):
@@ -292,11 +287,13 @@ class MlxLmEngine:
             # bad, retire it rather than 502 forever.
             raise CheckpointRejectedError(f"checkpoint unreadable: {exc}") from exc
         # The checkpoint prefix must be self-describing: only meta.tokens tells
-        # us which prefix the KV actually covers. A legacy blob with no recorded
-        # tokens cannot be verified against this request, so adopting it would
-        # mean trusting it covers tokens[:token_count] by construction. Refuse.
+        # us which prefix the KV actually covers. The daemon always writes
+        # meta.tokens, so a blob the index matched WITHOUT them cannot be
+        # verified against this request. Adopting it would trust it covers
+        # tokens[:token_count] by construction; silently running scratch while
+        # the daemon reports a hit would be an accounting lie. Reject it.
         if not meta.tokens:
-            return None, tokens
+            raise CheckpointRejectedError("checkpoint has no recorded token prefix")
         prefix_len = len(meta.tokens)
         if prefix_len < 2 or prefix_len > len(tokens):
             # A prefix shorter than 2 caches nothing. This also rejects legacy
@@ -319,7 +316,17 @@ class MlxLmEngine:
             tmp = fh.name
             fh.write(payload)
         try:
-            return load_prompt_cache(tmp), tokens[covered:]
+            # A safetensors/metadata parse failure is a bad checkpoint: reject so
+            # the daemon retires it instead of 500ing on every later request while
+            # the poison stays Published. A MemoryError/OSError here is transient
+            # (a real OOM or a disk fault), NOT corruption: let it propagate as a
+            # 500 so a healthy checkpoint is not retired.
+            try:
+                return load_prompt_cache(tmp), tokens[covered:]
+            except (ValueError, KeyError, TypeError, RuntimeError) as exc:
+                raise CheckpointRejectedError(
+                    f"checkpoint failed to load: {type(exc).__name__}: {exc}"
+                ) from exc
         finally:
             os.unlink(tmp)
 
@@ -469,16 +476,26 @@ class Handler(BaseHTTPRequestHandler):
                     # quarantines it and retries from scratch.
                     self._json(422, {"error": f"blob unreadable: {blob_path}"})
                     return
+                # Validate max_tokens before any bytes: a non-int here would
+                # blow up mid-stream after headers are sent (truncated 200), and
+                # a negative/huge value silently changes streaming. The daemon
+                # sends a bounded int; reject anything else as a client error.
+                max_tokens = req.get("max_tokens", 64)
+                if (
+                    not isinstance(max_tokens, int)
+                    or isinstance(max_tokens, bool)
+                    or max_tokens < 0
+                ):
+                    self._json(400, {"error": "max_tokens must be a non-negative integer"})
+                    return
                 if req.get("stream"):
-                    self._stream_ndjson(tokens, req.get("blob_path"), req.get("max_tokens", 64))
+                    self._stream_ndjson(tokens, req.get("blob_path"), max_tokens)
                 else:
                     blob_path = req.get("blob_path")
                     if blob_path and hasattr(self.engine, "generate_from_blob"):
-                        out = self.engine.generate_from_blob(
-                            tokens, blob_path, req.get("max_tokens", 64)
-                        )
+                        out = self.engine.generate_from_blob(tokens, blob_path, max_tokens)
                     else:
-                        out = self.engine.generate(tokens, req.get("max_tokens", 64))
+                        out = self.engine.generate(tokens, max_tokens)
                     self._json(200, {"tokens": out})
             else:
                 self._json(404, {"error": f"unknown path {self.path}"})
