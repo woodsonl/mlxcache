@@ -29,7 +29,9 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
-    "ruff>=0.16.9",
+    # Exact pin (like mlx-lm above): a floor admits a newer ruff whose new rules
+    # can fail CI while the lock still resolves the old one.
+    "ruff==0.16.9",
 ]
 
 [build-system]
