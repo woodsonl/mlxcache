@@ -69,7 +69,16 @@ impl Persistence {
             });
         }
 
-        fs::rename(&tmp_path, &final_path)?;
+        if let Err(source) = fs::rename(&tmp_path, &final_path) {
+            // A failed rename (ENOSPC on the directory, EACCES, ...) must not
+            // leak the temp file; classify it as DiskFull too so the ENOSPC
+            // rescue path handles it rather than a generic Io.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(PersistError::DiskFull {
+                path: final_path,
+                source,
+            });
+        }
         Ok(final_path)
     }
 
