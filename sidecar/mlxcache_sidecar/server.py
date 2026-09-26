@@ -245,10 +245,6 @@ class MlxLmEngine:
 
         with open(blob_path, "rb") as fh:
             meta, payload = decode(fh.read())
-        # A checkpoint with no KV payload caches nothing (a one-token prompt);
-        # mlx-lm cannot load an empty cache. Run from scratch.
-        if not payload:
-            return None, tokens
         # The checkpoint prefix is meta.tokens when recorded (self-describing);
         # old blobs fall back to the request's own prefix of length token_count.
         # The prefix LENGTH is validated numerically, not by slicing: a bad
@@ -260,6 +256,10 @@ class MlxLmEngine:
             # one-token checkpoints whose nonempty KV already holds that token:
             # adopting one and feeding the whole prompt would double-feed it.
             return None, tokens
+        # A multi-token checkpoint with no KV payload is CORRUPT (a truncated
+        # write), not uncacheable: return it to the loader so the failure
+        # propagates and the daemon quarantines the entry. Only an uncacheable
+        # prefix (<2 tokens, above) legitimately has an empty payload.
         prefix = meta.tokens if meta.tokens else tokens[:prefix_len]
         # The adapter is a trust boundary: verify the blob really covers this
         # request's prefix. If the recorded prefix disagrees with the request,

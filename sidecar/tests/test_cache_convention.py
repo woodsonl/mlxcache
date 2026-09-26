@@ -39,7 +39,7 @@ class FakeArray:
         return (1, len(self._d))
 
 
-def _install_fake_mlx(monkeypatch):
+def _install_fake_mlx(monkeypatch, on_load=None):
     """Install just enough of mlx / mlx_lm.models.cache to drive MlxLmEngine.
 
     Returns (prefill_lengths, model): the model records the token count it was
@@ -63,10 +63,15 @@ def _install_fake_mlx(monkeypatch):
     mx = types.ModuleType("mlx")
     mx.core = core
 
+    def _load(path):
+        if on_load is not None:
+            on_load()
+        return FakeCache(saved.get(path, 0))
+
     cache_mod = types.ModuleType("mlx_lm.models.cache")
     cache_mod.make_prompt_cache = lambda model: FakeCache(0)
     cache_mod.save_prompt_cache = lambda path, cache: saved.__setitem__(path, cache.len)
-    cache_mod.load_prompt_cache = lambda path: FakeCache(saved.get(path, 0))
+    cache_mod.load_prompt_cache = _load
 
     mlx_lm = types.ModuleType("mlx_lm")
     mlx_lm.models = types.ModuleType("mlx_lm.models")
@@ -171,6 +176,32 @@ def test_empty_payload_blob_is_not_adopted(monkeypatch, tmp_path):
     cache, prompt = eng._load_cache_delta(tokens, path)
     assert cache is None
     assert prompt == tokens
+
+
+def test_truncated_multi_token_blob_raises_for_quarantine(monkeypatch, tmp_path):
+    # Regression (structured Codex review): a MULTI-token checkpoint truncated to
+    # a valid header and empty payload is corrupt, not uncacheable. The loader
+    # must be attempted so the failure propagates and the daemon quarantines it.
+    # Swallowing it as scratch would report a hit and recompute forever.
+    loaded = []
+    _install_fake_mlx(monkeypatch, on_load=lambda: loaded.append(True))
+    eng = _engine()
+    tokens = [1, 2, 3]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "truncated.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b""))  # header valid, KV missing
+    try:
+        eng._load_cache_delta(tokens, path)
+    except Exception:
+        pass  # a real empty safetensors raises; the daemon quarantines
+    assert loaded, "a truncated multi-token blob must reach the loader, not be swallowed"
 
 
 def test_blob_for_a_different_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
