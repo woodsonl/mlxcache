@@ -29,7 +29,10 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
-    "ruff>=0.16.9",
+    # Exact pin: a floating floor lets a fresh resolve pick a newer ruff whose
+    # new rules can fail CI while the committed lock still resolves the old one.
+    # Same policy as the mlx-lm pin above.
+    "ruff==0.16.9",
 ]
 
 [build-system]
