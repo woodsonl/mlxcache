@@ -138,6 +138,47 @@ def test_adapter_prefill_resume_matches_scratch(engine):
     )
 
 
+def test_adapter_one_token_prompt_matches_scratch(engine):
+    """Regression: a ONE-token prompt. The cache covers tokens[:-1] = nothing, so
+    the resume path must feed the whole prompt once. The earlier special case
+    seeded the one token AND fed it as the delta, feeding it twice and diverging
+    from scratch on a one-token hit."""
+    import mlx.core as mx
+    from mlx_lm import stream_generate
+    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+
+    tokens = engine.tokenize("Hello")[:1]
+    assert len(tokens) == 1
+
+    scratch = [
+        r.token
+        for r in stream_generate(
+            engine.model, engine.tokenizer, prompt=mx.array(tokens), max_tokens=8
+        )
+    ]
+
+    payload = engine.prefill(tokens)
+    meta = CheckpointMeta(
+        fingerprint=Fingerprint(
+            model_id=engine.model_id,
+            tokenizer_hash=engine.tokenizer_hash,
+            kv_dtype=engine.kv_dtype,
+            kv_layout_version=1,
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    with TempSafetensors() as path:
+        with open(path, "wb") as fh:
+            fh.write(encode(meta, payload))
+        resumed = engine.generate_from_blob(tokens, path, max_tokens=8)
+
+    assert resumed == scratch, (
+        "one-token prompt resume diverged from scratch:\n"
+        f"  resumed={resumed[:8]}\n  scratch={scratch[:8]}"
+    )
+
+
 def test_roundtrip_measures_bytes_and_time(engine):
     """R1-5 numbers: bytes/token + serialize/deserialize wall time at 50K."""
     import mlx.core as mx
