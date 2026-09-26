@@ -46,6 +46,17 @@ async fn main() -> Result<()> {
         sidecar,
         persistence,
     });
+    // R1-4: rebuild the index from persisted checkpoints so a daemon restart
+    // resumes from disk instead of re-prefilling everything.
+    let report = state.orchestrator.rebuild_from_disk(&state.persistence);
+    if report.rebuilt > 0 || report.skipped > 0 || !report.errors.is_empty() {
+        tracing::info!(
+            rebuilt = report.rebuilt,
+            skipped = report.skipped,
+            errors = report.errors.len(),
+            "index rebuilt from persisted checkpoints"
+        );
+    }
     let app = mlxcache_daemon::http::router(state);
     let addr = std::env::var("MLXCACHE_ADDR").unwrap_or_else(|_| "127.0.0.1:8420".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;

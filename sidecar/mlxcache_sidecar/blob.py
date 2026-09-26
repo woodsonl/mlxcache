@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import struct
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 FORMAT_VERSION = 1
 
@@ -25,6 +25,7 @@ class Fingerprint:
 class CheckpointMeta:
     fingerprint: Fingerprint
     token_count: int
+    tokens: list[int] = field(default_factory=list)
     format_version: int = FORMAT_VERSION
 
 
@@ -43,6 +44,7 @@ def decode(blob: bytes) -> tuple[CheckpointMeta, bytes]:
     meta = CheckpointMeta(
         fingerprint=Fingerprint(**raw["fingerprint"]),
         token_count=raw["token_count"],
+        tokens=raw.get("tokens", []),
         format_version=raw["format_version"],
     )
     if meta.format_version != FORMAT_VERSION:
