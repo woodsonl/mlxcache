@@ -338,6 +338,24 @@ fn prefix_hash(tokens: &[u32]) -> u128 {
     ((hi as u128) << 64) | lo as u128
 }
 
+/// Map one raw NDJSON line from the sidecar into zero or more SSE frames.
+/// `{"done":true}` becomes `[DONE]`; a token line becomes `data: {...}`; a
+/// non-JSON line is a protocol violation and surfaces as a stream error.
+fn push_frame(frames: &mut Vec<Result<Vec<u8>, std::io::Error>>, raw: &[u8]) {
+    let line = String::from_utf8_lossy(raw);
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) if v.get("done").is_some() => frames.push(Ok(b"data: [DONE]\n\n".to_vec())),
+        Ok(v) => frames.push(Ok(format!("data: {v}\n\n").into_bytes())),
+        Err(_) => frames.push(Err(std::io::Error::other(
+            "sidecar emitted a non-JSON stream line",
+        ))),
+    }
+}
+
 /// Open the sidecar's NDJSON generation stream and re-emit it as SSE.
 /// Each sidecar line `{"token":..,"text":..}` becomes an OpenAI-style
 /// `data: {...}` chunk; the terminal `{"done":true}` closes with `[DONE]`.
@@ -372,43 +390,78 @@ async fn stream_response(
         .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?;
 
     // Split the upstream byte stream on newlines, then map each NDJSON line to
-    // an SSE frame. A tiny state machine keeps partial lines across chunks.
+    // an SSE frame. A tiny state machine keeps partial lines across chunks, and
+    // a final flush handles a trailing line with no newline plus a guaranteed
+    // [DONE] terminator (SSE clients wait for it; an early close must not leave
+    // them hanging or silently truncate the completion).
     let meta_bytes = format!("data: {meta_line}\n\n").into_bytes();
     let first =
         futures_util::stream::once(async move { Ok::<Vec<u8>, std::io::Error>(meta_bytes) });
 
-    let mut buf: Vec<u8> = Vec::new();
-    let body_stream = upstream.bytes_stream().flat_map(move |chunk| {
+    struct StreamState {
+        upstream: std::pin::Pin<
+            Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+        >,
+        buf: Vec<u8>,
+        done: bool,
+        terminated: bool,
+    }
+    let state = StreamState {
+        upstream: Box::pin(upstream.bytes_stream()),
+        buf: Vec::new(),
+        done: false,
+        terminated: false,
+    };
+    let body_stream = futures_util::stream::unfold(state, |mut st| async move {
+        use futures_util::StreamExt;
         let mut frames: Vec<Result<Vec<u8>, std::io::Error>> = Vec::new();
-        match chunk {
-            Ok(bytes) => {
-                buf.extend_from_slice(&bytes);
-                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&line);
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                        if v.get("done").is_some() {
-                            frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
-                        } else {
-                            frames.push(Ok(format!("data: {v}\n\n").into_bytes()));
+        loop {
+            if st.done {
+                return None;
+            }
+            match st.upstream.next().await {
+                Some(Ok(bytes)) => {
+                    st.buf.extend_from_slice(&bytes);
+                    while let Some(pos) = st.buf.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = st.buf.drain(..=pos).collect();
+                        push_frame(&mut frames, &line);
+                        if frames.last().is_some_and(|f| {
+                            f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
+                        }) {
+                            st.terminated = true;
                         }
-                    } else {
-                        // A non-JSON upstream line is a protocol violation; surfacing
-                        // it beats silently dropping a token (output would lie).
-                        frames.push(Err(std::io::Error::other(
-                            "sidecar emitted a non-JSON stream line",
-                        )));
+                    }
+                    if !frames.is_empty() {
+                        break;
                     }
                 }
+                Some(Err(e)) => {
+                    frames.push(Err(std::io::Error::other(e.to_string())));
+                    break;
+                }
+                None => {
+                    // Upstream ended: flush a trailing line with no newline, then
+                    // terminate with [DONE] unless the sidecar already sent it.
+                    if !st.buf.is_empty() {
+                        let line = std::mem::take(&mut st.buf);
+                        push_frame(&mut frames, &line);
+                        if frames.last().is_some_and(|f| {
+                            f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
+                        }) {
+                            st.terminated = true;
+                        }
+                    }
+                    if !st.terminated {
+                        frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
+                    }
+                    st.done = true;
+                    break;
+                }
             }
-            Err(e) => frames.push(Err(std::io::Error::other(e.to_string()))),
         }
-        futures_util::stream::iter(frames)
-    });
+        Some((futures_util::stream::iter(frames), st))
+    })
+    .flatten();
 
     let stream = first.chain(body_stream);
     let body = axum::body::Body::from_stream(stream);
@@ -443,6 +496,31 @@ mod tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
+
+    #[test]
+    fn push_frame_maps_ndjson_to_sse() {
+        let mut frames = Vec::new();
+        push_frame(&mut frames, b"{\"token\":5,\"text\":\"hi\"}\n");
+        assert_eq!(frames.len(), 1);
+        let text = String::from_utf8(frames[0].as_ref().unwrap().clone()).unwrap();
+        assert!(text.starts_with("data: {"));
+        assert!(text.ends_with("\n\n"));
+
+        frames.clear();
+        push_frame(&mut frames, b"{\"done\":true}\n");
+        assert_eq!(frames[0].as_ref().unwrap(), b"data: [DONE]\n\n");
+
+        // Blank lines and whitespace are ignored, not turned into frames.
+        frames.clear();
+        push_frame(&mut frames, b"\n");
+        push_frame(&mut frames, b"   \n");
+        assert!(frames.is_empty());
+
+        // A non-JSON line is a protocol violation.
+        frames.clear();
+        push_frame(&mut frames, b"not json\n");
+        assert!(frames[0].is_err());
+    }
 
     fn app() -> Router {
         let state = Arc::new(AppState {
