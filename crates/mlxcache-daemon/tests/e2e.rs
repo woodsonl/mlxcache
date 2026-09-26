@@ -597,7 +597,11 @@ async fn concurrent_identical_requests_share_one_prefill() {
         }));
     }
 
-    // Wait for the leader to be prefilling, then release the followers.
+    // Wait for the leader to be prefilling, then release the followers. If the
+    // leader never starts within the bound, fail loudly rather than release the
+    // followers unlocked (which would just re-elect a follower as leader and
+    // mask the setup failure).
+    let mut leader_started = false;
     for _ in 0..200 {
         let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
             .await
@@ -606,10 +610,15 @@ async fn concurrent_identical_requests_share_one_prefill() {
             .await
             .unwrap();
         if stats["prefill_count"].as_u64().unwrap_or(0) >= 1 {
+            leader_started = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert!(
+        leader_started,
+        "leader never began prefilling; cannot test coalescing"
+    );
     start_followers_tx.send_replace(true);
 
     let mut verdicts = Vec::new();
