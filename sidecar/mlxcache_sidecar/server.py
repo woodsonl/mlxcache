@@ -62,6 +62,12 @@ class SyntheticEngine:
         base = len(tokens)
         return [(base + i) % 2**31 for i in range(max_tokens)]
 
+    def stream(self, tokens: list[int], blob_path: str | None):
+        # Synthetic engine streams its deterministic tokens as text pieces.
+        for i, t in enumerate(self.generate(tokens, 0, 64)):
+            yield t, f"tok{i} "
+
+
 
 class MlxLmEngine:
     """Real mlx-lm engine. Lazy import; requires a downloaded model.
@@ -132,20 +138,43 @@ class MlxLmEngine:
         """
         return self._generate_with_cache(tokens, max_tokens, cache=None)
 
-    def _generate_with_cache(self, tokens: list[int], max_tokens: int, cache):
-        import mlx.core as mx  # noqa: PLC0415
-        from mlx_lm import stream_generate  # noqa: PLC0415
+    def stream(self, tokens: list[int], blob_path: str | None):
+        """Yield (token_id, text) for this request, resuming from `blob_path`
+        when present. This is the streaming entry the handler drives."""
+        cache = None
+        prompt = tokens
+        if blob_path:
+            cache, prompt = self._load_cache_delta(tokens, blob_path)
+            if cache is None:
+                prompt = tokens  # unexpectable cache: scratch
+        yield from self._stream_with_cache(prompt, cache)
 
-        out: list[int] = []
-        for resp in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt=mx.array(tokens),
-            max_tokens=max_tokens,
-            prompt_cache=cache,
-        ):
-            out.append(resp.token)
-        return out
+    def _stream_with_cache(self, prompt, cache):
+        # SyntheticEngine has no MLX; approximate streaming from its token list.
+        if not hasattr(self, "stream_with_cache"):
+            for t in self.generate(prompt, 0, 64):
+                yield t, ""
+            return
+        yield from self.stream_with_cache(prompt, cache)
+
+    def _load_cache_delta(self, tokens: list[int], blob_path: str):
+        """Returns (cache, delta_prompt) or (None, tokens). See generate_from_blob."""
+        from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
+
+        from .blob import decode  # noqa: PLC0415
+
+        with open(blob_path, "rb") as fh:
+            meta, payload = decode(fh.read())
+        cached = meta.token_count
+        if cached <= 0 or cached > len(tokens):
+            return None, tokens
+        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
+            tmp = fh.name
+            fh.write(payload)
+        try:
+            return load_prompt_cache(tmp), tokens[cached - 1 :]
+        finally:
+            os.unlink(tmp)
 
     def generate_from_blob(self, tokens: list[int], blob_path: str, max_tokens: int) -> list[int]:
         """Resume generation from a persisted wire-format checkpoint (a cache
@@ -155,26 +184,10 @@ class MlxLmEngine:
         is what the model still needs to see. We pass the tail so the cache
         supplies the cached prefix and generation continues identically to a
         scratch run over the full prompt (thesis guard, T2)."""
-        from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
-
-        from .blob import decode  # noqa: PLC0415
-
-        with open(blob_path, "rb") as fh:
-            meta, payload = decode(fh.read())
-        cached = meta.token_count
-        if cached <= 0 or cached > len(tokens):
-            # Unexpectable cache size for this request: fall back to scratch.
+        cache, prompt = self._load_cache_delta(tokens, blob_path)
+        if cache is None:
             return self._generate_with_cache(tokens, max_tokens, cache=None)
-        delta = tokens[cached - 1 :]  # last cached token + uncached tail
-        # load_prompt_cache needs a safetensors file: materialize the payload.
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
-            tmp = fh.name
-            fh.write(payload)
-        try:
-            cache = load_prompt_cache(tmp)
-            return self._generate_with_cache(delta, max_tokens, cache)
-        finally:
-            os.unlink(tmp)
+        return self._generate_with_cache(prompt, max_tokens, cache)
 
 
 def make_engine(model_id: str) -> SyntheticEngine | MlxLmEngine:
@@ -208,6 +221,31 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(length)) if length else {}
 
+    def _stream_ndjson(self, req: dict) -> None:
+        """Stream generation as newline-delimited JSON: one line per token,
+        then a final done line. Framed by connection close (HTTP/1.0-style)
+        so reqwest reads until EOF — no hand-rolled chunked encoding."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        n = 0
+        try:
+            for token, text in self.engine.stream(req["tokens"], req.get("blob_path")):
+                line = (json.dumps({"token": token, "text": text}) + "\n").encode()
+                self.wfile.write(line)
+                self.wfile.flush()
+                n += 1
+                if n >= req.get("max_tokens", 64):
+                    break
+            self.wfile.write((json.dumps({"done": True, "tokens": n}) + "\n").encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # Client went away mid-stream (R1-4 semantics): stop cleanly.
+            self.close_connection = True
+
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
         try:
             if self.path == "/tokenize":
@@ -220,16 +258,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._binary(200, blob)
             elif self.path == "/generate":
                 req = self._read_json()
-                blob_path = req.get("blob_path")
-                if blob_path and hasattr(self.engine, "generate_from_blob"):
-                    out = self.engine.generate_from_blob(
-                        req["tokens"], blob_path, req.get("max_tokens", 64)
-                    )
+                if req.get("stream"):
+                    self._stream_ndjson(req)
                 else:
-                    out = self.engine.generate(
-                        req["tokens"], req.get("prefill_from", 0), req.get("max_tokens", 64)
-                    )
-                self._json(200, {"tokens": out})
+                    blob_path = req.get("blob_path")
+                    if blob_path and hasattr(self.engine, "generate_from_blob"):
+                        out = self.engine.generate_from_blob(
+                            req["tokens"], blob_path, req.get("max_tokens", 64)
+                        )
+                    else:
+                        out = self.engine.generate(
+                            req["tokens"], req.get("prefill_from", 0), req.get("max_tokens", 64)
+                        )
+                    self._json(200, {"tokens": out})
             else:
                 self._json(404, {"error": f"unknown path {self.path}"})
         except Exception as exc:  # noqa: BLE001 — map all engine errors to 500 JSON
