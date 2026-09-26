@@ -219,8 +219,12 @@ async fn chat_completions(
                             tokens: tokens.clone(),
                             format_version: 1,
                         };
-                        let blob_name = format!("{:032x}.ckpt", hash);
-                        match state.persistence.publish_atomic(hash, &meta, &blob) {
+                        let blob_name = format!("{:032x}.ckpt", blob_key(&fingerprint, &tokens));
+                        match state.persistence.publish_atomic(
+                            blob_key(&fingerprint, &tokens),
+                            &meta,
+                            &blob,
+                        ) {
                             // ENOSPC rescue (registry): log and continue uncached.
                             Err(e) => {
                                 tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
@@ -347,6 +351,39 @@ fn prefix_hash(tokens: &[u32]) -> u128 {
     let lo = fnv1a(0xcbf29ce484222325, 0x00000100000001b3, tokens);
     let hi = fnv1a(0x9e3779b97f4a7c15, 0x880355f21e6d1965, tokens);
     ((hi as u128) << 64) | lo as u128
+}
+
+/// On-disk blob key: `prefix_hash(tokens)` folded with the model fingerprint.
+///
+/// The index key is the token prefix and the fingerprint is checked on every
+/// lookup, but the filename must ALSO be fingerprint-specific. Two models can
+/// share token ids; without the fingerprint in the name, the second model's
+/// prefill would overwrite the first model's blob in place, and the first
+/// model's still-valid index entry would load foreign KV on its next hit:
+/// silent wrong output. Prepending the fingerprint keeps the two files apart.
+fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u32]) -> u128 {
+    let mut f = fingerprint.model_id.clone();
+    f.push('\u{1f}');
+    f.push_str(&fingerprint.tokenizer_hash);
+    f.push('\u{1f}');
+    f.push_str(&fingerprint.kv_dtype);
+    f.push('\u{1f}');
+    f.push_str(&fingerprint.kv_layout_version.to_string());
+    // Fold the fingerprint into the token hash: hash the fingerprint bytes into
+    // both lanes first, then continue with the tokens.
+    let fp_bytes: Vec<u32> = f
+        .as_bytes()
+        .chunks(4)
+        .map(|c| {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            u32::from_le_bytes(b)
+        })
+        .collect();
+    let mut all = fp_bytes;
+    all.push(0xFFFF_FFFF); // domain separator so fp||tokens can't alias tokens
+    all.extend_from_slice(tokens);
+    prefix_hash(&all)
 }
 
 /// Map one raw NDJSON line from the sidecar into zero or more SSE frames.
@@ -622,6 +659,38 @@ mod tests {
         assert_eq!(prefix_hash(&a), prefix_hash(&[1, 2, 3, 4]));
         // Must exceed 64 bits (the 128-bit widening).
         assert!(prefix_hash(&a) > u64::MAX as u128);
+    }
+
+    #[test]
+    fn blob_key_is_fingerprint_specific() {
+        // Same tokens, two models: the on-disk key MUST differ, or one model's
+        // prefill overwrites the other's blob and a stale index entry serves
+        // foreign KV (silent wrong output).
+        let tokens = vec![10, 20, 30];
+        let a = mlxcache_core::contract::ModelFingerprint {
+            model_id: "model-a".into(),
+            tokenizer_hash: "tok-a".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+        };
+        let b = mlxcache_core::contract::ModelFingerprint {
+            model_id: "model-b".into(),
+            tokenizer_hash: "tok-a".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+        };
+        assert_ne!(blob_key(&a, &tokens), blob_key(&b, &tokens));
+        // Tokenizer-only difference must also separate.
+        let c = mlxcache_core::contract::ModelFingerprint {
+            model_id: "model-a".into(),
+            tokenizer_hash: "tok-b".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+        };
+        assert_ne!(blob_key(&a, &tokens), blob_key(&c, &tokens));
+        // Deterministic and distinct from the bare token hash.
+        assert_eq!(blob_key(&a, &tokens), blob_key(&a, &[10, 20, 30]));
+        assert_ne!(blob_key(&a, &tokens), prefix_hash(&tokens));
     }
 
     #[test]
