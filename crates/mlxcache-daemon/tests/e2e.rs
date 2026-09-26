@@ -158,12 +158,16 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
     // The follower path for the empty-blob (no-publish) case: N concurrent
     // one-token requests coalesce on a leader whose payload is empty. The leader
     // signals "no blob" (empty name); every follower must run from scratch, all
-    // must be served, and no checkpoint may be published. The prefill delay makes
-    // coalescing observable (the adapter holds the window open before returning
-    // the empty payload).
+    // must be served, and no checkpoint may be published.
+    //
+    // Coalescing is only guaranteed for requests that overlap in flight, so the
+    // test holds the leader open (MLXCACHE_PREFILL_DELAY) and releases the rest
+    // only after /stats confirms the leader is prefilling. A plain barrier on
+    // entry is not enough: a task can be scheduled past the leader's completion
+    // and legitimately become a second leader (observed prefill_count 2 on CI).
     let Some((sidecar_url, mut child)) = spawn_sidecar_with_env(&[
         ("MLXCACHE_TOKENIZE_ONE", "1"),
-        ("MLXCACHE_PREFILL_DELAY", "0.4"),
+        ("MLXCACHE_PREFILL_DELAY", "1.5"),
     ])
     .await
     else {
@@ -190,18 +194,25 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
     .to_string();
 
     const N: usize = 6;
-    // Release all requests together so they enter single-flight within the
-    // prefill window. Without a barrier the assertion depends on scheduler
-    // timing and a slow CI runner can start a second leader after the first
-    // prefill completes (observed: prefill_count 2).
-    let barrier = Arc::new(tokio::sync::Barrier::new(N));
+    // Task 0 starts immediately and becomes the leader, then sleeps 1.5s in the
+    // sidecar prefill. The remaining tasks are held on a watch channel until
+    // /stats shows prefill_count == 1, so they enter single-flight while the
+    // leader is provably in flight. This makes coalescing deterministic instead
+    // of dependent on scheduler timing.
+    let (start_followers_tx, followers_rx) = tokio::sync::watch::channel(false);
     let mut handles = Vec::new();
-    for _ in 0..N {
+    for i in 0..N {
         let app = router(state.clone());
         let body = body.clone();
-        let barrier = barrier.clone();
+        let mut start_followers = followers_rx.clone();
         handles.push(tokio::spawn(async move {
-            barrier.wait().await;
+            if i > 0 {
+                while !*start_followers.borrow() {
+                    if start_followers.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
             let res = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -219,6 +230,21 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
             v["mlxcache"]["verdict"].as_str().unwrap().to_string()
         }));
     }
+    // Wait until the leader is inside the sidecar prefill (count is incremented
+    // at prefill entry, before the delay), then release the followers.
+    for _ in 0..200 {
+        let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if stats["prefill_count"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    start_followers_tx.send_replace(true);
     for h in handles {
         assert_eq!(h.await.unwrap(), "miss", "nothing was cached");
     }
