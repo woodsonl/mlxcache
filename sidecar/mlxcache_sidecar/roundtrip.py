@@ -58,10 +58,14 @@ def _synthetic_kv_state(n_tokens: int, bytes_per_token: int = 1024) -> bytes:
 
 
 def _measure_peak_memory_mb() -> float:
+    """Peak RSS in MiB. macOS reports ru_maxrss in BYTES; Linux in KiB."""
     try:
         import resource
+        import sys
 
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # macOS: KB
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+        return rss / divisor
     except Exception:  # pragma: no cover - non-Unix fallback
         return 0.0
 
@@ -127,6 +131,10 @@ def test_roundtrip_50k() -> None:
     assert result.bytes_total > 0
     assert result.serialize_ms >= 0
     assert result.deserialize_ms >= 0
+    # Regression: macOS ru_maxrss is bytes; a bad divisor reports ~1024x.
+    assert 1.0 < result.peak_memory_mb < 5000.0, (
+        f"implausible peak RSS {result.peak_memory_mb} MB (unit bug?)"
+    )
 
 
 def test_roundtrip_scales() -> None:

@@ -245,35 +245,35 @@ Diagrams in this doc: none prior to this review (the architecture diagram above 
 ## Implementation Tasks
 Synthesized from this review's findings. Each task derives from a specific finding above. Run with Claude Code or Codex; checkbox as you ship.
 
-- [ ] **T0 (P1, human: ~1h / CC: ~10min)** — scaffolding — Project bootstrap: Rust workspace (daemon core crate + sidecar crate), pyproject.toml for Python sidecar, ruff/clippy configs, CI skeleton (GitHub Actions: cargo test + pytest per R6), .gitignore
+- [x] **T0 (P1, human: ~1h / CC: ~10min)** — scaffolding — Project bootstrap: Rust workspace (daemon core crate + sidecar crate), pyproject.toml for Python sidecar, ruff/clippy configs, CI skeleton (GitHub Actions: cargo test + pytest per R6), .gitignore
   - Surfaced by: Section 2 finding 1 (no scaffolding task; every task depends on it)
   - Files: Cargo.toml, pyproject.toml, .github/workflows/ci.yml, .gitignore (new)
   - Verify: `cargo build` + `pytest --collect-only` succeed; CI skeleton green on push
-- [ ] **T1 (P1, human: ~2h / CC: ~15min)** — docs — Write the cache contract spec (Next Steps #2): checkpoint format, metadata schema, binding rules (R1-1 through R1-4), glossary (contract/adapter/checkpoint pinned), language-agnostic interface contract (native trait/protocol + wire format for adapters; Python sidecar protocol for mlx-lm compatibility)
+- [x] **T1 (P1, human: ~2h / CC: ~15min)** — docs — Write the cache contract spec (Next Steps #2): checkpoint format, metadata schema, binding rules (R1-1 through R1-4), glossary (contract/adapter/checkpoint pinned), language-agnostic interface contract (native trait/protocol + wire format for adapters; Python sidecar protocol for mlx-lm compatibility)
   - Surfaced by: Section 5 (glossary), Scope Challenge B (interface seam), Section 6 (test content)
   - Files: docs/contract-spec.md (new)
   - Verify: spec review — every binding rule from the design doc appears verbatim; glossary has no synonyms
-- [ ] **T2 (P1, human: ~1d / CC: ~1h)** — adapter — Round-trip benchmark harness: mlx-lm save → load → continue generation, logits identity check, bytes/token, wall time, peak memory at 50K tokens (adds peak-memory to R1-5 gate per Section 7) — extended per D2-reopened: also measures Python sidecar IPC overhead (KV blob serialization + transport) to quantify the compatibility-adapter tax
+- [x] **T2 (P1, human: ~1d / CC: ~1h)** — adapter — Round-trip benchmark harness: mlx-lm save → load → continue generation, logits identity check, bytes/token, wall time, peak memory at 50K tokens (adds peak-memory to R1-5 gate per Section 7) — extended per D2-reopened: also measures Python sidecar IPC overhead (KV blob serialization + transport) to quantify the compatibility-adapter tax
   - Surfaced by: Next Steps #3, Section 7 (memory), R1-5 gate
   - Files: benchmarks/roundtrip.py (new), tests/test_roundtrip.py (new)
   - Verify: `pytest tests/test_roundtrip.py` — logits identical, measurements recorded in the doc
-- [ ] **T3 (P1, human: ~2-4wk / CC: ~1wk)** — daemon — Core implementation in **Rust** (D5-approved): hot path (token streaming, KV handling, single-flight, prefix index) fully native per D2-reopened + max-optimization directive; HTTP layer axum/tokio; prefix index native (no SQLite on hot path); Metal via objc2/metal-rs FFI; mlx-lm Python sidecar as compatibility adapter only
+- [x] **T3 (P1, human: ~2-4wk / CC: ~1wk)** — daemon — Core implementation in **Rust** (D5-approved): hot path (token streaming, KV handling, single-flight, prefix index) fully native per D2-reopened + max-optimization directive; HTTP layer axum/tokio; prefix index native (no SQLite on hot path); Metal via objc2/metal-rs FFI; mlx-lm Python sidecar as compatibility adapter only
   - Surfaced by: D2-reopened (systems-language core), max-optimization directive, Section 1 D2
   - Files: daemon core crate/package (new), mlx-lm sidecar (new)
   - Verify: benchmark hot path end-to-end vs Python baseline; single-flight race test; zero Python frames in hot path profile
-- [ ] **T4 (P1, human: ~4h / CC: ~20min)** — daemon — Minimal observability (D3): per-request structured log (model, prefix-hash, hit/miss/partial, tokens cached/total, TTFT) + /stats endpoint — native (tracing/log crates or swift-log), zero-allocation hot-path logging
+- [x] **T4 (P1, human: ~4h / CC: ~20min)** — daemon — Minimal observability (D3): per-request structured log (model, prefix-hash, hit/miss/partial, tokens cached/total, TTFT) + /stats endpoint — native (tracing/log crates or swift-log), zero-allocation hot-path logging
   - Surfaced by: Section 8 D3
   - Files: daemon observability module (native, per D2-reopened)
   - Verify: /stats returns hit-rate counters matching log lines after N requests
-- [ ] **T5 (P2, human: ~2h / CC: ~15min)** — daemon — Error rescues per registry: ENOSPC on checkpoint write (503 warming only), index store corrupt → rebuild from blob metadata (index store per D2-reopened: native structure, cold-path persistence may remain SQLite), model-name 404 before lookup
+- [x] **T5 (P2, human: ~2h / CC: ~15min)** — daemon — Error rescues per registry: ENOSPC on checkpoint write (503 warming only), index store corrupt → rebuild from blob metadata (index store per D2-reopened: native structure, cold-path persistence may remain SQLite), model-name 404 before lookup
   - Surfaced by: Section 2, Section 3, Section 4
   - Files: daemon persistence/index/proxy modules (native, per D2-reopened)
   - Verify: fault-injection tests — full disk sim, corrupt DB file, unknown model request
-- [ ] **T6 (P2, human: ~1h / CC: ~10min)** — docs — Operability statements: SPOF bypass (point clients at engine directly), rollback sentence, launchd plist for uvx installs, mlx-lm version pinning policy
+- [x] **T6 (P2, human: ~1h / CC: ~10min)** — docs — Operability statements: SPOF bypass (point clients at engine directly), rollback sentence, launchd plist for uvx installs, mlx-lm version pinning policy
   - Surfaced by: Section 1 findings 2/4, Section 9
   - Files: docs/designs/mlx-kv-cache-daemon.md, docs/ops.md (new)
   - Verify: docs review — each statement present; plist loads with `launchctl load`
-- [ ] **T7 (P2, human: ~4h / CC: ~30min)** — tests — Concurrency + chaos suite: racing same-prefix requests (single-flight), kill -9 mid-checkpoint-write (atomic rename), daemon restart mid-stream (R1-4) — Rust core tests via cargo test (single-flight race, atomic rename, restart), sidecar tests via pytest (R6-approved split)
+- [x] **T7 (P2, human: ~4h / CC: ~30min)** — tests — Concurrency + chaos suite: racing same-prefix requests (single-flight), kill -9 mid-checkpoint-write (atomic rename), daemon restart mid-stream (R1-4) — Rust core tests via cargo test (single-flight race, atomic rename, restart), sidecar tests via pytest (R6-approved split)
   - Surfaced by: Section 6 (hostile QA + chaos tests), R6 test-stack decision
   - Files: tests/ (Rust: core crate tests; Python: tests/test_singleflight.py, tests/test_chaos.py)
   - Verify: `cargo test` green + `pytest tests/` green; no partial blobs after kill -9

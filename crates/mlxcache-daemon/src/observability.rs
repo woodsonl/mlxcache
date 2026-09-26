@@ -5,7 +5,7 @@ use tracing::info;
 
 /// Emit the per-request log line. Fields: model, prefix-hash, verdict,
 /// tokens cached/total. Kept allocation-light: all scalars, one format call.
-pub fn log_request(model: &str, prefix_hash: u64, decision: &PolicyDecision, ttft_ms: u64) {
+pub fn log_request(model: &str, prefix_hash: u128, decision: &PolicyDecision, ttft_ms: u64) {
     let verdict_str = match decision.verdict {
         CacheVerdict::Hit => "hit",
         CacheVerdict::Miss => "miss",
