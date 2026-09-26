@@ -529,8 +529,14 @@ async fn concurrent_identical_requests_share_one_prefill() {
     // The core R1-3 promise: N identical uncached requests must trigger ONE
     // prefill, and every follower must still be served (from the leader's
     // freshly published checkpoint), not re-prefill from scratch.
+    //
+    // Coalescing is guaranteed only for requests that overlap in flight. The
+    // leader is held open (MLXCACHE_PREFILL_DELAY) and followers are released
+    // only after /stats confirms it is prefilling; spawning all N at once lets a
+    // task be scheduled past the leader's completion and legitimately become a
+    // second leader (observed as extra "miss" verdicts on CI).
     let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "0.5")]).await
+        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "2.0")]).await
     else {
         eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
         return;
@@ -556,11 +562,23 @@ async fn concurrent_identical_requests_share_one_prefill() {
     .to_string();
 
     const N: usize = 8;
+    // Task 0 is the leader and starts immediately; it sleeps 1.5s in the
+    // sidecar prefill. Followers wait on a watch channel until /stats shows the
+    // leader is in flight, so they enter single-flight deterministically.
+    let (start_followers_tx, start_followers_rx) = tokio::sync::watch::channel(false);
     let mut handles = Vec::new();
-    for _ in 0..N {
+    for i in 0..N {
         let app = router(state.clone());
         let body = body.clone();
+        let mut gate = start_followers_rx.clone();
         handles.push(tokio::spawn(async move {
+            if i != 0 {
+                while !*gate.borrow() {
+                    if gate.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
             let res = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -578,6 +596,48 @@ async fn concurrent_identical_requests_share_one_prefill() {
             v["mlxcache"]["verdict"].as_str().unwrap().to_string()
         }));
     }
+
+    // Wait for the leader to begin prefilling, then release the followers, so
+    // the requests genuinely overlap (with the leader held open by
+    // MLXCACHE_PREFILL_DELAY). If the leader never starts, fail loudly rather
+    // than release unlocked, which would re-elect a follower and mask the fault.
+    let mut leader_started = false;
+    for _ in 0..200 {
+        let stats: serde_json::Value =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                reqwest::get(format!("{sidecar_url}/stats"))
+                    .await?
+                    .json()
+                    .await
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                _ => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
+        if stats["prefill_count"].as_u64().unwrap_or(0) >= 1 {
+            leader_started = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        leader_started,
+        "leader never began prefilling; cannot test coalescing"
+    );
+    start_followers_tx.send_replace(true);
+
+    // The user-visible contract: N identical uncached requests trigger one
+    // prefill, and every request is served. Whether a follower takes the
+    // internal Role::Follower path or adopts the blob after the leader publishes
+    // is a scheduling detail (see the singleflight unit tests, which exercise
+    // the follower path directly with a waiter-count assertion). Here we hold
+    // the leader open so the requests genuinely overlap, then assert the outcome.
+    start_followers_tx.send_replace(true);
+
     let mut verdicts = Vec::new();
     for h in handles {
         verdicts.push(h.await.unwrap());
@@ -596,8 +656,8 @@ async fn concurrent_identical_requests_share_one_prefill() {
         "N={N} identical requests must coalesce to exactly 1 prefill; got {stats}"
     );
 
-    // Exactly one request (the leader) experienced a miss — it ran the prefill.
-    // Every follower adopted the leader's published checkpoint (hit/partial).
+    // Exactly one request (the leader) ran the prefill; the rest were served
+    // from its published checkpoint (hit/partial), so none re-prefilled.
     let misses = verdicts.iter().filter(|v| *v == "miss").count();
     assert_eq!(
         misses, 1,
