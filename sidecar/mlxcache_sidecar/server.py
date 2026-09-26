@@ -410,7 +410,7 @@ class MlxLmEngine:
             # a healthy checkpoint is not retired.
             try:
                 return load_prompt_cache(tmp), tokens[covered:]
-            except (ValueError, KeyError, TypeError) as exc:
+            except (ValueError, KeyError, TypeError, IndexError) as exc:
                 raise CheckpointRejectedError(
                     f"checkpoint failed to load: {type(exc).__name__}: {exc}"
                 ) from exc

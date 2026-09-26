@@ -182,7 +182,7 @@ impl Orchestrator {
             tokens: Vec<u32>,
             meta: mlxcache_core::contract::CheckpointMeta,
         }
-        let mut best: std::collections::HashMap<(Vec<u32>, String), Candidate> =
+        let mut best: std::collections::HashMap<Vec<u32>, Candidate> =
             std::collections::HashMap::new();
         let mut stale: Vec<String> = Vec::new();
         let mut max_persisted = 0u64;
@@ -212,7 +212,11 @@ impl Orchestrator {
                     if generation > max_persisted {
                         max_persisted = generation;
                     }
-                    let key = (meta.tokens.clone(), meta.fingerprint.tokenizer_hash.clone());
+                    // Group by the index's ACTUAL key (the token prefix only): it
+                    // stores one entry per node, so two publications at the same
+                    // prefix (e.g. a tokenizer-hash change) must be reconciled
+                    // here too, or both survive selection and race for the node.
+                    let key = meta.tokens.clone();
                     let cand = Candidate {
                         name,
                         generation,
