@@ -256,9 +256,12 @@ async fn chat_completions(
                                     blob_name.clone(),
                                 );
                                 // The leader's own request resumes from the blob it
-                                // just wrote (avoids re-prefilling the delta).
+                                // just wrote (avoids re-prefilling the delta). The
+                                // blob holds KV for tokens[:-1], so the covered
+                                // count is len-1, matching hit/partial and the
+                                // field's contract.
                                 outcome.blob_path = Some(blob_name.clone());
-                                outcome.prefill_from = tokens.len();
+                                outcome.prefill_from = tokens.len().saturating_sub(1);
                                 lead.complete(Ok(blob_name));
                             }
                         }
