@@ -3,7 +3,7 @@
 Endpoints (daemon -> sidecar protocol):
 - POST /tokenize  {"prompt": str} -> {"tokens": [u32], "tokenizer_hash": str}
 - POST /prefill   {"prompt": str, "tokens": [u32]} -> KV checkpoint blob (binary)
-- POST /generate  {"tokens": [u32], "prefill_from": int, "max_tokens": int,
+- POST /generate  {"tokens": [u32], "max_tokens": int, "blob_path": str|null,
                    "stream": bool} -> NDJSON token stream
 
 Engine selection: MLXCACHE_ENGINE=synthetic (default, hermetic) or mlx-lm
@@ -72,14 +72,14 @@ class SyntheticEngine:
         # Raw payload only; the daemon writes the checkpoint header.
         return payload
 
-    def generate(self, tokens: list[int], prefill_from: int, max_tokens: int) -> list[int]:
+    def generate(self, tokens: list[int], max_tokens: int) -> list[int]:
         # Deterministic continuation: token ids derived from context length.
         base = len(tokens)
         return [(base + i) % 2**31 for i in range(max_tokens)]
 
     def stream(self, tokens: list[int], blob_path: str | None):
         # Synthetic engine streams its deterministic tokens as text pieces.
-        for i, t in enumerate(self.generate(tokens, 0, 64)):
+        for i, t in enumerate(self.generate(tokens, 64)):
             yield t, f"tok{i} "
 
 
@@ -184,12 +184,12 @@ class MlxLmEngine:
         # header + this payload; encoding one here would double-wrap it.
         return payload
 
-    def generate(self, tokens: list[int], prefill_from: int, max_tokens: int) -> list[int]:
-        """Generate continuing from `prefill_from` cached tokens.
+    def generate(self, tokens: list[int], max_tokens: int) -> list[int]:
+        """Generate continuing from an optional persisted cache.
 
-        When prefill_from == len(tokens) (a full hit), the KV cache is loaded
-        from the blob the daemon passes; otherwise the delta is prefilled. The
-        daemon supplies the blob via MLXCACHE_* — see the /generate handler.
+        When the daemon supplies a blob the KV cache is loaded from it and the
+        uncovered tail is prefilled; otherwise generation runs from scratch. The
+        daemon supplies the blob via the /generate request body; see the handler.
         """
         return self._generate_with_cache(tokens, max_tokens, cache=None)
 
@@ -207,7 +207,7 @@ class MlxLmEngine:
     def _stream_with_cache(self, prompt, cache):
         # SyntheticEngine has no MLX stream path; approximate from its tokens.
         if not hasattr(self, "stream_with_cache"):
-            for t in self.generate(prompt, 0, 64):
+            for t in self.generate(prompt, 64):
                 yield t, ""
             return
         yield from self.stream_with_cache(prompt, cache)
@@ -416,9 +416,7 @@ class Handler(BaseHTTPRequestHandler):
                             tokens, blob_path, req.get("max_tokens", 64)
                         )
                     else:
-                        out = self.engine.generate(
-                            tokens, req.get("prefill_from", 0), req.get("max_tokens", 64)
-                        )
+                        out = self.engine.generate(tokens, req.get("max_tokens", 64))
                     self._json(200, {"tokens": out})
             else:
                 self._json(404, {"error": f"unknown path {self.path}"})

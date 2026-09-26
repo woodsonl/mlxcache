@@ -333,10 +333,7 @@ async fn chat_completions(
     // Generate: full context tokens, continuation from the request length.
     // The adapter opens the blob directly, so it needs the absolute path.
     let mut retired_blob = false;
-    let generated = match client
-        .generate(&tokens, outcome.prefill_from, 64, blob_arg)
-        .await
-    {
+    let generated = match client.generate(&tokens, 64, blob_arg).await {
         Ok(t) => t,
         Err(e) => {
             // If this request leaned on a blob and the adapter could not use it,
@@ -347,7 +344,7 @@ async fn chat_completions(
                 state.orchestrator.quarantine_checkpoint(&tokens);
                 retired_blob = true;
                 tracing::warn!(blob = %name, error = %e, "blob unusable; quarantined, retrying from scratch");
-                match client.generate(&tokens, 0, 64, None).await {
+                match client.generate(&tokens, 64, None).await {
                     Ok(t) => t,
                     Err(e2) => {
                         return Err(err(
@@ -492,10 +489,7 @@ async fn stream_response(
     let mut blob_for_open = outcome.blob_path.clone();
     let mut prefill_from = outcome.prefill_from;
     let retired_blob = std::cell::Cell::new(false);
-    let upstream = match client
-        .generate_stream(&tokens, prefill_from, 64, blob_arg)
-        .await
-    {
+    let upstream = match client.generate_stream(&tokens, 64, blob_arg).await {
         Ok(u) => u,
         Err(e) if blob_for_open.is_some() => {
             // The blob could not be opened (deleted/truncated/disk fault).
@@ -507,7 +501,7 @@ async fn stream_response(
             prefill_from = 0;
             retired_blob.set(true);
             client
-                .generate_stream(&tokens, 0, 64, None)
+                .generate_stream(&tokens, 64, None)
                 .await
                 .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?
         }
