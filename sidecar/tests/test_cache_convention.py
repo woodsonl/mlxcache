@@ -143,5 +143,37 @@ def test_seed_plus_delta_covers_the_whole_prompt(monkeypatch, tmp_path):
     assert seeded + len(prompt) == len(tokens)
 
 
+def test_blob_for_a_different_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
+    # A blob whose recorded prefix does not match the request must not be
+    # adopted: resuming from the wrong KV generates silently wrong output.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3, 4]
+    blob_path = _write_blob(str(tmp_path / "b.ckpt"), [9, 9, 9, 9])
+    cache, prompt = eng._load_cache_delta(tokens, blob_path)
+    assert cache is None
+    assert prompt == tokens
+
+
+def test_blob_without_recorded_prefix_is_still_adopted(monkeypatch, tmp_path):
+    # Old blobs have no tokens field; trust the daemon's index for those.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3, 4, 5]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=4,
+        tokens=[],
+    )
+    path = str(tmp_path / "old.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b"payload"))
+    cache, prompt = eng._load_cache_delta(tokens, path)
+    assert cache is not None
+    assert prompt == [4, 5]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
