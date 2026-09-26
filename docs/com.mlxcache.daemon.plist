@@ -30,6 +30,10 @@
     <!-- Durable checkpoint dir; the default /tmp/mlxcache-blobs is wiped on reboot. -->
     <key>MLXCACHE_BLOBS</key>
     <string>/Users/lance/Library/Application Support/mlxcache/blobs</string>
+    <!-- Shutdown grace must be UNDER ExitTimeOut below, or launchd SIGKILLs
+         before the daemon finishes draining. -->
+    <key>MLXCACHE_SHUTDOWN_GRACE_S</key>
+    <string>25</string>
     <key>RUST_LOG</key>
     <string>info</string>
   </dict>
@@ -37,6 +41,10 @@
   <true/>
   <key>RunAtLoad</key>
   <true/>
+  <!-- Seconds launchd waits after SIGTERM before SIGKILL. Must exceed
+       MLXCACHE_SHUTDOWN_GRACE_S so the daemon exits on its own terms. -->
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
   <key>StandardOutPath</key>
   <string>/tmp/mlxcache-daemon.log</string>
   <key>StandardErrorPath</key>
