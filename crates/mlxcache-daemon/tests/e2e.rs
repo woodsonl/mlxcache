@@ -394,6 +394,13 @@ async fn end_to_end_streaming_sse() {
         "verdict missing: {text}"
     );
     assert!(text.contains("data: [DONE]"), "terminal frame missing");
+    // [DONE] must appear exactly once and be the final frame, or SSE clients
+    // hang waiting or double-terminate.
+    assert_eq!(text.matches("data: [DONE]").count(), 1, "duplicate [DONE]");
+    assert!(
+        text.trim_end().ends_with("data: [DONE]"),
+        "[DONE] must be the last frame: {text}"
+    );
     let token_frames = text.matches("\"token\"").count();
     assert!(
         token_frames > 1,
