@@ -50,6 +50,9 @@ class SyntheticEngine:
 
     def prefill(self, tokens: list[int]) -> bytes:
         # KV payload: 1024 bytes/token, deterministic from token ids.
+        # ponytail: test-only counter; ThreadingHTTPServer is thread-per-request
+        # but the GIL makes this increment effectively safe. Add a lock if the
+        # coalescing e2e ever sees a lost count.
         self.prefill_count += 1
         # Optional delay (test knob): widens the single-flight window so
         # concurrent identical requests are provably coalesced. It runs BEFORE the
@@ -262,6 +265,12 @@ class MlxLmEngine:
         # request's prefix. If the recorded prefix disagrees with the request,
         # the blob belongs to a different prefix and resuming from it would
         # generate silently wrong output. Fall back to scratch.
+        # ponytail: when meta.tokens is absent this check is self-satisfying, so a
+        # legacy blob is trusted via the daemon's index. That is safe on the
+        # deployed path: the daemon only ever hands a blob_path it indexed, and
+        # rebuild_from_disk index only blobs with a recorded tokens prefix. A
+        # direct adapter call against an unindexed legacy blob is trusted by
+        # construction; require a recorded prefix here if that becomes reachable.
         if prefix != tokens[:prefix_len]:
             return None, tokens
         covered = prefix_len - 1

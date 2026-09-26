@@ -218,6 +218,17 @@ async fn chat_completions(
                     // follower branch below treats an empty name as a no-blob miss
                     // and runs from scratch too.
                     Ok(blob) if blob.is_empty() => {
+                        // Force a scratch decision so this request and every
+                        // follower report the same verdict: nothing was cached,
+                        // so no blob may be resumed from even if a shorter
+                        // ancestor had been matched.
+                        outcome.decision = mlxcache_core::policy::PolicyDecision {
+                            verdict: mlxcache_core::policy::CacheVerdict::Miss,
+                            matched_tokens: 0,
+                            request_tokens: tokens.len(),
+                        };
+                        outcome.blob_path = None;
+                        outcome.prefill_from = 0;
                         lead.complete(Ok(String::new()));
                     }
                     Ok(blob) => {
@@ -273,8 +284,15 @@ async fn chat_completions(
                         outcome = state.orchestrator.route(&tokens, &fingerprint);
                     }
                     Some(Ok(_)) => {
-                        // Leader cached nothing (empty blob): run from scratch,
-                        // like the leader did.
+                        // Leader cached nothing (empty blob): run from scratch and
+                        // report the same scratch verdict as the leader.
+                        outcome.decision = mlxcache_core::policy::PolicyDecision {
+                            verdict: mlxcache_core::policy::CacheVerdict::Miss,
+                            matched_tokens: 0,
+                            request_tokens: tokens.len(),
+                        };
+                        outcome.blob_path = None;
+                        outcome.prefill_from = 0;
                     }
                     None => {}
                 }
