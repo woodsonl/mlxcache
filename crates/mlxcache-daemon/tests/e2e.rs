@@ -128,3 +128,55 @@ async fn end_to_end_miss_then_hit() {
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
 }
+
+#[tokio::test]
+async fn end_to_end_streaming_sse() {
+    let (sidecar_url, mut child) = spawn_sidecar().await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+    let make_app = || router(state.clone());
+
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "stream me"}],
+        "stream": true,
+    })
+    .to_string();
+
+    let res = make_app()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        res.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    // Must lead with the mlxcache meta frame, carry token frames, end with [DONE].
+    assert!(text.contains("\"mlxcache\""), "meta frame missing: {text}");
+    assert!(text.contains("\"verdict\":\"miss\""), "verdict missing: {text}");
+    assert!(text.contains("data: [DONE]"), "terminal frame missing");
+    let token_frames = text.matches("\"token\"").count();
+    assert!(token_frames > 1, "expected multiple token frames, got {token_frames}");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}

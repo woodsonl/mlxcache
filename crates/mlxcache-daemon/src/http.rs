@@ -171,19 +171,15 @@ async fn chat_completions(
     let ttft_ms = started.elapsed().as_millis() as u64;
     log_request(&req.model, 0, &outcome.decision, ttft_ms);
 
-    // Prefill on miss/partial: single-flight keyed by full token prefix (R1-3),
-    // then persist the KV blob atomically. On hit: skip straight to generate.
+    // Prefill on miss/partial (single-flight, R1-3), then persist. On hit the
+    // published blob path is passed to the adapter. Shared by both modes.
     let client = state.sidecar.as_ref().expect("checked above");
     if outcome.decision.verdict != CacheVerdict::Hit {
-        let (guard, follower) = state
-            .singleflight
-            .try_lead(tokens.clone())
-            .await;
+        let (guard, follower) = state.singleflight.try_lead(tokens.clone()).await;
         match follower {
             None => {
                 match client.prefill(&tokens).await {
                     Ok(blob) => {
-                        // Prefix hash keys the blob; persistence handles atomic rename.
                         let hash = prefix_hash(&tokens);
                         let meta = mlxcache_core::contract::CheckpointMeta {
                             fingerprint: fingerprint.clone(),
@@ -191,8 +187,7 @@ async fn chat_completions(
                             format_version: 1,
                         };
                         if let Err(e) = state.persistence.publish_atomic(hash, &meta, &blob) {
-                            // ENOSPC rescue (registry): log and continue uncached —
-                            // never fail the request for a cache-write failure.
+                            // ENOSPC rescue (registry): log and continue uncached.
                             tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
                         } else {
                             state
@@ -203,19 +198,35 @@ async fn chat_completions(
                     }
                     Err(e) => {
                         drop(guard);
-                        return Err(err(
-                            StatusCode::BAD_GATEWAY,
-                            &e.to_string(),
-                            "adapter_error",
-                        ));
+                        return Err(err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"));
                     }
                 }
             }
             Some(mut rx) => {
-                // Follower: leader's prefill covers us; await its completion.
+                // Follower: leader's prefill covers us.
                 let _ = rx.recv().await;
             }
         }
+    }
+
+    // The adapter needs an absolute path to open the blob directly.
+    let blob_abs = match &outcome.blob_path {
+        Some(name) => state
+            .persistence
+            .blob_dir
+            .join(name)
+            .to_string_lossy()
+            .into_owned(),
+        None => String::new(),
+    };
+    let blob_arg = if outcome.blob_path.is_some() {
+        Some(blob_abs.as_str())
+    } else {
+        None
+    };
+
+    if req.stream {
+        return stream_response(state.clone(), client, tokens, outcome, blob_arg, ttft_ms).await;
     }
 
     // Generate: full context tokens, continuation from the request length.
@@ -253,6 +264,84 @@ fn prefix_hash(tokens: &[u32]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// Open the sidecar's NDJSON generation stream and re-emit it as SSE.
+/// Each sidecar line `{"token":..,"text":..}` becomes an OpenAI-style
+/// `data: {...}` chunk; the terminal `{"done":true}` closes with `[DONE]`.
+async fn stream_response(
+    _state: Arc<AppState>,
+    client: &SidecarClient,
+    tokens: Vec<u32>,
+    outcome: crate::orchestrator::RouteOutcome,
+    blob_arg: Option<&str>,
+    ttft_ms: u64,
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    use futures_util::StreamExt;
+
+    let verdict = match outcome.decision.verdict {
+        CacheVerdict::Hit => "hit",
+        CacheVerdict::Partial => "partial",
+        CacheVerdict::Miss => "miss",
+    };
+    let meta_line = serde_json::json!({
+        "mlxcache": {
+            "verdict": verdict,
+            "tokens_cached": outcome.decision.matched_tokens,
+            "tokens_total": outcome.decision.request_tokens,
+            "prefill_from": outcome.prefill_from,
+            "ttft_ms": ttft_ms,
+        }
+    });
+
+    let upstream = client
+        .generate_stream(&tokens, outcome.prefill_from, 64, blob_arg)
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?;
+
+    // Split the upstream byte stream on newlines, then map each NDJSON line to
+    // an SSE frame. A tiny state machine keeps partial lines across chunks.
+    let meta_bytes = format!("data: {meta_line}\n\n").into_bytes();
+    let first =
+        futures_util::stream::once(async move { Ok::<Vec<u8>, std::io::Error>(meta_bytes) });
+
+    let mut buf: Vec<u8> = Vec::new();
+    let body_stream = upstream
+        .bytes_stream()
+        .flat_map(move |chunk| {
+            let mut frames: Vec<Result<Vec<u8>, std::io::Error>> = Vec::new();
+            match chunk {
+                Ok(bytes) => {
+                    buf.extend_from_slice(&bytes);
+                    while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = buf.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(&line);
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            if v.get("done").is_some() {
+                                frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
+                            } else {
+                                frames.push(Ok(format!("data: {v}\n\n").into_bytes()));
+                            }
+                        }
+                    }
+                }
+                Err(e) => frames.push(Err(std::io::Error::other(e.to_string()))),
+            }
+            futures_util::stream::iter(frames)
+        });
+
+    let stream = first.chain(body_stream);
+    let body = axum::body::Body::from_stream(stream);
+    Ok(axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(body)
+        .expect("valid SSE response"))
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
