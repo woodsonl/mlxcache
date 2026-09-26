@@ -19,10 +19,19 @@
   <dict>
     <key>MLXCACHE_ADDR</key>
     <string>127.0.0.1:8420</string>
+    <!-- Set to the model(s) this daemon serves. Empty means every request 404s. -->
     <key>MLXCACHE_MODELS</key>
-    <string></string>
+    <string>REPLACE_WITH_MODEL_ID</string>
+    <!-- Set to the sidecar base URL. Do not set an empty string: an empty
+         value builds a client whose URLs are malformed. Omit the key entirely
+         to run with no adapter (requests then 503 with a clear message). -->
     <key>MLXCACHE_SIDECAR_URL</key>
-    <string></string>
+    <string>http://127.0.0.1:8421</string>
+    <!-- Durable checkpoint dir; the default /tmp/mlxcache-blobs is wiped on reboot. -->
+    <key>MLXCACHE_BLOBS</key>
+    <string>/Users/lance/Library/Application Support/mlxcache/blobs</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
   </dict>
   <key>KeepAlive</key>
   <true/>
