@@ -170,6 +170,17 @@ async fn chat_completions(
         }
     };
 
+    // A tokenizer can return zero tokens (e.g. an empty string for HF
+    // tokenizers). An empty prefix has no KV to cache and its hash is a shared
+    // constant, so every empty request would alias one blob. Reject it here.
+    if tokens.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "prompt tokenized to zero tokens",
+            "invalid_request_error",
+        ));
+    }
+
     // Route + classify (R1-1 fingerprint check inside classify). The tokenizer
     // hash comes from the adapter (R1-2): a constant here would let checkpoints
     // from different tokenizers share a fingerprint and be served wrongly.

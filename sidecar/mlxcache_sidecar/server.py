@@ -38,6 +38,9 @@ class SyntheticEngine:
     def tokenize(self, prompt: str) -> list[int]:
         # Deterministic token stream derived from the prompt hash. Not a real
         # tokenizer — the daemon contract only needs stable u32 tokens.
+        # Test knob: emulate a real tokenizer returning zero tokens.
+        if os.environ.get("MLXCACHE_TOKENIZE_EMPTY") == "1":
+            return []
         digest = hashlib.sha256(prompt.encode()).digest()
         return [int.from_bytes(digest[i : i + 4], "little") % 2**31 for i in range(0, 32, 4)]
 
