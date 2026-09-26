@@ -16,13 +16,13 @@ pub struct RouteOutcome {
     /// Covered KV: how many leading tokens the cache already holds, i.e. where
     /// prefill resumes. `matched_tokens - 1` for hit/partial, 0 for miss.
     pub prefill_from: usize,
-    /// Published blob to resume from, with its publication generation (None on a
-    /// full miss). The daemon hands the path to the adapter so the engine loads
-    /// cached KV instead of re-prefilling; the generation lets a late failure
-    /// retire exactly this publication, not a fresh republish that reused the
-    /// same deterministic name. Kept as one option so path and generation cannot
-    /// desynchronize.
-    pub blob: Option<(String, u64)>,
+    /// Published blob to resume from, with its publication generation and the
+    /// token prefix it is keyed by (None on a full miss). The daemon hands the
+    /// path to the adapter so the engine loads cached KV instead of
+    /// re-prefilling; the generation and prefix let a late failure retire exactly
+    /// this publication by descending its key, not a full-index scan. Kept as one
+    /// option so the three cannot desynchronize.
+    pub blob: Option<(String, u64, Vec<u32>)>,
 }
 
 pub struct Orchestrator {
@@ -65,9 +65,12 @@ impl Orchestrator {
             request_fingerprint,
         );
         // A fingerprint mismatch classifies as Miss and must not reuse the blob.
+        // The matched prefix is `tokens[..n]`, the exact key the entry lives at.
         let blob = match verdict {
             CacheVerdict::Miss => None,
-            _ => blob_path.zip(blob_generation),
+            _ => blob_path
+                .zip(blob_generation)
+                .map(|(p, g)| (p, g, tokens[..matched_tokens.unwrap_or(0)].to_vec())),
         };
         // `prefill_from` is the client-facing count of tokens already covered by
         // cached KV, i.e. where prefill resumes. A checkpoint published for a
@@ -104,13 +107,14 @@ impl Orchestrator {
 
     /// Mark a checkpoint unusable (R1-1): a blob that failed to load at request
     /// time is quarantined so identical requests stop hitting it and fall back to
-    /// scratch instead of erroring forever. Keyed by the published blob name and
-    /// the generation the request used, so it targets exactly the checkpoint that
-    /// failed — never a healthy ancestor on a partial match, and never a fresh
-    /// republish that reused the same deterministic name. Returns true if an
-    /// entry was marked.
-    pub fn quarantine_checkpoint(&self, blob_path: &str, generation: u64) -> bool {
-        self.index.quarantine_blob(blob_path, generation)
+    /// scratch instead of erroring forever. Keyed by the published blob name,
+    /// generation, and the token prefix the entry lives at, so it targets exactly
+    /// the checkpoint that failed — never a healthy ancestor on a partial match,
+    /// never a fresh republish that reused the same deterministic name, and in
+    /// O(prefix) rather than a full-index scan. Returns true if an entry was
+    /// marked.
+    pub fn quarantine_checkpoint(&self, blob_path: &str, generation: u64, prefix: &[u32]) -> bool {
+        self.index.quarantine_blob(blob_path, generation, prefix)
     }
 
     /// Count of quarantined checkpoints (observability/tests).

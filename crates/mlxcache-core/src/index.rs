@@ -118,64 +118,30 @@ impl PrefixIndex {
     /// Quarantine the entry that points at `blob_path` (R1-1): keep it visible
     /// for diagnostics but never serve it. Returns true if an entry was marked.
     ///
-    /// Targets the exact checkpoint by its published blob name AND generation, so
-    /// it cannot quarantine a healthy ancestor: the request may have matched a
-    /// shorter prefix than its own length, and a token walk from the request would
-    /// land on the wrong node once the matched entry is already gone. The
-    /// generation guards against retiring a fresh republish that reused the same
-    /// deterministic blob name after the entry this request used was replaced.
-    pub fn quarantine_blob(&self, blob_path: &str, generation: u64) -> bool {
+    /// `prefix` is the token key the entry lives at (from `lookup`), so this
+    /// descends directly in O(prefix) instead of scanning the whole tree. The
+    /// name and generation are verified at that node, so it still cannot
+    /// quarantine a healthy ancestor or a fresh republish that reused the same
+    /// deterministic blob name.
+    pub fn quarantine_blob(&self, blob_path: &str, generation: u64, prefix: &[u32]) -> bool {
         let mut root = self.write_lock();
-        // Pass 1: DFS with a shared path stack. Each stack frame is a node plus
-        // an iterator over its children, so the current path is one push/one pop
-        // per edge — O(total entries), never a per-edge Vec clone (which would be
-        // O(depth^2) for a long prefix). Only the found path is copied, once.
-        let mut path: Vec<u32> = Vec::new();
-        let mut found: Option<Vec<u32>> = None;
-        let mut stack: Vec<(&Node, std::collections::hash_map::Iter<'_, u32, Node>)> =
-            vec![(&root, root.children.iter())];
-        while let Some((node, _)) = stack.last() {
-            if node.entry.as_ref().is_some_and(|e| {
-                e.blob_path == blob_path
-                    && e.generation == generation
-                    && e.state == CheckpointState::Published
-            }) {
-                found = Some(path.clone());
-                break;
-            }
-            // Advance the top frame's iterator; `next_child` borrows only that
-            // frame, so the stack can be mutated after the borrow ends.
-            let next_child = stack
-                .last_mut()
-                .and_then(|(_, iter)| iter.next().map(|(t, child)| (*t, child)));
-            match next_child {
-                Some((t, child)) => {
-                    path.push(t);
-                    stack.push((child, child.children.iter()));
-                }
-                None => {
-                    stack.pop();
-                    path.pop();
-                }
-            }
-        }
-        let Some(key) = found else {
-            return false;
-        };
-        // Pass 2 (mutable): descend the recorded key path and quarantine it.
         let mut node: &mut Node = &mut root;
-        for t in &key {
+        for t in prefix {
             match node.children.get_mut(t) {
                 Some(child) => node = child,
                 None => return false,
             }
         }
         match &mut node.entry {
-            Some(entry) => {
+            Some(entry)
+                if entry.blob_path == blob_path
+                    && entry.generation == generation
+                    && entry.state == CheckpointState::Published =>
+            {
                 entry.state = CheckpointState::Quarantined;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -252,7 +218,7 @@ mod tests {
         let tokens = [1, 2, 3];
         index.publish(&tokens, meta(), "blob-123".into());
         let gen = index.lookup(&tokens).unwrap().0.generation;
-        assert!(index.quarantine_blob("blob-123", gen));
+        assert!(index.quarantine_blob("blob-123", gen, &tokens));
         assert!(index.lookup(&tokens).is_none());
         assert_eq!(index.published_count(), 0);
     }
@@ -270,7 +236,7 @@ mod tests {
         let (entry, matched) = index.lookup(&request).unwrap();
         assert_eq!(matched, 2);
         assert!(
-            index.quarantine_blob(&entry.blob_path, entry.generation),
+            index.quarantine_blob(&entry.blob_path, entry.generation, &request[..matched]),
             "quarantine must mark the matched entry on a partial request"
         );
         assert!(
@@ -289,7 +255,7 @@ mod tests {
         index.publish(&[1, 2, 3, 4], meta(), "deep".into());
         let deep = index.lookup(&[1, 2, 3, 4, 5]).unwrap().0;
         assert_eq!(deep.blob_path, "deep");
-        assert!(index.quarantine_blob(&deep.blob_path, deep.generation));
+        assert!(index.quarantine_blob(&deep.blob_path, deep.generation, &[1, 2, 3, 4]));
         assert!(
             index.lookup(&[1, 2, 3, 4, 5]).is_some(),
             "the shallower ancestor is still published"
@@ -312,7 +278,7 @@ mod tests {
         let gen2 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
         assert_ne!(gen1, gen2, "each publish bumps the generation");
         assert!(
-            !index.quarantine_blob("same-name", gen1),
+            !index.quarantine_blob("same-name", gen1, &[1, 2, 3]),
             "retiring a superseded generation must not touch the live entry"
         );
         assert!(
@@ -320,7 +286,7 @@ mod tests {
             "the fresh republish is still served"
         );
         assert!(
-            index.quarantine_blob("same-name", gen2),
+            index.quarantine_blob("same-name", gen2, &[1, 2, 3]),
             "retiring the live generation quarantines it"
         );
         assert!(
@@ -339,9 +305,26 @@ mod tests {
         let generation = index.publish(&[1, 2, 3], meta(), "leader-blob".into());
         assert_ne!(generation, 0, "a real publish has a non-zero generation");
         assert!(
-            index.quarantine_blob("leader-blob", generation),
+            index.quarantine_blob("leader-blob", generation, &[1, 2, 3]),
             "the generation publish returned must retire the entry"
         );
+        assert!(index.lookup(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn quarantine_blob_descends_the_given_prefix_only() {
+        // Keyed descent: a wrong prefix must not find (or touch) the entry, even
+        // with the right name+generation. This is why the caller passes the
+        // matched prefix; it also makes retirement O(prefix), not a full scan.
+        let index = PrefixIndex::new();
+        index.publish(&[1, 2, 3], meta(), "b".into());
+        let gen = index.lookup(&[1, 2, 3]).unwrap().0.generation;
+        assert!(
+            !index.quarantine_blob("b", gen, &[1, 2, 9]),
+            "a wrong prefix must not match the entry"
+        );
+        assert!(index.lookup(&[1, 2, 3]).is_some());
+        assert!(index.quarantine_blob("b", gen, &[1, 2, 3]));
         assert!(index.lookup(&[1, 2, 3]).is_none());
     }
 

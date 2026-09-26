@@ -136,6 +136,18 @@ impl Persistence {
         Ok((meta, bytes[4 + header_len..].to_vec()))
     }
 
+    /// Delete a published blob file on retirement (R1-1). Best-effort: a missing
+    /// file is fine, and an I/O failure is logged by the caller, not fatal. This
+    /// makes retirement durable — a blob left on disk would be re-indexed by the
+    /// next startup rebuild and resurrect the poison.
+    pub fn remove(&self, blob_name: &str) -> Result<(), PersistError> {
+        match fs::remove_file(self.blob_dir.join(blob_name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PersistError::Io(e)),
+        }
+    }
+
     /// Rebuild support (index corruption rescue): list all published blobs.
     /// Each blob's header carries its own token prefix (CheckpointMeta.tokens),
     /// so the index is rebuilt from blob metadata alone — blobs are the source
@@ -181,6 +193,20 @@ mod tests {
         let (m, payload) = p.load(&path).unwrap();
         assert_eq!(m.token_count, 10);
         assert_eq!(payload, b"kvbytes");
+    }
+
+    #[test]
+    fn remove_is_durable_and_idempotent() {
+        // Retirement deletes the file so a rebuild cannot resurrect the poison.
+        // Removing an already-missing file is fine (the request that retired it
+        // may race another).
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        let path = p.publish_atomic(0x1, &meta(10), b"kv").unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        p.remove(&name).unwrap();
+        assert!(!path.exists(), "retired blob file must be gone");
+        p.remove(&name).unwrap(); // idempotent
     }
 
     #[test]

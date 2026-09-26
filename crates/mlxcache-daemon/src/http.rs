@@ -307,7 +307,8 @@ async fn chat_completions(
                                     request_tokens: tokens.len(),
                                 };
                                 outcome.prefill_from = 0;
-                                outcome.blob = Some((blob_name.clone(), generation));
+                                outcome.blob =
+                                    Some((blob_name.clone(), generation, tokens.clone()));
                                 lead.complete(Ok(blob_name));
                             }
                         }
@@ -361,7 +362,7 @@ async fn chat_completions(
 
     // The adapter needs an absolute path to open the blob directly.
     let blob_abs = match &outcome.blob {
-        Some((name, _)) => state
+        Some((name, _, _)) => state
             .persistence
             .blob_dir
             .join(name)
@@ -393,10 +394,19 @@ async fn chat_completions(
             // from scratch. A checkpoint the adapter explicitly rejected (422)
             // is bad: quarantine it so identical requests stop failing. A mere
             // transport/decode failure must NOT retire a healthy checkpoint.
-            if let Some((name, generation)) = outcome.blob.clone() {
+            if let Some((name, generation, prefix)) = outcome.blob.clone() {
                 blob_unused = true;
                 if e.is_checkpoint_rejected() {
-                    state.orchestrator.quarantine_checkpoint(&name, generation);
+                    if state
+                        .orchestrator
+                        .quarantine_checkpoint(&name, generation, &prefix)
+                    {
+                        // Make retirement durable: a blob left on disk would be
+                        // re-indexed by the next startup rebuild.
+                        if let Err(e) = state.persistence.remove(&name) {
+                            tracing::warn!(blob = %name, error = %e, "quarantined but could not delete blob file");
+                        }
+                    }
                     tracing::warn!(
                         blob = %name,
                         error = %e,
@@ -574,8 +584,17 @@ async fn stream_response(
             // still starts. Quarantine only on an explicit adapter rejection
             // (422): a transport/decode failure must not retire a healthy blob.
             if e.is_checkpoint_rejected() {
-                if let Some((name, generation)) = blob_for_open.take() {
-                    state.orchestrator.quarantine_checkpoint(&name, generation);
+                if let Some((name, generation, prefix)) = blob_for_open.take() {
+                    if state
+                        .orchestrator
+                        .quarantine_checkpoint(&name, generation, &prefix)
+                    {
+                        // Make retirement durable: a blob left on disk would be
+                        // re-indexed by the next startup rebuild.
+                        if let Err(e) = state.persistence.remove(&name) {
+                            tracing::warn!(blob = %name, error = %e, "quarantined but could not delete blob file");
+                        }
+                    }
                     tracing::warn!(
                         blob = %name,
                         error = %e,

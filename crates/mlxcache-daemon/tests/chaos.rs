@@ -179,7 +179,7 @@ async fn restart_drops_streams_checkpoints_survive() {
         "checkpoint must survive restart"
     );
     assert_eq!(
-        out.blob.as_ref().map(|(name, _gen)| name.as_str()),
+        out.blob.as_ref().map(|(name, _gen, _pfx)| name.as_str()),
         Some("00000000000000000000000000000777.ckpt"),
         "rebuilt entry must point at the on-disk blob NAME (not an abs path)"
     );

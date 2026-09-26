@@ -286,6 +286,14 @@ class MlxLmEngine:
             raw = fh.read()
         try:
             meta, payload = decode(raw)
+            # The JSON header is untrusted: a field of the wrong type (e.g.
+            # "tokens":123) must be rejected here, inside the boundary. Letting
+            # len() raise a bare TypeError outside it would 500 forever and leave
+            # the poison selectable.
+            if not isinstance(meta.tokens, list) or not all(
+                isinstance(t, int) and not isinstance(t, bool) for t in meta.tokens
+            ):
+                raise ValueError("tokens must be a list of integers")
         except (ValueError, KeyError, TypeError) as exc:
             # A header that does not decode or lacks required fields is a bad
             # checkpoint: retire it rather than 500 forever while it stays
@@ -323,12 +331,14 @@ class MlxLmEngine:
         try:
             # A safetensors/metadata parse failure is a bad checkpoint: reject so
             # the daemon retires it instead of 500ing on every later request while
-            # the poison stays Published. A MemoryError/OSError here is transient
-            # (a real OOM or a disk fault), NOT corruption: let it propagate as a
-            # 500 so a healthy checkpoint is not retired.
+            # the poison stays Published. Only pure-Python parse/schema errors are
+            # corruption. MemoryError, OSError, and RuntimeError are transient
+            # (a real OOM, a disk fault; MLX's native reader raises RuntimeError on
+            # an OS read failure): let them propagate as a 500 so a healthy
+            # checkpoint is not retired.
             try:
                 return load_prompt_cache(tmp), tokens[covered:]
-            except (ValueError, KeyError, TypeError, RuntimeError) as exc:
+            except (ValueError, KeyError, TypeError) as exc:
                 raise CheckpointRejectedError(
                     f"checkpoint failed to load: {type(exc).__name__}: {exc}"
                 ) from exc
