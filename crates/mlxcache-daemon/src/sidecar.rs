@@ -56,6 +56,71 @@ impl SidecarClient {
         Ok(Self { config, http })
     }
 
+    pub async fn prefill(&self, tokens: &[u32]) -> Result<Vec<u8>, SidecarError> {
+        let url = format!("{}/prefill", self.config.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "tokens": tokens }))
+            .send()
+            .await
+            .map_err(|e| SidecarError::Unreachable {
+                url: url.clone(),
+                source: e,
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SidecarError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| SidecarError::Protocol(format!("bad prefill response: {e}")))
+    }
+
+    pub async fn generate(
+        &self,
+        tokens: &[u32],
+        prefill_from: usize,
+        max_tokens: usize,
+    ) -> Result<Vec<u32>, SidecarError> {
+        let url = format!("{}/generate", self.config.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "tokens": tokens,
+                "prefill_from": prefill_from,
+                "max_tokens": max_tokens,
+            }))
+            .send()
+            .await
+            .map_err(|e| SidecarError::Unreachable {
+                url: url.clone(),
+                source: e,
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SidecarError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        #[derive(serde::Deserialize)]
+        struct GenResponse {
+            tokens: Vec<u32>,
+        }
+        resp.json::<GenResponse>()
+            .await
+            .map(|r| r.tokens)
+            .map_err(|e| SidecarError::Protocol(format!("bad generate response: {e}")))
+    }
+
     pub async fn tokenize(&self, prompt: &str) -> Result<TokenizeResponse, SidecarError> {
         let url = format!("{}/tokenize", self.config.base_url);
         let resp = self

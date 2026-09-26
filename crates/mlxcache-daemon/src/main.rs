@@ -31,6 +31,14 @@ async fn main() -> Result<()> {
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
         served_models,
         sidecar,
+        persistence: mlxcache_daemon::persistence::Persistence::new(
+            std::env::var("MLXCACHE_BLOBS").unwrap_or_else(|_| "/tmp/mlxcache-blobs".into()),
+        )
+        .map_err(|e| {
+            eprintln!("fatal: blob dir init failed: {e}");
+            std::process::exit(1);
+        })
+        .unwrap_or_else(|_| unreachable!()),
     });
     let app = mlxcache_daemon::http::router(state);
     let addr = std::env::var("MLXCACHE_ADDR").unwrap_or_else(|_| "127.0.0.1:8420".into());

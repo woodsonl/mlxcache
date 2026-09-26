@@ -54,6 +54,7 @@ pub struct AppState {
     /// Models this daemon serves. Requests for anything else 404 before lookup.
     pub served_models: Vec<String>,
     pub sidecar: Option<SidecarClient>,
+    pub persistence: crate::persistence::Persistence,
 }
 
 /// Hit-rate counters (D3). Mutex over a small struct is fine at v1 scale.
@@ -170,9 +171,59 @@ async fn chat_completions(
     let ttft_ms = started.elapsed().as_millis() as u64;
     log_request(&req.model, 0, &outcome.decision, ttft_ms);
 
-    // v0: report the routing decision; full generation streaming lands with
-    // the sidecar prefill endpoint (next lane). Hit/partial responses carry
-    // the decision so the client sees real cache behavior.
+    // Prefill on miss/partial: single-flight keyed by full token prefix (R1-3),
+    // then persist the KV blob atomically. On hit: skip straight to generate.
+    let client = state.sidecar.as_ref().expect("checked above");
+    if outcome.decision.verdict != CacheVerdict::Hit {
+        let (guard, follower) = state
+            .singleflight
+            .try_lead(tokens.clone())
+            .await;
+        match follower {
+            None => {
+                match client.prefill(&tokens).await {
+                    Ok(blob) => {
+                        // Prefix hash keys the blob; persistence handles atomic rename.
+                        let hash = prefix_hash(&tokens);
+                        let meta = mlxcache_core::contract::CheckpointMeta {
+                            fingerprint: fingerprint.clone(),
+                            token_count: tokens.len() as u64,
+                            format_version: 1,
+                        };
+                        if let Err(e) = state.persistence.publish_atomic(hash, &meta, &blob) {
+                            // ENOSPC rescue (registry): log and continue uncached —
+                            // never fail the request for a cache-write failure.
+                            tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
+                        } else {
+                            state
+                                .orchestrator
+                                .publish_checkpoint(&tokens, meta, format!("{:016x}.ckpt", hash));
+                        }
+                        drop(guard);
+                    }
+                    Err(e) => {
+                        drop(guard);
+                        return Err(err(
+                            StatusCode::BAD_GATEWAY,
+                            &e.to_string(),
+                            "adapter_error",
+                        ));
+                    }
+                }
+            }
+            Some(mut rx) => {
+                // Follower: leader's prefill covers us; await its completion.
+                let _ = rx.recv().await;
+            }
+        }
+    }
+
+    // Generate: full context tokens, continuation from the request length.
+    let generated = match client.generate(&tokens, outcome.prefill_from, 64).await {
+        Ok(t) => t,
+        Err(e) => return Err(err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error")),
+    };
+
     let body = serde_json::json!({
         "mlxcache": {
             "verdict": match outcome.decision.verdict {
@@ -185,9 +236,20 @@ async fn chat_completions(
             "prefill_from": outcome.prefill_from,
             "ttft_ms": ttft_ms,
         },
-        "status": "routing_only_v0",
+        "generated_tokens": generated,
+        "status": "ok",
     });
     Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+/// FNV-1a over token ids — stable blob key for a token prefix.
+fn prefix_hash(tokens: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for t in tokens {
+        h ^= *t as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -221,6 +283,10 @@ mod tests {
             stats: Arc::new(Stats::default()),
             served_models: vec!["test-model".into()],
             sidecar: None,
+            persistence: crate::persistence::Persistence::new(
+                tempfile::tempdir().unwrap().keep(),
+            )
+            .unwrap(),
         });
         router(state)
     }
