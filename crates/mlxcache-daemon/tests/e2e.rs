@@ -374,6 +374,13 @@ async fn end_to_end_miss_then_hit() {
     assert_eq!(v["mlxcache"]["verdict"], "miss");
     assert_eq!(v["status"], "ok");
     assert!(!v["generated_tokens"].as_array().unwrap().is_empty());
+    // The synthetic tokenizer emits 8 tokens; the leader adopts the blob it
+    // just published, whose KV covers tokens[:-1] = 7. prefill_from reports the
+    // covered count, so it must be 7, not 8.
+    assert_eq!(
+        v["mlxcache"]["prefill_from"], 7,
+        "leader reports covered KV tokens (len-1), not the full request length"
+    );
 
     // Blob must be on disk now.
     assert_eq!(state.persistence.list_blobs().unwrap().len(), 1);
@@ -396,6 +403,10 @@ async fn end_to_end_miss_then_hit() {
     assert_eq!(
         v["mlxcache"]["verdict"], "hit",
         "same prompt must hit the published checkpoint"
+    );
+    assert_eq!(
+        v["mlxcache"]["prefill_from"], 7,
+        "hit reports covered KV tokens for the 8-token prefix (len-1)"
     );
 
     // Stats: 2 requests, 1 miss, 1 hit.
