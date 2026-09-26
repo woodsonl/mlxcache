@@ -7,7 +7,6 @@ import threading
 import httpx
 import pytest
 from mlxcache_sidecar import server
-from mlxcache_sidecar.blob import decode
 
 
 @pytest.fixture()
@@ -29,13 +28,10 @@ def test_tokenize_deterministic(sidecar_url):
     assert all(0 <= t < 2**31 for t in r1["tokens"])
 
 
-def test_prefill_blob_roundtrips(sidecar_url):
+def test_prefill_returns_raw_payload(sidecar_url):
+    # The daemon owns the header; /prefill returns the raw payload bytes.
     tokens = [1, 2, 3, 4]
-    blob = httpx.post(f"{sidecar_url}/prefill", json={"tokens": tokens}).content
-    meta, payload = decode(blob)
-    assert meta.token_count == 4
-    assert meta.fingerprint.model_id == "test-model"
-    assert meta.fingerprint.kv_layout_version == 1
+    payload = httpx.post(f"{sidecar_url}/prefill", json={"tokens": tokens}).content
     assert len(payload) == 4 * 1024
 
 
@@ -61,7 +57,5 @@ def test_health(sidecar_url):
 def test_prefill_large_tokens_no_overflow(sidecar_url):
     # Regression: token ids up to 2**31 overflow the 4-byte payload pack.
     tokens = [2**31 - 1, 2**31 - 2, 0]
-    blob = httpx.post(f"{sidecar_url}/prefill", json={"tokens": tokens}).content
-    meta, payload = decode(blob)
-    assert meta.token_count == 3
+    payload = httpx.post(f"{sidecar_url}/prefill", json={"tokens": tokens}).content
     assert len(payload) == 3 * 1024
