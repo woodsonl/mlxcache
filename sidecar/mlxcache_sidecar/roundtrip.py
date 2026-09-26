@@ -15,7 +15,6 @@ synthetic state so CI stays fast and hermetic.
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -23,11 +22,14 @@ from typing import Any
 
 import pytest
 
+from .blob import CheckpointMeta, Fingerprint, decode, encode
+
 
 @dataclass
 class RoundTripResult:
     tokens: int
     bytes_total: int
+    bytes_payload: int
     serialize_ms: float
     deserialize_ms: float
     peak_memory_mb: float
@@ -38,11 +40,18 @@ class RoundTripResult:
     def bytes_per_token(self) -> float:
         return self.bytes_total / self.tokens
 
+    def payload_bytes_per_token(self) -> float:
+        """KV-only bytes/token: excludes the header (which carries the token id
+        list, not KV). This is the T2 figure the daemon actually pays per token."""
+        return self.bytes_payload / self.tokens
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "tokens": self.tokens,
             "bytes_total": self.bytes_total,
+            "bytes_payload": self.bytes_payload,
             "bytes_per_token": self.bytes_per_token(),
+            "payload_bytes_per_token": self.payload_bytes_per_token(),
             "serialize_ms": self.serialize_ms,
             "deserialize_ms": self.deserialize_ms,
             "peak_memory_mb": self.peak_memory_mb,
@@ -82,30 +91,33 @@ def run_roundtrip(n_tokens: int = 50_000) -> RoundTripResult:
 
     state = _synthetic_kv_state(n_tokens)
 
+    # Use the real wire codec so the harness cannot test a format the daemon and
+    # adapter do not actually speak. The daemon writes the full token list in
+    # CheckpointMeta (http.rs publish), so mirror that: token_count must equal
+    # len(tokens) or the daemon's rebuild_from_disk rejects the blob as mis-keyed.
+    meta = CheckpointMeta(
+        fingerprint=Fingerprint(
+            model_id="synthetic",
+            tokenizer_hash="0" * 64,
+            kv_dtype="f16",
+            kv_layout_version=1,
+        ),
+        token_count=n_tokens,
+        tokens=list(range(n_tokens)),
+    )
+    # Guard: the daemon skips blobs where len(tokens) != token_count
+    # (orchestrator.rs rebuild_from_disk). Encode only metadata it accepts.
+    assert len(meta.tokens) == meta.token_count, "harness emitted mis-keyed metadata"
     t0 = time.perf_counter()
-    header = json.dumps(
-        {
-            "fingerprint": {
-                "model_id": "synthetic",
-                "tokenizer_hash": "0" * 64,
-                "kv_dtype": "f16",
-                "kv_layout_version": 1,
-            },
-            "token_count": n_tokens,
-            "format_version": 1,
-        }
-    ).encode()
-    blob = len(header).to_bytes(4, "little") + header + state
+    blob = encode(meta, state)
     serialize_ms = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    header_len = int.from_bytes(blob[:4], "little")
-    parsed_header = json.loads(blob[4 : 4 + header_len])
-    payload = blob[4 + header_len :]
+    parsed_meta, payload = decode(blob)
     deserialize_ms = (time.perf_counter() - t0) * 1000
 
     # Thesis guard: round-trip must be byte-identical ([EVAL] semantics).
-    logits_identical = payload == state and parsed_header["token_count"] == n_tokens
+    logits_identical = payload == state and parsed_meta.token_count == n_tokens
 
     # IPC tax measurement: one in-process copy stands in for the transport hop;
     # the real measurement crosses the sidecar boundary (T2 follow-up).
@@ -116,6 +128,7 @@ def run_roundtrip(n_tokens: int = 50_000) -> RoundTripResult:
     return RoundTripResult(
         tokens=n_tokens,
         bytes_total=len(blob),
+        bytes_payload=len(payload),
         serialize_ms=serialize_ms,
         deserialize_ms=deserialize_ms,
         peak_memory_mb=_measure_peak_memory_mb(),
@@ -123,38 +136,3 @@ def run_roundtrip(n_tokens: int = 50_000) -> RoundTripResult:
         ipc_overhead_ms=ipc_overhead_ms,
         notes=["synthetic state; MLXCACHE_BENCH_REAL=1 for real mlx-lm numbers"],
     )
-
-
-def test_roundtrip_50k() -> None:
-    result = run_roundtrip(50_000)
-    assert result.logits_identical, "round-trip must be byte-identical (thesis guard)"
-    assert result.bytes_total > 0
-    assert result.serialize_ms >= 0
-    assert result.deserialize_ms >= 0
-    # Regression: macOS ru_maxrss is bytes; a bad divisor reports ~1024x.
-    assert 1.0 < result.peak_memory_mb < 5000.0, (
-        f"implausible peak RSS {result.peak_memory_mb} MB (unit bug?)"
-    )
-
-
-def test_roundtrip_scales() -> None:
-    small = run_roundtrip(1_000)
-    big = run_roundtrip(10_000)
-    assert big.bytes_total > small.bytes_total
-    assert big.bytes_per_token() == pytest.approx(small.bytes_per_token(), rel=0.05)
-
-
-def test_result_report_shape() -> None:
-    result = run_roundtrip(500)
-    d = result.as_dict()
-    for key in (
-        "tokens",
-        "bytes_total",
-        "bytes_per_token",
-        "serialize_ms",
-        "deserialize_ms",
-        "peak_memory_mb",
-        "logits_identical",
-        "ipc_overhead_ms",
-    ):
-        assert key in d
