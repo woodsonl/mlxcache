@@ -90,8 +90,9 @@ async fn main() -> Result<()> {
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         // Resolve only when the watchdog observed a real signal. A dropped
         // sender means setup failed, which we have already treated as fatal.
+        // No logging here: a blocked log sink would stop this future from
+        // resolving, leaving axum accepting connections during the block.
         let _ = signal_rx.await;
-        tracing::info!("draining in-flight requests");
     });
     serve.await?;
     tracing::info!("mlxcache daemon stopped");

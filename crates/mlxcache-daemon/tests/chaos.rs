@@ -303,8 +303,8 @@ fn sigterm_triggers_graceful_shutdown() {
 
     let combined = format!("{}{}", err_h.join().unwrap(), out_h.join().unwrap());
     assert!(
-        combined.contains("draining in-flight requests"),
-        "shutdown should log the drain, got: {combined}"
+        combined.contains("mlxcache daemon stopped"),
+        "shutdown should log completion, got: {combined}"
     );
 }
 
