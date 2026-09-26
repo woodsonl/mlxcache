@@ -93,6 +93,51 @@ def test_roundtrip_logits_identical(engine):
     )
 
 
+def test_adapter_prefill_resume_matches_scratch(engine):
+    """Drives the REAL adapter path (MlxLmEngine.prefill -> generate_from_blob),
+    not raw mlx-lm. This is what the daemon actually calls on a miss then a hit:
+    the earlier convention bug (seeding the cache with all N tokens while the
+    resume path fed tokens[cached-1:]) made every real hit double-feed the last
+    token and diverge from scratch. This test would have caught it."""
+    import mlx.core as mx
+    from mlx_lm import stream_generate
+    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+
+    tokens = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 4)
+
+    scratch = [
+        r.token
+        for r in stream_generate(
+            engine.model, engine.tokenizer, prompt=mx.array(tokens), max_tokens=16
+        )
+    ]
+
+    # Miss path: the adapter produces the raw KV payload the daemon persists.
+    payload = engine.prefill(tokens)
+    meta = CheckpointMeta(
+        fingerprint=Fingerprint(
+            model_id=engine.model_id,
+            tokenizer_hash=engine.tokenizer_hash,
+            kv_dtype=engine.kv_dtype,
+            kv_layout_version=1,
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    blob = encode(meta, payload)
+
+    with TempSafetensors() as path:
+        with open(path, "wb") as fh:
+            fh.write(blob)
+        # Hit path: resume from the persisted blob exactly as the daemon does.
+        resumed = engine.generate_from_blob(tokens, path, max_tokens=16)
+
+    assert resumed == scratch, (
+        "adapter resume diverged from scratch (cache convention bug):\n"
+        f"  resumed={resumed[:8]}\n  scratch={scratch[:8]}"
+    )
+
+
 def test_roundtrip_measures_bytes_and_time(engine):
     """R1-5 numbers: bytes/token + serialize/deserialize wall time at 50K."""
     import mlx.core as mx
