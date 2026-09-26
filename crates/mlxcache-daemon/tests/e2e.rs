@@ -9,10 +9,10 @@ use http_body_util::BodyExt;
 use std::sync::Arc;
 use tower::util::ServiceExt;
 
+use mlxcache_core::singleflight::SingleFlight;
 use mlxcache_daemon::http::{router, AppState};
 use mlxcache_daemon::orchestrator::Orchestrator;
 use mlxcache_daemon::sidecar::{SidecarClient, SidecarConfig};
-use mlxcache_core::singleflight::SingleFlight;
 
 /// Spawn the real sidecar server (synthetic engine) on an ephemeral port.
 /// Returns None when `uv` or the sidecar package is unavailable, so the test
@@ -187,10 +187,16 @@ async fn end_to_end_streaming_sse() {
     let text = String::from_utf8_lossy(&bytes);
     // Must lead with the mlxcache meta frame, carry token frames, end with [DONE].
     assert!(text.contains("\"mlxcache\""), "meta frame missing: {text}");
-    assert!(text.contains("\"verdict\":\"miss\""), "verdict missing: {text}");
+    assert!(
+        text.contains("\"verdict\":\"miss\""),
+        "verdict missing: {text}"
+    );
     assert!(text.contains("data: [DONE]"), "terminal frame missing");
     let token_frames = text.matches("\"token\"").count();
-    assert!(token_frames > 1, "expected multiple token frames, got {token_frames}");
+    assert!(
+        token_frames > 1,
+        "expected multiple token frames, got {token_frames}"
+    );
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");

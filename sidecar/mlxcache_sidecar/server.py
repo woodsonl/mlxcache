@@ -41,8 +41,7 @@ class SyntheticEngine:
     def prefill(self, tokens: list[int]) -> bytes:
         # KV payload: 1024 bytes/token, deterministic from token ids.
         payload = b"".join(
-            ((t * 31 + i) & 0xFFFFFFFF).to_bytes(4, "little") * 256
-            for i, t in enumerate(tokens)
+            ((t * 31 + i) & 0xFFFFFFFF).to_bytes(4, "little") * 256 for i, t in enumerate(tokens)
         )
         # Raw payload only; the daemon writes the checkpoint header.
         return payload
@@ -56,7 +55,6 @@ class SyntheticEngine:
         # Synthetic engine streams its deterministic tokens as text pieces.
         for i, t in enumerate(self.generate(tokens, 0, 64)):
             yield t, f"tok{i} "
-
 
 
 class MlxLmEngine:
