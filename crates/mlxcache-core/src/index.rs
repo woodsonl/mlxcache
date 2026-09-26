@@ -76,7 +76,17 @@ impl PrefixIndex {
 
     /// Publish an entry. Only callable for a prefix whose ancestors are consistent;
     /// the atomic blob rename must have completed BEFORE this call (R1-3).
+    ///
+    /// The daemon caches KV for `tokens[:-1]`, so a published entry must hold at
+    /// least 2 tokens (a shorter prefix caches nothing and `lookup` would return
+    /// `matched_tokens < 2`). The hot path and `rebuild_from_disk` already skip
+    /// such prefixes; this asserts the invariant at the layer that owns it.
     pub fn publish(&self, tokens: &[u32], meta: CheckpointMeta, blob_path: String) {
+        debug_assert!(
+            tokens.len() >= 2,
+            "publish requires a >=2-token prefix (KV covers tokens[:-1]); got {}",
+            tokens.len()
+        );
         let mut root = self.write_lock();
         let mut node: &mut Node = &mut root;
         for t in tokens {
@@ -199,9 +209,27 @@ mod tests {
     #[test]
     fn publish_counts() {
         let index = PrefixIndex::new();
-        index.publish(&[1], meta(), "a".into());
-        index.publish(&[1, 2], meta(), "b".into());
+        index.publish(&[1, 2], meta(), "a".into());
+        index.publish(&[1, 2, 3], meta(), "b".into());
         assert_eq!(index.published_count(), 2);
+    }
+
+    #[test]
+    fn published_prefix_shorter_than_two_never_serves_kv() {
+        // Invariant the daemon relies on: a published checkpoint caches KV for
+        // tokens[:-1], so it must hold at least 2 tokens. The index must refuse
+        // (in debug builds) to publish anything shorter, or `lookup` could return
+        // matched_tokens < 2 and the request would be classified hit/partial with
+        // zero covered KV. publish_checkpoint already skips <2 on rebuild; this
+        // pins the guarantee at the index itself.
+        let index = PrefixIndex::new();
+        let one = std::panic::catch_unwind(|| {
+            index.publish(&[42], meta(), "short".into());
+        });
+        assert!(
+            one.is_err(),
+            "publishing a 1-token prefix must trip the index invariant"
+        );
     }
 
     #[test]
@@ -245,7 +273,7 @@ mod tests {
         assert_eq!(matched, 3);
         assert_eq!(entry.blob_path, "b");
         // Writes still work too.
-        index.publish(&[4], meta(), "c".into());
+        index.publish(&[4, 5], meta(), "c".into());
         assert_eq!(index.published_count(), 2);
     }
 }
