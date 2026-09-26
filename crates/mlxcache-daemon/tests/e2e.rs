@@ -96,6 +96,64 @@ async fn unusable_blob_is_quarantined_and_served_from_scratch() {
 }
 
 #[tokio::test]
+async fn one_token_prompt_serves_and_publishes_no_blob() {
+    // A one-token prompt caches nothing (empty adapter payload). The daemon must
+    // serve it from scratch, publish no checkpoint, and never report a phantom
+    // hit on the repeat request.
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_ONE", "1")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false,
+    })
+    .to_string();
+
+    for _ in 0..2 {
+        let res = router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mlxcache"]["verdict"], "miss", "nothing was cached");
+        assert!(!v["generated_tokens"].as_array().unwrap().is_empty());
+    }
+    assert_eq!(
+        state.persistence.list_blobs().unwrap().len(),
+        0,
+        "a one-token prompt must publish no blob"
+    );
+    assert_eq!(state.orchestrator.published_count(), 0);
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
 async fn end_to_end_miss_then_hit() {
     let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
         eprintln!("skipping: sidecar unavailable (install uv + sync deps)");

@@ -111,13 +111,15 @@ def test_prefill_seeds_the_cache_with_tokens_minus_one(monkeypatch):
     assert prefilled == [3]
 
 
-def test_single_token_prefill_seeds_the_one_token(monkeypatch):
-    # tokens[:-1] is empty for a one-token prompt; seed the token instead of
-    # crashing on an empty prefill.
+def test_single_token_prefill_caches_nothing(monkeypatch):
+    # A one-token prompt has an empty prefix; mlx-lm cannot save/load an empty
+    # prompt cache, and there is nothing to cache. prefill must not call the model
+    # and must return an empty payload so the daemon skips publishing.
     prefilled, model = _install_fake_mlx(monkeypatch)
     eng = _engine(model)
-    eng.prefill([7])
-    assert prefilled == [1]
+    payload = eng.prefill([7])
+    assert prefilled == [], "a one-token seed must not call the model"
+    assert payload == b"", "a one-token prefill must cache nothing"
 
 
 def test_resume_feeds_from_one_before_the_cached_count(monkeypatch, tmp_path):
@@ -126,21 +128,48 @@ def test_resume_feeds_from_one_before_the_cached_count(monkeypatch, tmp_path):
     tokens = [1, 2, 3, 4, 5]
     blob_path = _write_blob(str(tmp_path / "b.ckpt"), tokens[:4])
     _cache, prompt = eng._load_cache_delta(tokens, blob_path)
-    # Cache holds 4, so feed tokens[3:] and the model predicts token 5.
+    # The cache covers prefix[:-1] = 3 tokens, so feed tokens[3:] and the model
+    # predicts token 5 from the KV of tokens 1..3.
     assert prompt == [4, 5]
 
 
 def test_seed_plus_delta_covers_the_whole_prompt(monkeypatch, tmp_path):
-    # The end-to-end invariant: prefill(tokens) seeds len(tokens)-1, resume
-    # feeds tokens[cached-1:], and together they cover every token exactly once.
+    # The end-to-end invariant: prefill(tokens) seeds len(tokens)-1, resume feeds
+    # the uncovered tail, and together they cover every token exactly once.
+    # Checked for a multi-token prompt AND a one-token prompt (regression: the
+    # one-token case used to feed the token twice).
     prefilled, model = _install_fake_mlx(monkeypatch)
     eng = _engine(model)
-    tokens = [1, 2, 3, 4, 5, 6]
-    eng.prefill(tokens)
-    seeded = prefilled[-1]
-    blob_path = _write_blob(str(tmp_path / "b.ckpt"), tokens)
-    _cache, prompt = eng._load_cache_delta(tokens, blob_path)
-    assert seeded + len(prompt) == len(tokens)
+    for tokens in ([1, 2, 3, 4, 5, 6], [7]):
+        prefilled.clear()
+        eng.prefill(tokens)
+        seeded = prefilled[-1] if prefilled else 0
+        blob_path = _write_blob(str(tmp_path / f"b{len(tokens)}.ckpt"), tokens)
+        _cache, prompt = eng._load_cache_delta(tokens, blob_path)
+        assert seeded + len(prompt) == len(tokens), (
+            f"tokens={tokens} seeded={seeded} delta={prompt}"
+        )
+
+
+def test_empty_payload_blob_is_not_adopted(monkeypatch, tmp_path):
+    # A checkpoint with no KV payload (a one-token prompt) must run from scratch,
+    # not attempt to load an empty mlx-lm cache.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [7]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "empty.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b""))
+    cache, prompt = eng._load_cache_delta(tokens, path)
+    assert cache is None
+    assert prompt == tokens
 
 
 def test_blob_for_a_different_prefix_falls_back_to_scratch(monkeypatch, tmp_path):

@@ -212,34 +212,43 @@ async fn chat_completions(
             mlxcache_core::singleflight::Role::Leader(lead) => {
                 match client.prefill(&tokens).await {
                     Ok(blob) => {
-                        let meta = mlxcache_core::contract::CheckpointMeta {
-                            fingerprint: fingerprint.clone(),
-                            token_count: tokens.len() as u64,
-                            tokens: tokens.clone(),
-                            format_version: 1,
-                        };
-                        let blob_name = format!("{:032x}.ckpt", blob_key(&fingerprint, &tokens));
-                        match state.persistence.publish_atomic(
-                            blob_key(&fingerprint, &tokens),
-                            &meta,
-                            &blob,
-                        ) {
-                            // ENOSPC rescue (registry): log and continue uncached.
-                            Err(e) => {
-                                tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
-                                lead.complete(Err(e.to_string()));
-                            }
-                            Ok(_) => {
-                                state.orchestrator.publish_checkpoint(
-                                    &tokens,
-                                    meta,
-                                    blob_name.clone(),
-                                );
-                                // The leader's own request resumes from the blob
-                                // it just wrote (avoids re-prefilling the delta).
-                                outcome.blob_path = Some(blob_name.clone());
-                                outcome.prefill_from = tokens.len();
-                                lead.complete(Ok(blob_name));
+                        // An empty payload means the adapter cached nothing (e.g. a
+                        // one-token prompt). Publishing would index a checkpoint
+                        // with no KV; signal "no blob" (empty name) so followers
+                        // also run from scratch, and generate from scratch here.
+                        if blob.is_empty() {
+                            lead.complete(Ok(String::new()));
+                        } else {
+                            let meta = mlxcache_core::contract::CheckpointMeta {
+                                fingerprint: fingerprint.clone(),
+                                token_count: tokens.len() as u64,
+                                tokens: tokens.clone(),
+                                format_version: 1,
+                            };
+                            let blob_name =
+                                format!("{:032x}.ckpt", blob_key(&fingerprint, &tokens));
+                            match state.persistence.publish_atomic(
+                                blob_key(&fingerprint, &tokens),
+                                &meta,
+                                &blob,
+                            ) {
+                                // ENOSPC rescue (registry): log and continue uncached.
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
+                                    lead.complete(Err(e.to_string()));
+                                }
+                                Ok(_) => {
+                                    state.orchestrator.publish_checkpoint(
+                                        &tokens,
+                                        meta,
+                                        blob_name.clone(),
+                                    );
+                                    // The leader's own request resumes from the blob
+                                    // it just wrote (avoids re-prefilling the delta).
+                                    outcome.blob_path = Some(blob_name.clone());
+                                    outcome.prefill_from = tokens.len();
+                                    lead.complete(Ok(blob_name));
+                                }
                             }
                         }
                     }
@@ -258,10 +267,14 @@ async fn chat_completions(
                         // Leader failed too; surface the same adapter error.
                         return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
                     }
-                    Some(Ok(_)) => {
+                    Some(Ok(name)) if !name.is_empty() => {
                         // Re-route: the leader's publish is now visible, so this
                         // follower adopts it (hit/partial) instead of prefilling.
                         outcome = state.orchestrator.route(&tokens, &fingerprint);
+                    }
+                    Some(Ok(_)) => {
+                        // Leader cached nothing (empty blob): run from scratch,
+                        // like the leader did.
                     }
                     None => {}
                 }
