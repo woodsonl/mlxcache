@@ -211,6 +211,26 @@ async fn chat_completions(
         match state.singleflight.enter(tokens.clone()).await {
             mlxcache_core::singleflight::Role::Leader(lead) => {
                 match client.prefill(&tokens).await {
+                    // An empty payload means the adapter cached nothing (e.g. a
+                    // one-token prompt). Publishing would index a checkpoint with
+                    // no KV. The leader's publish result is an `Ok(blob_name)`, and
+                    // an empty name is the sentinel for "nothing published"; the
+                    // follower branch below treats an empty name as a no-blob miss
+                    // and runs from scratch too.
+                    Ok(blob) if blob.is_empty() => {
+                        // Force a scratch decision so this request and every
+                        // follower report the same verdict: nothing was cached,
+                        // so no blob may be resumed from even if a shorter
+                        // ancestor had been matched.
+                        outcome.decision = mlxcache_core::policy::PolicyDecision {
+                            verdict: mlxcache_core::policy::CacheVerdict::Miss,
+                            matched_tokens: 0,
+                            request_tokens: tokens.len(),
+                        };
+                        outcome.blob_path = None;
+                        outcome.prefill_from = 0;
+                        lead.complete(Ok(String::new()));
+                    }
                     Ok(blob) => {
                         let meta = mlxcache_core::contract::CheckpointMeta {
                             fingerprint: fingerprint.clone(),
@@ -235,8 +255,8 @@ async fn chat_completions(
                                     meta,
                                     blob_name.clone(),
                                 );
-                                // The leader's own request resumes from the blob
-                                // it just wrote (avoids re-prefilling the delta).
+                                // The leader's own request resumes from the blob it
+                                // just wrote (avoids re-prefilling the delta).
                                 outcome.blob_path = Some(blob_name.clone());
                                 outcome.prefill_from = tokens.len();
                                 lead.complete(Ok(blob_name));
@@ -258,10 +278,21 @@ async fn chat_completions(
                         // Leader failed too; surface the same adapter error.
                         return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
                     }
-                    Some(Ok(_)) => {
+                    Some(Ok(name)) if !name.is_empty() => {
                         // Re-route: the leader's publish is now visible, so this
                         // follower adopts it (hit/partial) instead of prefilling.
                         outcome = state.orchestrator.route(&tokens, &fingerprint);
+                    }
+                    Some(Ok(_)) => {
+                        // Leader cached nothing (empty blob): run from scratch and
+                        // report the same scratch verdict as the leader.
+                        outcome.decision = mlxcache_core::policy::PolicyDecision {
+                            verdict: mlxcache_core::policy::CacheVerdict::Miss,
+                            matched_tokens: 0,
+                            request_tokens: tokens.len(),
+                        };
+                        outcome.blob_path = None;
+                        outcome.prefill_from = 0;
                     }
                     None => {}
                 }

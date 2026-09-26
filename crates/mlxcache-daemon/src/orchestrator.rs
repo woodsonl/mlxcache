@@ -122,9 +122,11 @@ impl Orchestrator {
         for blob in blobs {
             match persistence.load(&blob) {
                 Ok((meta, _payload)) => {
-                    if meta.tokens.len() as u64 != meta.token_count || meta.tokens.is_empty() {
-                        // A blob with no recoverable prefix cannot be indexed;
-                        // skip it rather than publish a mis-keyed entry.
+                    // A prefix shorter than 2 tokens caches nothing (the adapter
+                    // never produces one), and a prefix that disagrees with its
+                    // own count cannot be keyed. Skip either rather than publish a
+                    // mis-keyed entry the adapter would refuse to serve.
+                    if meta.tokens.len() as u64 != meta.token_count || meta.tokens.len() < 2 {
                         report.skipped += 1;
                         continue;
                     }
