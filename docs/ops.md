@@ -34,9 +34,23 @@ bump before shipping. A failing benchmark = do not bump.
 
 ## Environment
 
+Daemon:
+
 | Variable | Default | Meaning |
 |---|---|---|
 | MLXCACHE_ADDR | 127.0.0.1:8420 | daemon bind address |
 | MLXCACHE_MODELS | (empty) | comma-separated models the daemon serves; requests for others 404 |
 | MLXCACHE_SIDECAR_URL | (unset) | sidecar base URL; unset = no adapter, requests 503 |
-| MLXCACHE_BENCH_REAL | (unset) | set to 1 for real mlx-lm benchmark (needs local model) |
+| MLXCACHE_BLOBS | /tmp/mlxcache-blobs | checkpoint blob directory; set a durable path for a real install |
+| MLXCACHE_SIDECAR_TIMEOUT_S | 120 | per-request sidecar timeout; must exceed the slowest prefill |
+| RUST_LOG | info | tracing filter for the daemon's JSON logs |
+
+Sidecar (compatibility adapter):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| MLXCACHE_ENGINE | synthetic | `mlx-lm` loads a real model; `synthetic` is hermetic |
+| MLXCACHE_MODEL | synthetic-model | model id to load (an mlx-lm repo or local path) |
+| MLXCACHE_SIDECAR_ADDR | 127.0.0.1 | sidecar bind address |
+| MLXCACHE_SIDECAR_PORT | 8421 | sidecar bind port |
+| MLXCACHE_BENCH_REAL | (unset) | set to 1 for the real mlx-lm benchmark (needs a local model) |
