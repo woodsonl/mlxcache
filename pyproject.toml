@@ -28,8 +28,8 @@ mlx = [
 dev = [
     # Exact pins (like mlx-lm above): a floor admits a newer release whose
     # behavior can differ between local and CI while the lock still resolves the
-    # old one, so a local pass can be a false green. uv.lock pins these too;
-    # the exact specifiers keep a lockless resolve deterministic.
+    # old one, so a local pass can be a false green. Pins are on direct deps
+    # only; transitive deps are pinned by uv.lock, which CI asserts with --locked.
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "httpx==0.28.1",
