@@ -536,7 +536,7 @@ async fn concurrent_identical_requests_share_one_prefill() {
     // task be scheduled past the leader's completion and legitimately become a
     // second leader (observed as extra "miss" verdicts on CI).
     let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "1.5")]).await
+        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "5.0")]).await
     else {
         eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
         return;
@@ -597,18 +597,30 @@ async fn concurrent_identical_requests_share_one_prefill() {
         }));
     }
 
-    // Wait for the leader to be prefilling, then release the followers. If the
-    // leader never starts within the bound, fail loudly rather than release the
-    // followers unlocked (which would just re-elect a follower as leader and
-    // mask the setup failure).
+    // Wait for the leader to be prefilling, then release the followers. The
+    // leader holds its prefill for MLXCACHE_PREFILL_DELAY (5s), far longer than
+    // this bounded poll, so it is provably still in flight when followers enter
+    // single-flight (otherwise a slow poll could release them after the leader
+    // finished and they would just hit normally, not coalesce). If the leader
+    // never starts within the bound, fail loudly rather than release unlocked
+    // (which would re-elect a follower as leader and mask the setup failure).
     let mut leader_started = false;
     for _ in 0..200 {
-        let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
+        let stats: serde_json::Value =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                reqwest::get(format!("{sidecar_url}/stats"))
+                    .await?
+                    .json()
+                    .await
+            })
             .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+            {
+                Ok(Ok(v)) => v,
+                _ => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
         if stats["prefill_count"].as_u64().unwrap_or(0) >= 1 {
             leader_started = true;
             break;
