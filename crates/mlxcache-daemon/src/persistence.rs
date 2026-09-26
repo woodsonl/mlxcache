@@ -14,6 +14,14 @@ pub struct Persistence {
     pub blob_dir: PathBuf,
 }
 
+/// Process-wide monotonic counter to make temp file names unique across
+/// concurrent publishes within one process.
+fn next_temp_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
     #[error("disk full or unwritable at {path}: {source}")]
@@ -43,7 +51,18 @@ impl Persistence {
         payload: &[u8],
     ) -> Result<PathBuf, PersistError> {
         let final_path = self.blob_dir.join(format!("{:032x}.ckpt", prefix_hash));
-        let tmp_path = self.blob_dir.join(format!("{:032x}.ckpt.tmp", prefix_hash));
+        // Unique temp name: two concurrent publishers for the same hash must not
+        // interleave writes into one temp file (that yields a corrupt blob which
+        // the rename then publishes as if complete). pid + counter keeps the
+        // name unique per write; the `.ckpt.tmp` suffix family is still excluded
+        // by list_blobs.
+        let unique = format!(
+            "{:032x}.{}.{}.ckpt.tmp",
+            prefix_hash,
+            std::process::id(),
+            next_temp_seq()
+        );
+        let tmp_path = self.blob_dir.join(unique);
 
         let header = serde_json::to_vec(meta).map_err(|e| PersistError::Corrupt {
             reason: format!("meta serialize: {e}"),
@@ -189,6 +208,40 @@ mod tests {
         p.publish_atomic(0x2, &meta(2), b"b").unwrap();
         fs::write(dir.path().join("stray.txt"), b"nope").unwrap();
         assert_eq!(p.list_blobs().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn concurrent_publish_same_hash_uses_unique_temps() {
+        // Two publishers for the same hash must not share a temp file; each
+        // rename must land a complete blob. Run them on threads to exercise the
+        // real concurrency, then verify the final blob loads clean.
+        let dir = tmpdir();
+        let p = std::sync::Arc::new(Persistence::new(dir.path()).unwrap());
+        let mut handles = Vec::new();
+        for i in 0..8u8 {
+            let p = p.clone();
+            handles.push(std::thread::spawn(move || {
+                p.publish_atomic(0x55, &meta(3), &[i; 4096]).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Exactly one final blob; no .tmp litter; it loads without corruption.
+        assert_eq!(p.list_blobs().unwrap().len(), 1);
+        let stray_tmp = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(stray_tmp, 0, "temp files must be renamed away, not leaked");
+        let blob = p.list_blobs().unwrap().pop().unwrap();
+        let (_m, payload) = p.load(&blob).unwrap();
+        assert_eq!(payload.len(), 4096);
+        assert!(
+            payload.iter().all(|b| *b == payload[0]),
+            "interleaved writes would mix payload bytes"
+        );
     }
 
     // ENOSPC simulation: write to a full filesystem is hard to simulate

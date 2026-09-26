@@ -199,6 +199,12 @@ class MlxLmEngine:
         cached = meta.token_count
         if cached <= 0 or cached > len(tokens):
             return None, tokens
+        # The adapter is a trust boundary: verify the blob really covers this
+        # request's prefix. If meta.tokens disagrees with tokens[:cached], the
+        # blob belongs to a different prefix and resuming from it would generate
+        # silently wrong output. Fall back to scratch.
+        if meta.tokens and meta.tokens != tokens[:cached]:
+            return None, tokens
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
             tmp = fh.name
             fh.write(payload)
