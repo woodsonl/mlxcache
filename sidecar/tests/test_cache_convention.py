@@ -316,6 +316,29 @@ def test_unhashable_dtype_is_rejected_not_500(monkeypatch, tmp_path):
             eng._load_cache_delta(tokens, path)
 
 
+def test_f64_dtype_is_rejected_before_native_load(monkeypatch, tmp_path):
+    # Regression (Codex pass 8): MLX's reader rejects F64 with RuntimeError, the
+    # same type as a transient read failure. A structurally-consistent F64 tensor
+    # must be a 422, so it is quarantined rather than 500-forever.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    header = json.dumps({"w": {"dtype": "F64", "shape": [1], "data_offsets": [0, 8]}}).encode()
+    payload = len(header).to_bytes(8, "little") + header + b"\x00" * 8
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "f64.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
 def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
     # adopted: resuming from the wrong KV generates silently wrong output. It is

@@ -185,6 +185,7 @@ impl Orchestrator {
         let mut best: std::collections::HashMap<(Vec<u32>, String), Candidate> =
             std::collections::HashMap::new();
         let mut stale: Vec<String> = Vec::new();
+        let mut max_persisted = 0u64;
         for blob in blobs {
             let name = blob
                 .file_name()
@@ -208,6 +209,9 @@ impl Orchestrator {
                         continue;
                     }
                     let generation = parse_generation(&name).unwrap_or(0);
+                    if generation > max_persisted {
+                        max_persisted = generation;
+                    }
                     let key = (meta.tokens.clone(), meta.fingerprint.tokenizer_hash.clone());
                     let cand = Candidate {
                         name,
@@ -236,7 +240,10 @@ impl Orchestrator {
             }
         }
         // Publish the winners, then remove every superseded file. A no-op reclaim
-        // callback: the deletion is explicit and post-publish.
+        // callback: the deletion is explicit and post-publish. Seed the counter
+        // above every persisted generation first so the generations we reserve
+        // here (and in later requests) sort above what is on disk.
+        self.index.seed_generation(max_persisted);
         for (_, cand) in best {
             let generation = self.reserve_generation();
             self.index

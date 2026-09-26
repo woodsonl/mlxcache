@@ -286,6 +286,26 @@ async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
         1,
         "the superseded generation is reclaimed"
     );
+
+    // Regression (Codex pass 8): after a restart the counter must be seeded above
+    // the persisted generation, so a NEW publication is not given a lower one and
+    // discarded by the next rebuild. Publish after rebuild; its name must encode
+    // a generation above 17.
+    let gen = orch.reserve_generation();
+    assert!(
+        gen > 17,
+        "counter must resume above the persisted max, got {gen}"
+    );
+    let newer = p.publish_atomic(0xabc, gen, &meta, b"newer").unwrap();
+    let orch2 = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let report2 = orch2.rebuild_from_disk(&p);
+    assert_eq!(report2.rebuilt, 1);
+    let out2 = orch2.route(&[1, 2, 3, 4], &fp);
+    assert_eq!(
+        out2.blob.as_ref().map(|(n, _, _)| n.as_str()),
+        newer.file_name().map(|n| n.to_string_lossy()).as_deref(),
+        "the newest publication survives a second restart"
+    );
 }
 
 #[cfg(unix)]

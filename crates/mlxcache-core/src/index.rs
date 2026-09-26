@@ -91,6 +91,15 @@ impl PrefixIndex {
             + 1
     }
 
+    /// Ensure the next reserved generation exceeds `max_persisted`. Called after
+    /// a startup rebuild so a restart cannot hand a new publication a LOWER
+    /// generation than a checkpoint already on disk — which the next rebuild
+    /// would then discard as an older generation, losing the new work.
+    pub fn seed_generation(&self, max_persisted: u64) {
+        self.next_generation
+            .fetch_max(max_persisted, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Publish an entry with a pre-reserved generation. Only callable for a prefix
     /// whose ancestors are consistent; the atomic blob rename must have completed
     /// BEFORE this call (R1-3).

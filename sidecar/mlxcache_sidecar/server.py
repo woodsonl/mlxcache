@@ -48,7 +48,6 @@ _SAFETENSORS_DTYPE_BYTES = {
     "F32": 4,
     "U64": 8,
     "I64": 8,
-    "F64": 8,
 }
 
 
