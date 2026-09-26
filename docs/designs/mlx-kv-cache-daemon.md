@@ -88,10 +88,14 @@ Before committing to checkpoint persistence: measure bytes/token for one represe
 - bytes/token: **57,344** (57 KB/token; 8K tokens = 459 MB → 50K tokens ≈ 2.9 GB, in the design's 1-5 GB envelope for a mid-size model)
 - serialize: **526 ms**; deserialize: **<1 ms** at 8K tokens; prefill **10.2 s**
 
-- **2s TTFT resume budget: HOLDS with margin** at both sizes — deserialize is negligible (memory-mapped); the dominant resume cost is delta prefill compute, not I/O. A hit eliminates the 10.2s prefill.
-- **Thesis guard PASSED at both sizes:** generation resumed from a saved-then-loaded prompt cache is token-for-token identical to scratch (`test_roundtrip_logits_identical`, `MLXCACHE_BENCH_REAL=1`). Disk tier viable; suspend/resume NOT deferred.
+*Qwen3-32B-4bit (the named representative, 64 layers):*
+- bytes/token: **262,150** (262 KB/token; 8K tokens = 2.1 GB → 50K tokens ≈ 13 GB, above the 1-5 GB envelope — see caveat)
+- serialize: **203 ms**; deserialize: **1 ms** at 2K tokens; prefill **11.1 s**
+
+- **2s TTFT resume budget: HOLDS with margin at all three sizes** — deserialize is negligible (memory-mapped); the dominant resume cost is delta prefill compute, not I/O. A hit eliminates the 10-11s prefill.
+- **Thesis guard PASSED at all three sizes:** generation resumed from a saved-then-loaded prompt cache is token-for-token identical to scratch. Additionally the real **adapter path** (`MlxLmEngine.prefill` → persisted blob → `generate_from_blob`, what the daemon actually calls) is token-identical to scratch, verifying the cache-convention fix (`test_adapter_prefill_resume_matches_scratch`). Disk tier viable; suspend/resume NOT deferred.
 - **Real daemon end-to-end verified** (7B-4bit): request 1 miss → checkpoint persisted (957 KB, 56 safetensors tensors = 28 layers × K,V) → request 2 hit reuses it. No errors.
-- Caveat: 32B-4bit (the named representative) pending; byte/token scales with layer count × hidden size, so expect ~3-4× the 7B figure. Identity + sub-ms deserialize are structural and expected to hold.
+- Caveat: byte/token scales with layer count × hidden size. At 32B-4bit, a 50K-token prefix is ~13 GB, beyond the 1-5 GB envelope the design assumed for a mid-size model; long-context 32B persistence needs the compression tier (fp8/quantized KV) rather than raw f16 KV. Identity + sub-ms deserialize hold structurally at every size.
 
 ### Success-criteria gating (R1-6, R1-7)
 

@@ -191,10 +191,6 @@ async fn chat_completions(
         kv_layout_version: 1,
     };
     let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
-    // Time from request start to the cache decision (= prefill + publish on a
-    // miss). This is the cache's contribution to TTFT; generation is measured
-    // separately so the field named `ttft_ms` does not silently exclude it.
-    let lookup_ms = started.elapsed().as_millis() as u64;
     // Compute the prefix key once: reused by the log line and (on miss) the
     // blob filename. Hashing a long prefix twice is wasted hot-path work.
     let hash = prefix_hash(&tokens);
@@ -273,6 +269,10 @@ async fn chat_completions(
         }
     }
 
+    // Time from request start to a usable cache state: routing plus, on a
+    // miss/partial, the leader's prefill and atomic publish (or the wait for a
+    // coalesced follower). This is the cache's real contribution to TTFT.
+    let lookup_ms = started.elapsed().as_millis() as u64;
     // Record + log the verdict the request saw: the leader a miss/partial (it
     // prefilled), a coalesced follower the hit/partial it adopted. Recording
     // after single-flight keeps stats truthful.

@@ -89,6 +89,7 @@ class MlxLmEngine:
         # identity. The vocab is deterministic and artifact-derived.
         self.tokenizer_hash = self._hash_vocab()
         self.kv_dtype = self._kv_dtype()
+        self.prefill_count = 0
 
     def _kv_dtype(self) -> str:
         """The KV/compute dtype this model will cache in (bf16 vs f16 changes the
@@ -141,6 +142,7 @@ class MlxLmEngine:
         import mlx.core as mx  # noqa: PLC0415
         from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
 
+        self.prefill_count = getattr(self, "prefill_count", 0) + 1
         # Cache convention (pinned; verified by the R1-5 thesis guard): the saved
         # cache covers tokens[:-1], NOT all tokens. On resume the adapter feeds
         # tokens[cached-1:] so the model predicts the final token from KV for the
