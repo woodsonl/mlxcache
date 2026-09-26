@@ -33,6 +33,7 @@ class SyntheticEngine:
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
         self.prefill_count = 0
+        self.tokenizer_hash = "synthetic"
 
     def tokenize(self, prompt: str) -> list[int]:
         # Deterministic token stream derived from the prompt hash. Not a real
@@ -79,9 +80,20 @@ class MlxLmEngine:
 
         self.model_id = model_id
         self.model, self.tokenizer = load(model_id)
-        self.tokenizer_hash = hashlib.sha256(
-            getattr(self.tokenizer, "name_or_path", model_id).encode()
-        ).hexdigest()[:16]
+        # Hash the vocabulary, not the model name: R1-2 pins the tokenizer
+        # artifact, and two different tokenizers can share a name_or_path-free
+        # identity. The vocab is deterministic and artifact-derived.
+        self.tokenizer_hash = self._hash_vocab()
+
+    def _hash_vocab(self) -> str:
+        vocab = getattr(self.tokenizer, "get_vocab", None)
+        if callable(vocab):
+            items = sorted(vocab().items())
+            payload = repr(items).encode()
+        else:
+            # Fall back to whatever identity the tokenizer exposes.
+            payload = repr(getattr(self.tokenizer, "name_or_path", self.model_id)).encode()
+        return hashlib.sha256(payload).hexdigest()[:16]
 
     def tokenize(self, prompt: str) -> list[int]:
         return self.tokenizer.encode(prompt)
@@ -299,7 +311,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/tokenize":
                 req = self._read_json()
                 tokens = self.engine.tokenize(req.get("prompt", ""))
-                self._json(200, {"tokens": tokens, "tokenizer_hash": "synthetic"})
+                self._json(
+                    200,
+                    {
+                        "tokens": tokens,
+                        "tokenizer_hash": getattr(self.engine, "tokenizer_hash", "synthetic"),
+                    },
+                )
             elif self.path == "/prefill":
                 req = self._read_json()
                 blob = self.engine.prefill(self._require(req, "tokens"))

@@ -28,6 +28,20 @@ def test_tokenize_deterministic(sidecar_url):
     assert all(0 <= t < 2**31 for t in r1["tokens"])
 
 
+def test_tokenize_returns_engine_hash_not_a_constant(sidecar_url):
+    # R1-2: the daemon pins THIS hash. A constant would let checkpoints from
+    # different tokenizers collide on fingerprint and be served wrongly.
+    r = httpx.post(f"{sidecar_url}/tokenize", json={"prompt": "x"}).json()
+    assert r["tokenizer_hash"] == "synthetic"  # the synthetic engine's own value
+    # It must come from the engine, not a hardcoded string in the handler.
+    server.Handler.engine.tokenizer_hash = "custom-abc"
+    try:
+        r2 = httpx.post(f"{sidecar_url}/tokenize", json={"prompt": "x"}).json()
+        assert r2["tokenizer_hash"] == "custom-abc"
+    finally:
+        server.Handler.engine.tokenizer_hash = "synthetic"
+
+
 def test_prefill_returns_raw_payload(sidecar_url):
     # The daemon owns the header; /prefill returns the raw payload bytes.
     tokens = [1, 2, 3, 4]
