@@ -278,46 +278,73 @@ async fn chat_completions(
                             format_version: 1,
                         };
                         let hash = blob_key(&fingerprint, &tokens);
-                        // Reserve the generation BEFORE writing so the on-disk
-                        // name is generation-specific (immutable). A republish
-                        // then never overwrites an earlier generation's file, so
-                        // a delayed retirement cannot delete a healthy
-                        // replacement.
-                        let generation = state.orchestrator.reserve_generation();
-                        let blob_name = format!("{:032x}-{:016x}.ckpt", hash, generation);
-                        match state
-                            .persistence
-                            .publish_atomic(hash, generation, &meta, &blob)
-                        {
-                            // ENOSPC rescue (registry): log and continue uncached.
-                            Err(e) => {
-                                tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
-                                lead.complete(Err(e.to_string()));
-                            }
-                            Ok(_) => {
-                                state.orchestrator.publish_checkpoint(
-                                    &state.persistence,
-                                    &tokens,
-                                    meta,
-                                    blob_name.clone(),
-                                    generation,
-                                );
-                                // The leader ran a FRESH prefill over the whole
-                                // prompt (the ancestor blob was not passed to the
-                                // adapter), so no prior-request KV was reused, even
-                                // on a partial. Report a miss with zero covered KV
-                                // so response, /stats, and the log agree on what
-                                // actually happened. Only generation resumes from
-                                // the blob just written; that is not reuse.
-                                outcome.decision = mlxcache_core::policy::PolicyDecision {
-                                    verdict: mlxcache_core::policy::CacheVerdict::Miss,
-                                    matched_tokens: 0,
-                                    request_tokens: tokens.len(),
-                                };
-                                outcome.prefill_from = 0;
-                                outcome.blob =
-                                    Some((blob_name.clone(), generation, tokens.clone()));
-                                lead.complete(Ok(blob_name));
+                        // Refuse before writing if the generation floor is unknown
+                        // (a failed startup scan): writing first would leak an
+                        // unindexed file on every request. Serve from scratch.
+                        if !state.orchestrator.can_publish() {
+                            // Floor unknown: don't write. Report a plain miss so
+                            // followers also serve from scratch (an empty name is
+                            // the "not cached" signal, not an error).
+                            tracing::warn!("not caching: startup recovery incomplete");
+                            outcome.decision = mlxcache_core::policy::PolicyDecision {
+                                verdict: mlxcache_core::policy::CacheVerdict::Miss,
+                                matched_tokens: 0,
+                                request_tokens: tokens.len(),
+                            };
+                            outcome.blob = None;
+                            outcome.prefill_from = 0;
+                            lead.complete(Ok(String::new()));
+                        } else {
+                            // Reserve the generation BEFORE writing so the on-disk
+                            // name is generation-specific (immutable). A republish
+                            // then never overwrites an earlier generation's file, so
+                            // a delayed retirement cannot delete a healthy
+                            // replacement.
+                            let generation = state.orchestrator.reserve_generation();
+                            let blob_name = format!("{:032x}-{:016x}.ckpt", hash, generation);
+                            match state
+                                .persistence
+                                .publish_atomic(hash, generation, &meta, &blob)
+                            {
+                                // ENOSPC rescue (registry): log and continue uncached.
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
+                                    lead.complete(Err(e.to_string()));
+                                }
+                                Ok(_) => {
+                                    let published = state.orchestrator.publish_checkpoint(
+                                        &state.persistence,
+                                        &tokens,
+                                        meta,
+                                        blob_name.clone(),
+                                        generation,
+                                    );
+                                    // publish_checkpoint is expected to succeed (we
+                                    // checked can_publish), but if the index rejected
+                                    // it, remove the now-unindexed file so it cannot
+                                    // leak.
+                                    if !published {
+                                        if let Err(e) = state.persistence.remove(&blob_name) {
+                                            tracing::warn!(error = %e, "could not remove unindexed blob");
+                                        }
+                                    }
+                                    // The leader ran a FRESH prefill over the whole
+                                    // prompt (the ancestor blob was not passed to the
+                                    // adapter), so no prior-request KV was reused, even
+                                    // on a partial. Report a miss with zero covered KV
+                                    // so response, /stats, and the log agree on what
+                                    // actually happened. Only generation resumes from
+                                    // the blob just written; that is not reuse.
+                                    outcome.decision = mlxcache_core::policy::PolicyDecision {
+                                        verdict: mlxcache_core::policy::CacheVerdict::Miss,
+                                        matched_tokens: 0,
+                                        request_tokens: tokens.len(),
+                                    };
+                                    outcome.prefill_from = 0;
+                                    outcome.blob =
+                                        Some((blob_name.clone(), generation, tokens.clone()));
+                                    lead.complete(Ok(blob_name));
+                                }
                             }
                         }
                     }

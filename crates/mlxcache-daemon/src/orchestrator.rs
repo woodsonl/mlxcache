@@ -134,6 +134,15 @@ impl Orchestrator {
         self.index.reserve_generation()
     }
 
+    /// Whether publishing is currently allowed. False after a failed startup
+    /// scan (the generation floor is unknown). Callers must check this BEFORE
+    /// writing a blob so a refusal does not leak an unindexed file.
+    pub fn can_publish(&self) -> bool {
+        !self
+            .recovery_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Mark a checkpoint unusable (R1-1): a blob that failed to load at request
     /// time is quarantined so identical requests stop hitting it and fall back to
     /// scratch instead of erroring forever. Keyed by the published blob name,
@@ -381,6 +390,10 @@ mod tests {
         assert!(
             !report.errors.is_empty(),
             "the scan must report the failure"
+        );
+        assert!(
+            !orch.can_publish(),
+            "publishing must be blocked after a failed scan"
         );
         assert!(
             !orch.publish_checkpoint(&missing, &[1, 2, 3], meta("m", 3), "blob".into(), 1),
