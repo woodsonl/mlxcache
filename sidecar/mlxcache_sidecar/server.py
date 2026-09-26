@@ -279,13 +279,18 @@ class MlxLmEngine:
 
         from .blob import decode  # noqa: PLC0415
 
+        # Read first: an OSError here (EIO, ENFILE, EMFILE, ENOMEM, a momentary
+        # disk fault) is TRANSIENT, not a bad checkpoint. Let it propagate as a
+        # 500 so the daemon retries without retiring a healthy entry.
+        with open(blob_path, "rb") as fh:
+            raw = fh.read()
         try:
-            with open(blob_path, "rb") as fh:
-                meta, payload = decode(fh.read())
-        except (OSError, ValueError) as exc:
-            # Unreadable file or a header that does not decode: the entry is
-            # bad, retire it rather than 502 forever.
-            raise CheckpointRejectedError(f"checkpoint unreadable: {exc}") from exc
+            meta, payload = decode(raw)
+        except (ValueError, KeyError, TypeError) as exc:
+            # A header that does not decode or lacks required fields is a bad
+            # checkpoint: retire it rather than 500 forever while it stays
+            # selectable.
+            raise CheckpointRejectedError(f"checkpoint header invalid: {exc}") from exc
         # The checkpoint prefix must be self-describing: only meta.tokens tells
         # us which prefix the KV actually covers. The daemon always writes
         # meta.tokens, so a blob the index matched WITHOUT them cannot be
@@ -465,17 +470,20 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/generate":
                 req = self._read_json()
                 tokens = self._require(req, "tokens")
-                # Real engines fail to load a missing/unreadable blob. Reject a
-                # non-empty blob_path whose file is absent, so the daemon's
-                # quarantine-and-retry path is exercised hermetically (the test
-                # deletes the blob between the miss and the repeat request).
+                # A MISSING blob is a bad checkpoint: 422 so the daemon
+                # quarantines it and retries from scratch. Use os.stat, not
+                # os.path.exists, so a transient stat failure (EIO, ENFILE)
+                # raises and becomes a 500 instead of being misread as "gone"
+                # and retiring a healthy entry. Real engines also fail to load a
+                # missing blob; this pre-check only makes the missing case a
+                # clean 422 before any bytes are written.
                 blob_path = req.get("blob_path")
-                if blob_path and not os.path.exists(blob_path):
-                    # The checkpoint the daemon asked us to resume from is gone:
-                    # a bad entry, not a request error. 422 so the daemon
-                    # quarantines it and retries from scratch.
-                    self._json(422, {"error": f"blob unreadable: {blob_path}"})
-                    return
+                if blob_path:
+                    try:
+                        os.stat(blob_path)
+                    except FileNotFoundError:
+                        self._json(422, {"error": f"blob missing: {blob_path}"})
+                        return
                 # Validate max_tokens before any bytes: a non-int here would
                 # blow up mid-stream after headers are sent (truncated 200), and
                 # a negative/huge value silently changes streaming. The daemon

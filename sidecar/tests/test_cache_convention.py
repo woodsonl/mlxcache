@@ -218,6 +218,43 @@ def test_corrupt_safetensors_load_is_rejected_not_500(monkeypatch, tmp_path):
         eng._load_cache_delta(tokens, path)
 
 
+def test_malformed_header_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex adversarial): a length-prefixed but schema-less header
+    # (e.g. {}) makes the JSON decode produce missing fields -> KeyError/TypeError.
+    # That is a bad checkpoint; it must be CheckpointRejectedError (422), not a
+    # 500 that leaves it selectable forever.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    path = str(tmp_path / "bad-header.ckpt")
+    body = b"{}"
+    with open(path, "wb") as fh:
+        fh.write(len(body).to_bytes(4, "little") + body + b"payload")
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_transient_read_error_is_not_quarantined(monkeypatch, tmp_path):
+    # Regression (Codex adversarial): a transient read failure (EIO/ENFILE) is
+    # NOT a bad checkpoint. It must propagate as-is (-> 500), not be converted to
+    # CheckpointRejectedError, so the daemon does not retire a healthy entry.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "healthy.ckpt"), tokens)
+
+    real_open = open
+
+    def _flaky_open(p, *a, **k):
+        if p == path:
+            raise OSError(5, "Input/output error")
+        return real_open(p, *a, **k)
+
+    monkeypatch.setattr("builtins.open", _flaky_open)
+    with pytest.raises(OSError):
+        eng._load_cache_delta(tokens, path)
+
+
 def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
     # adopted: resuming from the wrong KV generates silently wrong output. It is
