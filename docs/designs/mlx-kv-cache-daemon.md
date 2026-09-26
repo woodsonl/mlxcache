@@ -78,12 +78,20 @@ Sequencing: cache-max (universal proxy) ships first and proves the policy layer 
 
 Before committing to checkpoint persistence: measure bytes/token for one representative model (e.g. Qwen3-32B-4bit), measured serialize + deserialize wall time on the target disk, and derive whether the 2s TTFT resume budget holds. If the round-trip fails the budget, v1 ships memory-resident only and the disk tier waits for compression (fp8/quantized KV, CacheGen-style) — the suspend/resume criterion defers with it.
 
-**R1-5 MEASURED (2026-09-25, Qwen2-0.5B-Instruct, mlx-lm 0.31.3, Apple Silicon):**
-- bytes/token: **12,288** (12 KB/token; 8K tokens = 98 MB → 50K tokens ≈ 615 MB for this 24-layer model; larger models scale with layer count × hidden size)
+**R1-5 MEASURED (2026-09-25, mlx-lm 0.31.3, Apple Silicon):**
+
+*Qwen2-0.5B-Instruct (24 layers):*
+- bytes/token: **12,288** (12 KB/token; 8K tokens = 98 MB)
 - serialize: **20 ms**; deserialize: **<1 ms** (memory-mapped safetensors) at 8K tokens; prefill 697 ms
-- **2s TTFT resume budget: HOLDS with margin** — deserialize is negligible against the budget; the dominant resume cost is delta prefill compute, not I/O
-- **Thesis guard PASSED:** generation resumed from a saved-then-loaded prompt cache is token-for-token identical to scratch generation (`sidecar/tests/test_roundtrip_real.py::test_roundtrip_logits_identical`, `MLXCACHE_BENCH_REAL=1`). Disk tier is viable; suspend/resume criterion is NOT deferred.
-- Caveat: single small-model measurement. Re-run on the representative target model (Qwen3-32B-4bit) before treating the absolute byte figures as final; the identity result and sub-ms deserialize are structural and expected to hold.
+
+*Qwen2.5-7B-Instruct-4bit (28 layers, 4-bit):*
+- bytes/token: **57,344** (57 KB/token; 8K tokens = 459 MB → 50K tokens ≈ 2.9 GB, in the design's 1-5 GB envelope for a mid-size model)
+- serialize: **526 ms**; deserialize: **<1 ms** at 8K tokens; prefill **10.2 s**
+
+- **2s TTFT resume budget: HOLDS with margin** at both sizes — deserialize is negligible (memory-mapped); the dominant resume cost is delta prefill compute, not I/O. A hit eliminates the 10.2s prefill.
+- **Thesis guard PASSED at both sizes:** generation resumed from a saved-then-loaded prompt cache is token-for-token identical to scratch (`test_roundtrip_logits_identical`, `MLXCACHE_BENCH_REAL=1`). Disk tier viable; suspend/resume NOT deferred.
+- **Real daemon end-to-end verified** (7B-4bit): request 1 miss → checkpoint persisted (957 KB, 56 safetensors tensors = 28 layers × K,V) → request 2 hit reuses it. No errors.
+- Caveat: 32B-4bit (the named representative) pending; byte/token scales with layer count × hidden size, so expect ~3-4× the 7B figure. Identity + sub-ms deserialize are structural and expected to hold.
 
 ### Success-criteria gating (R1-6, R1-7)
 
