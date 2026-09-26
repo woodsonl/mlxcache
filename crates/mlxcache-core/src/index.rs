@@ -172,4 +172,24 @@ mod tests {
         index.publish(&[1, 2], meta(), "b".into());
         assert_eq!(index.published_count(), 2);
     }
+
+    #[test]
+    fn matched_never_exceeds_request_length() {
+        // A request that is a strict prefix of a longer published entry must
+        // NOT match the longer entry: the walk ends when request tokens run out,
+        // so no entry beyond the request tail is ever seen. This guards the
+        // invariant that `classify` can never see matched_tokens > request_tokens.
+        let index = PrefixIndex::new();
+        index.publish(&[1, 2, 3, 4, 5], meta(), "long".into());
+        assert!(
+            index.lookup(&[1, 2]).is_none(),
+            "short request must not match a longer entry"
+        );
+        // And the overlapping case: published [1,2], request [1,2,3] matches at 2.
+        let index = PrefixIndex::new();
+        index.publish(&[1, 2], meta(), "short".into());
+        let (_, matched) = index.lookup(&[1, 2, 3]).unwrap();
+        assert_eq!(matched, 2);
+        assert!(matched <= 3);
+    }
 }

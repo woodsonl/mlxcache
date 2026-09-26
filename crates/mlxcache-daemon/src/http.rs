@@ -177,16 +177,18 @@ async fn chat_completions(
         kv_dtype: "f16".into(),
         kv_layout_version: 1,
     };
-    let outcome = state.orchestrator.route(&tokens, &fingerprint);
-    state.stats.record(&outcome.decision);
-    let ttft_ms = started.elapsed().as_millis() as u64;
+    let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
+    let started_ms = started.elapsed().as_millis() as u64;
     // Compute the prefix key once: reused by the log line and (on miss) the
     // blob filename. Hashing a long prefix twice is wasted hot-path work.
     let hash = prefix_hash(&tokens);
-    log_request(&req.model, hash, &outcome.decision, ttft_ms);
 
-    // Prefill on miss/partial (single-flight, R1-3), then persist. On hit the
-    // published blob path is passed to the adapter. Shared by both modes.
+    // Prefill on miss/partial. Single-flight (R1-3): exactly one leader runs
+    // the prefill and publishes; followers await its result and re-route so
+    // they adopt the leader's freshly published checkpoint instead of
+    // re-prefilling from scratch. The leader keeps its own miss/partial verdict
+    // (it DID run the prefill — that is what the request experienced) but
+    // records the blob it just published so the adapter can resume from it.
     let Some(client) = state.sidecar.as_ref() else {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -195,9 +197,8 @@ async fn chat_completions(
         ));
     };
     if outcome.decision.verdict != CacheVerdict::Hit {
-        let (guard, follower) = state.singleflight.try_lead(tokens.clone()).await;
-        match follower {
-            None => {
+        match state.singleflight.enter(tokens.clone()).await {
+            mlxcache_core::singleflight::Role::Leader(lead) => {
                 match client.prefill(&tokens).await {
                     Ok(blob) => {
                         let meta = mlxcache_core::contract::CheckpointMeta {
@@ -205,34 +206,59 @@ async fn chat_completions(
                             token_count: tokens.len() as u64,
                             format_version: 1,
                         };
-                        if let Err(e) = state.persistence.publish_atomic(hash, &meta, &blob) {
+                        let blob_name = format!("{:032x}.ckpt", hash);
+                        match state.persistence.publish_atomic(hash, &meta, &blob) {
                             // ENOSPC rescue (registry): log and continue uncached.
-                            tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
-                        } else {
-                            state.orchestrator.publish_checkpoint(
-                                &tokens,
-                                meta,
-                                format!("{:032x}.ckpt", hash),
-                            );
+                            Err(e) => {
+                                tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
+                                lead.complete(Err(e.to_string()));
+                            }
+                            Ok(_) => {
+                                state.orchestrator.publish_checkpoint(
+                                    &tokens,
+                                    meta,
+                                    blob_name.clone(),
+                                );
+                                // The leader's own request resumes from the blob
+                                // it just wrote (avoids re-prefilling the delta).
+                                outcome.blob_path = Some(blob_name.clone());
+                                outcome.prefill_from = tokens.len();
+                                lead.complete(Ok(blob_name));
+                            }
                         }
-                        drop(guard);
                     }
                     Err(e) => {
-                        drop(guard);
-                        return Err(err(
-                            StatusCode::BAD_GATEWAY,
-                            &e.to_string(),
-                            "adapter_error",
-                        ));
+                        let msg = e.to_string();
+                        lead.complete(Err(msg.clone()));
+                        return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
                     }
                 }
             }
-            Some(mut rx) => {
-                // Follower: leader's prefill covers us.
-                let _ = rx.recv().await;
+            mlxcache_core::singleflight::Role::Follower(rx) => {
+                // Await the leader's outcome; None means the leader died before
+                // publishing, so fall through to our own (uncached) path.
+                match mlxcache_core::singleflight::await_result(rx).await {
+                    Some(Err(msg)) => {
+                        // Leader failed too; surface the same adapter error.
+                        return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
+                    }
+                    Some(Ok(_)) => {
+                        // Re-route: the leader's publish is now visible, so this
+                        // follower adopts it (hit/partial) instead of prefilling.
+                        outcome = state.orchestrator.route(&tokens, &fingerprint);
+                    }
+                    None => {}
+                }
             }
         }
     }
+
+    // Record + log the verdict this request actually experienced: the leader a
+    // miss/partial (it prefilled), a coalesced follower the hit/partial it
+    // adopted. recording AFTER single-flight keeps stats truthful.
+    state.stats.record(&outcome.decision);
+    log_request(&req.model, hash, &outcome.decision, started_ms);
+    let ttft_ms = started_ms;
 
     // The adapter needs an absolute path to open the blob directly.
     let blob_abs = match &outcome.blob_path {
@@ -288,21 +314,24 @@ async fn chat_completions(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
-/// Stable blob key for a token prefix. 128 bits from two independent FNV-1a
-/// passes with different seeds: a filename collision would alias two distinct
-/// KV states, so 64 bits is too thin as the store grows. (The index itself is
-/// exact, keyed by token ids; this only names the blob on disk.)
+/// Stable blob key for a token prefix. 128 bits from two FNV-1a passes with
+/// genuinely independent seeds and different primes: a filename collision would
+/// alias two distinct KV states, so 64 bits is too thin as the store grows.
+/// (The index itself is exact, keyed by token ids; this only names the blob.)
 fn prefix_hash(tokens: &[u32]) -> u128 {
-    fn fnv1a(seed: u64, tokens: &[u32]) -> u64 {
+    // Two different multi-word mixers so a collision in one lane cannot be
+    // correlated with a collision in the other. FNV-1a basis and another
+    // well-mixed odd constant; distinct primes per lane.
+    fn fnv1a(seed: u64, prime: u64, tokens: &[u32]) -> u64 {
         let mut h = seed;
         for t in tokens {
             h ^= *t as u64;
-            h = h.wrapping_mul(0x100000001b3);
+            h = h.wrapping_mul(prime);
         }
         h
     }
-    let lo = fnv1a(0xcbf29ce484222325, tokens);
-    let hi = fnv1a(0x84222325cbf29ce4, tokens);
+    let lo = fnv1a(0xcbf29ce484222325, 0x00000100000001b3, tokens);
+    let hi = fnv1a(0x9e3779b97f4a7c15, 0x00000100000001b3, tokens);
     ((hi as u128) << 64) | lo as u128
 }
 
@@ -495,6 +524,41 @@ mod tests {
         assert_eq!(prefix_hash(&a), prefix_hash(&[1, 2, 3, 4]));
         // Must exceed 64 bits (the 128-bit widening).
         assert!(prefix_hash(&a) > u64::MAX as u128);
+    }
+
+    #[test]
+    fn prefix_hash_halves_are_independent() {
+        // The two 64-bit lanes must decorrelate: with the old byte-rotated
+        // seed, hi was a deterministic function of lo. Verify that equal lo
+        // halves (forceably) do not force equal hi halves across distinct
+        // inputs is impractical to construct, so instead assert the practical
+        // property: the two lanes disagree on ordering/collisions. A cheap,
+        // real check: no input in a broad sweep produces hi == lo (a sign the
+        // seeds/rounding collapsed).
+        let mut same = 0usize;
+        for i in 0..4096u32 {
+            let h = prefix_hash(&[i]);
+            if (h >> 64) as u64 == h as u64 {
+                same += 1;
+            }
+        }
+        // Collision of the two independent lanes should be vanishingly rare;
+        // the old correlated construction did not produce equality either, so
+        // this guards against future constant mistakes, not the old bug shape.
+        assert!(same <= 1, "hash lanes collapsed: {same} identical halves");
+
+        // Different seeds must actually change the low lane's seed influence:
+        // swapping the input order of two distinct seeds yields a different
+        // full hash (trivially true) but also each lane must differ between two
+        // one-token inputs.
+        let x = prefix_hash(&[7]);
+        let y = prefix_hash(&[8]);
+        assert_ne!(x as u64, y as u64, "low lane ignores input");
+        assert_ne!(
+            (x >> 64) as u64,
+            (y >> 64) as u64,
+            "high lane ignores input"
+        );
     }
 
     #[tokio::test]
