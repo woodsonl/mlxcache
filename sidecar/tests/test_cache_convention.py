@@ -227,5 +227,50 @@ def test_recorded_prefix_wins_over_token_count(monkeypatch, tmp_path):
     assert prompt == [3, 4, 5]
 
 
+def test_legacy_one_token_checkpoint_is_not_adopted(monkeypatch, tmp_path):
+    # Regression (Codex P1): a pre-fix cache dir holds a NONEMPTY one-token
+    # checkpoint. It must be rejected on prefix length, not payload emptiness,
+    # or the hit path adopts it and feeds the single token twice.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [7]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=1,
+        tokens=tokens,
+    )
+    path = str(tmp_path / "legacy.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b"NONEMPTY_CACHE_BYTES"))
+    cache, prompt = eng._load_cache_delta(tokens, path)
+    assert cache is None, "a one-token checkpoint must never be adopted"
+    assert prompt == tokens
+
+
+def test_bad_token_count_without_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
+    # Regression (Codex P2): an old blob with no recorded tokens and an
+    # out-of-range or zero token_count must fall back to scratch. Slicing would
+    # silently clamp an oversized count and adopt a bogus cache.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    for bad in (0, -1, 9):
+        meta = blob.CheckpointMeta(
+            fingerprint=blob.Fingerprint(
+                model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+            ),
+            token_count=bad,
+            tokens=[],
+        )
+        path = str(tmp_path / f"bad{bad}.ckpt")
+        with open(path, "wb") as fh:
+            fh.write(blob.encode(meta, b"payload"))
+        cache, prompt = eng._load_cache_delta(tokens, path)
+        assert cache is None, f"token_count={bad} must not be adopted"
+        assert prompt == tokens
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

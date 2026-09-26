@@ -51,16 +51,18 @@ class SyntheticEngine:
     def prefill(self, tokens: list[int]) -> bytes:
         # KV payload: 1024 bytes/token, deterministic from token ids.
         self.prefill_count += 1
+        # Optional delay (test knob): widens the single-flight window so
+        # concurrent identical requests are provably coalesced. It runs BEFORE the
+        # empty-prefix return below so a one-token prompt also holds the window
+        # open, letting the concurrency test exercise the follower path.
+        delay = float(os.environ.get("MLXCACHE_PREFILL_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
         # A prompt shorter than 2 tokens has an empty cache prefix (mirrors
         # MlxLmEngine): cache nothing so the daemon skips publishing an empty
         # payload.
         if len(tokens) < 2:
             return b""
-        # Optional delay (test knob): widens the single-flight window so
-        # concurrent identical requests are provably coalesced.
-        delay = float(os.environ.get("MLXCACHE_PREFILL_DELAY", "0"))
-        if delay:
-            time.sleep(delay)
         payload = b"".join(
             ((t * 31 + i) & 0xFFFFFFFF).to_bytes(4, "little") * 256 for i, t in enumerate(tokens)
         )
@@ -246,16 +248,23 @@ class MlxLmEngine:
             return None, tokens
         # The checkpoint prefix is meta.tokens when recorded (self-describing);
         # old blobs fall back to the request's own prefix of length token_count.
-        prefix = meta.tokens if meta.tokens else tokens[: meta.token_count]
-        if len(prefix) > len(tokens):
+        # The prefix LENGTH is validated numerically, not by slicing: a bad
+        # token_count (0, negative, or larger than the request) must fall back to
+        # scratch, and Python slicing would silently clamp an oversized value.
+        prefix_len = len(meta.tokens) if meta.tokens else meta.token_count
+        if prefix_len < 2 or prefix_len > len(tokens):
+            # A prefix shorter than 2 caches nothing. This also rejects legacy
+            # one-token checkpoints whose nonempty KV already holds that token:
+            # adopting one and feeding the whole prompt would double-feed it.
             return None, tokens
+        prefix = meta.tokens if meta.tokens else tokens[:prefix_len]
         # The adapter is a trust boundary: verify the blob really covers this
         # request's prefix. If the recorded prefix disagrees with the request,
         # the blob belongs to a different prefix and resuming from it would
         # generate silently wrong output. Fall back to scratch.
-        if prefix != tokens[: len(prefix)]:
+        if prefix != tokens[:prefix_len]:
             return None, tokens
-        covered = max(len(prefix) - 1, 0)
+        covered = prefix_len - 1
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
             tmp = fh.name
             fh.write(payload)

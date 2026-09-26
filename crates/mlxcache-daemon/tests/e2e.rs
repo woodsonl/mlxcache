@@ -158,10 +158,12 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
     // The follower path for the empty-blob (no-publish) case: N concurrent
     // one-token requests coalesce on a leader whose payload is empty. The leader
     // signals "no blob" (empty name); every follower must run from scratch, all
-    // must be served, and no checkpoint may be published.
+    // must be served, and no checkpoint may be published. The prefill delay makes
+    // coalescing observable (the adapter holds the window open before returning
+    // the empty payload).
     let Some((sidecar_url, mut child)) = spawn_sidecar_with_env(&[
         ("MLXCACHE_TOKENIZE_ONE", "1"),
-        ("MLXCACHE_PREFILL_DELAY", "0.3"),
+        ("MLXCACHE_PREFILL_DELAY", "0.4"),
     ])
     .await
     else {
@@ -175,7 +177,8 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
         served_models: vec!["e2e-model".into()],
         sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
     });
@@ -212,6 +215,19 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
     for h in handles {
         assert_eq!(h.await.unwrap(), "miss", "nothing was cached");
     }
+    // The delay makes a single leader observable: N identical requests must
+    // coalesce to exactly one prefill, so the follower branch is exercised.
+    let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["prefill_count"].as_u64(),
+        Some(1),
+        "N={N} one-token requests must coalesce to 1 prefill; got {stats}"
+    );
     assert_eq!(
         state.persistence.list_blobs().unwrap().len(),
         0,
