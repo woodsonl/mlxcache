@@ -66,6 +66,15 @@ impl SidecarClient {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(120);
+        Self::with_timeout(config, timeout_s)
+    }
+
+    /// Build with an explicit timeout (testable without mutating global env).
+    pub fn with_timeout(config: SidecarConfig, timeout_s: u64) -> Result<Self, SidecarError> {
+        // ponytail: this is a total request timeout, so it also bounds a
+        // streaming generation's wall time. Fine at max_tokens=64; if a future
+        // long-generation mode is added, drop the client timeout for streams and
+        // apply a connect-only timeout instead.
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_s))
             .build()
@@ -221,11 +230,11 @@ mod tests {
         // daemon (regression: the builder previously had no timeout at all).
         // 203.0.113.0/24 (TEST-NET-3) is non-routable, so a connect never
         // completes; the client must give up within its configured timeout.
-        std::env::set_var("MLXCACHE_SIDECAR_TIMEOUT_S", "1");
-        let c = SidecarClient::new(SidecarConfig::new(
-            "http://203.0.113.1:9".into(),
-            "m".into(),
-        ))
+        // Uses with_timeout (not global env) so parallel tests are not raced.
+        let c = SidecarClient::with_timeout(
+            SidecarConfig::new("http://203.0.113.1:9".into(), "m".into()),
+            1,
+        )
         .expect("client builds");
         let start = std::time::Instant::now();
         let res = c.tokenize("x").await;
@@ -235,6 +244,5 @@ mod tests {
             "must respect the configured timeout, took {:?}",
             start.elapsed()
         );
-        std::env::remove_var("MLXCACHE_SIDECAR_TIMEOUT_S");
     }
 }
