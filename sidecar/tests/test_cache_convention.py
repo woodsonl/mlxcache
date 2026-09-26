@@ -1,13 +1,15 @@
 """Hermetic tests for MlxLmEngine's cache convention (no MLX, no model).
 
 Pins the invariant the R1-5 thesis guard proves on real hardware: the saved
-checkpoint cache covers tokens[:-1], and the resume path feeds tokens[cached-1:]
-so the model predicts the final token from KV of the preceding ones. If the two
-halves disagree, every cache hit generates different output than a scratch run.
+checkpoint cache covers prefix[:-1], and the resume path feeds the uncovered tail
+(tokens[len(prefix)-1:]) so the model predicts the final token from KV of the
+preceding ones. If the two halves disagree, every cache hit generates different
+output than a scratch run.
 """
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import types
 
@@ -38,7 +40,7 @@ class FakeArray:
         return (1, len(self._d))
 
 
-def _install_fake_mlx(monkeypatch):
+def _install_fake_mlx(monkeypatch, on_load=None):
     """Install just enough of mlx / mlx_lm.models.cache to drive MlxLmEngine.
 
     Returns (prefill_lengths, model): the model records the token count it was
@@ -62,10 +64,15 @@ def _install_fake_mlx(monkeypatch):
     mx = types.ModuleType("mlx")
     mx.core = core
 
+    def _load(path):
+        if on_load is not None:
+            on_load()
+        return FakeCache(saved.get(path, 0))
+
     cache_mod = types.ModuleType("mlx_lm.models.cache")
     cache_mod.make_prompt_cache = lambda model: FakeCache(0)
     cache_mod.save_prompt_cache = lambda path, cache: saved.__setitem__(path, cache.len)
-    cache_mod.load_prompt_cache = lambda path: FakeCache(saved.get(path, 0))
+    cache_mod.load_prompt_cache = _load
 
     mlx_lm = types.ModuleType("mlx_lm")
     mlx_lm.models = types.ModuleType("mlx_lm.models")
@@ -111,13 +118,15 @@ def test_prefill_seeds_the_cache_with_tokens_minus_one(monkeypatch):
     assert prefilled == [3]
 
 
-def test_single_token_prefill_seeds_the_one_token(monkeypatch):
-    # tokens[:-1] is empty for a one-token prompt; seed the token instead of
-    # crashing on an empty prefill.
+def test_single_token_prefill_caches_nothing(monkeypatch):
+    # A one-token prompt has an empty prefix; mlx-lm cannot save/load an empty
+    # prompt cache, and there is nothing to cache. prefill must not call the model
+    # and must return an empty payload so the daemon skips publishing.
     prefilled, model = _install_fake_mlx(monkeypatch)
     eng = _engine(model)
-    eng.prefill([7])
-    assert prefilled == [1]
+    payload = eng.prefill([7])
+    assert prefilled == [], "a one-token seed must not call the model"
+    assert payload == b"", "a one-token prefill must cache nothing"
 
 
 def test_resume_feeds_from_one_before_the_cached_count(monkeypatch, tmp_path):
@@ -126,21 +135,74 @@ def test_resume_feeds_from_one_before_the_cached_count(monkeypatch, tmp_path):
     tokens = [1, 2, 3, 4, 5]
     blob_path = _write_blob(str(tmp_path / "b.ckpt"), tokens[:4])
     _cache, prompt = eng._load_cache_delta(tokens, blob_path)
-    # Cache holds 4, so feed tokens[3:] and the model predicts token 5.
+    # The cache covers prefix[:-1] = 3 tokens, so feed tokens[3:] and the model
+    # predicts token 5 from the KV of tokens 1..3.
     assert prompt == [4, 5]
 
 
 def test_seed_plus_delta_covers_the_whole_prompt(monkeypatch, tmp_path):
-    # The end-to-end invariant: prefill(tokens) seeds len(tokens)-1, resume
-    # feeds tokens[cached-1:], and together they cover every token exactly once.
+    # The end-to-end invariant: prefill(tokens) seeds len(tokens)-1, resume feeds
+    # the uncovered tail, and together they cover every token exactly once.
+    # Checked for a multi-token prompt AND a one-token prompt (regression: the
+    # one-token case used to feed the token twice).
     prefilled, model = _install_fake_mlx(monkeypatch)
     eng = _engine(model)
-    tokens = [1, 2, 3, 4, 5, 6]
-    eng.prefill(tokens)
-    seeded = prefilled[-1]
-    blob_path = _write_blob(str(tmp_path / "b.ckpt"), tokens)
-    _cache, prompt = eng._load_cache_delta(tokens, blob_path)
-    assert seeded + len(prompt) == len(tokens)
+    for tokens in ([1, 2, 3, 4, 5, 6], [7]):
+        prefilled.clear()
+        eng.prefill(tokens)
+        seeded = prefilled[-1] if prefilled else 0
+        blob_path = _write_blob(str(tmp_path / f"b{len(tokens)}.ckpt"), tokens)
+        _cache, prompt = eng._load_cache_delta(tokens, blob_path)
+        assert seeded + len(prompt) == len(tokens), (
+            f"tokens={tokens} seeded={seeded} delta={prompt}"
+        )
+
+
+def test_empty_payload_blob_is_not_adopted(monkeypatch, tmp_path):
+    # A checkpoint with no KV payload (a one-token prompt) must run from scratch,
+    # not attempt to load an empty mlx-lm cache.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [7]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "empty.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b""))
+    cache, prompt = eng._load_cache_delta(tokens, path)
+    assert cache is None
+    assert prompt == tokens
+
+
+def test_truncated_multi_token_blob_raises_for_quarantine(monkeypatch, tmp_path):
+    # Regression (structured Codex review): a MULTI-token checkpoint truncated to
+    # a valid header and empty payload is corrupt, not uncacheable. The loader
+    # must be attempted so the failure propagates and the daemon quarantines it.
+    # Swallowing it as scratch would report a hit and recompute forever.
+    loaded = []
+    _install_fake_mlx(monkeypatch, on_load=lambda: loaded.append(True))
+    eng = _engine()
+    tokens = [1, 2, 3]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "truncated.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b""))  # header valid, KV missing
+    # A real empty safetensors raises; the daemon quarantines. Here the fake
+    # loader records the attempt, which is the behavior under test.
+    with contextlib.suppress(Exception):
+        eng._load_cache_delta(tokens, path)
+    assert loaded, "a truncated multi-token blob must reach the loader, not be swallowed"
 
 
 def test_blob_for_a_different_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
@@ -173,6 +235,73 @@ def test_blob_without_recorded_prefix_is_still_adopted(monkeypatch, tmp_path):
     cache, prompt = eng._load_cache_delta(tokens, path)
     assert cache is not None
     assert prompt == [4, 5]
+
+
+def test_recorded_prefix_wins_over_token_count(monkeypatch, tmp_path):
+    # When a blob records meta.tokens, its length defines the prefix; token_count
+    # is ignored for the delta. A blob whose token_count disagrees must still
+    # resume from tokens[len(prefix)-1:], not token_count.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3, 4, 5]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=4,  # stale/lying; the recorded prefix is authoritative
+        tokens=[1, 2, 3],
+    )
+    path = str(tmp_path / "mismatch.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b"payload"))
+    _cache, prompt = eng._load_cache_delta(tokens, path)
+    # prefix = [1,2,3] -> covered = 2 -> delta = tokens[2:]
+    assert prompt == [3, 4, 5]
+
+
+def test_legacy_one_token_checkpoint_is_not_adopted(monkeypatch, tmp_path):
+    # Regression (Codex P1): a pre-fix cache dir holds a NONEMPTY one-token
+    # checkpoint. It must be rejected on prefix length, not payload emptiness,
+    # or the hit path adopts it and feeds the single token twice.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [7]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=1,
+        tokens=tokens,
+    )
+    path = str(tmp_path / "legacy.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b"NONEMPTY_CACHE_BYTES"))
+    cache, prompt = eng._load_cache_delta(tokens, path)
+    assert cache is None, "a one-token checkpoint must never be adopted"
+    assert prompt == tokens
+
+
+def test_bad_token_count_without_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
+    # Regression (Codex P2): an old blob with no recorded tokens and an
+    # out-of-range or zero token_count must fall back to scratch. Slicing would
+    # silently clamp an oversized count and adopt a bogus cache.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    for bad in (0, -1, 9):
+        meta = blob.CheckpointMeta(
+            fingerprint=blob.Fingerprint(
+                model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+            ),
+            token_count=bad,
+            tokens=[],
+        )
+        path = str(tmp_path / f"bad{bad}.ckpt")
+        with open(path, "wb") as fh:
+            fh.write(blob.encode(meta, b"payload"))
+        cache, prompt = eng._load_cache_delta(tokens, path)
+        assert cache is None, f"token_count={bad} must not be adopted"
+        assert prompt == tokens
 
 
 if __name__ == "__main__":

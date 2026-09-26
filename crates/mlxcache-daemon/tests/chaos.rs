@@ -118,6 +118,34 @@ fn crash_before_rename_never_serves_partial() {
     assert_eq!(payload, b"complete-kv");
 }
 
+#[test]
+fn rebuild_skips_one_token_legacy_blob() {
+    // Regression (adversarial F1): a legacy one-token checkpoint (nonempty KV,
+    // token_count=1) must not be indexed on rebuild. Otherwise the daemon
+    // reports a "hit" the adapter refuses to serve, so the client sees a hit
+    // that silently ran from scratch.
+    let dir = tempfile::tempdir().unwrap();
+    let p = mlxcache_daemon::persistence::Persistence::new(dir.path()).unwrap();
+    let meta = CheckpointMeta {
+        fingerprint: mlxcache_daemon::orchestrator::test_support::fp("m"),
+        token_count: 1,
+        tokens: vec![7],
+        format_version: 1,
+    };
+    p.publish_atomic(0x1, &meta, b"nonempty-legacy-kv").unwrap();
+
+    let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let report = orch.rebuild_from_disk(&p);
+    assert_eq!(report.rebuilt, 0, "a one-token blob must not be indexed");
+    assert_eq!(report.skipped, 1);
+    let out = orch.route(&[7], &mlxcache_daemon::orchestrator::test_support::fp("m"));
+    assert_eq!(
+        out.decision.verdict,
+        mlxcache_core::policy::CacheVerdict::Miss,
+        "no indexed one-token entry, so the request is an honest miss"
+    );
+}
+
 #[tokio::test]
 async fn restart_drops_streams_checkpoints_survive() {
     // R1-4: a "restart" is a fresh Orchestrator; checkpoints published to

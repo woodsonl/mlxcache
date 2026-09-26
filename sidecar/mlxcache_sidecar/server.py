@@ -42,17 +42,30 @@ class SyntheticEngine:
         # Test knob: emulate a real tokenizer returning zero tokens.
         if os.environ.get("MLXCACHE_TOKENIZE_EMPTY") == "1":
             return []
+        # Test knob: emulate a one-token prompt (nothing cacheable).
+        if os.environ.get("MLXCACHE_TOKENIZE_ONE") == "1":
+            return [12345]
         digest = hashlib.sha256(prompt.encode()).digest()
         return [int.from_bytes(digest[i : i + 4], "little") % 2**31 for i in range(0, 32, 4)]
 
     def prefill(self, tokens: list[int]) -> bytes:
         # KV payload: 1024 bytes/token, deterministic from token ids.
+        # ponytail: test-only counter; ThreadingHTTPServer is thread-per-request
+        # but the GIL makes this increment effectively safe. Add a lock if the
+        # coalescing e2e ever sees a lost count.
         self.prefill_count += 1
         # Optional delay (test knob): widens the single-flight window so
-        # concurrent identical requests are provably coalesced.
+        # concurrent identical requests are provably coalesced. It runs BEFORE the
+        # empty-prefix return below so a one-token prompt also holds the window
+        # open, letting the concurrency test exercise the follower path.
         delay = float(os.environ.get("MLXCACHE_PREFILL_DELAY", "0"))
         if delay:
             time.sleep(delay)
+        # A prompt shorter than 2 tokens has an empty cache prefix (mirrors
+        # MlxLmEngine): cache nothing so the daemon skips publishing an empty
+        # payload.
+        if len(tokens) < 2:
+            return b""
         payload = b"".join(
             ((t * 31 + i) & 0xFFFFFFFF).to_bytes(4, "little") * 256 for i, t in enumerate(tokens)
         )
@@ -144,15 +157,17 @@ class MlxLmEngine:
 
         self.prefill_count = getattr(self, "prefill_count", 0) + 1
         # Cache convention (pinned; verified by the R1-5 thesis guard): the saved
-        # cache covers tokens[:-1], NOT all tokens. On resume the adapter feeds
-        # tokens[cached-1:] so the model predicts the final token from KV for the
-        # preceding ones — identical to a scratch run. Caching all tokens here
-        # (the earlier behavior) double-fed the last token and diverged from the
-        # guard's proven semantics on every hit.
-        # A single-token prompt has an empty prefix: cache the one token so the
-        # resume path still has a valid (length-1) cache to feed from.
-        seed = tokens[:-1] if len(tokens) > 1 else tokens
-        cache, _ = self._prefill_cache(seed)
+        # cache covers tokens[:-1], NOT all tokens. On resume the adapter feeds the
+        # uncovered tail (tokens[len(prefix)-1:]) so the model predicts the final
+        # token from KV of the preceding ones — identical to a scratch run.
+        #
+        # A one-token prompt has an empty prefix: mlx-lm cannot save/load an empty
+        # prompt cache, and there is nothing to cache, so return no payload. The
+        # daemon skips publishing an empty payload and the request runs from
+        # scratch.
+        if len(tokens) < 2:
+            return b""
+        cache, _ = self._prefill_cache(tokens[:-1])
         # safetensors needs a real file; write to a temp, then read the bytes.
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
             tmp = fh.name
@@ -218,27 +233,52 @@ class MlxLmEngine:
         return out
 
     def _load_cache_delta(self, tokens: list[int], blob_path: str):
-        """Returns (cache, delta_prompt) or (None, tokens). See generate_from_blob."""
+        """Returns (cache, delta_prompt) or (None, tokens). See generate_from_blob.
+
+        The persisted cache covers the checkpoint prefix MINUS its final token
+        (see prefill), so the delta is exactly the tokens the cache does not
+        cover: tokens[covered:]. Uniform for every prompt length, including a
+        one-token prompt whose cache covers 0 tokens (delta = the whole prompt)."""
         from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
 
         from .blob import decode  # noqa: PLC0415
 
         with open(blob_path, "rb") as fh:
             meta, payload = decode(fh.read())
-        cached = meta.token_count
-        if cached <= 0 or cached > len(tokens):
+        # The checkpoint prefix is meta.tokens when recorded (self-describing);
+        # old blobs fall back to the request's own prefix of length token_count.
+        # The prefix LENGTH is validated numerically, not by slicing: a bad
+        # token_count (0, negative, or larger than the request) must fall back to
+        # scratch, and Python slicing would silently clamp an oversized value.
+        prefix_len = len(meta.tokens) if meta.tokens else meta.token_count
+        if prefix_len < 2 or prefix_len > len(tokens):
+            # A prefix shorter than 2 caches nothing. This also rejects legacy
+            # one-token checkpoints whose nonempty KV already holds that token:
+            # adopting one and feeding the whole prompt would double-feed it.
             return None, tokens
+        # A multi-token checkpoint with no KV payload is CORRUPT (a truncated
+        # write), not uncacheable: return it to the loader so the failure
+        # propagates and the daemon quarantines the entry. Only an uncacheable
+        # prefix (<2 tokens, above) legitimately has an empty payload.
+        prefix = meta.tokens if meta.tokens else tokens[:prefix_len]
         # The adapter is a trust boundary: verify the blob really covers this
-        # request's prefix. If meta.tokens disagrees with tokens[:cached], the
-        # blob belongs to a different prefix and resuming from it would generate
-        # silently wrong output. Fall back to scratch.
-        if meta.tokens and meta.tokens != tokens[:cached]:
+        # request's prefix. If the recorded prefix disagrees with the request,
+        # the blob belongs to a different prefix and resuming from it would
+        # generate silently wrong output. Fall back to scratch.
+        # ponytail: when meta.tokens is absent this check is self-satisfying, so a
+        # legacy blob is trusted via the daemon's index. That is safe on the
+        # deployed path: the daemon only ever hands a blob_path it indexed, and
+        # rebuild_from_disk index only blobs with a recorded tokens prefix. A
+        # direct adapter call against an unindexed legacy blob is trusted by
+        # construction; require a recorded prefix here if that becomes reachable.
+        if prefix != tokens[:prefix_len]:
             return None, tokens
+        covered = prefix_len - 1
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
             tmp = fh.name
             fh.write(payload)
         try:
-            return load_prompt_cache(tmp), tokens[cached - 1 :]
+            return load_prompt_cache(tmp), tokens[covered:]
         finally:
             os.unlink(tmp)
 
