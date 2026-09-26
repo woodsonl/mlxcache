@@ -219,7 +219,10 @@ async fn chat_completions(
     }
 
     // Generate: full context tokens, continuation from the request length.
-    let generated = match client.generate(&tokens, outcome.prefill_from, 64).await {
+    let generated = match client
+        .generate(&tokens, outcome.prefill_from, 64, outcome.blob_path.as_deref())
+        .await
+    {
         Ok(t) => t,
         Err(e) => return Err(err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error")),
     };

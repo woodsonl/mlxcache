@@ -87,6 +87,7 @@ impl SidecarClient {
         tokens: &[u32],
         prefill_from: usize,
         max_tokens: usize,
+        blob_path: Option<&str>,
     ) -> Result<Vec<u32>, SidecarError> {
         let url = format!("{}/generate", self.config.base_url);
         let resp = self
@@ -96,6 +97,7 @@ impl SidecarClient {
                 "tokens": tokens,
                 "prefill_from": prefill_from,
                 "max_tokens": max_tokens,
+                "blob_path": blob_path,
             }))
             .send()
             .await
