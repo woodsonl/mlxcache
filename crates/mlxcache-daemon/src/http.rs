@@ -442,6 +442,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_json_rejected() {
+        // Registry row: malformed JSON -> 400 (axum's Json extractor rejects
+        // before the handler runs; the body must still be a 4xx, not a 500).
+        let res = post_json(app(), r#"{"model": broken"#).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn missing_required_field_rejected() {
+        // model present, messages absent -> deserialization error -> 4xx.
+        let res = post_json(app(), r#"{"model":"test-model"}"#).await;
+        assert!(res.status().is_client_error(), "got {}", res.status());
+    }
+
+    #[tokio::test]
     async fn unknown_model_404_before_lookup() {
         let res = post_json(
             app(),
