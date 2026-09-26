@@ -79,14 +79,16 @@ impl PrefixIndex {
     ///
     /// The daemon caches KV for `tokens[:-1]`, so a published entry must hold at
     /// least 2 tokens (a shorter prefix caches nothing and `lookup` would return
-    /// `matched_tokens < 2`). The hot path and `rebuild_from_disk` already skip
-    /// such prefixes; this asserts the invariant at the layer that owns it.
+    /// `matched_tokens < 2`, classifying a request hit/partial with zero covered
+    /// KV). Enforced in release, not only debug: the adapter (sidecar) is a trust
+    /// boundary, and a non-conforming adapter could return a non-empty payload
+    /// for a 1-token prompt. A short prefix is silently not published, matching
+    /// the caller's "empty blob means nothing cached" convention; never panic, so
+    /// a hostile adapter cannot crash the daemon.
     pub fn publish(&self, tokens: &[u32], meta: CheckpointMeta, blob_path: String) {
-        debug_assert!(
-            tokens.len() >= 2,
-            "publish requires a >=2-token prefix (KV covers tokens[:-1]); got {}",
-            tokens.len()
-        );
+        if tokens.len() < 2 {
+            return;
+        }
         let mut root = self.write_lock();
         let mut node: &mut Node = &mut root;
         for t in tokens {
@@ -217,18 +219,22 @@ mod tests {
     #[test]
     fn published_prefix_shorter_than_two_never_serves_kv() {
         // Invariant the daemon relies on: a published checkpoint caches KV for
-        // tokens[:-1], so it must hold at least 2 tokens. The index must refuse
-        // (in debug builds) to publish anything shorter, or `lookup` could return
-        // matched_tokens < 2 and the request would be classified hit/partial with
-        // zero covered KV. publish_checkpoint already skips <2 on rebuild; this
-        // pins the guarantee at the index itself.
+        // tokens[:-1], so it must hold at least 2 tokens. A shorter prefix must
+        // not be published, or `lookup` could return matched_tokens < 2 and the
+        // request would be classified hit/partial with zero covered KV. The guard
+        // is a real release-time check (the adapter is a trust boundary), so a
+        // short prefix is silently dropped rather than indexed. Uses a prefix
+        // whose second token would otherwise make lookup succeed at depth 1.
         let index = PrefixIndex::new();
-        let one = std::panic::catch_unwind(|| {
-            index.publish(&[42], meta(), "short".into());
-        });
+        index.publish(&[42], meta(), "short".into());
+        assert_eq!(
+            index.published_count(),
+            0,
+            "a 1-token prefix must not index"
+        );
         assert!(
-            one.is_err(),
-            "publishing a 1-token prefix must trip the index invariant"
+            index.lookup(&[42]).is_none(),
+            "a 1-token prefix must never match"
         );
     }
 

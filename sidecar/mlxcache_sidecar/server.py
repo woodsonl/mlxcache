@@ -356,8 +356,20 @@ class Handler(BaseHTTPRequestHandler):
         """Stream generation as newline-delimited JSON: one line per token,
         then a final done line. Framed by connection close (HTTP/1.0-style)
         so reqwest reads until EOF — no hand-rolled chunked encoding."""
-        # Validation happens in do_POST BEFORE any bytes are sent, so a bad
-        # request can still yield a clean 400 rather than a truncated 200.
+        # Prime the generator BEFORE sending 200. Loading the checkpoint happens
+        # on the first step of the engine's stream generator; if the blob is
+        # corrupt or unreadable, that raises here and do_POST maps it to a clean
+        # 500. Once bytes are sent we can only truncate, and a truncated 200
+        # leaves the daemon's stream path unable to quarantine the bad checkpoint
+        # (it sees success, then a broken stream).
+        gen = self.engine.stream(tokens, blob_path)
+        try:
+            first = next(gen)
+        except StopIteration:
+            first = None
+
+        # Validation happens before any bytes are sent, so a load failure still
+        # yields a clean 500 rather than a truncated 200.
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Connection", "close")
@@ -366,13 +378,19 @@ class Handler(BaseHTTPRequestHandler):
 
         n = 0
         try:
-            for token, text in self.engine.stream(tokens, blob_path):
-                line = (json.dumps({"token": token, "text": text}) + "\n").encode()
-                self.wfile.write(line)
+            if first is not None:
+                token, text = first
+                self.wfile.write((json.dumps({"token": token, "text": text}) + "\n").encode())
                 self.wfile.flush()
                 n += 1
-                if n >= max_tokens:
+            while n < max_tokens:
+                try:
+                    token, text = next(gen)
+                except StopIteration:
                     break
+                self.wfile.write((json.dumps({"token": token, "text": text}) + "\n").encode())
+                self.wfile.flush()
+                n += 1
             self.wfile.write((json.dumps({"done": True, "tokens": n}) + "\n").encode())
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

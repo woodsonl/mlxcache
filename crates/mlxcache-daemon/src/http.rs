@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use mlxcache_core::contract::ModelFingerprint;
-use mlxcache_core::policy::{CacheVerdict, PolicyDecision};
+use mlxcache_core::policy::{covered_kv_tokens, CacheVerdict, PolicyDecision};
 use mlxcache_core::singleflight::SingleFlight;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -91,9 +91,33 @@ impl Stats {
         // tokens_cached counts KV actually in hand (covered = matched-1), the
         // same value the response reports as tokens_cached/prefill_from. Counting
         // matched_tokens here would overstate reuse by one per hit.
-        s.tokens_cached +=
-            mlxcache_core::policy::covered_kv_tokens(d.verdict, d.matched_tokens) as u64;
+        s.tokens_cached += covered_kv_tokens(d.verdict, d.matched_tokens) as u64;
         s.tokens_total += d.request_tokens as u64;
+    }
+
+    /// Correct a decision whose checkpoint was retired (quarantined) after
+    /// `record`: no KV was actually reused, so drop the covered count and move
+    /// the verdict to a miss. Otherwise /stats and hit_rate report reuse for a
+    /// request that ran from scratch. The per-response body is already corrected
+    /// on the retire path; this keeps the aggregate consistent with it.
+    ///
+    /// No-op for a decision already recorded as Miss: a cold-miss leader keeps
+    /// its miss verdict while adopting the blob it just published, and retiring
+    /// that blob must not count a second miss for the one request.
+    pub fn correct_retire(&self, d: &PolicyDecision) {
+        if d.verdict == CacheVerdict::Miss {
+            return;
+        }
+        let mut s = self.lock();
+        match d.verdict {
+            CacheVerdict::Hit => s.hits = s.hits.saturating_sub(1),
+            CacheVerdict::Partial => s.partials = s.partials.saturating_sub(1),
+            CacheVerdict::Miss => {}
+        }
+        s.misses += 1;
+        s.tokens_cached = s
+            .tokens_cached
+            .saturating_sub(covered_kv_tokens(d.verdict, d.matched_tokens) as u64);
     }
 }
 
@@ -221,7 +245,12 @@ async fn chat_completions(
                     // an empty name is the sentinel for "nothing published"; the
                     // follower branch below treats an empty name as a no-blob miss
                     // and runs from scratch too.
-                    Ok(blob) if blob.is_empty() => {
+                    //
+                    // A <2-token prefix caches nothing even if a non-conforming
+                    // adapter returned bytes: the index refuses to key it, so
+                    // persisting and adopting it would write a blob no lookup can
+                    // serve and hand the adapter a checkpoint covering zero KV.
+                    Ok(blob) if blob.is_empty() || tokens.len() < 2 => {
                         // Force a scratch decision so this request and every
                         // follower report the same verdict: nothing was cached,
                         // so no blob may be resumed from even if a shorter
@@ -259,13 +288,15 @@ async fn chat_completions(
                                     meta,
                                     blob_name.clone(),
                                 );
-                                // The leader's own request resumes from the blob it
-                                // just wrote (avoids re-prefilling the delta). The
-                                // blob holds KV for tokens[:-1], so the covered
-                                // count is len-1, matching hit/partial and the
-                                // field's contract.
+                                // The leader's generation resumes from the blob it
+                                // just wrote (avoids re-prefilling the delta), but
+                                // that is not cross-request cache reuse: the KV was
+                                // built by THIS request, not served from an earlier
+                                // one. Keep the routed covered count (0 on a cold
+                                // miss, matched-1 on a partial) so the response,
+                                // /stats, the log, and README's "0 on a miss" all
+                                // agree. Only blob_path drives generation.
                                 outcome.blob_path = Some(blob_name.clone());
-                                outcome.prefill_from = tokens.len().saturating_sub(1);
                                 lead.complete(Ok(blob_name));
                             }
                         }
@@ -350,6 +381,9 @@ async fn chat_completions(
             if let Some(name) = outcome.blob_path.clone() {
                 state.orchestrator.quarantine_checkpoint(&tokens);
                 retired_blob = true;
+                // Correct the aggregate: the covered KV counted at record() was
+                // never in hand.
+                state.stats.correct_retire(&outcome.decision);
                 // Correct the decision's claim: no KV was actually reused.
                 tracing::warn!(
                     blob = %name,
@@ -505,6 +539,7 @@ async fn stream_response(
             // Quarantine it and retry from scratch so the stream still starts.
             if let Some(name) = blob_for_open.take() {
                 state.orchestrator.quarantine_checkpoint(&tokens);
+                state.stats.correct_retire(&outcome.decision);
                 tracing::warn!(
                     blob = %name,
                     error = %e,
@@ -880,5 +915,29 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         let stats: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(stats["requests"], 0, "404s must not enter the cache stats");
+    }
+
+    #[test]
+    fn stats_correct_retire_removes_claimed_reuse() {
+        // A hit recorded, then quarantined, must end as a miss with zero claimed
+        // KV, or /stats and hit_rate report reuse that never happened.
+        let stats = Stats::default();
+        let hit = PolicyDecision {
+            verdict: CacheVerdict::Hit,
+            matched_tokens: 8,
+            request_tokens: 8,
+        };
+        stats.record(&hit);
+        {
+            let s = stats.lock();
+            assert_eq!(s.hits, 1);
+            assert_eq!(s.tokens_cached, 7);
+        }
+        stats.correct_retire(&hit);
+        let s = stats.lock();
+        assert_eq!(s.hits, 0, "retired hit must not remain a hit");
+        assert_eq!(s.misses, 1, "retired hit is an effective miss");
+        assert_eq!(s.tokens_cached, 0, "no KV was actually reused");
+        assert_eq!(s.requests, 1, "the request still happened");
     }
 }

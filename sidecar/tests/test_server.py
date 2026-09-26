@@ -156,3 +156,35 @@ def test_malformed_json_is_400(sidecar_url):
     code, body = _raw_post(sidecar_url, "/prefill", "3", b"{x}")
     assert code == 400
     assert "malformed JSON" in body
+
+
+def test_stream_corrupt_blob_is_500_not_truncated_200(sidecar_url, tmp_path, monkeypatch):
+    # Regression (Codex adversarial P1): the real engine loads the checkpoint on
+    # the first step of its stream generator. If that raises AFTER 200 is sent,
+    # the daemon sees a failed stream but cannot quarantine the checkpoint, and
+    # the poison stays selectable forever. The load must run BEFORE headers, so a
+    # corrupt payload yields a clean 500 (which the daemon quarantines on).
+    class LoadThenStream:
+        name = "load-then-stream"
+        tokenizer_hash = "synthetic"
+        kv_dtype = "synthetic"
+        prefill_count = 0
+
+        def stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+            # Mirrors MlxLmEngine.stream: the load happens before the first yield.
+            if blob_path:
+                raise ValueError("corrupt safetensors payload")
+            yield 1, "a"
+
+    bad = tmp_path / "corrupt.ckpt"
+    bad.write_bytes(b"not a real blob")
+    monkeypatch.setattr(server.Handler, "engine", LoadThenStream())
+    try:
+        r = httpx.post(
+            f"{sidecar_url}/generate",
+            json={"tokens": [1, 2], "max_tokens": 1, "blob_path": str(bad), "stream": True},
+        )
+        assert r.status_code == 500, f"expected clean 500, got {r.status_code}"
+        assert r.headers.get("content-type", "").startswith("application/json")
+    finally:
+        server.Handler.engine = server.make_engine("test-model")

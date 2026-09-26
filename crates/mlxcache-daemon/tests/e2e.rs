@@ -374,12 +374,17 @@ async fn end_to_end_miss_then_hit() {
     assert_eq!(v["mlxcache"]["verdict"], "miss");
     assert_eq!(v["status"], "ok");
     assert!(!v["generated_tokens"].as_array().unwrap().is_empty());
-    // The synthetic tokenizer emits 8 tokens; the leader adopts the blob it
-    // just published, whose KV covers tokens[:-1] = 7. prefill_from reports the
-    // covered count, so it must be 7, not 8.
+    // The synthetic tokenizer emits 8 tokens. A cold miss built its own KV; no
+    // KV came from an earlier request, so prefill_from/tokens_cached report 0
+    // (README: "0 on a miss"). Generation still resumes from the blob the leader
+    // just wrote, but that is not cross-request reuse.
     assert_eq!(
-        v["mlxcache"]["prefill_from"], 7,
-        "leader reports covered KV tokens (len-1), not the full request length"
+        v["mlxcache"]["prefill_from"], 0,
+        "a cold miss reused no prior KV"
+    );
+    assert_eq!(
+        v["mlxcache"]["tokens_cached"], 0,
+        "a cold miss cached nothing from a prior request"
     );
 
     // Blob must be on disk now.
@@ -884,12 +889,12 @@ async fn end_to_end_streaming_sse() {
     let ttft_pos = text.find("\"ttft_ms\"").expect("ttft frame missing");
     let done_pos = text.find("data: [DONE]").unwrap();
     assert!(ttft_pos < done_pos, "ttft frame must precede [DONE]");
-    // First request (miss): the leader prefills, publishes, then adopts its own
-    // blob, so it reports covered KV = 7 (8-token prefix) for both tokens_cached
-    // and prefill_from. They must agree; tokens_cached must not report 8.
+    // First request (miss): the leader prefills and publishes, but no prior KV
+    // was reused, so tokens_cached and prefill_from are both 0 (README: "0 on a
+    // miss"). They must agree with each other.
     assert!(
-        text.contains("\"tokens_cached\":7") && text.contains("\"prefill_from\":7"),
-        "leader miss must report covered KV (7), not matched prefix (8): {text}"
+        text.contains("\"tokens_cached\":0") && text.contains("\"prefill_from\":0"),
+        "cold-miss stream must report 0 covered KV: {text}"
     );
 
     // Second identical stream request: a hit. The meta frame must report
