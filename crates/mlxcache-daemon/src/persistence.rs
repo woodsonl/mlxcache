@@ -67,7 +67,13 @@ impl Persistence {
         let header = serde_json::to_vec(meta).map_err(|e| PersistError::Corrupt {
             reason: format!("meta serialize: {e}"),
         })?;
-        let header_len = (header.len() as u32).to_le_bytes();
+        // The on-disk header length is a u32; reject rather than silently
+        // truncate (a header this large is pathological, but truncation would
+        // corrupt every later read).
+        let header_len_u32 = u32::try_from(header.len()).map_err(|_| PersistError::Corrupt {
+            reason: format!("checkpoint header too large: {} bytes", header.len()),
+        })?;
+        let header_len = header_len_u32.to_le_bytes();
 
         let write_result = (|| -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp_path)?;
