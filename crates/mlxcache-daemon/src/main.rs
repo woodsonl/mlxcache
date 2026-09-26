@@ -6,9 +6,15 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Non-blocking logging: log writes go to a bounded channel drained by a
+    // background thread, so a stalled log sink can never block a request, the
+    // shutdown future, or any synchronous tracing event on the exit path. Keep
+    // the guard alive for the process lifetime; dropping it flushes the worker.
+    let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .json()
+        .with_writer(log_writer)
         .init();
 
     let served_models: Vec<String> = std::env::var("MLXCACHE_MODELS")
