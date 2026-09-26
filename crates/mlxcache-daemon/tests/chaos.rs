@@ -109,6 +109,7 @@ fn crash_before_rename_never_serves_partial() {
     let meta = CheckpointMeta {
         fingerprint: mlxcache_daemon::orchestrator::test_support::fp("m"),
         token_count: 3,
+        tokens: vec![1, 2, 3],
         format_version: 1,
     };
     let path = p.publish_atomic(0xabc, &meta, b"complete-kv").unwrap();
@@ -127,18 +128,19 @@ async fn restart_drops_streams_checkpoints_survive() {
     let meta = CheckpointMeta {
         fingerprint: mlxcache_daemon::orchestrator::test_support::fp("m"),
         token_count: 4,
+        tokens: vec![1, 2, 3, 4],
         format_version: 1,
     };
     let path = p.publish_atomic(0x777, &meta, b"kv").unwrap();
 
-    // "Restart": fresh index.
+    // "Restart": fresh index, rebuild from disk via the real startup path.
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
-    // Rebuild: scan blobs, republish into index (this is the index-corruption
-    // recovery path too).
-    for blob in p.list_blobs().unwrap() {
-        let (meta, _payload) = p.load(&blob).unwrap();
-        orch.publish_checkpoint(&[1, 2, 3, 4], meta, blob.to_string_lossy().into());
-    }
+    let report = orch.rebuild_from_disk(&p);
+    assert_eq!(
+        report.rebuilt, 1,
+        "the persisted checkpoint must be rebuilt"
+    );
+    assert_eq!(report.skipped, 0);
     let out = orch.route(
         &[1, 2, 3, 4],
         &mlxcache_daemon::orchestrator::test_support::fp("m"),
@@ -148,5 +150,55 @@ async fn restart_drops_streams_checkpoints_survive() {
         mlxcache_core::policy::CacheVerdict::Hit,
         "checkpoint must survive restart"
     );
+    assert_eq!(
+        out.blob_path.as_deref(),
+        Some("00000000000000000000000000000777.ckpt"),
+        "rebuilt entry must point at the on-disk blob NAME (not an abs path)"
+    );
     assert!(path.exists());
+}
+
+#[tokio::test]
+async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
+    // A restart must serve: (a) the exact persisted prefix, (b) an extension of
+    // it as a partial hit, and (c) must not publish a corrupt/mis-keyed blob.
+    let dir = tempfile::tempdir().unwrap();
+    let p = mlxcache_daemon::persistence::Persistence::new(dir.path()).unwrap();
+    let fp = mlxcache_daemon::orchestrator::test_support::fp("m");
+    let good = CheckpointMeta {
+        fingerprint: fp.clone(),
+        token_count: 4,
+        tokens: vec![1, 2, 3, 4],
+        format_version: 1,
+    };
+    p.publish_atomic(0x1, &good, b"kv").unwrap();
+
+    // A corrupt blob (garbage bytes) and a blob with no recoverable prefix.
+    std::fs::write(dir.path().join("deadbeef.ckpt"), b"not-a-blob").unwrap();
+    let noprefix = CheckpointMeta {
+        fingerprint: fp.clone(),
+        token_count: 2,
+        tokens: vec![],
+        format_version: 1,
+    };
+    p.publish_atomic(0x2, &noprefix, b"kv").unwrap();
+
+    let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let report = orch.rebuild_from_disk(&p);
+    assert_eq!(report.rebuilt, 1, "only the well-formed blob is indexed");
+    assert_eq!(report.skipped, 2, "corrupt + no-prefix blobs are skipped");
+    assert_eq!(report.errors.len(), 1, "the corrupt blob is reported");
+
+    // Exact hit after rebuild.
+    assert_eq!(
+        orch.route(&[1, 2, 3, 4], &fp).decision.verdict,
+        mlxcache_core::policy::CacheVerdict::Hit
+    );
+    // Extension -> partial hit at the persisted prefix.
+    let ext = orch.route(&[1, 2, 3, 4, 5, 6], &fp);
+    assert_eq!(
+        ext.decision.verdict,
+        mlxcache_core::policy::CacheVerdict::Partial
+    );
+    assert_eq!(ext.prefill_from, 4);
 }

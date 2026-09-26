@@ -133,6 +133,7 @@ mod tests {
         CheckpointMeta {
             fingerprint: fingerprint(),
             token_count: 3,
+            tokens: vec![1, 2, 3],
             format_version: 1,
         }
     }
