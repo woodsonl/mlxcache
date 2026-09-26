@@ -367,6 +367,28 @@ def test_index_error_from_loader_is_rejected_not_500(monkeypatch, tmp_path):
         eng._load_cache_delta(tokens, path)
 
 
+def test_non_string_metadata_is_rejected(monkeypatch, tmp_path):
+    # Regression (Codex pass 11): MLX rejects a non-string metadata value with
+    # RuntimeError; the validator must reject it too, so it is a 422 not a 500.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    header = json.dumps({"__metadata__": {"x": 123}}).encode()
+    payload = len(header).to_bytes(8, "little") + header
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "bad-meta.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
 def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
     # adopted: resuming from the wrong KV generates silently wrong output. It is

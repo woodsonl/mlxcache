@@ -69,6 +69,12 @@ def _valid_safetensors(payload: bytes) -> bool:
     data_len = len(payload) - 8 - n
     for name, spec in header.items():
         if name == "__metadata__":
+            # Metadata is a string->string map; anything else, MLX rejects with a
+            # RuntimeError we would misread as transient.
+            if not isinstance(spec, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in spec.items()
+            ):
+                return False
             continue
         if not isinstance(spec, dict):
             return False

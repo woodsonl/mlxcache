@@ -28,6 +28,11 @@ pub struct RouteOutcome {
 pub struct Orchestrator {
     pub index: Arc<PrefixIndex>,
     pub singleflight: Arc<SingleFlight>,
+    /// Set when the startup scan FAILED, so the floor is unknown. Publishing is
+    /// refused while set: an unseen higher-generation file could be on disk, and
+    /// publishing below it would let the next restart discard this checkpoint.
+    /// A daemon that never scanned (fresh, empty dir) may publish with floor 0.
+    recovery_failed: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Orchestrator {
@@ -41,6 +46,7 @@ impl Orchestrator {
         Self {
             index: Arc::new(PrefixIndex::new()),
             singleflight: Arc::new(SingleFlight::new()),
+            recovery_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -104,6 +110,17 @@ impl Orchestrator {
         blob_path: String,
         generation: u64,
     ) -> bool {
+        // Refuse to publish after a FAILED scan: the generation floor is unknown,
+        // so an unseen higher-generation file could be on disk and the next
+        // restart would discard a checkpoint published below it. Serving is
+        // unaffected (the caller just does not cache).
+        if self
+            .recovery_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            tracing::warn!("refusing to publish: startup recovery failed, floor unknown");
+            return false;
+        }
         self.index
             .publish(tokens, meta, blob_path, generation, |old| {
                 if let Err(e) = persistence.remove(old) {
@@ -165,9 +182,17 @@ impl Orchestrator {
             Ok(b) => b,
             Err(e) => {
                 report.errors.push(format!("list_blobs: {e}"));
+                // Mark the floor unknown: publishing stays disabled so a new
+                // checkpoint cannot be assigned a generation below an on-disk one
+                // this failed scan could not see.
+                self.recovery_failed
+                    .store(true, std::sync::atomic::Ordering::Release);
                 return report;
             }
         };
+        // The scan succeeded: the filename floor below is now authoritative.
+        self.recovery_failed
+            .store(false, std::sync::atomic::Ordering::Release);
         // Two passes. Directory order is arbitrary, and files now carry immutable
         // per-generation names, so processing in order and reclaiming as we go
         // would let an older corrupt generation delete the newer repair that
@@ -334,6 +359,36 @@ mod tests {
         crate::persistence::Persistence::new(tempfile::tempdir().unwrap().keep()).unwrap()
     }
 
+    /// Publish in a test (publishing is allowed until a scan FAILS).
+    fn publish(orch: &Orchestrator, tokens: &[u32], meta: CheckpointMeta, name: &str, gen: u64) {
+        orch.publish_checkpoint(&persist(), tokens, meta, name.into(), gen);
+    }
+
+    #[test]
+    fn publish_refused_after_a_failed_scan() {
+        // If the startup scan fails, the generation floor is unknown, so
+        // publishing must be refused (Codex pass 11). A nonexistent dir makes
+        // list_blobs fail.
+        let orch = Orchestrator::new();
+        // Build a Persistence on a real dir, then replace the dir with a FILE so
+        // read_dir fails and list_blobs errors.
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("blobs");
+        let missing = crate::persistence::Persistence::new(&dir).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::write(&dir, b"x").unwrap();
+        let report = orch.rebuild_from_disk(&missing);
+        assert!(
+            !report.errors.is_empty(),
+            "the scan must report the failure"
+        );
+        assert!(
+            !orch.publish_checkpoint(&missing, &[1, 2, 3], meta("m", 3), "blob".into(), 1),
+            "publishing must be refused while the floor is unknown"
+        );
+        assert_eq!(orch.published_count(), 0);
+    }
+
     #[test]
     fn miss_then_hit_roundtrip() {
         let orch = Orchestrator::new();
@@ -346,7 +401,7 @@ mod tests {
         assert_eq!(out.prefill_from, 0);
 
         // Publish after "prefill"
-        orch.publish_checkpoint(&persist(), &tokens, meta("m", 4), "blob-1".into(), 1);
+        publish(&orch, &tokens, meta("m", 4), "blob-1", 1);
 
         // Hit: full match. KV covers prefix[:-1] = 3 of 4 tokens.
         let out = orch.route(&tokens, &f);
@@ -365,7 +420,7 @@ mod tests {
     fn fingerprint_mismatch_never_hits() {
         let orch = Orchestrator::new();
         let tokens = vec![1, 2, 3];
-        orch.publish_checkpoint(&persist(), &tokens, meta("model-a", 3), "blob-a".into(), 1);
+        publish(&orch, &tokens, meta("model-a", 3), "blob-a", 1);
         let out = orch.route(&tokens, &fp("model-b"));
         assert_eq!(out.decision.verdict, CacheVerdict::Miss);
         assert_eq!(out.prefill_from, 0);
@@ -384,7 +439,7 @@ mod tests {
 
         let mut meta_a = meta("m", 3);
         meta_a.fingerprint = a.clone();
-        orch.publish_checkpoint(&persist(), &tokens, meta_a, "blob-a".into(), 1);
+        publish(&orch, &tokens, meta_a, "blob-a", 1);
         assert_eq!(orch.route(&tokens, &a).decision.verdict, CacheVerdict::Hit);
         let out = orch.route(&tokens, &b);
         assert_eq!(out.decision.verdict, CacheVerdict::Miss);
