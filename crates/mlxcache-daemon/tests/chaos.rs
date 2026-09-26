@@ -29,9 +29,9 @@ async fn singleflight_race_one_winner() {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     lead.complete(Ok("blob".into()));
                 }
-                Role::Follower(rx) => {
+                Role::Follower(mut f) => {
                     // Followers await the leader's published result.
-                    let _ = await_result(rx).await;
+                    let _ = await_result(&mut f).await;
                 }
             }
         }));
@@ -62,8 +62,8 @@ async fn singleflight_different_keys_run_parallel() {
                     c.fetch_add(1, Ordering::SeqCst);
                     lead.complete(Ok("blob".into()));
                 }
-                Role::Follower(rx) => {
-                    let _ = await_result(rx).await;
+                Role::Follower(mut f) => {
+                    let _ = await_result(&mut f).await;
                 }
             }
         }));

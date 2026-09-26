@@ -273,10 +273,10 @@ async fn chat_completions(
                     }
                 }
             }
-            mlxcache_core::singleflight::Role::Follower(rx) => {
+            mlxcache_core::singleflight::Role::Follower(mut follower) => {
                 // Await the leader's outcome; None means the leader died before
                 // publishing, so fall through to our own (uncached) path.
-                match mlxcache_core::singleflight::await_result(rx).await {
+                match mlxcache_core::singleflight::await_result(&mut follower).await {
                     Some(Err(msg)) => {
                         // Leader failed too; surface the same adapter error.
                         return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
