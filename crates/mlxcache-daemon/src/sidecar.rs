@@ -123,6 +123,43 @@ impl SidecarClient {
             .map_err(|e| SidecarError::Protocol(format!("bad generate response: {e}")))
     }
 
+    /// Start a streaming generation: returns a byte stream of NDJSON from the
+    /// sidecar (one `{"token":..,"text":..}` per token, then `{"done":true}`).
+    pub async fn generate_stream(
+        &self,
+        tokens: &[u32],
+        prefill_from: usize,
+        max_tokens: usize,
+        blob_path: Option<&str>,
+    ) -> Result<reqwest::Response, SidecarError> {
+        let url = format!("{}/generate", self.config.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "tokens": tokens,
+                "prefill_from": prefill_from,
+                "max_tokens": max_tokens,
+                "blob_path": blob_path,
+                "stream": true,
+            }))
+            .send()
+            .await
+            .map_err(|e| SidecarError::Unreachable {
+                url: url.clone(),
+                source: e,
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SidecarError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp)
+    }
+
     pub async fn tokenize(&self, prompt: &str) -> Result<TokenizeResponse, SidecarError> {
         let url = format!("{}/tokenize", self.config.base_url);
         let resp = self
