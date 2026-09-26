@@ -296,6 +296,7 @@ async fn chat_completions(
                             }
                             Ok(_) => {
                                 state.orchestrator.publish_checkpoint(
+                                    &state.persistence,
                                     &tokens,
                                     meta,
                                     blob_name.clone(),

@@ -98,12 +98,18 @@ impl Orchestrator {
     /// generation-specific. Returns false if the prefix was too short to publish.
     pub fn publish_checkpoint(
         &self,
+        persistence: &crate::persistence::Persistence,
         tokens: &[u32],
         meta: CheckpointMeta,
         blob_path: String,
         generation: u64,
     ) -> bool {
-        self.index.publish(tokens, meta, blob_path, generation)
+        self.index
+            .publish(tokens, meta, blob_path, generation, |old| {
+                if let Err(e) = persistence.remove(old) {
+                    tracing::warn!(blob = %old, error = %e, "could not reclaim superseded blob file");
+                }
+            })
     }
 
     /// Reserve a publication generation for the next checkpoint write.
@@ -191,7 +197,7 @@ impl Orchestrator {
                         .unwrap_or_else(|| blob.to_string_lossy().into_owned());
                     let tokens = meta.tokens.clone();
                     let generation = self.reserve_generation();
-                    self.publish_checkpoint(&tokens, meta, name, generation);
+                    self.publish_checkpoint(persistence, &tokens, meta, name, generation);
                     report.rebuilt += 1;
                 }
                 Err(e) => {
@@ -248,6 +254,13 @@ mod tests {
         }
     }
 
+    /// A Persistence over a leaked tempdir, for publish tests that do not
+    /// exercise file reclamation. The deletion callback is a no-op on absent
+    /// files, so the missing files are harmless.
+    fn persist() -> crate::persistence::Persistence {
+        crate::persistence::Persistence::new(tempfile::tempdir().unwrap().keep()).unwrap()
+    }
+
     #[test]
     fn miss_then_hit_roundtrip() {
         let orch = Orchestrator::new();
@@ -260,7 +273,7 @@ mod tests {
         assert_eq!(out.prefill_from, 0);
 
         // Publish after "prefill"
-        orch.publish_checkpoint(&tokens, meta("m", 4), "blob-1".into(), 1);
+        orch.publish_checkpoint(&persist(), &tokens, meta("m", 4), "blob-1".into(), 1);
 
         // Hit: full match. KV covers prefix[:-1] = 3 of 4 tokens.
         let out = orch.route(&tokens, &f);
@@ -279,7 +292,7 @@ mod tests {
     fn fingerprint_mismatch_never_hits() {
         let orch = Orchestrator::new();
         let tokens = vec![1, 2, 3];
-        orch.publish_checkpoint(&tokens, meta("model-a", 3), "blob-a".into(), 1);
+        orch.publish_checkpoint(&persist(), &tokens, meta("model-a", 3), "blob-a".into(), 1);
         let out = orch.route(&tokens, &fp("model-b"));
         assert_eq!(out.decision.verdict, CacheVerdict::Miss);
         assert_eq!(out.prefill_from, 0);
@@ -298,7 +311,7 @@ mod tests {
 
         let mut meta_a = meta("m", 3);
         meta_a.fingerprint = a.clone();
-        orch.publish_checkpoint(&tokens, meta_a, "blob-a".into(), 1);
+        orch.publish_checkpoint(&persist(), &tokens, meta_a, "blob-a".into(), 1);
         assert_eq!(orch.route(&tokens, &a).decision.verdict, CacheVerdict::Hit);
         let out = orch.route(&tokens, &b);
         assert_eq!(out.decision.verdict, CacheVerdict::Miss);

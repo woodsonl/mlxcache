@@ -538,7 +538,15 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".ckpt"))
         .collect();
-    assert_eq!(ckpts.len(), 2, "each model needs its own blob: {ckpts:?}");
+    // The index holds one entry per token prefix. Both models tokenize the same
+    // prompt, so the second publish replaces the first at that node and reclaims
+    // its immutable file — exactly one blob survives, with no generation leak.
+    // The evicted model is a fingerprint miss (recomputed), never an error.
+    assert_eq!(
+        ckpts.len(),
+        1,
+        "the superseded generation must be reclaimed: {ckpts:?}"
+    );
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");

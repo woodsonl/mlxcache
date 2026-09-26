@@ -109,6 +109,7 @@ impl PrefixIndex {
         meta: CheckpointMeta,
         blob_path: String,
         generation: u64,
+        on_replaced: impl FnOnce(&str),
     ) -> bool {
         if tokens.len() < 2 {
             return false;
@@ -117,6 +118,15 @@ impl PrefixIndex {
         let mut node: &mut Node = &mut root;
         for t in tokens {
             node = node.children.entry(*t).or_default();
+        }
+        // Reclaim the superseded generation's file: with immutable per-generation
+        // names, replacing an entry (a fingerprint-miss republish at the same
+        // prefix) would otherwise leak the old file forever. Runs under the write
+        // lock so a concurrent retire of the old entry cannot race the unlink.
+        if let Some(old) = &node.entry {
+            if old.blob_path != blob_path {
+                on_replaced(&old.blob_path);
+            }
         }
         node.entry = Some(IndexEntry {
             meta,
@@ -213,7 +223,7 @@ mod tests {
     /// Reserve a generation and publish (the real call order), returning it.
     fn publish_entry(index: &PrefixIndex, tokens: &[u32], name: &str) -> u64 {
         let generation = index.reserve_generation();
-        assert!(index.publish(tokens, meta(), name.into(), generation));
+        assert!(index.publish(tokens, meta(), name.into(), generation, |_| {}));
         generation
     }
 
@@ -385,6 +395,31 @@ mod tests {
     }
 
     #[test]
+    fn publish_reclaims_the_replaced_generation() {
+        // Immutable per-generation names mean a republish at the same prefix
+        // (a fingerprint-miss overwrite) leaves the old file behind unless it is
+        // reclaimed. The on_replaced callback must receive the superseded name.
+        let index = PrefixIndex::new();
+        let gen1 = index.reserve_generation();
+        assert!(index.publish(&[1, 2, 3], meta(), "old".into(), gen1, |_| {}));
+        let gen2 = index.reserve_generation();
+        let reclaimed = std::cell::RefCell::new(None);
+        assert!(
+            index.publish(&[1, 2, 3], meta(), "new".into(), gen2, |old| {
+                *reclaimed.borrow_mut() = Some(old.to_string());
+            })
+        );
+        assert_eq!(reclaimed.borrow().as_deref(), Some("old"));
+        // Re-publishing the SAME name (same file) must not try to delete it.
+        let gen3 = index.reserve_generation();
+        let mut called = false;
+        assert!(index.publish(&[1, 2, 3], meta(), "new".into(), gen3, |_| {
+            called = true;
+        }));
+        assert!(!called, "republishing the same path must not reclaim it");
+    }
+
+    #[test]
     fn publish_counts() {
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2], "a");
@@ -403,7 +438,7 @@ mod tests {
         // whose second token would otherwise make lookup succeed at depth 1.
         let index = PrefixIndex::new();
         let gen = index.reserve_generation();
-        assert!(!index.publish(&[42], meta(), "short".into(), gen));
+        assert!(!index.publish(&[42], meta(), "short".into(), gen, |_| {}));
         assert_eq!(
             index.published_count(),
             0,

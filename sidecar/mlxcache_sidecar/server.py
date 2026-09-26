@@ -33,12 +33,31 @@ class CheckpointRejectedError(Exception):
     checkpoint."""
 
 
+_SAFETENSORS_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "U16": 2,
+    "I16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "U32": 4,
+    "I32": 4,
+    "F32": 4,
+    "U64": 8,
+    "I64": 8,
+    "F64": 8,
+}
+
+
 def _valid_safetensors(payload: bytes) -> bool:
     """Structural check of a safetensors blob: an 8-byte little-endian header
-    length, then that many bytes of JSON object, then each tensor's
-    `data_offsets` within the remaining data. Deterministic corruption is caught
-    here so it can be classified as a rejection regardless of which exception the
-    native loader would raise."""
+    length, then that many bytes of JSON object, then each tensor's dtype, shape,
+    and `data_offsets` consistent with the remaining data. Deterministic
+    corruption is caught here so it can be classified as a rejection regardless
+    of which exception the native loader would raise."""
     if len(payload) < 8:
         return False
     n = int.from_bytes(payload[:8], "little")
@@ -56,7 +75,15 @@ def _valid_safetensors(payload: bytes) -> bool:
             continue
         if not isinstance(spec, dict):
             return False
+        dtype = spec.get("dtype")
+        shape = spec.get("shape")
         offs = spec.get("data_offsets")
+        if dtype not in _SAFETENSORS_DTYPE_BYTES:
+            return False
+        if not isinstance(shape, list) or not all(
+            isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape
+        ):
+            return False
         if (
             not isinstance(offs, list)
             or len(offs) != 2
@@ -64,7 +91,11 @@ def _valid_safetensors(payload: bytes) -> bool:
         ):
             return False
         start, end = offs
-        if start < 0 or end < start or end > data_len:
+        elements = 1
+        for d in shape:
+            elements *= d
+        expected = elements * _SAFETENSORS_DTYPE_BYTES[dtype]
+        if start < 0 or end < start or end > data_len or end - start != expected:
             return False
     return True
 
