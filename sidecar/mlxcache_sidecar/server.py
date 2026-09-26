@@ -250,6 +250,8 @@ class MlxLmEngine:
         # tokens cannot be verified against this request, so adopting it would
         # mean trusting it covers tokens[:token_count] by construction. Refuse:
         # resuming from the wrong KV generates silently wrong output.
+        # meta.token_count is advisory only (a length, not an identity): any
+        # prefix of that length would pass, so it must never authorize adoption.
         if not meta.tokens:
             return None, tokens
         prefix_len = len(meta.tokens)
