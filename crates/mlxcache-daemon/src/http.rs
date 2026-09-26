@@ -397,16 +397,14 @@ async fn chat_completions(
             if let Some((name, generation, prefix)) = outcome.blob.clone() {
                 blob_unused = true;
                 if e.is_checkpoint_rejected() {
-                    if state
-                        .orchestrator
-                        .quarantine_checkpoint(&name, generation, &prefix)
-                    {
-                        // Make retirement durable: a blob left on disk would be
-                        // re-indexed by the next startup rebuild.
-                        if let Err(e) = state.persistence.remove(&name) {
-                            tracing::warn!(blob = %name, error = %e, "quarantined but could not delete blob file");
-                        }
-                    }
+                    // Quarantine marks the entry; the blob file is deleted under
+                    // the index lock (durable retirement, race-free vs republish).
+                    state.orchestrator.quarantine_checkpoint(
+                        &state.persistence,
+                        &name,
+                        generation,
+                        &prefix,
+                    );
                     tracing::warn!(
                         blob = %name,
                         error = %e,
@@ -585,16 +583,12 @@ async fn stream_response(
             // (422): a transport/decode failure must not retire a healthy blob.
             if e.is_checkpoint_rejected() {
                 if let Some((name, generation, prefix)) = blob_for_open.take() {
-                    if state
-                        .orchestrator
-                        .quarantine_checkpoint(&name, generation, &prefix)
-                    {
-                        // Make retirement durable: a blob left on disk would be
-                        // re-indexed by the next startup rebuild.
-                        if let Err(e) = state.persistence.remove(&name) {
-                            tracing::warn!(blob = %name, error = %e, "quarantined but could not delete blob file");
-                        }
-                    }
+                    state.orchestrator.quarantine_checkpoint(
+                        &state.persistence,
+                        &name,
+                        generation,
+                        &prefix,
+                    );
                     tracing::warn!(
                         blob = %name,
                         error = %e,

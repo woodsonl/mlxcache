@@ -111,10 +111,22 @@ impl Orchestrator {
     /// generation, and the token prefix the entry lives at, so it targets exactly
     /// the checkpoint that failed — never a healthy ancestor on a partial match,
     /// never a fresh republish that reused the same deterministic name, and in
-    /// O(prefix) rather than a full-index scan. Returns true if an entry was
-    /// marked.
-    pub fn quarantine_checkpoint(&self, blob_path: &str, generation: u64, prefix: &[u32]) -> bool {
-        self.index.quarantine_blob(blob_path, generation, prefix)
+    /// O(prefix) rather than a full-index scan. The blob file is deleted under the
+    /// index write lock so a concurrent republish cannot lose its file. Returns
+    /// true if an entry was marked.
+    pub fn quarantine_checkpoint(
+        &self,
+        persistence: &crate::persistence::Persistence,
+        blob_path: &str,
+        generation: u64,
+        prefix: &[u32],
+    ) -> bool {
+        self.index
+            .quarantine_blob(blob_path, generation, prefix, || {
+                if let Err(e) = persistence.remove(blob_path) {
+                    tracing::warn!(blob = %blob_path, error = %e, "quarantined but could not delete blob file");
+                }
+            })
     }
 
     /// Count of quarantined checkpoints (observability/tests).

@@ -95,6 +95,11 @@ def _engine(model=None):
     return eng
 
 
+def _valid_safetensors_bytes() -> bytes:
+    header = b'{"__metadata__":{}}'
+    return len(header).to_bytes(8, "little") + header
+
+
 def _write_blob(path, tokens):
     meta = blob.CheckpointMeta(
         fingerprint=blob.Fingerprint(
@@ -104,7 +109,7 @@ def _write_blob(path, tokens):
         tokens=tokens,
     )
     with open(path, "wb") as fh:
-        fh.write(blob.encode(meta, b"payload"))
+        fh.write(blob.encode(meta, _valid_safetensors_bytes()))
     return path
 
 
@@ -255,6 +260,35 @@ def test_transient_read_error_is_not_quarantined(monkeypatch, tmp_path):
         eng._load_cache_delta(tokens, path)
 
 
+def test_invalid_safetensors_rejected_before_native_load(monkeypatch, tmp_path):
+    # Regression (Codex pass 4): MLX's native parser raises RuntimeError for a bad
+    # safetensors header, the same type as a transient read failure. We validate
+    # the framing ourselves, so a payload with a bogus header length is rejected
+    # (422) even though RuntimeError from the loader below is treated as
+    # transient. The loader is monkeypatched to raise RuntimeError to prove the
+    # structural check runs first.
+    _install_fake_mlx(monkeypatch)
+
+    def _native_boom(_path):
+        raise RuntimeError("safetensors: invalid header length")
+
+    sys.modules["mlx_lm.models.cache"].load_prompt_cache = _native_boom
+    eng = _engine()
+    tokens = [1, 2, 3]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "bad-inner.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b"\x00" * 8))  # header length 0 -> invalid
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
 def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
     # adopted: resuming from the wrong KV generates silently wrong output. It is
@@ -307,7 +341,7 @@ def test_recorded_prefix_wins_over_token_count(monkeypatch, tmp_path):
     )
     path = str(tmp_path / "mismatch.ckpt")
     with open(path, "wb") as fh:
-        fh.write(blob.encode(meta, b"payload"))
+        fh.write(blob.encode(meta, _valid_safetensors_bytes()))
     _cache, prompt = eng._load_cache_delta(tokens, path)
     # prefix = [1,2,3] -> covered = 2 -> delta = tokens[2:]
     assert prompt == [3, 4, 5]

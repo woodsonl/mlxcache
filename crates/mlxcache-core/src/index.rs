@@ -123,7 +123,19 @@ impl PrefixIndex {
     /// name and generation are verified at that node, so it still cannot
     /// quarantine a healthy ancestor or a fresh republish that reused the same
     /// deterministic blob name.
-    pub fn quarantine_blob(&self, blob_path: &str, generation: u64, prefix: &[u32]) -> bool {
+    ///
+    /// `on_retired` runs WHILE the write lock is held, after the entry is marked.
+    /// The caller deletes the blob file there: holding the lock across the delete
+    /// serializes it against `publish` (same lock), so a concurrent republish of
+    /// the same deterministic name cannot land between the generation check and
+    /// the unlink and lose its file. Keep the callback short (one unlink).
+    pub fn quarantine_blob(
+        &self,
+        blob_path: &str,
+        generation: u64,
+        prefix: &[u32],
+        on_retired: impl FnOnce(),
+    ) -> bool {
         let mut root = self.write_lock();
         let mut node: &mut Node = &mut root;
         for t in prefix {
@@ -139,6 +151,7 @@ impl PrefixIndex {
                     && entry.state == CheckpointState::Published =>
             {
                 entry.state = CheckpointState::Quarantined;
+                on_retired();
                 true
             }
             _ => false,
@@ -218,7 +231,7 @@ mod tests {
         let tokens = [1, 2, 3];
         index.publish(&tokens, meta(), "blob-123".into());
         let gen = index.lookup(&tokens).unwrap().0.generation;
-        assert!(index.quarantine_blob("blob-123", gen, &tokens));
+        assert!(index.quarantine_blob("blob-123", gen, &tokens, || {}));
         assert!(index.lookup(&tokens).is_none());
         assert_eq!(index.published_count(), 0);
     }
@@ -236,7 +249,12 @@ mod tests {
         let (entry, matched) = index.lookup(&request).unwrap();
         assert_eq!(matched, 2);
         assert!(
-            index.quarantine_blob(&entry.blob_path, entry.generation, &request[..matched]),
+            index.quarantine_blob(
+                &entry.blob_path,
+                entry.generation,
+                &request[..matched],
+                || {}
+            ),
             "quarantine must mark the matched entry on a partial request"
         );
         assert!(
@@ -255,7 +273,7 @@ mod tests {
         index.publish(&[1, 2, 3, 4], meta(), "deep".into());
         let deep = index.lookup(&[1, 2, 3, 4, 5]).unwrap().0;
         assert_eq!(deep.blob_path, "deep");
-        assert!(index.quarantine_blob(&deep.blob_path, deep.generation, &[1, 2, 3, 4]));
+        assert!(index.quarantine_blob(&deep.blob_path, deep.generation, &[1, 2, 3, 4], || {}));
         assert!(
             index.lookup(&[1, 2, 3, 4, 5]).is_some(),
             "the shallower ancestor is still published"
@@ -278,7 +296,7 @@ mod tests {
         let gen2 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
         assert_ne!(gen1, gen2, "each publish bumps the generation");
         assert!(
-            !index.quarantine_blob("same-name", gen1, &[1, 2, 3]),
+            !index.quarantine_blob("same-name", gen1, &[1, 2, 3], || {}),
             "retiring a superseded generation must not touch the live entry"
         );
         assert!(
@@ -286,7 +304,7 @@ mod tests {
             "the fresh republish is still served"
         );
         assert!(
-            index.quarantine_blob("same-name", gen2, &[1, 2, 3]),
+            index.quarantine_blob("same-name", gen2, &[1, 2, 3], || {}),
             "retiring the live generation quarantines it"
         );
         assert!(
@@ -305,7 +323,7 @@ mod tests {
         let generation = index.publish(&[1, 2, 3], meta(), "leader-blob".into());
         assert_ne!(generation, 0, "a real publish has a non-zero generation");
         assert!(
-            index.quarantine_blob("leader-blob", generation, &[1, 2, 3]),
+            index.quarantine_blob("leader-blob", generation, &[1, 2, 3], || {}),
             "the generation publish returned must retire the entry"
         );
         assert!(index.lookup(&[1, 2, 3]).is_none());
@@ -320,12 +338,31 @@ mod tests {
         index.publish(&[1, 2, 3], meta(), "b".into());
         let gen = index.lookup(&[1, 2, 3]).unwrap().0.generation;
         assert!(
-            !index.quarantine_blob("b", gen, &[1, 2, 9]),
+            !index.quarantine_blob("b", gen, &[1, 2, 9], || {}),
             "a wrong prefix must not match the entry"
         );
         assert!(index.lookup(&[1, 2, 3]).is_some());
-        assert!(index.quarantine_blob("b", gen, &[1, 2, 3]));
+        assert!(index.quarantine_blob("b", gen, &[1, 2, 3], || {}));
         assert!(index.lookup(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn quarantine_callback_runs_only_on_match() {
+        // The on_retired callback (blob deletion) must run only when the entry is
+        // actually quarantined. A stale generation must not delete the live
+        // entry's file.
+        let index = PrefixIndex::new();
+        index.publish(&[1, 2, 3], meta(), "b".into());
+        let gen1 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
+        index.publish(&[1, 2, 3], meta(), "b".into()); // republish -> gen2
+        let called = std::cell::Cell::new(false);
+        assert!(!index.quarantine_blob("b", gen1, &[1, 2, 3], || called.set(true)));
+        assert!(
+            !called.get(),
+            "stale generation must not run the delete callback"
+        );
+        assert!(index.quarantine_blob("b", gen1 + 1, &[1, 2, 3], || called.set(true)));
+        assert!(called.get(), "the matching entry runs the callback");
     }
 
     #[test]

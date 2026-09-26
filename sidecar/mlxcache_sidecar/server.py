@@ -33,6 +33,23 @@ class CheckpointRejectedError(Exception):
     checkpoint."""
 
 
+def _valid_safetensors(payload: bytes) -> bool:
+    """Structural check of a safetensors blob: an 8-byte little-endian header
+    length, then that many bytes of JSON object. Deterministic corruption is
+    caught here so it can be classified as a rejection regardless of which
+    exception the native loader would raise."""
+    if len(payload) < 8:
+        return False
+    n = int.from_bytes(payload[:8], "little")
+    if n == 0 or 8 + n > len(payload):
+        return False
+    try:
+        header = json.loads(payload[8 : 8 + n])
+    except (ValueError, TypeError):
+        return False
+    return isinstance(header, dict)
+
+
 class SyntheticEngine:
     """Hermetic engine: deterministic tokens + KV bytes, no MLX dependency."""
 
@@ -324,18 +341,24 @@ class MlxLmEngine:
         # write), not uncacheable: reject so the daemon quarantines the entry.
         if not payload:
             raise CheckpointRejectedError("checkpoint payload is empty")
+        # Validate the safetensors framing ourselves, BEFORE handing it to MLX.
+        # MLX's native parser raises RuntimeError for a bad header length, the
+        # same type it uses for a transient OS read failure, so we cannot classify
+        # from the exception alone. A malformed inner header is deterministic
+        # corruption: reject it here so it is retired, while RuntimeError from the
+        # loader below stays transient (500).
+        if not _valid_safetensors(payload):
+            raise CheckpointRejectedError("checkpoint payload is not valid safetensors")
         covered = prefix_len - 1
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
             tmp = fh.name
             fh.write(payload)
         try:
-            # A safetensors/metadata parse failure is a bad checkpoint: reject so
-            # the daemon retires it instead of 500ing on every later request while
-            # the poison stays Published. Only pure-Python parse/schema errors are
-            # corruption. MemoryError, OSError, and RuntimeError are transient
-            # (a real OOM, a disk fault; MLX's native reader raises RuntimeError on
-            # an OS read failure): let them propagate as a 500 so a healthy
-            # checkpoint is not retired.
+            # A pure-Python parse/schema failure is corruption: reject so the
+            # daemon retires it. MemoryError, OSError, and RuntimeError are
+            # transient (a real OOM, a disk fault; MLX's native reader raises
+            # RuntimeError on an OS read failure): let them propagate as a 500 so
+            # a healthy checkpoint is not retired.
             try:
                 return load_prompt_cache(tmp), tokens[covered:]
             except (ValueError, KeyError, TypeError) as exc:
