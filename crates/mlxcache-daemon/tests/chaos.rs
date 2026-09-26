@@ -308,6 +308,42 @@ async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
     );
 }
 
+#[tokio::test]
+async fn rebuild_seeds_generation_above_unloadable_files_too() {
+    // Regression (Codex pass 10): the generation floor must come from FILENAMES,
+    // not only files that load. A higher-generation file that is temporarily
+    // unreadable must still raise the floor, or a replacement published now gets
+    // a lower generation and is deleted once the higher one recovers.
+    let dir = tempfile::tempdir().unwrap();
+    let p = mlxcache_daemon::persistence::Persistence::new(dir.path()).unwrap();
+    let fp = mlxcache_daemon::orchestrator::test_support::fp("m");
+    // A structurally valid blob at generation 3.
+    let meta = CheckpointMeta {
+        fingerprint: fp.clone(),
+        token_count: 4,
+        tokens: vec![1, 2, 3, 4],
+        format_version: 1,
+    };
+    p.publish_atomic(0x1, 3, &meta, b"kv").unwrap();
+    // A higher-generation file whose body is unreadable (truncated header): it is
+    // skipped by the load, but its NAME must still seed the floor above 17.
+    std::fs::write(
+        dir.path()
+            .join("00000000000000000000000000000002-0000000000000011.ckpt"),
+        b"xx",
+    )
+    .unwrap();
+
+    let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let report = orch.rebuild_from_disk(&p);
+    assert_eq!(report.rebuilt, 1, "only the valid blob is indexed");
+    let gen = orch.reserve_generation();
+    assert!(
+        gen > 17,
+        "the floor must account for the unloadable generation-17 filename, got {gen}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_triggers_graceful_shutdown() {

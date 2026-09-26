@@ -185,7 +185,17 @@ impl Orchestrator {
         let mut best: std::collections::HashMap<Vec<u32>, Candidate> =
             std::collections::HashMap::new();
         let mut stale: Vec<String> = Vec::new();
-        let mut max_persisted = 0u64;
+        // Seed the generation floor from EVERY filename, before any I/O. A file
+        // that fails to load now (transient read error) is still a publication
+        // that could load later; if we only counted files that load, a restart
+        // would hand a replacement a LOWER generation, and the recovered
+        // higher-generation file would then delete it.
+        let max_persisted = blobs
+            .iter()
+            .filter_map(|b| b.file_name())
+            .filter_map(|n| parse_generation(&n.to_string_lossy()))
+            .max()
+            .unwrap_or(0);
         for blob in blobs {
             let name = blob
                 .file_name()
@@ -209,9 +219,6 @@ impl Orchestrator {
                         continue;
                     }
                     let generation = parse_generation(&name).unwrap_or(0);
-                    if generation > max_persisted {
-                        max_persisted = generation;
-                    }
                     // Group by the index's ACTUAL key (the token prefix only): it
                     // stores one entry per node, so two publications at the same
                     // prefix (e.g. a tokenizer-hash change) must be reconciled

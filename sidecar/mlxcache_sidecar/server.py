@@ -37,8 +37,6 @@ _SAFETENSORS_DTYPE_BYTES = {
     "BOOL": 1,
     "U8": 1,
     "I8": 1,
-    "F8_E4M3": 1,
-    "F8_E5M2": 1,
     "U16": 2,
     "I16": 2,
     "F16": 2,
