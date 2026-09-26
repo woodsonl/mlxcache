@@ -44,21 +44,31 @@ impl Persistence {
 
     /// Atomic publish: write to `<final>.tmp`, fsync, rename. A crash mid-write
     /// leaves only the temp file, never a partial final blob (R1-3).
+    ///
+    /// The final name embeds `generation`, so every publication is an immutable
+    /// file: a republish of the same prefix writes a NEW name rather than
+    /// overwriting an earlier generation's file. That is what makes retirement
+    /// safe — a delayed quarantine of generation N unlinks only N's file and can
+    /// never delete a replacement the daemon just wrote.
     pub fn publish_atomic(
         &self,
         prefix_hash: u128,
+        generation: u64,
         meta: &CheckpointMeta,
         payload: &[u8],
     ) -> Result<PathBuf, PersistError> {
-        let final_path = self.blob_dir.join(format!("{:032x}.ckpt", prefix_hash));
+        let final_path = self
+            .blob_dir
+            .join(format!("{:032x}-{:016x}.ckpt", prefix_hash, generation));
         // Unique temp name: two concurrent publishers for the same hash must not
         // interleave writes into one temp file (that yields a corrupt blob which
         // the rename then publishes as if complete). pid + counter keeps the
         // name unique per write; the `.ckpt.tmp` suffix family is still excluded
         // by list_blobs.
         let unique = format!(
-            "{:032x}.{}.{}.ckpt.tmp",
+            "{:032x}-{:016x}.{}.{}.ckpt.tmp",
             prefix_hash,
+            generation,
             std::process::id(),
             next_temp_seq()
         );
@@ -187,7 +197,9 @@ mod tests {
     fn atomic_publish_and_load() {
         let dir = tmpdir();
         let p = Persistence::new(dir.path()).unwrap();
-        let path = p.publish_atomic(0xdeadbeef, &meta(10), b"kvbytes").unwrap();
+        let path = p
+            .publish_atomic(0xdeadbeef, 1, &meta(10), b"kvbytes")
+            .unwrap();
         assert!(path.exists());
         assert!(!path.to_string_lossy().ends_with(".tmp"));
         let (m, payload) = p.load(&path).unwrap();
@@ -202,7 +214,7 @@ mod tests {
         // may race another).
         let dir = tmpdir();
         let p = Persistence::new(dir.path()).unwrap();
-        let path = p.publish_atomic(0x1, &meta(10), b"kv").unwrap();
+        let path = p.publish_atomic(0x1, 1, &meta(10), b"kv").unwrap();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         p.remove(&name).unwrap();
         assert!(!path.exists(), "retired blob file must be gone");
@@ -228,7 +240,7 @@ mod tests {
             tokens: vec![9],
             format_version: 99,
         };
-        let path = p.publish_atomic(0x2, &m, b"x").unwrap();
+        let path = p.publish_atomic(0x2, 1, &m, b"x").unwrap();
         assert!(matches!(p.load(&path), Err(PersistError::Corrupt { .. })));
     }
 
@@ -236,8 +248,8 @@ mod tests {
     fn list_blobs_finds_published_only() {
         let dir = tmpdir();
         let p = Persistence::new(dir.path()).unwrap();
-        p.publish_atomic(0x1, &meta(1), b"a").unwrap();
-        p.publish_atomic(0x2, &meta(2), b"b").unwrap();
+        p.publish_atomic(0x1, 1, &meta(1), b"a").unwrap();
+        p.publish_atomic(0x2, 1, &meta(2), b"b").unwrap();
         fs::write(dir.path().join("stray.txt"), b"nope").unwrap();
         assert_eq!(p.list_blobs().unwrap().len(), 2);
     }
@@ -253,7 +265,7 @@ mod tests {
         for i in 0..8u8 {
             let p = p.clone();
             handles.push(std::thread::spawn(move || {
-                p.publish_atomic(0x55, &meta(3), &[i; 4096]).unwrap();
+                p.publish_atomic(0x55, 1, &meta(3), &[i; 4096]).unwrap();
             }));
         }
         for h in handles {
@@ -288,7 +300,7 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(true);
         fs::set_permissions(dir.path(), perms).unwrap();
-        let result = p.publish_atomic(0x3, &meta(1), b"x");
+        let result = p.publish_atomic(0x3, 1, &meta(1), b"x");
         // Restore so tempdir cleanup works (explicit 0o755, not set_readonly(false))
         let mut perms = fs::metadata(dir.path()).unwrap().permissions();
         use std::os::unix::fs::PermissionsExt;

@@ -112,7 +112,7 @@ fn crash_before_rename_never_serves_partial() {
         tokens: vec![1, 2, 3],
         format_version: 1,
     };
-    let path = p.publish_atomic(0xabc, &meta, b"complete-kv").unwrap();
+    let path = p.publish_atomic(0xabc, 1, &meta, b"complete-kv").unwrap();
     let (m, payload) = p.load(&path).unwrap();
     assert_eq!(m.token_count, 3);
     assert_eq!(payload, b"complete-kv");
@@ -132,7 +132,8 @@ fn rebuild_skips_one_token_legacy_blob() {
         tokens: vec![7],
         format_version: 1,
     };
-    p.publish_atomic(0x1, &meta, b"nonempty-legacy-kv").unwrap();
+    p.publish_atomic(0x1, 1, &meta, b"nonempty-legacy-kv")
+        .unwrap();
 
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report = orch.rebuild_from_disk(&p);
@@ -159,7 +160,7 @@ async fn restart_drops_streams_checkpoints_survive() {
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
     };
-    let path = p.publish_atomic(0x777, &meta, b"kv").unwrap();
+    let path = p.publish_atomic(0x777, 1, &meta, b"kv").unwrap();
 
     // "Restart": fresh index, rebuild from disk via the real startup path.
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
@@ -180,7 +181,7 @@ async fn restart_drops_streams_checkpoints_survive() {
     );
     assert_eq!(
         out.blob.as_ref().map(|(name, _gen, _pfx)| name.as_str()),
-        Some("00000000000000000000000000000777.ckpt"),
+        Some("00000000000000000000000000000777-0000000000000001.ckpt"),
         "rebuilt entry must point at the on-disk blob NAME (not an abs path)"
     );
     assert!(path.exists());
@@ -199,7 +200,7 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
     };
-    p.publish_atomic(0x1, &good, b"kv").unwrap();
+    p.publish_atomic(0x1, 1, &good, b"kv").unwrap();
 
     // A corrupt blob (garbage bytes) and a blob with no recoverable prefix.
     std::fs::write(dir.path().join("deadbeef.ckpt"), b"not-a-blob").unwrap();
@@ -209,7 +210,7 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         tokens: vec![],
         format_version: 1,
     };
-    p.publish_atomic(0x2, &noprefix, b"kv").unwrap();
+    p.publish_atomic(0x2, 1, &noprefix, b"kv").unwrap();
 
     // A multi-token blob with an EMPTY payload: a truncated write the adapter
     // rejects at runtime. The file can outlive its retirement (a repaired
@@ -221,7 +222,7 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         tokens: vec![7, 7, 7],
         format_version: 1,
     };
-    p.publish_atomic(0x3, &empty, b"").unwrap();
+    p.publish_atomic(0x3, 1, &empty, b"").unwrap();
 
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report = orch.rebuild_from_disk(&p);

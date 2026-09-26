@@ -81,8 +81,19 @@ impl PrefixIndex {
         best
     }
 
-    /// Publish an entry. Only callable for a prefix whose ancestors are consistent;
-    /// the atomic blob rename must have completed BEFORE this call (R1-3).
+    /// Reserve the next publication generation. Callers reserve BEFORE writing
+    /// the blob so the file can carry a generation-specific (immutable) name: a
+    /// republish never overwrites an earlier generation's file, so a delayed
+    /// retirement cannot delete a healthy replacement.
+    pub fn reserve_generation(&self) -> u64 {
+        self.next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// Publish an entry with a pre-reserved generation. Only callable for a prefix
+    /// whose ancestors are consistent; the atomic blob rename must have completed
+    /// BEFORE this call (R1-3).
     ///
     /// The daemon caches KV for `tokens[:-1]`, so a published entry must hold at
     /// least 2 tokens (a shorter prefix caches nothing and `lookup` would return
@@ -91,28 +102,29 @@ impl PrefixIndex {
     /// boundary, and a non-conforming adapter could return a non-empty payload
     /// for a 1-token prompt. A short prefix is silently not published, matching
     /// the caller's "empty blob means nothing cached" convention; never panic, so
-    /// a hostile adapter cannot crash the daemon. Returns the publication
-    /// generation (0 if not published).
-    pub fn publish(&self, tokens: &[u32], meta: CheckpointMeta, blob_path: String) -> u64 {
+    /// a hostile adapter cannot crash the daemon. Returns true if published.
+    pub fn publish(
+        &self,
+        tokens: &[u32],
+        meta: CheckpointMeta,
+        blob_path: String,
+        generation: u64,
+    ) -> bool {
         if tokens.len() < 2 {
-            return 0;
+            return false;
         }
         let mut root = self.write_lock();
         let mut node: &mut Node = &mut root;
         for t in tokens {
             node = node.children.entry(*t).or_default();
         }
-        let generation = self
-            .next_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
         node.entry = Some(IndexEntry {
             meta,
             blob_path,
             generation,
             state: CheckpointState::Published,
         });
-        generation
+        true
     }
 
     /// Quarantine the entry that points at `blob_path` (R1-1): keep it visible
@@ -198,6 +210,13 @@ mod tests {
         }
     }
 
+    /// Reserve a generation and publish (the real call order), returning it.
+    fn publish_entry(index: &PrefixIndex, tokens: &[u32], name: &str) -> u64 {
+        let generation = index.reserve_generation();
+        assert!(index.publish(tokens, meta(), name.into(), generation));
+        generation
+    }
+
     fn meta() -> CheckpointMeta {
         CheckpointMeta {
             fingerprint: fingerprint(),
@@ -212,7 +231,7 @@ mod tests {
         let index = PrefixIndex::new();
         let tokens = [1, 2, 3];
         assert!(index.lookup(&tokens).is_none());
-        index.publish(&tokens, meta(), "blob-123".into());
+        let _ = publish_entry(&index, &tokens, "blob-123");
         // Exact match
         let (entry, matched) = index.lookup(&tokens).unwrap();
         assert_eq!(matched, 3);
@@ -229,7 +248,7 @@ mod tests {
     fn quarantined_entries_not_served() {
         let index = PrefixIndex::new();
         let tokens = [1, 2, 3];
-        index.publish(&tokens, meta(), "blob-123".into());
+        let _ = publish_entry(&index, &tokens, "blob-123");
         let gen = index.lookup(&tokens).unwrap().0.generation;
         assert!(index.quarantine_blob("blob-123", gen, &tokens, || {}));
         assert!(index.lookup(&tokens).is_none());
@@ -243,7 +262,7 @@ mod tests {
         // walk past it to the request terminal (where there is no entry), or a
         // poison blob stays Published and is served forever.
         let index = PrefixIndex::new();
-        index.publish(&[1, 2], meta(), "short".into());
+        let _ = publish_entry(&index, &[1, 2], "short");
         // Request extends the published prefix; lookup matches at depth 2.
         let request = [1, 2, 3, 4];
         let (entry, matched) = index.lookup(&request).unwrap();
@@ -269,8 +288,8 @@ mod tests {
         // With nested entries [1,2] and [1,2,3,4], a request [1,2,3,4,5]
         // matches the deepest, [1,2,3,4]; quarantine that one, not the ancestor.
         let index = PrefixIndex::new();
-        index.publish(&[1, 2], meta(), "ancestor".into());
-        index.publish(&[1, 2, 3, 4], meta(), "deep".into());
+        let _ = publish_entry(&index, &[1, 2], "ancestor");
+        let _ = publish_entry(&index, &[1, 2, 3, 4], "deep");
         let deep = index.lookup(&[1, 2, 3, 4, 5]).unwrap().0;
         assert_eq!(deep.blob_path, "deep");
         assert!(index.quarantine_blob(&deep.blob_path, deep.generation, &[1, 2, 3, 4], || {}));
@@ -290,9 +309,9 @@ mod tests {
         // then republish the SAME name (gen 2); retiring gen 1 must be a no-op,
         // and retiring gen 2 must quarantine.
         let index = PrefixIndex::new();
-        index.publish(&[1, 2, 3], meta(), "same-name".into());
+        let _ = publish_entry(&index, &[1, 2, 3], "same-name");
         let gen1 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
-        index.publish(&[1, 2, 3], meta(), "same-name".into());
+        let _ = publish_entry(&index, &[1, 2, 3], "same-name");
         let gen2 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
         assert_ne!(gen1, gen2, "each publish bumps the generation");
         assert!(
@@ -320,7 +339,7 @@ mod tests {
         // caller kept None), quarantine would match nothing and leave poison
         // Published. Pin the round trip.
         let index = PrefixIndex::new();
-        let generation = index.publish(&[1, 2, 3], meta(), "leader-blob".into());
+        let generation = publish_entry(&index, &[1, 2, 3], "leader-blob");
         assert_ne!(generation, 0, "a real publish has a non-zero generation");
         assert!(
             index.quarantine_blob("leader-blob", generation, &[1, 2, 3], || {}),
@@ -335,7 +354,7 @@ mod tests {
         // with the right name+generation. This is why the caller passes the
         // matched prefix; it also makes retirement O(prefix), not a full scan.
         let index = PrefixIndex::new();
-        index.publish(&[1, 2, 3], meta(), "b".into());
+        let _ = publish_entry(&index, &[1, 2, 3], "b");
         let gen = index.lookup(&[1, 2, 3]).unwrap().0.generation;
         assert!(
             !index.quarantine_blob("b", gen, &[1, 2, 9], || {}),
@@ -352,9 +371,9 @@ mod tests {
         // actually quarantined. A stale generation must not delete the live
         // entry's file.
         let index = PrefixIndex::new();
-        index.publish(&[1, 2, 3], meta(), "b".into());
+        let _ = publish_entry(&index, &[1, 2, 3], "b");
         let gen1 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
-        index.publish(&[1, 2, 3], meta(), "b".into()); // republish -> gen2
+        let _ = publish_entry(&index, &[1, 2, 3], "b"); // republish -> gen2
         let called = std::cell::Cell::new(false);
         assert!(!index.quarantine_blob("b", gen1, &[1, 2, 3], || called.set(true)));
         assert!(
@@ -368,8 +387,8 @@ mod tests {
     #[test]
     fn publish_counts() {
         let index = PrefixIndex::new();
-        index.publish(&[1, 2], meta(), "a".into());
-        index.publish(&[1, 2, 3], meta(), "b".into());
+        let _ = publish_entry(&index, &[1, 2], "a");
+        let _ = publish_entry(&index, &[1, 2, 3], "b");
         assert_eq!(index.published_count(), 2);
     }
 
@@ -383,7 +402,8 @@ mod tests {
         // short prefix is silently dropped rather than indexed. Uses a prefix
         // whose second token would otherwise make lookup succeed at depth 1.
         let index = PrefixIndex::new();
-        index.publish(&[42], meta(), "short".into());
+        let gen = index.reserve_generation();
+        assert!(!index.publish(&[42], meta(), "short".into(), gen));
         assert_eq!(
             index.published_count(),
             0,
@@ -402,14 +422,14 @@ mod tests {
         // so no entry beyond the request tail is ever seen. This guards the
         // invariant that `classify` can never see matched_tokens > request_tokens.
         let index = PrefixIndex::new();
-        index.publish(&[1, 2, 3, 4, 5], meta(), "long".into());
+        let _ = publish_entry(&index, &[1, 2, 3, 4, 5], "long");
         assert!(
             index.lookup(&[1, 2]).is_none(),
             "short request must not match a longer entry"
         );
         // And the overlapping case: published [1,2], request [1,2,3] matches at 2.
         let index = PrefixIndex::new();
-        index.publish(&[1, 2], meta(), "short".into());
+        let _ = publish_entry(&index, &[1, 2], "short");
         let (_, matched) = index.lookup(&[1, 2, 3]).unwrap();
         assert_eq!(matched, 2);
         assert!(matched <= 3);
@@ -421,7 +441,7 @@ mod tests {
         // still be served, not abort the daemon.
         use std::sync::Arc;
         let index = Arc::new(PrefixIndex::new());
-        index.publish(&[1, 2, 3], meta(), "b".into());
+        let _ = publish_entry(&index, &[1, 2, 3], "b");
 
         let idx = index.clone();
         let _ = std::thread::spawn(move || {
@@ -436,7 +456,7 @@ mod tests {
         assert_eq!(matched, 3);
         assert_eq!(entry.blob_path, "b");
         // Writes still work too.
-        index.publish(&[4, 5], meta(), "c".into());
+        let _ = publish_entry(&index, &[4, 5], "c");
         assert_eq!(index.published_count(), 2);
     }
 }

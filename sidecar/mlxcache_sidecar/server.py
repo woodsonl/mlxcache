@@ -35,9 +35,10 @@ class CheckpointRejectedError(Exception):
 
 def _valid_safetensors(payload: bytes) -> bool:
     """Structural check of a safetensors blob: an 8-byte little-endian header
-    length, then that many bytes of JSON object. Deterministic corruption is
-    caught here so it can be classified as a rejection regardless of which
-    exception the native loader would raise."""
+    length, then that many bytes of JSON object, then each tensor's
+    `data_offsets` within the remaining data. Deterministic corruption is caught
+    here so it can be classified as a rejection regardless of which exception the
+    native loader would raise."""
     if len(payload) < 8:
         return False
     n = int.from_bytes(payload[:8], "little")
@@ -47,7 +48,25 @@ def _valid_safetensors(payload: bytes) -> bool:
         header = json.loads(payload[8 : 8 + n])
     except (ValueError, TypeError):
         return False
-    return isinstance(header, dict)
+    if not isinstance(header, dict):
+        return False
+    data_len = len(payload) - 8 - n
+    for name, spec in header.items():
+        if name == "__metadata__":
+            continue
+        if not isinstance(spec, dict):
+            return False
+        offs = spec.get("data_offsets")
+        if (
+            not isinstance(offs, list)
+            or len(offs) != 2
+            or not all(isinstance(o, int) and not isinstance(o, bool) for o in offs)
+        ):
+            return False
+        start, end = offs
+        if start < 0 or end < start or end > data_len:
+            return False
+    return True
 
 
 class SyntheticEngine:

@@ -277,22 +277,29 @@ async fn chat_completions(
                             tokens: tokens.clone(),
                             format_version: 1,
                         };
-                        let blob_name = format!("{:032x}.ckpt", blob_key(&fingerprint, &tokens));
-                        match state.persistence.publish_atomic(
-                            blob_key(&fingerprint, &tokens),
-                            &meta,
-                            &blob,
-                        ) {
+                        let hash = blob_key(&fingerprint, &tokens);
+                        // Reserve the generation BEFORE writing so the on-disk
+                        // name is generation-specific (immutable). A republish
+                        // then never overwrites an earlier generation's file, so
+                        // a delayed retirement cannot delete a healthy
+                        // replacement.
+                        let generation = state.orchestrator.reserve_generation();
+                        let blob_name = format!("{:032x}-{:016x}.ckpt", hash, generation);
+                        match state
+                            .persistence
+                            .publish_atomic(hash, generation, &meta, &blob)
+                        {
                             // ENOSPC rescue (registry): log and continue uncached.
                             Err(e) => {
                                 tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
                                 lead.complete(Err(e.to_string()));
                             }
                             Ok(_) => {
-                                let generation = state.orchestrator.publish_checkpoint(
+                                state.orchestrator.publish_checkpoint(
                                     &tokens,
                                     meta,
                                     blob_name.clone(),
+                                    generation,
                                 );
                                 // The leader ran a FRESH prefill over the whole
                                 // prompt (the ancestor blob was not passed to the
