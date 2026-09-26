@@ -45,7 +45,10 @@ impl SingleFlight {
     pub async fn try_lead(
         &self,
         key: Vec<u32>,
-    ) -> (InFlightGuard, Option<broadcast::Receiver<Result<(), SingleFlightError>>>) {
+    ) -> (
+        InFlightGuard,
+        Option<broadcast::Receiver<Result<(), SingleFlightError>>>,
+    ) {
         let mut map = self.map.lock().await;
         if let Some(entry) = map.get(&key) {
             let rx = entry.done.subscribe();
@@ -56,12 +59,7 @@ impl SingleFlight {
             return (guard, Some(rx));
         }
         let (tx, _) = broadcast::channel(1);
-        map.insert(
-            key.clone(),
-            InFlightEntry {
-                done: tx,
-            },
-        );
+        map.insert(key.clone(), InFlightEntry { done: tx });
         let guard = InFlightGuard {
             key,
             map: Arc::clone(&self.map),
@@ -94,10 +92,7 @@ mod tests {
 
         let (guard2, follower2) = sf.try_lead(key.clone()).await;
         let mut rx = follower2.expect("second caller follows");
-        assert!(Arc::ptr_eq(
-            &guard1.map,
-            &guard2.map
-        ));
+        assert!(Arc::ptr_eq(&guard1.map, &guard2.map));
 
         // Leader completes successfully; follower is notified.
         let map = sf.map.lock().await;

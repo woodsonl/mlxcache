@@ -20,9 +20,9 @@ async fn main() -> Result<()> {
     let sidecar_base = std::env::var("MLXCACHE_SIDECAR_URL").ok();
     let sidecar = sidecar_base.and_then(|url| {
         let model = served_models.first().cloned().unwrap_or_default();
-        mlxcache_daemon::sidecar::SidecarClient::new(
-            mlxcache_daemon::sidecar::SidecarConfig::new(url, model),
-        )
+        mlxcache_daemon::sidecar::SidecarClient::new(mlxcache_daemon::sidecar::SidecarConfig::new(
+            url, model,
+        ))
         .ok()
     });
     let state = Arc::new(mlxcache_daemon::http::AppState {

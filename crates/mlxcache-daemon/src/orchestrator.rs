@@ -42,11 +42,7 @@ impl Orchestrator {
     /// Route a tokenized request: lookup, classify, decide prefill origin.
     /// Tokenization and fingerprint come from the adapter (R1-2); the daemon
     /// never re-tokenizes.
-    pub fn route(
-        &self,
-        tokens: &[u32],
-        request_fingerprint: &ModelFingerprint,
-    ) -> RouteOutcome {
+    pub fn route(&self, tokens: &[u32], request_fingerprint: &ModelFingerprint) -> RouteOutcome {
         let lookup = self.index.lookup(tokens);
         let (matched_tokens, matched_fp, blob_path) = match &lookup {
             Some((entry, n)) => (
@@ -56,7 +52,12 @@ impl Orchestrator {
             ),
             None => (None, None, None),
         };
-        let verdict = classify(matched_tokens, tokens.len(), matched_fp, request_fingerprint);
+        let verdict = classify(
+            matched_tokens,
+            tokens.len(),
+            matched_fp,
+            request_fingerprint,
+        );
         // A fingerprint mismatch classifies as Miss and must not reuse the blob.
         let blob_path = match verdict {
             CacheVerdict::Miss => None,

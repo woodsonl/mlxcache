@@ -134,8 +134,13 @@ async fn chat_completions(
     }
 
     let started = std::time::Instant::now();
-    let prompt = serde_json::to_string(&req.messages)
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "unserializable messages", "invalid_request_error"))?;
+    let prompt = serde_json::to_string(&req.messages).map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "unserializable messages",
+            "invalid_request_error",
+        )
+    })?;
 
     // Tokenize via adapter (R1-2). Sidecar unavailable → 503 naming it.
     let tokens = match &state.sidecar {
@@ -202,15 +207,21 @@ async fn chat_completions(
                             // ENOSPC rescue (registry): log and continue uncached.
                             tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
                         } else {
-                            state
-                                .orchestrator
-                                .publish_checkpoint(&tokens, meta, format!("{:032x}.ckpt", hash));
+                            state.orchestrator.publish_checkpoint(
+                                &tokens,
+                                meta,
+                                format!("{:032x}.ckpt", hash),
+                            );
                         }
                         drop(guard);
                     }
                     Err(e) => {
                         drop(guard);
-                        return Err(err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"));
+                        return Err(err(
+                            StatusCode::BAD_GATEWAY,
+                            &e.to_string(),
+                            "adapter_error",
+                        ));
                     }
                 }
             }
@@ -243,9 +254,18 @@ async fn chat_completions(
 
     // Generate: full context tokens, continuation from the request length.
     // The adapter opens the blob directly, so it needs the absolute path.
-    let generated = match client.generate(&tokens, outcome.prefill_from, 64, blob_arg).await {
+    let generated = match client
+        .generate(&tokens, outcome.prefill_from, 64, blob_arg)
+        .await
+    {
         Ok(t) => t,
-        Err(e) => return Err(err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error")),
+        Err(e) => {
+            return Err(err(
+                StatusCode::BAD_GATEWAY,
+                &e.to_string(),
+                "adapter_error",
+            ))
+        }
     };
 
     let body = serde_json::json!({
@@ -324,33 +344,31 @@ async fn stream_response(
         futures_util::stream::once(async move { Ok::<Vec<u8>, std::io::Error>(meta_bytes) });
 
     let mut buf: Vec<u8> = Vec::new();
-    let body_stream = upstream
-        .bytes_stream()
-        .flat_map(move |chunk| {
-            let mut frames: Vec<Result<Vec<u8>, std::io::Error>> = Vec::new();
-            match chunk {
-                Ok(bytes) => {
-                    buf.extend_from_slice(&bytes);
-                    while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = buf.drain(..=pos).collect();
-                        let line = String::from_utf8_lossy(&line);
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                            if v.get("done").is_some() {
-                                frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
-                            } else {
-                                frames.push(Ok(format!("data: {v}\n\n").into_bytes()));
-                            }
+    let body_stream = upstream.bytes_stream().flat_map(move |chunk| {
+        let mut frames: Vec<Result<Vec<u8>, std::io::Error>> = Vec::new();
+        match chunk {
+            Ok(bytes) => {
+                buf.extend_from_slice(&bytes);
+                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&line);
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        if v.get("done").is_some() {
+                            frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
+                        } else {
+                            frames.push(Ok(format!("data: {v}\n\n").into_bytes()));
                         }
                     }
                 }
-                Err(e) => frames.push(Err(std::io::Error::other(e.to_string()))),
             }
-            futures_util::stream::iter(frames)
-        });
+            Err(e) => frames.push(Err(std::io::Error::other(e.to_string()))),
+        }
+        futures_util::stream::iter(frames)
+    });
 
     let stream = first.chain(body_stream);
     let body = axum::body::Body::from_stream(stream);
@@ -393,10 +411,8 @@ mod tests {
             stats: Arc::new(Stats::default()),
             served_models: vec!["test-model".into()],
             sidecar: None,
-            persistence: crate::persistence::Persistence::new(
-                tempfile::tempdir().unwrap().keep(),
-            )
-            .unwrap(),
+            persistence: crate::persistence::Persistence::new(tempfile::tempdir().unwrap().keep())
+                .unwrap(),
         });
         router(state)
     }
@@ -417,7 +433,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_messages_rejected() {
-        let res = post_json(app(), r#"{"model":"test-model","messages":[],"stream":false}"#).await;
+        let res = post_json(
+            app(),
+            r#"{"model":"test-model","messages":[],"stream":false}"#,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -449,7 +469,11 @@ mod tests {
         let b = vec![1, 2, 3, 5];
         let c = vec![1, 2, 3];
         assert_ne!(prefix_hash(&a), prefix_hash(&b), "tail difference aliased");
-        assert_ne!(prefix_hash(&a), prefix_hash(&c), "length difference aliased");
+        assert_ne!(
+            prefix_hash(&a),
+            prefix_hash(&c),
+            "length difference aliased"
+        );
         // Deterministic: same input, same key.
         assert_eq!(prefix_hash(&a), prefix_hash(&[1, 2, 3, 4]));
         // Must exceed 64 bits (the 128-bit widening).
