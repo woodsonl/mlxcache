@@ -1,29 +1,22 @@
 //! Minimal observability (D3): per-request structured log line + counters.
 
-use mlxcache_core::policy::{CacheVerdict, PolicyDecision};
+use mlxcache_core::policy::{covered_kv_tokens, CacheVerdict, PolicyDecision};
 use tracing::info;
-
-/// Tokens whose KV the cache decision expects to reuse: matched_tokens - 1 for
-/// hit/partial (the adapter caches tokens[:-1]), 0 for miss. This is the
-/// decision's claim, logged BEFORE the checkpoint is opened; if adoption later
-/// falls back to scratch (quarantine), the response reports prefill_from=0 and a
-/// warn line records the mismatch. Same value and same definition as the
-/// response's `prefill_from` and `tokens_cached` (policy::covered_kv_tokens).
-fn kv_claimed(verdict: CacheVerdict, matched_tokens: usize) -> usize {
-    mlxcache_core::policy::covered_kv_tokens(verdict, matched_tokens)
-}
 
 /// Emit the per-request log line. Fields: model, prefix-hash, verdict, claimed
 /// KV reuse/total, decision time. Kept allocation-light: all scalars, one
 /// format call. This records the cache DECISION; the effective reuse is reported
-/// in the response (prefill_from) and corrected here only on fallback.
+/// in the response (prefill_from) and corrected here only on fallback. The
+/// claimed/covered count comes from `policy::covered_kv_tokens`, the same
+/// definition the response's `prefill_from`/`tokens_cached` use, so the three
+/// fields cannot drift apart by a token.
 pub fn log_request(model: &str, prefix_hash: u128, decision: &PolicyDecision, ttft_ms: u64) {
     let verdict_str = match decision.verdict {
         CacheVerdict::Hit => "hit",
         CacheVerdict::Miss => "miss",
         CacheVerdict::Partial => "partial",
     };
-    let covered = kv_claimed(decision.verdict, decision.matched_tokens);
+    let covered = covered_kv_tokens(decision.verdict, decision.matched_tokens);
     info!(
         model = model,
         prefix_hash = prefix_hash,
@@ -49,15 +42,5 @@ mod tests {
             request_tokens: 60,
         };
         log_request("test-model", 0xdeadbeef, &d, 12);
-    }
-
-    #[test]
-    fn kv_claimed_matches_decided_reuse() {
-        // Hit/partial claim matched-1 (KV for tokens[:-1]); miss claims 0.
-        assert_eq!(kv_claimed(CacheVerdict::Hit, 50), 49);
-        assert_eq!(kv_claimed(CacheVerdict::Partial, 4), 3);
-        assert_eq!(kv_claimed(CacheVerdict::Miss, 4), 0);
-        // Degenerate match of 0 must not underflow.
-        assert_eq!(kv_claimed(CacheVerdict::Partial, 0), 0);
     }
 }

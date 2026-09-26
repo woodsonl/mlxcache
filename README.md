@@ -68,8 +68,11 @@ curl -s http://127.0.0.1:8420/stats
 
 The first response carries `"verdict":"miss"`, the second `"verdict":"hit"` with
 `"prefill_from":<n>` — `n` is the number of leading tokens whose KV came from the
-cache (prefill resumes at `n`), so the daemon skipped re-prefilling them.
-`/stats` reports the running hit rate.
+cache (prefill resumes at `n`), so the daemon skipped re-prefilling them. A
+checkpoint caches KV for `tokens[:-1]` (the adapter saves the cache up to the
+last token), so for an `L`-token prompt `prefill_from` is `L-1`. The response
+also carries `"tokens_cached"`, the same covered-KV count (0 on a miss), and
+`"tokens_total"`. `/stats` reports the running hit rate.
 
 ## Real inference (mlx-lm)
 
@@ -118,10 +121,13 @@ curl -N -X POST http://127.0.0.1:8420/v1/chat/completions \
 ## Building and testing
 
 ```bash
-cargo test --workspace                 # Rust: core, daemon, chaos, e2e
+uv sync --group dev                      # pytest, ruff (what CI installs)
+cargo fmt --all -- --check               # formatting gate (CI fails on drift)
+cargo test --workspace                   # Rust: core, daemon, chaos, e2e
 cargo clippy --workspace --all-targets -- -D warnings
-uv run pytest sidecar/tests/           # Python: sidecar, blob codec, roundtrip
+uv run pytest sidecar/tests/             # Python: sidecar, blob codec, roundtrip
 uv run ruff check sidecar/
+uv run ruff format --check sidecar/
 ```
 
 The real mlx-lm round-trip gate (needs a downloaded model) is opt-in:
