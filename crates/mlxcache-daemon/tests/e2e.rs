@@ -479,6 +479,10 @@ async fn end_to_end_streaming_sse() {
         token_frames > 1,
         "expected multiple token frames, got {token_frames}"
     );
+    // The real TTFT (first generated token) is reported before the terminator.
+    let ttft_pos = text.find("\"ttft_ms\"").expect("ttft frame missing");
+    let done_pos = text.find("data: [DONE]").unwrap();
+    assert!(ttft_pos < done_pos, "ttft frame must precede [DONE]");
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");

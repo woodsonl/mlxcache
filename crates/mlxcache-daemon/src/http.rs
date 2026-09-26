@@ -191,7 +191,10 @@ async fn chat_completions(
         kv_layout_version: 1,
     };
     let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
-    let started_ms = started.elapsed().as_millis() as u64;
+    // Time from request start to the cache decision (= prefill + publish on a
+    // miss). This is the cache's contribution to TTFT; generation is measured
+    // separately so the field named `ttft_ms` does not silently exclude it.
+    let lookup_ms = started.elapsed().as_millis() as u64;
     // Compute the prefix key once: reused by the log line and (on miss) the
     // blob filename. Hashing a long prefix twice is wasted hot-path work.
     let hash = prefix_hash(&tokens);
@@ -274,8 +277,7 @@ async fn chat_completions(
     // prefilled), a coalesced follower the hit/partial it adopted. Recording
     // after single-flight keeps stats truthful.
     state.stats.record(&outcome.decision);
-    log_request(&req.model, hash, &outcome.decision, started_ms);
-    let ttft_ms = started_ms;
+    log_request(&req.model, hash, &outcome.decision, lookup_ms);
 
     // The adapter needs an absolute path to open the blob directly.
     let blob_abs = match &outcome.blob_path {
@@ -294,7 +296,7 @@ async fn chat_completions(
     };
 
     if req.stream {
-        return stream_response(state.clone(), client, tokens, outcome, blob_arg, ttft_ms).await;
+        return stream_response(state.clone(), client, tokens, outcome, blob_arg, started).await;
     }
 
     // Generate: full context tokens, continuation from the request length.
@@ -313,6 +315,7 @@ async fn chat_completions(
         }
     };
 
+    let total_ms = started.elapsed().as_millis() as u64;
     let body = serde_json::json!({
         "mlxcache": {
             "verdict": match outcome.decision.verdict {
@@ -323,7 +326,11 @@ async fn chat_completions(
             "tokens_cached": outcome.decision.matched_tokens,
             "tokens_total": outcome.decision.request_tokens,
             "prefill_from": outcome.prefill_from,
-            "ttft_ms": ttft_ms,
+            // Time to the cache decision (prefill+publish on a miss). The
+            // non-streaming path has no first-token hook, so the full round trip
+            // is reported separately as total_ms.
+            "lookup_ms": lookup_ms,
+            "total_ms": total_ms,
         },
         "generated_tokens": generated,
         "status": "ok",
@@ -413,10 +420,14 @@ async fn stream_response(
     tokens: Vec<u32>,
     outcome: crate::orchestrator::RouteOutcome,
     blob_arg: Option<&str>,
-    ttft_ms: u64,
+    started: std::time::Instant,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     use futures_util::StreamExt;
 
+    // Time from request start to the cache decision, known before the first
+    // token exists. The true TTFT (first generated token) is only known once the
+    // sidecar emits it, so it is reported in the terminal frame, not here.
+    let lookup_ms = started.elapsed().as_millis() as u64;
     let verdict = match outcome.decision.verdict {
         CacheVerdict::Hit => "hit",
         CacheVerdict::Partial => "partial",
@@ -428,7 +439,7 @@ async fn stream_response(
             "tokens_cached": outcome.decision.matched_tokens,
             "tokens_total": outcome.decision.request_tokens,
             "prefill_from": outcome.prefill_from,
-            "ttft_ms": ttft_ms,
+            "lookup_ms": lookup_ms,
         }
     });
 
@@ -453,12 +464,16 @@ async fn stream_response(
         buf: Vec<u8>,
         done: bool,
         terminated: bool,
+        started: std::time::Instant,
+        ttft_ms: Option<u64>,
     }
     let state = StreamState {
         upstream: Box::pin(upstream.bytes_stream()),
         buf: Vec::new(),
         done: false,
         terminated: false,
+        started,
+        ttft_ms: None,
     };
     let body_stream = futures_util::stream::unfold(state, |mut st| async move {
         use futures_util::StreamExt;
@@ -473,9 +488,28 @@ async fn stream_response(
                     while let Some(pos) = st.buf.iter().position(|b| *b == b'\n') {
                         let line: Vec<u8> = st.buf.drain(..=pos).collect();
                         push_frame(&mut frames, &line);
-                        if frames.last().is_some_and(|f| {
+                        let last_done = frames.last().is_some_and(|f| {
                             f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
-                        }) {
+                        });
+                        // The first real token line marks TTFT.
+                        if st.ttft_ms.is_none() && !last_done {
+                            let is_token = frames.last().is_some_and(|f| {
+                                f.as_ref().is_ok_and(|b| b.starts_with(b"data: {"))
+                            });
+                            if is_token {
+                                st.ttft_ms = Some(st.started.elapsed().as_millis() as u64);
+                            }
+                        }
+                        if last_done {
+                            // Insert the true-TTFT stats frame BEFORE [DONE] so the
+                            // terminator stays the last frame. push_frame already
+                            // appended [DONE]; re-emit it after the stats frame.
+                            let done = frames.pop().expect("just pushed [DONE]");
+                            if let Some(ttft) = st.ttft_ms {
+                                let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
+                                frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
+                            }
+                            frames.push(done);
                             st.terminated = true;
                         }
                     }
@@ -500,6 +534,11 @@ async fn stream_response(
                         }
                     }
                     if !st.terminated {
+                        // No [DONE] yet: emit the TTFT stats frame then terminate.
+                        if let Some(ttft) = st.ttft_ms {
+                            let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
+                            frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
+                        }
                         frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
                     }
                     st.done = true;
