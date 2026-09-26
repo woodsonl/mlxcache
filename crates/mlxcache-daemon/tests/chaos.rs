@@ -228,5 +228,5 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         ext.decision.verdict,
         mlxcache_core::policy::CacheVerdict::Partial
     );
-    assert_eq!(ext.prefill_from, 4);
+    assert_eq!(ext.prefill_from, 3);
 }

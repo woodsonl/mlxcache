@@ -63,10 +63,16 @@ impl Orchestrator {
             CacheVerdict::Miss => None,
             _ => blob_path,
         };
+        // `prefill_from` is the client-facing count of tokens already covered by
+        // cached KV, i.e. where prefill resumes. A checkpoint published for a
+        // prefix of length N holds KV for N-1 tokens (the adapter caches
+        // tokens[:-1]; see MlxLmEngine.prefill), so a hit or partial at a prefix
+        // of length M reports M-1. Miss reports 0.
         let prefill_from = match verdict {
-            CacheVerdict::Hit => tokens.len(), // nothing to prefill
-            CacheVerdict::Partial => matched_tokens.unwrap_or(0),
             CacheVerdict::Miss => 0,
+            CacheVerdict::Hit | CacheVerdict::Partial => {
+                matched_tokens.unwrap_or(0).saturating_sub(1)
+            }
         };
         RouteOutcome {
             decision: PolicyDecision {
@@ -208,16 +214,17 @@ mod tests {
         // Publish after "prefill"
         orch.publish_checkpoint(&tokens, meta("m", 4), "blob-1".into());
 
-        // Hit: full match
+        // Hit: full match. KV covers prefix[:-1] = 3 of 4 tokens.
         let out = orch.route(&tokens, &f);
         assert_eq!(out.decision.verdict, CacheVerdict::Hit);
-        assert_eq!(out.prefill_from, 4);
+        assert_eq!(out.prefill_from, 3);
 
-        // Partial: extension of the published prefix
+        // Partial: extension of the published prefix. The 4-token checkpoint's
+        // KV covers 3 tokens, so prefill resumes at 3.
         let ext = vec![1, 2, 3, 4, 5, 6];
         let out = orch.route(&ext, &f);
         assert_eq!(out.decision.verdict, CacheVerdict::Partial);
-        assert_eq!(out.prefill_from, 4);
+        assert_eq!(out.prefill_from, 3);
     }
 
     #[test]
