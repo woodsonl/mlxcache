@@ -213,8 +213,10 @@ async fn chat_completions(
                 match client.prefill(&tokens).await {
                     // An empty payload means the adapter cached nothing (e.g. a
                     // one-token prompt). Publishing would index a checkpoint with
-                    // no KV; signal "no blob" (empty name) so followers also run
-                    // from scratch, and generate from scratch here.
+                    // no KV. The leader's publish result is an `Ok(blob_name)`, and
+                    // an empty name is the sentinel for "nothing published"; the
+                    // follower branch below treats an empty name as a no-blob miss
+                    // and runs from scratch too.
                     Ok(blob) if blob.is_empty() => {
                         lead.complete(Ok(String::new()));
                     }

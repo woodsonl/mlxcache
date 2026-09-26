@@ -1,9 +1,10 @@
 """Hermetic tests for MlxLmEngine's cache convention (no MLX, no model).
 
 Pins the invariant the R1-5 thesis guard proves on real hardware: the saved
-checkpoint cache covers tokens[:-1], and the resume path feeds tokens[cached-1:]
-so the model predicts the final token from KV of the preceding ones. If the two
-halves disagree, every cache hit generates different output than a scratch run.
+checkpoint cache covers prefix[:-1], and the resume path feeds the uncovered tail
+(tokens[len(prefix)-1:]) so the model predicts the final token from KV of the
+preceding ones. If the two halves disagree, every cache hit generates different
+output than a scratch run.
 """
 
 from __future__ import annotations
@@ -202,6 +203,28 @@ def test_blob_without_recorded_prefix_is_still_adopted(monkeypatch, tmp_path):
     cache, prompt = eng._load_cache_delta(tokens, path)
     assert cache is not None
     assert prompt == [4, 5]
+
+
+def test_recorded_prefix_wins_over_token_count(monkeypatch, tmp_path):
+    # When a blob records meta.tokens, its length defines the prefix; token_count
+    # is ignored for the delta. A blob whose token_count disagrees must still
+    # resume from tokens[len(prefix)-1:], not token_count.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3, 4, 5]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=4,  # stale/lying; the recorded prefix is authoritative
+        tokens=[1, 2, 3],
+    )
+    path = str(tmp_path / "mismatch.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b"payload"))
+    _cache, prompt = eng._load_cache_delta(tokens, path)
+    # prefix = [1,2,3] -> covered = 2 -> delta = tokens[2:]
+    assert prompt == [3, 4, 5]
 
 
 if __name__ == "__main__":

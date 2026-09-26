@@ -154,6 +154,133 @@ async fn one_token_prompt_serves_and_publishes_no_blob() {
 }
 
 #[tokio::test]
+async fn concurrent_one_token_requests_all_run_from_scratch() {
+    // The follower path for the empty-blob (no-publish) case: N concurrent
+    // one-token requests coalesce on a leader whose payload is empty. The leader
+    // signals "no blob" (empty name); every follower must run from scratch, all
+    // must be served, and no checkpoint may be published.
+    let Some((sidecar_url, mut child)) = spawn_sidecar_with_env(&[
+        ("MLXCACHE_TOKENIZE_ONE", "1"),
+        ("MLXCACHE_PREFILL_DELAY", "0.3"),
+    ])
+    .await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false,
+    })
+    .to_string();
+
+    const N: usize = 6;
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let app = router(state.clone());
+        let body = body.clone();
+        handles.push(tokio::spawn(async move {
+            let res = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200, "every request must be served");
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v["mlxcache"]["verdict"].as_str().unwrap().to_string()
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.unwrap(), "miss", "nothing was cached");
+    }
+    assert_eq!(
+        state.persistence.list_blobs().unwrap().len(),
+        0,
+        "no checkpoint may be published for a one-token prompt"
+    );
+    assert_eq!(state.orchestrator.published_count(), 0);
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn one_token_streaming_serves_and_publishes_no_blob() {
+    // The streaming path for the no-publish case: a one-token prompt must stream
+    // a 200 SSE with a miss verdict and publish nothing.
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_ONE", "1")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+    })
+    .to_string();
+
+    let res = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("\"verdict\":\"miss\""), "SSE meta: {text}");
+    assert!(
+        text.trim_end().ends_with("data: [DONE]"),
+        "SSE tail: {text}"
+    );
+    assert_eq!(
+        state.persistence.list_blobs().unwrap().len(),
+        0,
+        "no checkpoint may be published for a one-token prompt"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
 async fn end_to_end_miss_then_hit() {
     let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
         eprintln!("skipping: sidecar unavailable (install uv + sync deps)");

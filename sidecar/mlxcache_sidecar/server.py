@@ -51,8 +51,9 @@ class SyntheticEngine:
     def prefill(self, tokens: list[int]) -> bytes:
         # KV payload: 1024 bytes/token, deterministic from token ids.
         self.prefill_count += 1
-        # A one-token prompt has an empty cache prefix (mirrors MlxLmEngine):
-        # cache nothing so the daemon skips publishing.
+        # A prompt shorter than 2 tokens has an empty cache prefix (mirrors
+        # MlxLmEngine): cache nothing so the daemon skips publishing an empty
+        # payload.
         if len(tokens) < 2:
             return b""
         # Optional delay (test knob): widens the single-flight window so
@@ -152,13 +153,13 @@ class MlxLmEngine:
         self.prefill_count = getattr(self, "prefill_count", 0) + 1
         # Cache convention (pinned; verified by the R1-5 thesis guard): the saved
         # cache covers tokens[:-1], NOT all tokens. On resume the adapter feeds the
-        # uncovered tail (tokens[len(cache):]) so the model predicts the final
+        # uncovered tail (tokens[len(prefix)-1:]) so the model predicts the final
         # token from KV of the preceding ones — identical to a scratch run.
         #
         # A one-token prompt has an empty prefix: mlx-lm cannot save/load an empty
         # prompt cache, and there is nothing to cache, so return no payload. The
-        # daemon skips publishing (prefix shorter than 2 has no value) and the
-        # request runs from scratch.
+        # daemon skips publishing an empty payload and the request runs from
+        # scratch.
         if len(tokens) < 2:
             return b""
         cache, _ = self._prefill_cache(tokens[:-1])
