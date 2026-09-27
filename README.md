@@ -81,9 +81,10 @@ A checkpoint the adapter cannot use is retired, not retried forever. The adapter
 answers `422` when the blob is gone, corrupt, or its recorded prefix disagrees
 with the request; the daemon quarantines that entry and serves the request from
 scratch. A generic decode or transport failure (`500`) does not retire a healthy
-checkpoint. Retirement is keyed by the publication generation the request used,
-so a late failure cannot quarantine a fresh republish that reused the same
-deterministic blob name.
+checkpoint. Each publication is written to its own file (`{hash}-{generation}
+.ckpt`), and retirement is keyed by the publication generation the request used,
+so a late failure unlinks only that publication's file — never a fresh republish
+that replaced it.
 
 ## Real inference (mlx-lm)
 
@@ -108,7 +109,10 @@ First run downloads the weights.
 
 Set `"stream": true` and the daemon returns OpenAI-style SSE: a leading
 `data: {"mlxcache":{...}}` frame with the cache verdict, one
-`data: {"token":..,"text":..}` per generated token, then `data: [DONE]`.
+`data: {"token":..,"text":..}` per generated token, then `data: [DONE]`. If the
+engine dies mid-stream the daemon emits a `data:
+{"error":{"type":"upstream_error",...}}` frame before `[DONE]`, so a truncated
+answer is not mistaken for a finished one.
 
 ```bash
 curl -N -X POST http://127.0.0.1:8420/v1/chat/completions \
