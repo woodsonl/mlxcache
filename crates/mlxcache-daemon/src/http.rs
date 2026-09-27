@@ -1082,4 +1082,40 @@ mod tests {
         assert_eq!(s.tokens_cached, 0, "no KV was actually reused");
         assert_eq!(s.requests, 1, "the request still happened");
     }
+
+    #[test]
+    fn stats_correct_retire_partial_and_miss() {
+        let stats = Stats::default();
+        // A partial recorded, then retired: partials->misses, covered KV dropped.
+        let partial = PolicyDecision {
+            verdict: CacheVerdict::Partial,
+            matched_tokens: 6,
+            request_tokens: 10,
+        };
+        stats.record(&partial);
+        {
+            let s = stats.lock();
+            assert_eq!(s.partials, 1);
+            assert_eq!(s.tokens_cached, 5);
+        }
+        stats.correct_retire(&partial);
+        {
+            let s = stats.lock();
+            assert_eq!(s.partials, 0, "retired partial must not remain a partial");
+            assert_eq!(s.misses, 1);
+            assert_eq!(s.tokens_cached, 0, "no KV was actually reused");
+        }
+        // correct_retire on an already-Miss decision is a no-op: a cold-miss
+        // leader keeps its miss while adopting the blob it just published, and
+        // retiring that blob must not count a second miss.
+        let miss = PolicyDecision {
+            verdict: CacheVerdict::Miss,
+            matched_tokens: 0,
+            request_tokens: 10,
+        };
+        stats.record(&miss);
+        stats.correct_retire(&miss);
+        let s = stats.lock();
+        assert_eq!(s.misses, 2, "the miss is not double-counted");
+    }
 }

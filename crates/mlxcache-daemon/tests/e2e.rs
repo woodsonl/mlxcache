@@ -95,6 +95,81 @@ async fn unusable_blob_is_quarantined_and_served_from_scratch() {
     child.wait().expect("reap sidecar");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
+    // Regression (coverage audit): after a FAILED startup scan the generation
+    // floor is unknown, so the handler must serve from scratch and write NO
+    // checkpoint (writing first would leak an unindexed file on every request).
+    use std::os::unix::fs::PermissionsExt;
+    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let persistence = mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap();
+    // Make the dir unreadable so list_blobs fails, then run the real startup
+    // scan: it sets recovery_failed and blocks publishing.
+    let mut perms = std::fs::metadata(blobs.path()).unwrap().permissions();
+    let orig = perms.mode();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(blobs.path(), perms).unwrap();
+    let orchestrator = Orchestrator::new();
+    let report = orchestrator.rebuild_from_disk(&persistence);
+    assert!(!report.errors.is_empty(), "scan must report the failure");
+    assert!(!orchestrator.can_publish(), "publishing must be blocked");
+    // Restore access so the handler can at least attempt (and refuse) a write.
+    let mut perms = std::fs::metadata(blobs.path()).unwrap().permissions();
+    perms.set_mode(orig);
+    std::fs::set_permissions(blobs.path(), perms).unwrap();
+
+    let state = Arc::new(AppState {
+        orchestrator,
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+        ),
+        persistence,
+    });
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "no cache please"}],
+        "stream": false,
+    })
+    .to_string();
+    let res = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "request is still served");
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "miss");
+    assert_eq!(
+        state.orchestrator.published_count(),
+        0,
+        "no entry may be indexed while the floor is unknown"
+    );
+    let ckpts = std::fs::read_dir(blobs.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".ckpt"))
+        .count();
+    assert_eq!(ckpts, 0, "no blob file may be written: {ckpts}");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
 #[tokio::test]
 async fn one_token_prompt_serves_and_publishes_no_blob() {
     // A one-token prompt caches nothing (empty adapter payload). The daemon must

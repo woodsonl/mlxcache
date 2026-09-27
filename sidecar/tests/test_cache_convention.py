@@ -495,6 +495,38 @@ def test_overlapping_tensor_ranges_rejected(monkeypatch, tmp_path):
         eng._load_cache_delta(tokens, path)
 
 
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        [0, 2],  # span 2 != shape[2] * F16(2) = 4 (too small)
+        [0, 6],  # span 6 != 4 (too large, still within data)
+        [0, 99],  # end exceeds data_len
+    ],
+)
+def test_tensor_byte_span_mismatch_rejected(monkeypatch, tmp_path, offsets):
+    # Regression (coverage audit): the shape/offset byte-span check must reject
+    # a header whose data_offsets span disagrees with shape * dtype size, before
+    # MLX sees it (MLX raises RuntimeError -> misread as transient 500).
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    header = json.dumps({"w": {"dtype": "F16", "shape": [2], "data_offsets": offsets}}).encode()
+    data = b"\x00" * 8
+    payload = len(header).to_bytes(8, "little") + header + data
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "span.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
 def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
     # adopted: resuming from the wrong KV generates silently wrong output. It is
