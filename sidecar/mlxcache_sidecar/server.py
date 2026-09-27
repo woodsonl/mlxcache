@@ -85,14 +85,17 @@ def _valid_safetensors(payload: bytes) -> bool:
         # strict UTF-8 and forbid the non-standard numeric constants.
         text = payload[8 : 8 + n].decode("utf-8")
         header = json.loads(text, parse_constant=_reject_json_constant)
+        # A lone surrogate (a \uD800-\uDFFF escape) parses fine in Python but is
+        # not valid UTF-8; MLX rejects it. The strict decode above catches raw
+        # bytes; this catches escaped surrogates in keys and values. It is inside
+        # the guard because the traversal recurses: a deeply nested header raises
+        # RecursionError here, and an escaping RecursionError is a RuntimeError
+        # the daemon would misread as transient (500) instead of retiring it.
+        if _has_lone_surrogate(header):
+            return False
     except (ValueError, TypeError, RecursionError):
         return False
     if not isinstance(header, dict):
-        return False
-    # A lone surrogate (a \uD800-\uDFFF escape) parses fine in Python but is not
-    # valid UTF-8; MLX rejects it. The strict decode above catches raw bytes;
-    # this catches escaped surrogates in keys and values.
-    if _has_lone_surrogate(header):
         return False
     data_len = len(payload) - 8 - n
     ranges: list[tuple[int, int]] = []
