@@ -25,6 +25,36 @@ launchctl load ~/Library/LaunchAgents/com.mlxcache.daemon.plist
 KeepAlive keeps the daemon running; a crash restarts it within seconds.
 Streams in flight drop (R1-4); clients retry.
 
+## Checkpoint durability and recovery
+
+Checkpoints are an optimization; the daemon must serve correctly with an empty,
+partial, or corrupt blob directory.
+
+- **Immutable per-generation files.** Each publication writes a new file named
+  `{hash}-{generation}.ckpt`. A generation is a monotonic counter reserved per
+  publication, so a delayed retirement unlinks only its own file and never a
+  republish that replaced it.
+- **Startup rebuild.** `rebuild_from_disk` runs before the daemon binds its
+  listener. It recovers in two passes: group blobs by token prefix, keep the
+  highest generation per prefix, publish the winners, then delete the superseded
+  files. Blobs that cache nothing or cannot be keyed — a prefix shorter than 2,
+  a recorded count that disagrees with the prefix length, or an empty KV
+  payload — are skipped and left on disk.
+- **Generation floor.** The floor is computed from every filename it can parse
+  before any blob is read, and seeded into the counter (highest `{generation}`
+  wins, via `fetch_max`) before recovered entries are re-published, so a fresh
+  publication can never reuse a generation that an existing file already
+  claims. A filename that does not match the daemon's own
+  `{hash:032x}-{generation:016x}.ckpt` shape is treated as foreign: it joins
+  selection at generation 0 and is reclaimed if a parseable blob claims the same
+  prefix. The daemon only ever writes parseable names, so this affects files not
+  produced by this daemon (legacy or hand-placed).
+- **Publish is refused while the floor is unknown.** If the startup scan fails
+  (e.g. an unreadable blob directory), the daemon sets a recovered-failure
+  guard and refuses all publications. Requests still serve — they run a full
+  prefill and simply do not persist — so a failed scan degrades to
+  no-cache, never to unindexed files or resurrected poison on the next start.
+
 ## mlx-lm version pinning
 
 The sidecar adapter wraps mlx-lm's save/load_prompt_cache, which is lossy
