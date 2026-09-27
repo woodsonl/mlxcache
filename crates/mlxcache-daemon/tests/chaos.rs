@@ -112,7 +112,7 @@ fn crash_before_rename_never_serves_partial() {
         tokens: vec![1, 2, 3],
         format_version: 1,
     };
-    let path = p.publish_atomic(0xabc, &meta, b"complete-kv").unwrap();
+    let path = p.publish_atomic(0xabc, 1, &meta, b"complete-kv").unwrap();
     let (m, payload) = p.load(&path).unwrap();
     assert_eq!(m.token_count, 3);
     assert_eq!(payload, b"complete-kv");
@@ -132,7 +132,8 @@ fn rebuild_skips_one_token_legacy_blob() {
         tokens: vec![7],
         format_version: 1,
     };
-    p.publish_atomic(0x1, &meta, b"nonempty-legacy-kv").unwrap();
+    p.publish_atomic(0x1, 1, &meta, b"nonempty-legacy-kv")
+        .unwrap();
 
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report = orch.rebuild_from_disk(&p);
@@ -159,7 +160,7 @@ async fn restart_drops_streams_checkpoints_survive() {
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
     };
-    let path = p.publish_atomic(0x777, &meta, b"kv").unwrap();
+    let path = p.publish_atomic(0x777, 1, &meta, b"kv").unwrap();
 
     // "Restart": fresh index, rebuild from disk via the real startup path.
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
@@ -179,8 +180,8 @@ async fn restart_drops_streams_checkpoints_survive() {
         "checkpoint must survive restart"
     );
     assert_eq!(
-        out.blob_path.as_deref(),
-        Some("00000000000000000000000000000777.ckpt"),
+        out.blob.as_ref().map(|(name, _gen, _pfx)| name.as_str()),
+        Some("00000000000000000000000000000777-0000000000000001.ckpt"),
         "rebuilt entry must point at the on-disk blob NAME (not an abs path)"
     );
     assert!(path.exists());
@@ -199,7 +200,7 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
     };
-    p.publish_atomic(0x1, &good, b"kv").unwrap();
+    p.publish_atomic(0x1, 1, &good, b"kv").unwrap();
 
     // A corrupt blob (garbage bytes) and a blob with no recoverable prefix.
     std::fs::write(dir.path().join("deadbeef.ckpt"), b"not-a-blob").unwrap();
@@ -209,12 +210,27 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         tokens: vec![],
         format_version: 1,
     };
-    p.publish_atomic(0x2, &noprefix, b"kv").unwrap();
+    p.publish_atomic(0x2, 1, &noprefix, b"kv").unwrap();
+
+    // A multi-token blob with an EMPTY payload: a truncated write the adapter
+    // rejects at runtime. The file can outlive its retirement (a repaired
+    // republish writes a different deterministic name), so rebuild must skip it
+    // rather than resurrect the poison.
+    let empty = CheckpointMeta {
+        fingerprint: fp.clone(),
+        token_count: 3,
+        tokens: vec![7, 7, 7],
+        format_version: 1,
+    };
+    p.publish_atomic(0x3, 1, &empty, b"").unwrap();
 
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report = orch.rebuild_from_disk(&p);
     assert_eq!(report.rebuilt, 1, "only the well-formed blob is indexed");
-    assert_eq!(report.skipped, 2, "corrupt + no-prefix blobs are skipped");
+    assert_eq!(
+        report.skipped, 3,
+        "corrupt, no-prefix, and empty-payload blobs are skipped"
+    );
     assert_eq!(report.errors.len(), 1, "the corrupt blob is reported");
 
     // Exact hit after rebuild.
@@ -229,6 +245,103 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         mlxcache_core::policy::CacheVerdict::Partial
     );
     assert_eq!(ext.prefill_from, 3);
+}
+
+#[tokio::test]
+async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
+    // Regression (Codex pass 7): immutable per-generation names mean a prefix can
+    // have several files on disk. Directory order is arbitrary, so recovery must
+    // pick the LATEST publication (highest generation) per prefix and must not
+    // let an older file overwrite (and delete) the newer repair.
+    let dir = tempfile::tempdir().unwrap();
+    let p = mlxcache_daemon::persistence::Persistence::new(dir.path()).unwrap();
+    let fp = mlxcache_daemon::orchestrator::test_support::fp("m");
+    let meta = CheckpointMeta {
+        fingerprint: fp.clone(),
+        token_count: 4,
+        tokens: vec![1, 2, 3, 4],
+        format_version: 1,
+    };
+    // Same prefix, generations 5 and 17. gen 17 is the repair; it must win.
+    p.publish_atomic(0xabc, 5, &meta, b"old").unwrap();
+    let repair = p.publish_atomic(0xabc, 17, &meta, b"new").unwrap();
+
+    let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let report = orch.rebuild_from_disk(&p);
+    assert_eq!(report.rebuilt, 1, "one entry per prefix");
+    let out = orch.route(&[1, 2, 3, 4], &fp);
+    let name = out.blob.as_ref().map(|(n, _, _)| n.as_str());
+    assert_eq!(
+        name,
+        repair.file_name().map(|n| n.to_string_lossy()).as_deref(),
+        "the highest generation is indexed"
+    );
+    assert!(repair.exists(), "the repair file must survive recovery");
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".ckpt"))
+            .count(),
+        1,
+        "the superseded generation is reclaimed"
+    );
+
+    // Regression (Codex pass 8): after a restart the counter must be seeded above
+    // the persisted generation, so a NEW publication is not given a lower one and
+    // discarded by the next rebuild. Publish after rebuild; its name must encode
+    // a generation above 17.
+    let gen = orch.reserve_generation();
+    assert!(
+        gen > 17,
+        "counter must resume above the persisted max, got {gen}"
+    );
+    let newer = p.publish_atomic(0xabc, gen, &meta, b"newer").unwrap();
+    let orch2 = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let report2 = orch2.rebuild_from_disk(&p);
+    assert_eq!(report2.rebuilt, 1);
+    let out2 = orch2.route(&[1, 2, 3, 4], &fp);
+    assert_eq!(
+        out2.blob.as_ref().map(|(n, _, _)| n.as_str()),
+        newer.file_name().map(|n| n.to_string_lossy()).as_deref(),
+        "the newest publication survives a second restart"
+    );
+}
+
+#[tokio::test]
+async fn rebuild_seeds_generation_above_unloadable_files_too() {
+    // Regression (Codex pass 10): the generation floor must come from FILENAMES,
+    // not only files that load. A higher-generation file that is temporarily
+    // unreadable must still raise the floor, or a replacement published now gets
+    // a lower generation and is deleted once the higher one recovers.
+    let dir = tempfile::tempdir().unwrap();
+    let p = mlxcache_daemon::persistence::Persistence::new(dir.path()).unwrap();
+    let fp = mlxcache_daemon::orchestrator::test_support::fp("m");
+    // A structurally valid blob at generation 3.
+    let meta = CheckpointMeta {
+        fingerprint: fp.clone(),
+        token_count: 4,
+        tokens: vec![1, 2, 3, 4],
+        format_version: 1,
+    };
+    p.publish_atomic(0x1, 3, &meta, b"kv").unwrap();
+    // A higher-generation file whose body is unreadable (truncated header): it is
+    // skipped by the load, but its NAME must still seed the floor above 17.
+    std::fs::write(
+        dir.path()
+            .join("00000000000000000000000000000002-0000000000000011.ckpt"),
+        b"xx",
+    )
+    .unwrap();
+
+    let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let report = orch.rebuild_from_disk(&p);
+    assert_eq!(report.rebuilt, 1, "only the valid blob is indexed");
+    let gen = orch.reserve_generation();
+    assert!(
+        gen > 17,
+        "the floor must account for the unloadable generation-17 filename, got {gen}"
+    );
 }
 
 #[cfg(unix)]

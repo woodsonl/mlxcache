@@ -25,6 +25,118 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+class CheckpointRejectedError(Exception):
+    """A checkpoint the daemon asked us to resume from is bad: corrupt payload,
+    undecodable header, or a recorded prefix that disagrees with the request.
+    Mapped to HTTP 422 so the daemon retires (quarantines) the entry. Distinct
+    from a decode/generation failure, which must NOT retire a healthy
+    checkpoint."""
+
+
+_SAFETENSORS_DTYPE_BYTES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "U16": 2,
+    "I16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "U32": 4,
+    "I32": 4,
+    "F32": 4,
+    "U64": 8,
+    "I64": 8,
+}
+
+
+def _reject_json_constant(name: str) -> None:
+    """Reject NaN/Infinity: the JSON spec forbids them and MLX's parser does too,
+    but Python's json accepts them by default."""
+    raise ValueError(f"non-standard JSON constant: {name}")
+
+
+def _has_lone_surrogate(obj: object) -> bool:
+    """True if any string anywhere in the parsed JSON contains a lone surrogate
+    (U+D800-U+DFFF), which is not valid UTF-8 and which MLX rejects."""
+    if isinstance(obj, str):
+        return any("\ud800" <= c <= "\udfff" for c in obj)
+    if isinstance(obj, dict):
+        return any(_has_lone_surrogate(k) or _has_lone_surrogate(v) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_has_lone_surrogate(v) for v in obj)
+    return False
+
+
+def _valid_safetensors(payload: bytes) -> bool:
+    """Structural check of a safetensors blob: an 8-byte little-endian header
+    length, then that many bytes of JSON object, then each tensor's dtype, shape,
+    and `data_offsets` consistent with the remaining data. Deterministic
+    corruption is caught here so it can be classified as a rejection regardless
+    of which exception the native loader would raise."""
+    if len(payload) < 8:
+        return False
+    n = int.from_bytes(payload[:8], "little")
+    if n == 0 or 8 + n > len(payload):
+        return False
+    try:
+        # Match MLX's strict parser, not Python's lenient one. Python accepts
+        # UTF-16 headers, lone surrogates, and NaN/Infinity; MLX rejects all
+        # three with a RuntimeError we would misread as transient. Decode as
+        # strict UTF-8 and forbid the non-standard numeric constants.
+        text = payload[8 : 8 + n].decode("utf-8")
+        header = json.loads(text, parse_constant=_reject_json_constant)
+    except (ValueError, TypeError, RecursionError):
+        return False
+    if not isinstance(header, dict):
+        return False
+    # A lone surrogate (a \uD800-\uDFFF escape) parses fine in Python but is not
+    # valid UTF-8; MLX rejects it. The strict decode above catches raw bytes;
+    # this catches escaped surrogates in keys and values.
+    if _has_lone_surrogate(header):
+        return False
+    data_len = len(payload) - 8 - n
+    ranges: list[tuple[int, int]] = []
+    for name, spec in header.items():
+        if name == "__metadata__":
+            # Metadata is a string->string map; anything else, MLX rejects with a
+            # RuntimeError we would misread as transient.
+            if not isinstance(spec, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in spec.items()
+            ):
+                return False
+            continue
+        if not isinstance(spec, dict):
+            return False
+        dtype = spec.get("dtype")
+        shape = spec.get("shape")
+        offs = spec.get("data_offsets")
+        if not isinstance(dtype, str) or dtype not in _SAFETENSORS_DTYPE_BYTES:
+            return False
+        if not isinstance(shape, list) or not all(
+            isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape
+        ):
+            return False
+        if (
+            not isinstance(offs, list)
+            or len(offs) != 2
+            or not all(isinstance(o, int) and not isinstance(o, bool) for o in offs)
+        ):
+            return False
+        start, end = offs
+        elements = 1
+        for d in shape:
+            elements *= d
+        expected = elements * _SAFETENSORS_DTYPE_BYTES[dtype]
+        if start < 0 or end < start or end > data_len or end - start != expected:
+            return False
+        ranges.append((start, end))
+    # Safetensors forbids overlapping tensor ranges; the native loader rejects
+    # them. Two tensors claiming the same bytes would otherwise pass here and
+    # raise a RuntimeError we misread as transient.
+    ranges.sort()
+    return all(ranges[i][0] >= ranges[i - 1][1] for i in range(1, len(ranges)))
+
+
 class SyntheticEngine:
     """Hermetic engine: deterministic tokens + KV bytes, no MLX dependency."""
 
@@ -80,6 +192,20 @@ class SyntheticEngine:
     def stream(self, tokens: list[int], blob_path: str | None):
         # Synthetic engine streams its deterministic tokens as text pieces.
         for i, t in enumerate(self.generate(tokens, 64)):
+            yield t, f"tok{i} "
+
+    def prepare_stream(self, tokens: list[int], blob_path: str | None):
+        """Load any checkpoint and return (prompt, cache) BEFORE streaming.
+
+        Split from generation so the handler can surface a rejected checkpoint as
+        a clean 422 (which the daemon quarantines) rather than a mid-stream
+        failure. The synthetic engine has no cache; returns the prompt as-is.
+        """
+        return tokens, None
+
+    def stream_prepared(self, prompt: list[int], cache):
+        """Yield (token_id, text) from an already-prepared prompt/cache."""
+        for i, t in enumerate(self.generate(prompt, 64)):
             yield t, f"tok{i} "
 
 
@@ -196,20 +322,27 @@ class MlxLmEngine:
     def stream(self, tokens: list[int], blob_path: str | None):
         """Yield (token_id, text) for this request, resuming from `blob_path`
         when present. This is the streaming entry the handler drives."""
+        prompt, cache = self.prepare_stream(tokens, blob_path)
+        yield from self.stream_prepared(prompt, cache)
+
+    def prepare_stream(self, tokens: list[int], blob_path: str | None):
+        """Load the checkpoint (may raise for a corrupt blob) and return
+        (prompt, cache). Done before headers are sent so a load failure is a
+        clean 422, not a truncated stream. First-token decode happens later, in
+        stream_prepared, so a decode error does not look like blob corruption."""
         cache = None
         prompt = tokens
         if blob_path:
             cache, prompt = self._load_cache_delta(tokens, blob_path)
             if cache is None:
                 prompt = tokens  # unexpectable cache: scratch
+        return prompt, cache
+
+    def stream_prepared(self, prompt, cache):
+        """Yield (token_id, text) after the checkpoint is already loaded."""
         yield from self._stream_with_cache(prompt, cache)
 
     def _stream_with_cache(self, prompt, cache):
-        # SyntheticEngine has no MLX stream path; approximate from its tokens.
-        if not hasattr(self, "stream_with_cache"):
-            for t in self.generate(prompt, 64):
-                yield t, ""
-            return
         yield from self.stream_with_cache(prompt, cache)
 
     def stream_with_cache(self, tokens, cache):
@@ -225,6 +358,8 @@ class MlxLmEngine:
     def _generate_with_cache(self, tokens: list[int], max_tokens: int, cache) -> list[int]:
         """Collect a bounded generation from the streaming path, so the
         non-streaming /generate mode reuses the identical decode logic."""
+        if max_tokens <= 0:
+            return []
         out: list[int] = []
         for token, _text in self._stream_with_cache(tokens, cache):
             out.append(token)
@@ -233,7 +368,12 @@ class MlxLmEngine:
         return out
 
     def _load_cache_delta(self, tokens: list[int], blob_path: str):
-        """Returns (cache, delta_prompt) or (None, tokens). See generate_from_blob.
+        """Returns (cache, delta_prompt), or (None, tokens) when the checkpoint
+        is legitimately uncacheable for this request (a prefix shorter than 2
+        tokens, or a legacy blob with no recorded tokens). Raises
+        CheckpointRejectedError when the checkpoint is BAD — corrupt payload, or a
+        recorded prefix that disagrees with the request — so the daemon retires
+        the entry instead of resuming from wrong KV.
 
         The persisted cache covers the checkpoint prefix MINUS its final token
         (see prefill), so the delta is exactly the tokens the cache does not
@@ -243,40 +383,75 @@ class MlxLmEngine:
 
         from .blob import decode  # noqa: PLC0415
 
+        # Read first: an OSError here (EIO, ENFILE, EMFILE, ENOMEM, a momentary
+        # disk fault) is TRANSIENT, not a bad checkpoint. Let it propagate as a
+        # 500 so the daemon retries without retiring a healthy entry.
         with open(blob_path, "rb") as fh:
-            meta, payload = decode(fh.read())
+            raw = fh.read()
+        try:
+            meta, payload = decode(raw)
+            # The JSON header is untrusted: a field of the wrong type (e.g.
+            # "tokens":123) must be rejected here, inside the boundary. Letting
+            # len() raise a bare TypeError outside it would 500 forever and leave
+            # the poison selectable.
+            if not isinstance(meta.tokens, list) or not all(
+                isinstance(t, int) and not isinstance(t, bool) for t in meta.tokens
+            ):
+                raise ValueError("tokens must be a list of integers")
+        except (ValueError, KeyError, TypeError) as exc:
+            # A header that does not decode or lacks required fields is a bad
+            # checkpoint: retire it rather than 500 forever while it stays
+            # selectable.
+            raise CheckpointRejectedError(f"checkpoint header invalid: {exc}") from exc
         # The checkpoint prefix must be self-describing: only meta.tokens tells
-        # us which prefix the KV actually covers. A legacy blob with no recorded
-        # tokens cannot be verified against this request, so adopting it would
-        # mean trusting it covers tokens[:token_count] by construction. Refuse:
-        # resuming from the wrong KV generates silently wrong output.
-        # meta.token_count is advisory only (a length, not an identity): any
-        # prefix of that length would pass, so it must never authorize adoption.
+        # us which prefix the KV actually covers. The daemon always writes
+        # meta.tokens, so a blob the index matched WITHOUT them cannot be
+        # verified against this request. Adopting it would trust it covers
+        # tokens[:token_count] by construction; silently running scratch while
+        # the daemon reports a hit would be an accounting lie. Reject it.
         if not meta.tokens:
-            return None, tokens
+            raise CheckpointRejectedError("checkpoint has no recorded token prefix")
         prefix_len = len(meta.tokens)
         if prefix_len < 2 or prefix_len > len(tokens):
             # A prefix shorter than 2 caches nothing. This also rejects legacy
             # one-token checkpoints whose nonempty KV already holds that token:
             # adopting one and feeding the whole prompt would double-feed it.
             return None, tokens
-        # A multi-token checkpoint with no KV payload is CORRUPT (a truncated
-        # write), not uncacheable: return it to the loader so the failure
-        # propagates and the daemon quarantines the entry. Only an uncacheable
-        # prefix (<2 tokens, above) legitimately has an empty payload.
-        prefix = meta.tokens
         # The adapter is a trust boundary: verify the blob really covers this
-        # request's prefix. If the recorded prefix disagrees with the request,
-        # the blob belongs to a different prefix and resuming from it would
-        # generate silently wrong output. Fall back to scratch.
+        # request's prefix. A disagreement means the file does not match the
+        # index entry that pointed at it (mislabeled/corrupt): retire it, do not
+        # silently resume from or ignore wrong KV.
+        prefix = meta.tokens
         if prefix != tokens[:prefix_len]:
-            return None, tokens
+            raise CheckpointRejectedError("checkpoint prefix does not match the request")
+        # A multi-token checkpoint with no KV payload is CORRUPT (a truncated
+        # write), not uncacheable: reject so the daemon quarantines the entry.
+        if not payload:
+            raise CheckpointRejectedError("checkpoint payload is empty")
+        # Validate the safetensors framing ourselves, BEFORE handing it to MLX.
+        # MLX's native parser raises RuntimeError for a bad header length, the
+        # same type it uses for a transient OS read failure, so we cannot classify
+        # from the exception alone. A malformed inner header is deterministic
+        # corruption: reject it here so it is retired, while RuntimeError from the
+        # loader below stays transient (500).
+        if not _valid_safetensors(payload):
+            raise CheckpointRejectedError("checkpoint payload is not valid safetensors")
         covered = prefix_len - 1
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
             tmp = fh.name
             fh.write(payload)
         try:
-            return load_prompt_cache(tmp), tokens[covered:]
+            # A pure-Python parse/schema failure is corruption: reject so the
+            # daemon retires it. MemoryError, OSError, and RuntimeError are
+            # transient (a real OOM, a disk fault; MLX's native reader raises
+            # RuntimeError on an OS read failure): let them propagate as a 500 so
+            # a healthy checkpoint is not retired.
+            try:
+                return load_prompt_cache(tmp), tokens[covered:]
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+                raise CheckpointRejectedError(
+                    f"checkpoint failed to load: {type(exc).__name__}: {exc}"
+                ) from exc
         finally:
             os.unlink(tmp)
 
@@ -356,8 +531,14 @@ class Handler(BaseHTTPRequestHandler):
         """Stream generation as newline-delimited JSON: one line per token,
         then a final done line. Framed by connection close (HTTP/1.0-style)
         so reqwest reads until EOF — no hand-rolled chunked encoding."""
-        # Validation happens in do_POST BEFORE any bytes are sent, so a bad
-        # request can still yield a clean 400 rather than a truncated 200.
+        # Load/validate the checkpoint BEFORE sending 200. A bad blob raises
+        # CheckpointRejectedError here and do_POST maps it to a clean 422, which the
+        # daemon quarantines. Only the load is primed: first-token decode runs
+        # after headers, so a decode error (OOM) truncates the stream without
+        # being mistaken for blob corruption. Once bytes are sent we cannot
+        # switch to a 422.
+        prompt, cache = self.engine.prepare_stream(tokens, blob_path)
+
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Connection", "close")
@@ -366,17 +547,27 @@ class Handler(BaseHTTPRequestHandler):
 
         n = 0
         try:
-            for token, text in self.engine.stream(tokens, blob_path):
-                line = (json.dumps({"token": token, "text": text}) + "\n").encode()
-                self.wfile.write(line)
+            gen = self.engine.stream_prepared(prompt, cache)
+            while n < max_tokens:
+                try:
+                    token, text = next(gen)
+                except StopIteration:
+                    break
+                self.wfile.write((json.dumps({"token": token, "text": text}) + "\n").encode())
                 self.wfile.flush()
                 n += 1
-                if n >= max_tokens:
-                    break
             self.wfile.write((json.dumps({"done": True, "tokens": n}) + "\n").encode())
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             # Client went away mid-stream (R1-4 semantics): stop cleanly.
+            self.close_connection = True
+        except Exception:  # noqa: BLE001 — after headers, never emit a 2nd response
+            # A mid-stream engine failure (OOM, decode error) must not fall
+            # through to do_POST's 500 writer: that would append a JSON error
+            # body to a live 200 stream, which the daemon reads as a token frame.
+            # Truncate the stream by closing, WITHOUT a `done` line, so the daemon
+            # sees EOF-without-completion and surfaces an upstream error.
+            traceback.print_exc()
             self.close_connection = True
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
@@ -399,30 +590,50 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/generate":
                 req = self._read_json()
                 tokens = self._require(req, "tokens")
-                # Real engines fail to load a missing/unreadable blob. Reject a
-                # non-empty blob_path whose file is absent, so the daemon's
-                # quarantine-and-retry path is exercised hermetically (the test
-                # deletes the blob between the miss and the repeat request).
+                # A MISSING blob is a bad checkpoint: 422 so the daemon
+                # quarantines it and retries from scratch. Use os.stat, not
+                # os.path.exists, so a transient stat failure (EIO, ENFILE)
+                # raises and becomes a 500 instead of being misread as "gone"
+                # and retiring a healthy entry. Real engines also fail to load a
+                # missing blob; this pre-check only makes the missing case a
+                # clean 422 before any bytes are written.
                 blob_path = req.get("blob_path")
-                if blob_path and not os.path.exists(blob_path):
-                    self._json(500, {"error": f"blob unreadable: {blob_path}"})
+                if blob_path:
+                    try:
+                        os.stat(blob_path)
+                    except FileNotFoundError:
+                        self._json(422, {"error": f"blob missing: {blob_path}"})
+                        return
+                # Validate max_tokens before any bytes: a non-int here would
+                # blow up mid-stream after headers are sent (truncated 200), and
+                # a negative/huge value silently changes streaming. The daemon
+                # sends a bounded int; reject anything else as a client error.
+                max_tokens = req.get("max_tokens", 64)
+                if (
+                    not isinstance(max_tokens, int)
+                    or isinstance(max_tokens, bool)
+                    or max_tokens < 0
+                ):
+                    self._json(400, {"error": "max_tokens must be a non-negative integer"})
                     return
                 if req.get("stream"):
-                    self._stream_ndjson(tokens, req.get("blob_path"), req.get("max_tokens", 64))
+                    self._stream_ndjson(tokens, req.get("blob_path"), max_tokens)
                 else:
                     blob_path = req.get("blob_path")
                     if blob_path and hasattr(self.engine, "generate_from_blob"):
-                        out = self.engine.generate_from_blob(
-                            tokens, blob_path, req.get("max_tokens", 64)
-                        )
+                        out = self.engine.generate_from_blob(tokens, blob_path, max_tokens)
                     else:
-                        out = self.engine.generate(tokens, req.get("max_tokens", 64))
+                        out = self.engine.generate(tokens, max_tokens)
                     self._json(200, {"tokens": out})
             else:
                 self._json(404, {"error": f"unknown path {self.path}"})
         except Handler._BadRequestError as exc:
             # Client error: 400 with a stable message (no internal detail).
             self._json(400, {"error": str(exc)})
+        except CheckpointRejectedError as exc:
+            # 422: the checkpoint is bad, not the request or the engine. The
+            # daemon quarantines the entry on this status and retries scratch.
+            self._json(422, {"error": str(exc)})
         except Exception as exc:  # noqa: BLE001 — map all engine errors to 500 JSON
             traceback.print_exc()
             self._json(500, {"error": str(exc)})
