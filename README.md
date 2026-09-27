@@ -67,9 +67,24 @@ curl -s http://127.0.0.1:8420/stats
 ```
 
 The first response carries `"verdict":"miss"`, the second `"verdict":"hit"` with
-`"prefill_from":<n>` — `n` is the number of leading tokens whose KV came from the
-cache (prefill resumes at `n`), so the daemon skipped re-prefilling them.
-`/stats` reports the running hit rate.
+`"prefill_from":<n>` — `n` is the number of leading tokens the adapter resumed
+from a stored checkpoint instead of pre-filling, so the daemon skipped
+re-prefilling them. A checkpoint caches KV for `tokens[:-1]` (the adapter saves
+the cache up to the last token), so for an `L`-token prompt a full hit reports
+`L-1`. A request that has to run its own prefill (a miss, or the single-flight
+leader even on a partial) reports `0`: it reused no prior KV even though
+generation then resumes from the blob it just wrote. The response also carries
+`"tokens_cached"`, the same count, and `"tokens_total"`. `/stats` reports the
+running hit rate.
+
+A checkpoint the adapter cannot use is retired, not retried forever. The adapter
+answers `422` when the blob is gone, corrupt, or its recorded prefix disagrees
+with the request; the daemon quarantines that entry and serves the request from
+scratch. A generic decode or transport failure (`500`) does not retire a healthy
+checkpoint. Each publication is written to its own file (`{hash}-{generation}
+.ckpt`), and retirement is keyed by the publication generation the request used,
+so a late failure unlinks only that publication's file — never a fresh republish
+that replaced it.
 
 ## Real inference (mlx-lm)
 
@@ -94,7 +109,10 @@ First run downloads the weights.
 
 Set `"stream": true` and the daemon returns OpenAI-style SSE: a leading
 `data: {"mlxcache":{...}}` frame with the cache verdict, one
-`data: {"token":..,"text":..}` per generated token, then `data: [DONE]`.
+`data: {"token":..,"text":..}` per generated token, then `data: [DONE]`. If the
+engine dies mid-stream the daemon emits a `data:
+{"error":{"type":"upstream_error",...}}` frame before `[DONE]`, so a truncated
+answer is not mistaken for a finished one.
 
 ```bash
 curl -N -X POST http://127.0.0.1:8420/v1/chat/completions \
@@ -118,10 +136,13 @@ curl -N -X POST http://127.0.0.1:8420/v1/chat/completions \
 ## Building and testing
 
 ```bash
-cargo test --workspace                 # Rust: core, daemon, chaos, e2e
+uv sync --group dev                      # pytest, ruff (what CI installs)
+cargo fmt --all -- --check               # formatting gate (CI fails on drift)
+cargo test --workspace                   # Rust: core, daemon, chaos, e2e
 cargo clippy --workspace --all-targets -- -D warnings
-uv run pytest sidecar/tests/           # Python: sidecar, blob codec, roundtrip
+uv run pytest sidecar/tests/             # Python: sidecar, blob codec, roundtrip
 uv run ruff check sidecar/
+uv run ruff format --check sidecar/
 ```
 
 The real mlx-lm round-trip gate (needs a downloaded model) is opt-in:

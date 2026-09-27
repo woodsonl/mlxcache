@@ -95,6 +95,81 @@ async fn unusable_blob_is_quarantined_and_served_from_scratch() {
     child.wait().expect("reap sidecar");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
+    // Regression (coverage audit): after a FAILED startup scan the generation
+    // floor is unknown, so the handler must serve from scratch and write NO
+    // checkpoint (writing first would leak an unindexed file on every request).
+    use std::os::unix::fs::PermissionsExt;
+    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let persistence = mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap();
+    // Make the dir unreadable so list_blobs fails, then run the real startup
+    // scan: it sets recovery_failed and blocks publishing.
+    let mut perms = std::fs::metadata(blobs.path()).unwrap().permissions();
+    let orig = perms.mode();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(blobs.path(), perms).unwrap();
+    let orchestrator = Orchestrator::new();
+    let report = orchestrator.rebuild_from_disk(&persistence);
+    assert!(!report.errors.is_empty(), "scan must report the failure");
+    assert!(!orchestrator.can_publish(), "publishing must be blocked");
+    // Restore access so the handler can at least attempt (and refuse) a write.
+    let mut perms = std::fs::metadata(blobs.path()).unwrap().permissions();
+    perms.set_mode(orig);
+    std::fs::set_permissions(blobs.path(), perms).unwrap();
+
+    let state = Arc::new(AppState {
+        orchestrator,
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+        ),
+        persistence,
+    });
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "no cache please"}],
+        "stream": false,
+    })
+    .to_string();
+    let res = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "request is still served");
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "miss");
+    assert_eq!(
+        state.orchestrator.published_count(),
+        0,
+        "no entry may be indexed while the floor is unknown"
+    );
+    let ckpts = std::fs::read_dir(blobs.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".ckpt"))
+        .count();
+    assert_eq!(ckpts, 0, "no blob file may be written: {ckpts}");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
 #[tokio::test]
 async fn one_token_prompt_serves_and_publishes_no_blob() {
     // A one-token prompt caches nothing (empty adapter payload). The daemon must
@@ -374,12 +449,17 @@ async fn end_to_end_miss_then_hit() {
     assert_eq!(v["mlxcache"]["verdict"], "miss");
     assert_eq!(v["status"], "ok");
     assert!(!v["generated_tokens"].as_array().unwrap().is_empty());
-    // The synthetic tokenizer emits 8 tokens; the leader adopts the blob it
-    // just published, whose KV covers tokens[:-1] = 7. prefill_from reports the
-    // covered count, so it must be 7, not 8.
+    // The synthetic tokenizer emits 8 tokens. A cold miss built its own KV; no
+    // KV came from an earlier request, so prefill_from/tokens_cached report 0
+    // (README: "0 on a miss"). Generation still resumes from the blob the leader
+    // just wrote, but that is not cross-request reuse.
     assert_eq!(
-        v["mlxcache"]["prefill_from"], 7,
-        "leader reports covered KV tokens (len-1), not the full request length"
+        v["mlxcache"]["prefill_from"], 0,
+        "a cold miss reused no prior KV"
+    );
+    assert_eq!(
+        v["mlxcache"]["tokens_cached"], 0,
+        "a cold miss cached nothing from a prior request"
     );
 
     // Blob must be on disk now.
@@ -408,6 +488,14 @@ async fn end_to_end_miss_then_hit() {
         v["mlxcache"]["prefill_from"], 7,
         "hit reports covered KV tokens for the 8-token prefix (len-1)"
     );
+    // tokens_cached must agree with prefill_from: both name the KV actually in
+    // hand (covered = len-1 = 7), not the matched prefix length (8). A client
+    // reading tokens_cached=8 would believe one more token of KV is cached than
+    // the adapter can resume from.
+    assert_eq!(
+        v["mlxcache"]["tokens_cached"], 7,
+        "tokens_cached must report covered KV, matching prefill_from"
+    );
 
     // Stats: 2 requests, 1 miss, 1 hit.
     let res = make_app()
@@ -424,6 +512,13 @@ async fn end_to_end_miss_then_hit() {
     assert_eq!(stats["requests"], 2);
     assert_eq!(stats["hits"], 1);
     assert_eq!(stats["misses"], 1);
+    // tokens_cached accumulates covered KV (miss=0, hit=7 for the 8-token
+    // prefix), matching the per-response field. Summing matched_tokens would
+    // report 8 here and inflate hit_rate.
+    assert_eq!(
+        stats["tokens_cached"], 7,
+        "/stats must accumulate covered KV, not matched prefix length"
+    );
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
@@ -518,7 +613,15 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".ckpt"))
         .collect();
-    assert_eq!(ckpts.len(), 2, "each model needs its own blob: {ckpts:?}");
+    // The index holds one entry per token prefix. Both models tokenize the same
+    // prompt, so the second publish replaces the first at that node and reclaims
+    // its immutable file — exactly one blob survives, with no generation leak.
+    // The evicted model is a fingerprint miss (recomputed), never an error.
+    assert_eq!(
+        ckpts.len(),
+        1,
+        "the superseded generation must be reclaimed: {ckpts:?}"
+    );
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
@@ -834,7 +937,7 @@ async fn end_to_end_streaming_sse() {
                 .method("POST")
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
-                .body(Body::from(body))
+                .body(Body::from(body.clone()))
                 .unwrap(),
         )
         .await
@@ -869,6 +972,38 @@ async fn end_to_end_streaming_sse() {
     let ttft_pos = text.find("\"ttft_ms\"").expect("ttft frame missing");
     let done_pos = text.find("data: [DONE]").unwrap();
     assert!(ttft_pos < done_pos, "ttft frame must precede [DONE]");
+    // First request (miss): the leader prefills and publishes, but no prior KV
+    // was reused, so tokens_cached and prefill_from are both 0 (README: "0 on a
+    // miss"). They must agree with each other.
+    assert!(
+        text.contains("\"tokens_cached\":0") && text.contains("\"prefill_from\":0"),
+        "cold-miss stream must report 0 covered KV: {text}"
+    );
+
+    // Second identical stream request: a hit. The meta frame must report
+    // tokens_cached = prefill_from = covered KV (8-token prefix -> 7), not 8.
+    let res = make_app()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("\"verdict\":\"hit\""),
+        "second stream must be a hit: {text}"
+    );
+    assert!(
+        text.contains("\"tokens_cached\":7") && text.contains("\"prefill_from\":7"),
+        "hit stream must report covered KV (7), not matched prefix (8): {text}"
+    );
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");

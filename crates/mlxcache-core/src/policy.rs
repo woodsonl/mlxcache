@@ -18,6 +18,12 @@ pub enum CacheVerdict {
 }
 
 /// Classification of a lookup against the index + fingerprint rules (R1-1).
+///
+/// A match of fewer than 2 tokens is treated as a miss: a checkpoint caches KV
+/// for `tokens[:-1]`, so it holds nothing until it covers 2 tokens. The index
+/// refuses to publish such prefixes, so this is defense in depth against any
+/// path that still produces one — a hit/partial with zero covered KV would hand
+/// the adapter a blob to resume from while reporting no reuse.
 pub fn classify(
     matched_tokens: Option<usize>,
     request_tokens: usize,
@@ -25,7 +31,7 @@ pub fn classify(
     request_fingerprint: &ModelFingerprint,
 ) -> CacheVerdict {
     match matched_tokens {
-        Some(0) => CacheVerdict::Miss,
+        Some(n) if n < 2 => CacheVerdict::Miss,
         Some(n) => {
             if matched_fingerprint != Some(request_fingerprint) {
                 return CacheVerdict::Miss;
@@ -65,6 +71,17 @@ pub struct PolicyDecision {
     pub request_tokens: usize,
 }
 
+/// Tokens whose KV a decision actually covers: `matched_tokens - 1` for
+/// hit/partial (the adapter caches `tokens[:-1]`), 0 for miss. This is the one
+/// definition of the client-facing `prefill_from` / `tokens_cached` /
+/// `kv_claimed` value, so those fields cannot drift apart by a token.
+pub fn covered_kv_tokens(verdict: CacheVerdict, matched_tokens: usize) -> usize {
+    match verdict {
+        CacheVerdict::Miss => 0,
+        CacheVerdict::Hit | CacheVerdict::Partial => matched_tokens.saturating_sub(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +101,17 @@ mod tests {
         assert_eq!(classify(Some(5), 5, Some(&f), &f), CacheVerdict::Hit);
         assert_eq!(classify(Some(3), 5, Some(&f), &f), CacheVerdict::Partial);
         assert_eq!(classify(None, 5, None, &f), CacheVerdict::Miss);
+    }
+
+    #[test]
+    fn classify_match_under_two_is_miss() {
+        // A match of <2 tokens covers no KV; never hit/partial. A 1-token
+        // "exact" match (n == request_tokens == 1) must still be a miss, or the
+        // request would be a hit with zero covered KV.
+        let f = fp("m");
+        assert_eq!(classify(Some(1), 1, Some(&f), &f), CacheVerdict::Miss);
+        assert_eq!(classify(Some(1), 5, Some(&f), &f), CacheVerdict::Miss);
+        assert_eq!(classify(Some(0), 5, Some(&f), &f), CacheVerdict::Miss);
     }
 
     #[test]
@@ -107,5 +135,16 @@ mod tests {
         };
         assert_eq!(eviction_score(&anchor), 0);
         assert!(eviction_score(&cold) > 0);
+    }
+
+    #[test]
+    fn covered_kv_is_matched_minus_one() {
+        // The one definition of cached/covered KV: matched-1 for hit/partial
+        // (adapter caches tokens[:-1]), 0 for miss, and never underflows.
+        assert_eq!(covered_kv_tokens(CacheVerdict::Hit, 8), 7);
+        assert_eq!(covered_kv_tokens(CacheVerdict::Partial, 8), 7);
+        assert_eq!(covered_kv_tokens(CacheVerdict::Miss, 8), 0);
+        assert_eq!(covered_kv_tokens(CacheVerdict::Partial, 0), 0);
+        assert_eq!(covered_kv_tokens(CacheVerdict::Hit, 1), 0);
     }
 }
