@@ -75,6 +75,8 @@ CheckpointMeta = {
 - Structure: **radix tree over token IDs** (R7-spec-perf). O(prefix length) lookup; shared-prefix memory efficiency; matches mlx-lm LRUPromptCache trie semantics.
 - Node states: absent → in-flight (single-flight lock) → published (post-rename) → quarantined.
 - Invalid transition: published → in-flight. Prevented by index check before prefill.
+- Publication is **per-generation**: every publish reserves a monotonic generation and writes an immutable `{hash}-{generation}.ckpt`, so replacing an entry reclaims the prior file under the index lock and a retirement keyed by `(blob name, generation, prefix)` unlinks only its own generation.
+- The generation counter is seeded from on-disk filenames and guarded by a failed-startup-scan flag; publishing is refused until the floor is known, so recovery never reuses a generation an existing file claims.
 
 ## TTFT budget decomposition (R7-spec-perf)
 

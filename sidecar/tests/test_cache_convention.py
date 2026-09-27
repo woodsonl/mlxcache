@@ -436,6 +436,38 @@ def test_deeply_nested_header_is_rejected_not_500(monkeypatch, tmp_path):
         eng._load_cache_delta(tokens, path)
 
 
+def test_header_that_parses_but_recurses_during_validation_is_rejected(monkeypatch, tmp_path):
+    # Regression (Codex pass 14): the pass-12 test above only covers RecursionError
+    # inside json.loads. A header that PARSES as a dict but nests deeply inside a
+    # value the lone-surrogate traversal must walk blows RecursionError *outside*
+    # the decode guard. RecursionError is a RuntimeError, so it would escape as a
+    # 500 and leave the poison published. It must be a 422.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    node: object = "x"
+    for _ in range(2000):
+        node = [node]
+    # "t" is a structurally valid tensor; "deep" parses fine and is only walked
+    # by the surrogate check.
+    header = json.dumps(
+        {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}, "deep": node}
+    ).encode()
+    payload = len(header).to_bytes(8, "little") + header + b"\x00" * 4
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "recursive-validate.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
 @pytest.mark.parametrize(
     "raw_header",
     [
