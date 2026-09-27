@@ -48,6 +48,38 @@ pub enum SidecarError {
     Http { status: u16, body: String },
     #[error("sidecar protocol violation: {0}")]
     Protocol(String),
+    /// The sidecar rejected the checkpoint we asked it to resume from (HTTP
+    /// 422): corrupt payload, undecodable header, or a prefix that disagrees
+    /// with the request. Only this error retires the entry; a decode or
+    /// transport failure must NOT quarantine a healthy checkpoint.
+    #[error("checkpoint rejected by adapter: {body}")]
+    CheckpointRejected { body: String },
+}
+
+impl SidecarError {
+    /// Whether this error means the checkpoint we passed is bad and must be
+    /// quarantined. True only for the adapter's explicit rejection.
+    pub fn is_checkpoint_rejected(&self) -> bool {
+        matches!(self, SidecarError::CheckpointRejected { .. })
+    }
+}
+
+/// Map a non-success sidecar response to the right error. HTTP 422 is the
+/// adapter's explicit checkpoint rejection; everything else is a plain HTTP
+/// error. Shared so every endpoint classifies identically.
+async fn classify_http_error(resp: reqwest::Response) -> SidecarError {
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    classify_status(status, body)
+}
+
+/// The status/body classification, pure so it is unit-testable.
+fn classify_status(status: u16, body: String) -> SidecarError {
+    if status == 422 {
+        SidecarError::CheckpointRejected { body }
+    } else {
+        SidecarError::Http { status, body }
+    }
 }
 
 /// Minimal async HTTP client for the sidecar. reqwest keeps the connection
@@ -96,11 +128,7 @@ impl SidecarClient {
             })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SidecarError::Http {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(classify_http_error(resp).await);
         }
         resp.bytes()
             .await
@@ -131,11 +159,7 @@ impl SidecarClient {
             })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SidecarError::Http {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(classify_http_error(resp).await);
         }
         #[derive(serde::Deserialize)]
         struct GenResponse {
@@ -173,11 +197,7 @@ impl SidecarClient {
             })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SidecarError::Http {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(classify_http_error(resp).await);
         }
         Ok(resp)
     }
@@ -198,11 +218,7 @@ impl SidecarClient {
             })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SidecarError::Http {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(classify_http_error(resp).await);
         }
         resp.json::<TokenizeResponse>()
             .await
@@ -218,6 +234,24 @@ mod tests {
     fn config_shapes() {
         let c = SidecarConfig::new("http://127.0.0.1:8421".into(), "m".into());
         assert_eq!(c.base_url, "http://127.0.0.1:8421");
+    }
+
+    #[test]
+    fn status_classification_is_422_only() {
+        // Only 422 retires a checkpoint; every other failure must not, or a
+        // transient 500 would quarantine a healthy entry.
+        let rejected = classify_status(422, "bad header".into());
+        assert!(rejected.is_checkpoint_rejected());
+        assert!(matches!(rejected, SidecarError::CheckpointRejected { .. }));
+
+        for status in [500u16, 503, 502, 400, 404, 200] {
+            let e = classify_status(status, "x".into());
+            assert!(
+                !e.is_checkpoint_rejected(),
+                "status {status} must not retire a checkpoint"
+            );
+            assert!(matches!(e, SidecarError::Http { status: s, .. } if s == status));
+        }
     }
 
     #[tokio::test]
