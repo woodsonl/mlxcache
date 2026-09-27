@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use mlxcache_core::contract::ModelFingerprint;
-use mlxcache_core::policy::{CacheVerdict, PolicyDecision};
+use mlxcache_core::policy::{covered_kv_tokens, CacheVerdict, PolicyDecision};
 use mlxcache_core::singleflight::SingleFlight;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -69,7 +69,13 @@ pub struct StatsInner {
     pub hits: u64,
     pub misses: u64,
     pub partials: u64,
+    /// Sum of covered KV across requests. On a retire, `correct_retire` subtracts
+    /// the entry's covered count, so this reflects KV actually in hand.
     pub tokens_cached: u64,
+    /// Sum of request lengths. `hit_rate = tokens_cached / tokens_total` is a
+    /// coarse reuse diagnostic, not a true per-request fraction: a retire lowers
+    /// the numerator without lowering this, so the ratio can dip below the
+    /// fraction of requests that hit. Read it as a trend, not an exact rate.
     pub tokens_total: u64,
 }
 
@@ -88,8 +94,36 @@ impl Stats {
             CacheVerdict::Miss => s.misses += 1,
             CacheVerdict::Partial => s.partials += 1,
         }
-        s.tokens_cached += d.matched_tokens as u64;
+        // tokens_cached counts KV actually in hand (covered = matched-1), the
+        // same value the response reports as tokens_cached/prefill_from. Counting
+        // matched_tokens here would overstate reuse by one per hit.
+        s.tokens_cached += covered_kv_tokens(d.verdict, d.matched_tokens) as u64;
         s.tokens_total += d.request_tokens as u64;
+    }
+
+    /// Correct a decision whose checkpoint was retired (quarantined) after
+    /// `record`: no KV was actually reused, so drop the covered count and move
+    /// the verdict to a miss. Otherwise /stats and hit_rate report reuse for a
+    /// request that ran from scratch. The per-response body is already corrected
+    /// on the retire path; this keeps the aggregate consistent with it.
+    ///
+    /// No-op for a decision already recorded as Miss: a cold-miss leader keeps
+    /// its miss verdict while adopting the blob it just published, and retiring
+    /// that blob must not count a second miss for the one request.
+    pub fn correct_retire(&self, d: &PolicyDecision) {
+        if d.verdict == CacheVerdict::Miss {
+            return;
+        }
+        let mut s = self.lock();
+        match d.verdict {
+            CacheVerdict::Hit => s.hits = s.hits.saturating_sub(1),
+            CacheVerdict::Partial => s.partials = s.partials.saturating_sub(1),
+            CacheVerdict::Miss => {}
+        }
+        s.misses += 1;
+        s.tokens_cached = s
+            .tokens_cached
+            .saturating_sub(covered_kv_tokens(d.verdict, d.matched_tokens) as u64);
     }
 }
 
@@ -191,9 +225,10 @@ async fn chat_completions(
         kv_layout_version: 1,
     };
     let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
-    // Compute the prefix key once: reused by the log line and (on miss) the
-    // blob filename. Hashing a long prefix twice is wasted hot-path work.
-    let hash = prefix_hash(&tokens);
+    // The token-only prefix hash for the request log line. The blob filename
+    // uses a DIFFERENT key (blob_key = fingerprint + tokens), computed in the
+    // leader branch where the fingerprint is in scope; the two are not equal.
+    let prefix_hash = prefix_hash(&tokens);
 
     // Prefill on miss/partial. Single-flight (R1-3): one leader runs the
     // prefill and publishes; followers await its result and re-route so they
@@ -217,7 +252,12 @@ async fn chat_completions(
                     // an empty name is the sentinel for "nothing published"; the
                     // follower branch below treats an empty name as a no-blob miss
                     // and runs from scratch too.
-                    Ok(blob) if blob.is_empty() => {
+                    //
+                    // A <2-token prefix caches nothing even if a non-conforming
+                    // adapter returned bytes: the index refuses to key it, so
+                    // persisting and adopting it would write a blob no lookup can
+                    // serve and hand the adapter a checkpoint covering zero KV.
+                    Ok(blob) if blob.is_empty() || tokens.len() < 2 => {
                         // Force a scratch decision so this request and every
                         // follower report the same verdict: nothing was cached,
                         // so no blob may be resumed from even if a shorter
@@ -227,7 +267,7 @@ async fn chat_completions(
                             matched_tokens: 0,
                             request_tokens: tokens.len(),
                         };
-                        outcome.blob_path = None;
+                        outcome.blob = None;
                         outcome.prefill_from = 0;
                         lead.complete(Ok(String::new()));
                     }
@@ -238,31 +278,74 @@ async fn chat_completions(
                             tokens: tokens.clone(),
                             format_version: 1,
                         };
-                        let blob_name = format!("{:032x}.ckpt", blob_key(&fingerprint, &tokens));
-                        match state.persistence.publish_atomic(
-                            blob_key(&fingerprint, &tokens),
-                            &meta,
-                            &blob,
-                        ) {
-                            // ENOSPC rescue (registry): log and continue uncached.
-                            Err(e) => {
-                                tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
-                                lead.complete(Err(e.to_string()));
-                            }
-                            Ok(_) => {
-                                state.orchestrator.publish_checkpoint(
-                                    &tokens,
-                                    meta,
-                                    blob_name.clone(),
-                                );
-                                // The leader's own request resumes from the blob it
-                                // just wrote (avoids re-prefilling the delta). The
-                                // blob holds KV for tokens[:-1], so the covered
-                                // count is len-1, matching hit/partial and the
-                                // field's contract.
-                                outcome.blob_path = Some(blob_name.clone());
-                                outcome.prefill_from = tokens.len().saturating_sub(1);
-                                lead.complete(Ok(blob_name));
+                        let key = blob_key(&fingerprint, &tokens);
+                        // Refuse before writing if the generation floor is unknown
+                        // (a failed startup scan): writing first would leak an
+                        // unindexed file on every request. Serve from scratch.
+                        if !state.orchestrator.can_publish() {
+                            // Floor unknown: don't write. Report a plain miss so
+                            // followers also serve from scratch (an empty name is
+                            // the "not cached" signal, not an error).
+                            tracing::warn!("not caching: startup recovery incomplete");
+                            outcome.decision = mlxcache_core::policy::PolicyDecision {
+                                verdict: mlxcache_core::policy::CacheVerdict::Miss,
+                                matched_tokens: 0,
+                                request_tokens: tokens.len(),
+                            };
+                            outcome.blob = None;
+                            outcome.prefill_from = 0;
+                            lead.complete(Ok(String::new()));
+                        } else {
+                            // Reserve the generation BEFORE writing so the on-disk
+                            // name is generation-specific (immutable). A republish
+                            // then never overwrites an earlier generation's file, so
+                            // a delayed retirement cannot delete a healthy
+                            // replacement.
+                            let generation = state.orchestrator.reserve_generation();
+                            let blob_name = format!("{:032x}-{:016x}.ckpt", key, generation);
+                            match state
+                                .persistence
+                                .publish_atomic(key, generation, &meta, &blob)
+                            {
+                                // ENOSPC rescue (registry): log and continue uncached.
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
+                                    lead.complete(Err(e.to_string()));
+                                }
+                                Ok(_) => {
+                                    let published = state.orchestrator.publish_checkpoint(
+                                        &state.persistence,
+                                        &tokens,
+                                        meta,
+                                        blob_name.clone(),
+                                        generation,
+                                    );
+                                    // publish_checkpoint is expected to succeed (we
+                                    // checked can_publish), but if the index rejected
+                                    // it, remove the now-unindexed file so it cannot
+                                    // leak.
+                                    if !published {
+                                        if let Err(e) = state.persistence.remove(&blob_name) {
+                                            tracing::warn!(error = %e, "could not remove unindexed blob");
+                                        }
+                                    }
+                                    // The leader ran a FRESH prefill over the whole
+                                    // prompt (the ancestor blob was not passed to the
+                                    // adapter), so no prior-request KV was reused, even
+                                    // on a partial. Report a miss with zero covered KV
+                                    // so response, /stats, and the log agree on what
+                                    // actually happened. Only generation resumes from
+                                    // the blob just written; that is not reuse.
+                                    outcome.decision = mlxcache_core::policy::PolicyDecision {
+                                        verdict: mlxcache_core::policy::CacheVerdict::Miss,
+                                        matched_tokens: 0,
+                                        request_tokens: tokens.len(),
+                                    };
+                                    outcome.prefill_from = 0;
+                                    outcome.blob =
+                                        Some((blob_name.clone(), generation, tokens.clone()));
+                                    lead.complete(Ok(blob_name));
+                                }
                             }
                         }
                     }
@@ -294,7 +377,7 @@ async fn chat_completions(
                             matched_tokens: 0,
                             request_tokens: tokens.len(),
                         };
-                        outcome.blob_path = None;
+                        outcome.blob = None;
                         outcome.prefill_from = 0;
                     }
                     None => {}
@@ -311,11 +394,11 @@ async fn chat_completions(
     // prefilled), a coalesced follower the hit/partial it adopted. Recording
     // after single-flight keeps stats truthful.
     state.stats.record(&outcome.decision);
-    log_request(&req.model, hash, &outcome.decision, lookup_ms);
+    log_request(&req.model, prefix_hash, &outcome.decision, lookup_ms);
 
     // The adapter needs an absolute path to open the blob directly.
-    let blob_abs = match &outcome.blob_path {
-        Some(name) => state
+    let blob_abs = match &outcome.blob {
+        Some((name, _, _)) => state
             .persistence
             .blob_dir
             .join(name)
@@ -323,7 +406,7 @@ async fn chat_completions(
             .into_owned(),
         None => String::new(),
     };
-    let blob_arg = if outcome.blob_path.is_some() {
+    let blob_arg = if outcome.blob.is_some() {
         Some(blob_abs.as_str())
     } else {
         None
@@ -335,26 +418,50 @@ async fn chat_completions(
 
     // Generate: full context tokens, continuation from the request length.
     // The adapter opens the blob directly, so it needs the absolute path.
-    let mut retired_blob = false;
+    // True when this request leaned on a blob but ended up not using its KV
+    // (rejected OR a transient failure). The response and aggregate must then
+    // report a scratch run: no prior KV was reused. Quarantine is a separate
+    // decision, taken only on an explicit adapter rejection.
+    let mut blob_unused = false;
     let generated = match client.generate(&tokens, 64, blob_arg).await {
         Ok(t) => t,
         Err(e) => {
-            // If this request leaned on a blob and the adapter could not use it,
-            // the checkpoint is bad (deleted, truncated, disk fault). Quarantine
-            // it (R1-1) so identical requests stop 502ing, then retry from
-            // scratch. A scratch failure is a genuine adapter error.
-            if let Some(name) = outcome.blob_path.clone() {
-                state.orchestrator.quarantine_checkpoint(&tokens);
-                retired_blob = true;
-                // Correct the decision's claim: no KV was actually reused.
-                tracing::warn!(
-                    blob = %name,
-                    error = %e,
-                    kv_claimed = outcome.prefill_from,
-                    "blob unusable; quarantined, retrying from scratch (effective prefill_from=0)"
-                );
+            // If this request leaned on a blob and the request failed, retry
+            // from scratch. A checkpoint the adapter explicitly rejected (422)
+            // is bad: quarantine it so identical requests stop failing. A mere
+            // transport/decode failure must NOT retire a healthy checkpoint.
+            if let Some((name, generation, prefix)) = outcome.blob.clone() {
+                blob_unused = true;
+                if e.is_checkpoint_rejected() {
+                    // Quarantine marks the entry; the blob file is deleted under
+                    // the index lock (durable retirement, race-free vs republish).
+                    state.orchestrator.quarantine_checkpoint(
+                        &state.persistence,
+                        &name,
+                        generation,
+                        &prefix,
+                    );
+                    tracing::warn!(
+                        blob = %name,
+                        error = %e,
+                        kv_claimed = outcome.prefill_from,
+                        "blob rejected by adapter; quarantined, retrying from scratch (effective prefill_from=0)"
+                    );
+                } else {
+                    tracing::warn!(
+                        blob = %name,
+                        error = %e,
+                        "blob run failed with a non-rejection error; retrying from scratch without quarantine (effective prefill_from=0)"
+                    );
+                }
                 match client.generate(&tokens, 64, None).await {
-                    Ok(t) => t,
+                    Ok(t) => {
+                        // Correct the aggregate only after the scratch retry
+                        // succeeds: the covered KV counted at record() was never
+                        // in hand. A 502 must not be counted as a served miss.
+                        state.stats.correct_retire(&outcome.decision);
+                        t
+                    }
                     Err(e2) => {
                         return Err(err(
                             StatusCode::BAD_GATEWAY,
@@ -376,7 +483,7 @@ async fn chat_completions(
     let total_ms = started.elapsed().as_millis() as u64;
     let body = serde_json::json!({
         "mlxcache": {
-            "verdict": if retired_blob {
+            "verdict": if blob_unused {
                 "miss"
             } else {
                 match outcome.decision.verdict {
@@ -385,13 +492,9 @@ async fn chat_completions(
                     CacheVerdict::Miss => "miss",
                 }
             },
-            "tokens_cached": if retired_blob {
-                0
-            } else {
-                outcome.decision.matched_tokens
-            },
+            "tokens_cached": if blob_unused { 0 } else { outcome.prefill_from },
             "tokens_total": outcome.decision.request_tokens,
-            "prefill_from": if retired_blob { 0 } else { outcome.prefill_from },
+            "prefill_from": if blob_unused { 0 } else { outcome.prefill_from },
             // Time to the cache decision (prefill+publish on a miss). The
             // non-streaming path has no first-token hook, so the full round trip
             // is reported separately as total_ms.
@@ -435,13 +538,20 @@ fn prefix_hash(tokens: &[u32]) -> u128 {
 /// model's still-valid index entry would load foreign KV on its next hit:
 /// silent wrong output. Prepending the fingerprint keeps the two files apart.
 fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u32]) -> u128 {
-    let mut f = fingerprint.model_id.clone();
-    f.push('\u{1f}');
-    f.push_str(&fingerprint.tokenizer_hash);
-    f.push('\u{1f}');
-    f.push_str(&fingerprint.kv_dtype);
-    f.push('\u{1f}');
-    f.push_str(&fingerprint.kv_layout_version.to_string());
+    // Length-prefix each field so no field's bytes can be re-split across the
+    // boundaries: joining with a separator is ambiguous when model_id itself
+    // (request-controlled) contains the separator, which would alias two
+    // fingerprints to one key and one blob file.
+    fn put(out: &mut String, field: &str) {
+        out.push_str(&field.len().to_string());
+        out.push(':');
+        out.push_str(field);
+    }
+    let mut f = String::new();
+    put(&mut f, &fingerprint.model_id);
+    put(&mut f, &fingerprint.tokenizer_hash);
+    put(&mut f, &fingerprint.kv_dtype);
+    put(&mut f, &fingerprint.kv_layout_version.to_string());
     // Fold the fingerprint into the token hash: hash the fingerprint bytes into
     // both lanes first, then continue with the tokens.
     let fp_bytes: Vec<u32> = f
@@ -495,29 +605,49 @@ async fn stream_response(
     // sidecar emits it, so it is reported in the terminal frame, not here.
     let lookup_ms = started.elapsed().as_millis() as u64;
 
-    let mut blob_for_open = outcome.blob_path.clone();
+    let mut blob_for_open = outcome.blob.clone();
     let mut prefill_from = outcome.prefill_from;
-    let retired_blob = std::cell::Cell::new(false);
+    // True when the stream leaned on a blob but ran from scratch instead
+    // (rejection OR transient failure): the meta frame and aggregate must then
+    // report a miss. Quarantine stays conditional on an explicit rejection.
+    let blob_unused = std::cell::Cell::new(false);
     let upstream = match client.generate_stream(&tokens, 64, blob_arg).await {
         Ok(u) => u,
         Err(e) if blob_for_open.is_some() => {
-            // The blob could not be opened (deleted/truncated/disk fault).
-            // Quarantine it and retry from scratch so the stream still starts.
-            if let Some(name) = blob_for_open.take() {
-                state.orchestrator.quarantine_checkpoint(&tokens);
+            // The stream could not be opened. Retry from scratch so the stream
+            // still starts. Quarantine only on an explicit adapter rejection
+            // (422): a transport/decode failure must not retire a healthy blob.
+            if e.is_checkpoint_rejected() {
+                if let Some((name, generation, prefix)) = blob_for_open.take() {
+                    state.orchestrator.quarantine_checkpoint(
+                        &state.persistence,
+                        &name,
+                        generation,
+                        &prefix,
+                    );
+                    tracing::warn!(
+                        blob = %name,
+                        error = %e,
+                        kv_claimed = prefill_from,
+                        "blob rejected by adapter; quarantined, retrying stream from scratch (effective prefill_from=0)"
+                    );
+                }
+            } else {
                 tracing::warn!(
-                    blob = %name,
                     error = %e,
-                    kv_claimed = prefill_from,
-                    "blob unusable; quarantined, retrying stream from scratch (effective prefill_from=0)"
+                    "stream open failed with a non-rejection error; retrying from scratch without quarantine (effective prefill_from=0)"
                 );
             }
             prefill_from = 0;
-            retired_blob.set(true);
-            client
+            blob_unused.set(true);
+            let upstream = client
                 .generate_stream(&tokens, 64, None)
                 .await
-                .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?
+                .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?;
+            // Correct the aggregate only after the scratch retry succeeded: a
+            // 502 must not be counted as a served miss.
+            state.stats.correct_retire(&outcome.decision);
+            upstream
         }
         Err(e) => {
             return Err(err(
@@ -530,22 +660,35 @@ async fn stream_response(
 
     // The meta frame reflects what this stream actually did: if the blob was
     // retired, it is a scratch run (miss), not the original hit/partial.
-    let (verdict, effective_cached) = if retired_blob.get() {
-        ("miss", 0)
+    // tokens_cached and prefill_from are the same quantity (covered KV), so both
+    // come from the single `prefill_from` value, already zeroed on retire.
+    //
+    // ponytail: the meta frame is sent BEFORE the first token so TTFT can be
+    // reported. A mid-stream decode failure after a successful load truncates
+    // the stream (the adapter cannot tell OOM from a corrupt-but-loadable blob)
+    // and is signaled by an `upstream_error` frame, not a retirement: the design
+    // forbids retiring a healthy checkpoint on a transient decode failure. If a
+    // blob proves persistently undecodable, add a consecutive-failure counter
+    // that retires after K and re-emit a corrected terminal frame.
+    //
+    // /stats semantics on truncation: the checkpoint DID load and its covered KV
+    // WAS reused, so `hits`/`tokens_cached` are NOT corrected — they measure KV
+    // reuse (a trend metric), while `upstream_error` frames measure requests that
+    // completed. The two are distinct on purpose; do not "fix" one to match the
+    // other without changing the documented meaning of the metric.
+    let verdict = if blob_unused.get() {
+        "miss"
     } else {
-        (
-            match outcome.decision.verdict {
-                CacheVerdict::Hit => "hit",
-                CacheVerdict::Partial => "partial",
-                CacheVerdict::Miss => "miss",
-            },
-            outcome.decision.matched_tokens,
-        )
+        match outcome.decision.verdict {
+            CacheVerdict::Hit => "hit",
+            CacheVerdict::Partial => "partial",
+            CacheVerdict::Miss => "miss",
+        }
     };
     let meta_line = serde_json::json!({
         "mlxcache": {
             "verdict": verdict,
-            "tokens_cached": effective_cached,
+            "tokens_cached": prefill_from,
             "tokens_total": outcome.decision.request_tokens,
             "prefill_from": prefill_from,
             "lookup_ms": lookup_ms,
@@ -627,7 +770,11 @@ async fn stream_response(
                 }
                 None => {
                     // Upstream ended: flush a trailing line with no newline, then
-                    // terminate with [DONE] unless the sidecar already sent it.
+                    // terminate. A clean end is the sidecar's `{"done":true}` line
+                    // (already mapped to `[DONE]` by push_frame). If EOF arrives
+                    // WITHOUT that marker, the sidecar died mid-stream (decode
+                    // error, OOM, crash): surface an error frame so the client
+                    // does not read a silent truncation as a completed answer.
                     if !st.buf.is_empty() {
                         let line = std::mem::take(&mut st.buf);
                         push_frame(&mut frames, &line);
@@ -638,11 +785,18 @@ async fn stream_response(
                         }
                     }
                     if !st.terminated {
-                        // No [DONE] yet: emit the TTFT stats frame then terminate.
                         if let Some(ttft) = st.ttft_ms {
                             let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
                             frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
                         }
+                        // Truncated upstream: an explicit error, not a success.
+                        let err = serde_json::json!({
+                            "error": {
+                                "message": "upstream stream ended without a completion marker",
+                                "type": "upstream_error",
+                            }
+                        });
+                        frames.push(Ok(format!("data: {err}\n\n").into_bytes()));
                         frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
                     }
                     st.done = true;
@@ -839,6 +993,28 @@ mod tests {
     }
 
     #[test]
+    fn blob_key_folds_fields_unambiguously() {
+        // Length-prefixed fields: model_id is request-controlled and could carry
+        // the old separator, which would let two distinct fingerprints fold to
+        // one key and alias one blob file. With length prefixes the split is
+        // unique, so these two must differ.
+        let tokens = vec![1, 2, 3];
+        let a = mlxcache_core::contract::ModelFingerprint {
+            model_id: "m\u{1f}tok".into(),
+            tokenizer_hash: "x".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+        };
+        let b = mlxcache_core::contract::ModelFingerprint {
+            model_id: "m".into(),
+            tokenizer_hash: "tok\u{1f}x".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+        };
+        assert_ne!(blob_key(&a, &tokens), blob_key(&b, &tokens));
+    }
+
+    #[test]
     fn prefix_hash_halves_are_independent() {
         // Both 64-bit lanes must react to a one-token change, so a collision in
         // one lane does not imply a collision in the other.
@@ -881,5 +1057,65 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         let stats: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(stats["requests"], 0, "404s must not enter the cache stats");
+    }
+
+    #[test]
+    fn stats_correct_retire_removes_claimed_reuse() {
+        // A hit recorded, then quarantined, must end as a miss with zero claimed
+        // KV, or /stats and hit_rate report reuse that never happened.
+        let stats = Stats::default();
+        let hit = PolicyDecision {
+            verdict: CacheVerdict::Hit,
+            matched_tokens: 8,
+            request_tokens: 8,
+        };
+        stats.record(&hit);
+        {
+            let s = stats.lock();
+            assert_eq!(s.hits, 1);
+            assert_eq!(s.tokens_cached, 7);
+        }
+        stats.correct_retire(&hit);
+        let s = stats.lock();
+        assert_eq!(s.hits, 0, "retired hit must not remain a hit");
+        assert_eq!(s.misses, 1, "retired hit is an effective miss");
+        assert_eq!(s.tokens_cached, 0, "no KV was actually reused");
+        assert_eq!(s.requests, 1, "the request still happened");
+    }
+
+    #[test]
+    fn stats_correct_retire_partial_and_miss() {
+        let stats = Stats::default();
+        // A partial recorded, then retired: partials->misses, covered KV dropped.
+        let partial = PolicyDecision {
+            verdict: CacheVerdict::Partial,
+            matched_tokens: 6,
+            request_tokens: 10,
+        };
+        stats.record(&partial);
+        {
+            let s = stats.lock();
+            assert_eq!(s.partials, 1);
+            assert_eq!(s.tokens_cached, 5);
+        }
+        stats.correct_retire(&partial);
+        {
+            let s = stats.lock();
+            assert_eq!(s.partials, 0, "retired partial must not remain a partial");
+            assert_eq!(s.misses, 1);
+            assert_eq!(s.tokens_cached, 0, "no KV was actually reused");
+        }
+        // correct_retire on an already-Miss decision is a no-op: a cold-miss
+        // leader keeps its miss while adopting the blob it just published, and
+        // retiring that blob must not count a second miss.
+        let miss = PolicyDecision {
+            verdict: CacheVerdict::Miss,
+            matched_tokens: 0,
+            request_tokens: 10,
+        };
+        stats.record(&miss);
+        stats.correct_retire(&miss);
+        let s = stats.lock();
+        assert_eq!(s.misses, 2, "the miss is not double-counted");
     }
 }

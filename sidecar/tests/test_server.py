@@ -156,3 +156,142 @@ def test_malformed_json_is_400(sidecar_url):
     code, body = _raw_post(sidecar_url, "/prefill", "3", b"{x}")
     assert code == 400
     assert "malformed JSON" in body
+
+
+def test_stream_corrupt_blob_is_422_not_truncated_200(sidecar_url, tmp_path, monkeypatch):
+    # Regression (Codex adversarial P1): the real engine loads the checkpoint on
+    # the first step of its stream generator. If that raises AFTER 200 is sent,
+    # the daemon sees a failed stream but cannot quarantine the checkpoint, and
+    # the poison stays selectable forever. The load must run BEFORE headers, so a
+    # rejected checkpoint yields a clean 422 (which the daemon quarantines on).
+    class LoadThenStream:
+        name = "load-then-stream"
+        tokenizer_hash = "synthetic"
+        kv_dtype = "synthetic"
+        prefill_count = 0
+
+        def prepare_stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+            if blob_path:
+                raise server.CheckpointRejectedError("corrupt safetensors payload")
+            return tokens, None
+
+        def stream_prepared(self, prompt, cache):  # noqa: ANN001, ANN201
+            yield 1, "a"
+
+    bad = tmp_path / "corrupt.ckpt"
+    bad.write_bytes(b"not a real blob")
+    monkeypatch.setattr(server.Handler, "engine", LoadThenStream())
+    try:
+        r = httpx.post(
+            f"{sidecar_url}/generate",
+            json={"tokens": [1, 2], "max_tokens": 1, "blob_path": str(bad), "stream": True},
+        )
+        assert r.status_code == 422, f"expected clean 422, got {r.status_code}"
+        assert r.headers.get("content-type", "").startswith("application/json")
+    finally:
+        server.Handler.engine = server.make_engine("test-model")
+
+
+def test_stream_generic_load_error_is_500_not_quarantine(sidecar_url, tmp_path, monkeypatch):
+    # A non-rejection failure while opening the stream (e.g. OOM) is a 500, not a
+    # 422: the daemon must retry from scratch WITHOUT retiring the checkpoint.
+    # Only CheckpointRejectedError maps to 422.
+    class OomThenStream:
+        name = "oom-then-stream"
+        tokenizer_hash = "synthetic"
+        kv_dtype = "synthetic"
+        prefill_count = 0
+
+        def prepare_stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+            if blob_path:
+                raise MemoryError("out of memory loading cache")
+            return tokens, None
+
+        def stream_prepared(self, prompt, cache):  # noqa: ANN001, ANN201
+            yield 1, "a"
+
+    blob = tmp_path / "healthy.ckpt"
+    blob.write_bytes(b"whatever")
+    monkeypatch.setattr(server.Handler, "engine", OomThenStream())
+    try:
+        r = httpx.post(
+            f"{sidecar_url}/generate",
+            json={"tokens": [1, 2], "max_tokens": 1, "blob_path": str(blob), "stream": True},
+        )
+        assert r.status_code == 500, f"expected 500 (no quarantine), got {r.status_code}"
+    finally:
+        server.Handler.engine = server.make_engine("test-model")
+
+
+def test_stream_midstream_error_does_not_inject_error_frame(sidecar_url, monkeypatch):
+    # Regression (Codex adversarial F2): once headers are sent, a generator
+    # failure must truncate the stream WITHOUT a done marker (so the daemon can
+    # surface an upstream error), not fall through to do_POST's 500 writer which
+    # would append a JSON error body to a live 200 and be read as a token frame.
+    class FailsMidStream:
+        name = "fails-mid-stream"
+        tokenizer_hash = "synthetic"
+        kv_dtype = "synthetic"
+        prefill_count = 0
+
+        def prepare_stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+            return tokens, None
+
+        def stream_prepared(self, prompt, cache):  # noqa: ANN001, ANN201
+            yield 1, "a"  # load succeeded; the first token is emitted
+            raise RuntimeError("decode blew up mid-stream")
+
+    monkeypatch.setattr(server.Handler, "engine", FailsMidStream())
+    try:
+        r = httpx.post(
+            f"{sidecar_url}/generate",
+            json={"tokens": [1, 2], "max_tokens": 4, "stream": True},
+        )
+        assert r.status_code == 200, "headers were already committed"
+        assert '"error"' not in r.text, "a mid-stream error must not inject an error frame"
+        assert '"done"' not in r.text, "truncation must not send a completion marker"
+    finally:
+        server.Handler.engine = server.make_engine("test-model")
+
+
+def test_stream_zero_max_tokens_yields_no_tokens(sidecar_url):
+    # Regression (Codex adversarial F3): priming the generator must not force a
+    # token when max_tokens <= 0.
+    r = httpx.post(
+        f"{sidecar_url}/generate",
+        json={"tokens": [1, 2], "max_tokens": 0, "stream": True},
+    )
+    assert r.status_code == 200
+    token_lines = [ln for ln in r.text.splitlines() if '"token"' in ln]
+    assert token_lines == [], f"max_tokens=0 emitted tokens: {r.text}"
+    assert '"done": true' in r.text or '"done":true' in r.text
+
+
+def test_stream_load_error_not_treated_as_decode_error(sidecar_url, monkeypatch):
+    # Regression (Codex adversarial F3): a first-token decode failure must NOT be
+    # reported as blob corruption (500); the checkpoint loaded fine. It surfaces
+    # after headers as a truncated stream, so the daemon does not quarantine a
+    # healthy checkpoint.
+    class DecodeFailsAfterLoad:
+        name = "decode-fails"
+        tokenizer_hash = "synthetic"
+        kv_dtype = "synthetic"
+        prefill_count = 0
+
+        def prepare_stream(self, tokens, blob_path):  # noqa: ANN001, ANN201
+            return tokens, None  # load ok
+
+        def stream_prepared(self, prompt, cache):  # noqa: ANN001, ANN201
+            raise MemoryError("first decode OOM")
+            yield 1, "unreachable"  # pragma: no cover
+
+    monkeypatch.setattr(server.Handler, "engine", DecodeFailsAfterLoad())
+    try:
+        r = httpx.post(
+            f"{sidecar_url}/generate",
+            json={"tokens": [1, 2], "max_tokens": 1, "stream": True},
+        )
+        assert r.status_code == 200, "a decode error after load must not be a 500"
+        assert '"done"' not in r.text
+    finally:
+        server.Handler.engine = server.make_engine("test-model")

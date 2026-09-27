@@ -9,12 +9,12 @@ output than a scratch run.
 
 from __future__ import annotations
 
-import contextlib
+import json
 import sys
 import types
 
 import pytest
-from mlxcache_sidecar import blob
+from mlxcache_sidecar import blob, server
 
 
 class FakeCache:
@@ -96,6 +96,11 @@ def _engine(model=None):
     return eng
 
 
+def _valid_safetensors_bytes() -> bytes:
+    header = b'{"__metadata__":{}}'
+    return len(header).to_bytes(8, "little") + header
+
+
 def _write_blob(path, tokens):
     meta = blob.CheckpointMeta(
         fingerprint=blob.Fingerprint(
@@ -105,7 +110,7 @@ def _write_blob(path, tokens):
         tokens=tokens,
     )
     with open(path, "wb") as fh:
-        fh.write(blob.encode(meta, b"payload"))
+        fh.write(blob.encode(meta, _valid_safetensors_bytes()))
     return path
 
 
@@ -182,10 +187,9 @@ def test_empty_payload_blob_is_not_adopted(monkeypatch, tmp_path):
 def test_truncated_multi_token_blob_raises_for_quarantine(monkeypatch, tmp_path):
     # Regression (structured Codex review): a MULTI-token checkpoint truncated to
     # a valid header and empty payload is corrupt, not uncacheable. The loader
-    # must be attempted so the failure propagates and the daemon quarantines it.
+    # must reject it (CheckpointRejectedError -> 422) so the daemon quarantines it.
     # Swallowing it as scratch would report a hit and recompute forever.
-    loaded = []
-    _install_fake_mlx(monkeypatch, on_load=lambda: loaded.append(True))
+    _install_fake_mlx(monkeypatch)
     eng = _engine()
     tokens = [1, 2, 3]
     meta = blob.CheckpointMeta(
@@ -198,30 +202,349 @@ def test_truncated_multi_token_blob_raises_for_quarantine(monkeypatch, tmp_path)
     path = str(tmp_path / "truncated.ckpt")
     with open(path, "wb") as fh:
         fh.write(blob.encode(meta, b""))  # header valid, KV missing
-    # A real empty safetensors raises; the daemon quarantines. Here the fake
-    # loader records the attempt, which is the behavior under test.
-    with contextlib.suppress(Exception):
+    with pytest.raises(server.CheckpointRejectedError):
         eng._load_cache_delta(tokens, path)
-    assert loaded, "a truncated multi-token blob must reach the loader, not be swallowed"
 
 
-def test_blob_for_a_different_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
+def test_corrupt_safetensors_load_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex adversarial): a multi-token blob with a nonempty but
+    # corrupt payload makes load_prompt_cache raise. That is a bad checkpoint, so
+    # it must become CheckpointRejectedError (422 -> daemon retires it), not a
+    # generic 500 that leaves the poison Published and retried forever.
+    _install_fake_mlx(monkeypatch)
+
+    def _boom(_path):
+        raise ValueError("invalid safetensors header")
+
+    sys.modules["mlx_lm.models.cache"].load_prompt_cache = _boom
+    eng = _engine()
+    tokens = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "corrupt.ckpt"), tokens)
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_malformed_header_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex adversarial): a length-prefixed but schema-less header
+    # (e.g. {}) makes the JSON decode produce missing fields -> KeyError/TypeError.
+    # That is a bad checkpoint; it must be CheckpointRejectedError (422), not a
+    # 500 that leaves it selectable forever.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    path = str(tmp_path / "bad-header.ckpt")
+    body = b"{}"
+    with open(path, "wb") as fh:
+        fh.write(len(body).to_bytes(4, "little") + body + b"payload")
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_transient_read_error_is_not_quarantined(monkeypatch, tmp_path):
+    # Regression (Codex adversarial): a transient read failure (EIO/ENFILE) is
+    # NOT a bad checkpoint. It must propagate as-is (-> 500), not be converted to
+    # CheckpointRejectedError, so the daemon does not retire a healthy entry.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "healthy.ckpt"), tokens)
+
+    real_open = open
+
+    def _flaky_open(p, *a, **k):
+        if p == path:
+            raise OSError(5, "Input/output error")
+        return real_open(p, *a, **k)
+
+    monkeypatch.setattr("builtins.open", _flaky_open)
+    with pytest.raises(OSError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_invalid_safetensors_rejected_before_native_load(monkeypatch, tmp_path):
+    # Regression (Codex pass 4): MLX's native parser raises RuntimeError for a bad
+    # safetensors header, the same type as a transient read failure. We validate
+    # the framing ourselves, so a payload with a bogus header length is rejected
+    # (422) even though RuntimeError from the loader below is treated as
+    # transient. The loader is monkeypatched to raise RuntimeError to prove the
+    # structural check runs first.
+    _install_fake_mlx(monkeypatch)
+
+    def _native_boom(_path):
+        raise RuntimeError("safetensors: invalid header length")
+
+    sys.modules["mlx_lm.models.cache"].load_prompt_cache = _native_boom
+    eng = _engine()
+    tokens = [1, 2, 3]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "bad-inner.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, b"\x00" * 8))  # header length 0 -> invalid
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_unhashable_dtype_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex pass 7): a safetensors header with "dtype":[] or {}
+    # must be a 422, not a TypeError escaping to a 500. The validator checks the
+    # dtype is a str before the dict membership test.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    for bad_dtype in ([], {}):
+        header = json.dumps(
+            {"w": {"dtype": bad_dtype, "shape": [1], "data_offsets": [0, 2]}}
+        ).encode()
+        payload = len(header).to_bytes(8, "little") + header + b"\x00\x00"
+        meta = blob.CheckpointMeta(
+            fingerprint=blob.Fingerprint(
+                model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+            ),
+            token_count=len(tokens),
+            tokens=tokens,
+        )
+        path = str(tmp_path / "bad-dtype.ckpt")
+        with open(path, "wb") as fh:
+            fh.write(blob.encode(meta, payload))
+        with pytest.raises(server.CheckpointRejectedError):
+            eng._load_cache_delta(tokens, path)
+
+
+@pytest.mark.parametrize("dtype", ["F8_E4M3", "F8_E5M2", "F64"])
+def test_unsupported_dtype_is_rejected_before_native_load(monkeypatch, tmp_path, dtype):
+    # Regression (Codex pass 8/10): MLX's reader rejects F64 and the F8 dtypes
+    # with RuntimeError, the same type as a transient read failure. A
+    # structurally-consistent tensor of an unsupported dtype must be a 422, so it
+    # is quarantined rather than 500-forever.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    header = json.dumps({"w": {"dtype": dtype, "shape": [1], "data_offsets": [0, 1]}}).encode()
+    payload = len(header).to_bytes(8, "little") + header + b"\x00"
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "bad-dtype.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_index_error_from_loader_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex pass 9): mlx-lm accesses keys.shape[2] and raises
+    # IndexError on a malformed KV shape. That deterministic schema failure must
+    # be a 422, not a 500 that leaves the entry selectable forever.
+    _install_fake_mlx(monkeypatch)
+
+    def _shape_boom(_path):
+        raise IndexError("tuple index out of range")
+
+    sys.modules["mlx_lm.models.cache"].load_prompt_cache = _shape_boom
+    eng = _engine()
+    tokens = [1, 2, 3]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "bad-shape.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, _valid_safetensors_bytes()))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_non_string_metadata_is_rejected(monkeypatch, tmp_path):
+    # Regression (Codex pass 11): MLX rejects a non-string metadata value with
+    # RuntimeError; the validator must reject it too, so it is a 422 not a 500.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    header = json.dumps({"__metadata__": {"x": 123}}).encode()
+    payload = len(header).to_bytes(8, "little") + header
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "bad-meta.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_attribute_error_from_loader_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex pass 12): the loader accessing a metadata field that does
+    # not exist on the cache class raises AttributeError. Deterministic -> 422.
+    _install_fake_mlx(monkeypatch)
+
+    def _attr_boom(_path):
+        raise AttributeError("no attribute 'from_state'")
+
+    sys.modules["mlx_lm.models.cache"].load_prompt_cache = _attr_boom
+    eng = _engine()
+    tokens = [1, 2, 3]
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "bad-attr.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, _valid_safetensors_bytes()))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_deeply_nested_header_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex pass 12): json.loads on a deeply nested header raises
+    # RecursionError, which must be a 422 not a 500.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    header = ("[" * 100000 + "]" * 100000).encode()
+    payload = len(header).to_bytes(8, "little") + header
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "nested.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+@pytest.mark.parametrize(
+    "raw_header",
+    [
+        '{"a":1}'.encode("utf-16"),  # UTF-16, not UTF-8
+        b'{"x":NaN}',  # non-standard constant
+        b'{"x":Infinity}',  # non-standard constant
+        b'{"x":"\\ud800"}',  # lone surrogate escape
+    ],
+)
+def test_lenient_json_headers_rejected_like_native(monkeypatch, tmp_path, raw_header):
+    # Regression (Codex pass 13): Python's json accepts UTF-16, NaN/Infinity, and
+    # lone surrogates; MLX's strict parser rejects them with RuntimeError. All
+    # must be a 422, not a 500 that leaves the entry selectable.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    payload = len(raw_header).to_bytes(8, "little") + raw_header
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "lenient.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_overlapping_tensor_ranges_rejected(monkeypatch, tmp_path):
+    # Regression (pre-landing review): safetensors forbids overlapping tensor
+    # ranges. Two tensors claiming the same bytes must be a 422, not passed to
+    # MLX (which raises RuntimeError -> misread as transient 500).
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    header = json.dumps(
+        {
+            "a": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]},
+            "b": {"dtype": "F16", "shape": [2], "data_offsets": [2, 6]},
+        }
+    ).encode()
+    payload = len(header).to_bytes(8, "little") + header + b"\x00" * 8
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "overlap.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        [0, 2],  # span 2 != shape[2] * F16(2) = 4 (too small)
+        [0, 6],  # span 6 != 4 (too large, still within data)
+        [0, 99],  # end exceeds data_len
+    ],
+)
+def test_tensor_byte_span_mismatch_rejected(monkeypatch, tmp_path, offsets):
+    # Regression (coverage audit): the shape/offset byte-span check must reject
+    # a header whose data_offsets span disagrees with shape * dtype size, before
+    # MLX sees it (MLX raises RuntimeError -> misread as transient 500).
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    tokens = [1, 2, 3]
+    header = json.dumps({"w": {"dtype": "F16", "shape": [2], "data_offsets": offsets}}).encode()
+    data = b"\x00" * 8
+    payload = len(header).to_bytes(8, "little") + header + data
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="fake", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    path = str(tmp_path / "span.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(blob.encode(meta, payload))
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, path)
+
+
+def test_blob_for_a_different_prefix_is_rejected(monkeypatch, tmp_path):
     # A blob whose recorded prefix does not match the request must not be
-    # adopted: resuming from the wrong KV generates silently wrong output.
+    # adopted: resuming from the wrong KV generates silently wrong output. It is
+    # bad (mislabeled/corrupt), so reject it for quarantine, not silent scratch.
     _install_fake_mlx(monkeypatch)
     eng = _engine()
     tokens = [1, 2, 3, 4]
     blob_path = _write_blob(str(tmp_path / "b.ckpt"), [9, 9, 9, 9])
-    cache, prompt = eng._load_cache_delta(tokens, blob_path)
-    assert cache is None
-    assert prompt == tokens
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta(tokens, blob_path)
 
 
-def test_blob_without_recorded_prefix_falls_back_to_scratch(monkeypatch, tmp_path):
-    # A legacy blob with no recorded tokens cannot be verified to cover this
-    # request's prefix, so it must not be adopted. token_count alone is not
-    # identity: any prefix of that length would be trusted. Resuming from the
-    # wrong KV is silent wrong output (the trust boundary).
+def test_blob_without_recorded_prefix_is_rejected(monkeypatch, tmp_path):
+    # The daemon always writes meta.tokens, so a matched blob WITHOUT them is
+    # corrupt: it cannot be verified to cover this request's prefix, and adopting
+    # it would trust token_count alone (any prefix of that length passes).
+    # Silently running scratch while the daemon reports a hit is an accounting
+    # lie, so reject it for retirement.
     _install_fake_mlx(monkeypatch)
     eng = _engine()
     tokens = [1, 2, 3, 4, 5]
@@ -236,9 +559,8 @@ def test_blob_without_recorded_prefix_falls_back_to_scratch(monkeypatch, tmp_pat
         path = str(tmp_path / f"old{count}.ckpt")
         with open(path, "wb") as fh:
             fh.write(blob.encode(meta, b"payload"))
-        cache, prompt = eng._load_cache_delta(tokens, path)
-        assert cache is None, f"no recorded prefix (count={count}) must not be adopted"
-        assert prompt == tokens
+        with pytest.raises(server.CheckpointRejectedError):
+            eng._load_cache_delta(tokens, path)
 
 
 def test_recorded_prefix_wins_over_token_count(monkeypatch, tmp_path):
@@ -257,7 +579,7 @@ def test_recorded_prefix_wins_over_token_count(monkeypatch, tmp_path):
     )
     path = str(tmp_path / "mismatch.ckpt")
     with open(path, "wb") as fh:
-        fh.write(blob.encode(meta, b"payload"))
+        fh.write(blob.encode(meta, _valid_safetensors_bytes()))
     _cache, prompt = eng._load_cache_delta(tokens, path)
     # prefix = [1,2,3] -> covered = 2 -> delta = tokens[2:]
     assert prompt == [3, 4, 5]
