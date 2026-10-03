@@ -26,9 +26,14 @@ struct InFlightEntry {
 
 /// Leader token. Only the leader holds one, so only the leader removes the
 /// entry on drop; followers hold no guard.
+///
+/// Keys are `Arc<[u32]>`: followers look up with a plain `&[u32]` (no copy of
+/// the token sequence), and a leader pays exactly ONE allocation to move its
+/// slice into the map. With `Vec<u32>` keys, every request cloned the full
+/// token vector to enter (O(n) alloc + memcpy — 128 KB at a 32 K-token prompt).
 pub struct Leadership {
-    key: Vec<u32>,
-    map: Arc<Mutex<HashMap<Vec<u32>, InFlightEntry>>>,
+    key: Arc<[u32]>,
+    map: Arc<Mutex<HashMap<Arc<[u32]>, InFlightEntry>>>,
     done: watch::Sender<Option<PrefillResult>>,
     waiters: Arc<AtomicUsize>,
 }
@@ -52,12 +57,12 @@ impl Drop for Leadership {
         // later follower subscribes to a finished entry. Drop cannot await, so
         // hand the removal to the runtime; if there is no runtime (e.g. a test
         // thread), fall back to a try_lock so the entry does not leak.
-        let key = std::mem::take(&mut self.key);
+        let key = std::mem::replace(&mut self.key, Arc::from([]));
         let map = Arc::clone(&self.map);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    map.lock().await.remove(&key);
+                    map.lock().await.remove(key.as_ref());
                 });
             }
             Err(_) => {
@@ -65,7 +70,7 @@ impl Drop for Leadership {
                 // A contended lock here leaks one entry until process exit,
                 // which only affects non-runtime drop paths (tests, teardown).
                 if let Ok(mut m) = map.try_lock() {
-                    m.remove(&key);
+                    m.remove(key.as_ref());
                 }
             }
         }
@@ -73,7 +78,7 @@ impl Drop for Leadership {
 }
 
 pub struct SingleFlight {
-    map: Arc<Mutex<HashMap<Vec<u32>, InFlightEntry>>>,
+    map: Arc<Mutex<HashMap<Arc<[u32]>, InFlightEntry>>>,
 }
 
 impl Default for SingleFlight {
@@ -118,9 +123,13 @@ impl SingleFlight {
     }
 
     /// Become the leader for `key`, or a follower of the in-flight leader.
-    pub async fn enter(&self, key: Vec<u32>) -> Role {
+    ///
+    /// Borrows the token slice: a follower copies nothing, a leader pays one
+    /// `Arc<[u32]>` allocation for the map key. (`Arc<[u32]>: Borrow<[u32]>`
+    /// makes the borrowed lookups hash-equal with the stored key.)
+    pub async fn enter(&self, key: &[u32]) -> Role {
         let mut map = self.map.lock().await;
-        if let Some(entry) = map.get(&key) {
+        if let Some(entry) = map.get(key) {
             // Subscribe BEFORE counting: a leader that observes waiter_count
             // must know the receiver already exists, or it could publish before
             // we subscribe and the send would find no receiver.
@@ -133,15 +142,16 @@ impl SingleFlight {
         }
         let (tx, _rx) = watch::channel(None);
         let waiters = Arc::new(AtomicUsize::new(0));
+        let owned: Arc<[u32]> = Arc::from(key);
         map.insert(
-            key.clone(),
+            Arc::clone(&owned),
             InFlightEntry {
                 done: tx.clone(),
                 waiters: Arc::clone(&waiters),
             },
         );
         Role::Leader(Leadership {
-            key,
+            key: owned,
             map: Arc::clone(&self.map),
             done: tx,
             waiters,
@@ -184,14 +194,14 @@ mod tests {
         let sf = SingleFlight::new();
         let key = vec![1, 2, 3];
 
-        let leader = match sf.enter(key.clone()).await {
+        let leader = match sf.enter(&key).await {
             Role::Leader(l) => l,
             Role::Follower(_) => panic!("first caller must lead"),
         };
 
         let mut followers = Vec::new();
         for _ in 0..4 {
-            match sf.enter(key.clone()).await {
+            match sf.enter(&key).await {
                 Role::Follower(f) => followers.push(f),
                 Role::Leader(_) => panic!("only one leader allowed"),
             }
@@ -209,11 +219,11 @@ mod tests {
     async fn leader_error_propagates_to_followers() {
         let sf = SingleFlight::new();
         let key = vec![9, 9];
-        let leader = match sf.enter(key.clone()).await {
+        let leader = match sf.enter(&key).await {
             Role::Leader(l) => l,
             Role::Follower(_) => panic!(),
         };
-        let mut follower = match sf.enter(key).await {
+        let mut follower = match sf.enter(&key).await {
             Role::Follower(f) => f,
             Role::Leader(_) => panic!(),
         };
@@ -229,7 +239,7 @@ mod tests {
         let sf = SingleFlight::new();
         let key = vec![5];
         {
-            let leader = match sf.enter(key.clone()).await {
+            let leader = match sf.enter(&key).await {
                 Role::Leader(l) => l,
                 Role::Follower(_) => panic!(),
             };
@@ -238,7 +248,7 @@ mod tests {
         // Give the spawned removal a chance to run.
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        match sf.enter(key).await {
+        match sf.enter(&key).await {
             Role::Leader(_) => {}
             Role::Follower(_) => panic!("entry must be removed after leader drop"),
         }
@@ -247,8 +257,8 @@ mod tests {
     #[tokio::test]
     async fn different_keys_do_not_block() {
         let sf = SingleFlight::new();
-        let a = matches!(sf.enter(vec![1]).await, Role::Leader(_));
-        let b = matches!(sf.enter(vec![2]).await, Role::Leader(_));
+        let a = matches!(sf.enter(&[1]).await, Role::Leader(_));
+        let b = matches!(sf.enter(&[2]).await, Role::Leader(_));
         assert!(a && b, "distinct keys both lead");
     }
 
@@ -257,11 +267,11 @@ mod tests {
         let sf = SingleFlight::new();
         let key = vec![7];
         let mut follower = {
-            let leader = match sf.enter(key.clone()).await {
+            let leader = match sf.enter(&key).await {
                 Role::Leader(l) => l,
                 Role::Follower(_) => panic!(),
             };
-            let follower = match sf.enter(key).await {
+            let follower = match sf.enter(&key).await {
                 Role::Follower(f) => f,
                 Role::Leader(_) => panic!(),
             };

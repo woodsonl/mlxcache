@@ -54,6 +54,14 @@ pub enum SidecarError {
     /// transport failure must NOT quarantine a healthy checkpoint.
     #[error("checkpoint rejected by adapter: {body}")]
     CheckpointRejected { body: String },
+    #[error("sidecar stream did not open within {secs}s at {url}")]
+    StreamOpenTimeout { url: String, secs: u64 },
+}
+
+/// Default idle budget for a live generation stream (seconds): the longest
+/// gap between bytes the daemon tolerates before declaring the sidecar wedged.
+fn default_stream_idle_s() -> u64 {
+    60
 }
 
 impl SidecarError {
@@ -86,7 +94,17 @@ fn classify_status(status: u16, body: String) -> SidecarError {
 /// pool warm; JSON bodies only (KV blobs stream through a separate path).
 pub struct SidecarClient {
     config: SidecarConfig,
+    /// JSON calls (tokenize/prefill/generate): a TOTAL request timeout is
+    /// correct for them — each has a bounded, short-ish duration.
     http: reqwest::Client,
+    /// Streaming generation: NO total timeout (a decode stream's wall time is
+    /// unbounded by design). Connect is bounded by `connect_timeout`; the
+    /// open phase (send → response headers) by `stream_open`; and idle gaps
+    /// between body chunks are enforced per-read by the caller via
+    /// [`Self::stream_idle_timeout`].
+    stream_http: reqwest::Client,
+    stream_open: std::time::Duration,
+    stream_idle: std::time::Duration,
 }
 
 impl SidecarClient {
@@ -98,28 +116,67 @@ impl SidecarClient {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(120);
-        Self::with_timeout(config, timeout_s)
+        let idle_s: u64 = std::env::var("MLXCACHE_STREAM_IDLE_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        Self::with_timeouts(config, timeout_s, idle_s)
     }
 
-    /// Build with an explicit timeout (testable without mutating global env).
+    /// Build with an explicit total timeout for JSON calls (testable without
+    /// mutating global env); stream budgets keep their defaults.
     pub fn with_timeout(config: SidecarConfig, timeout_s: u64) -> Result<Self, SidecarError> {
-        // ponytail: this is a total request timeout, so it also bounds a
-        // streaming generation's wall time. Fine at max_tokens=64; if a future
-        // long-generation mode is added, drop the client timeout for streams and
-        // apply a connect-only timeout instead.
+        Self::with_timeouts(config, timeout_s, default_stream_idle_s())
+    }
+
+    /// Build with explicit JSON-total and stream-idle budgets (seconds).
+    pub fn with_timeouts(
+        config: SidecarConfig,
+        timeout_s: u64,
+        stream_idle_s: u64,
+    ) -> Result<Self, SidecarError> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_s))
             .build()
             .map_err(|_e| SidecarError::Protocol("client build failed".into()))?;
-        Ok(Self { config, http })
+        let stream_http = reqwest::Client::builder()
+            // Bound connect attempts on streams; everything after the response
+            // headers is governed by open/idle budgets, not a total deadline.
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|_e| SidecarError::Protocol("stream client build failed".into()))?;
+        Ok(Self {
+            config,
+            http,
+            stream_http,
+            // The open deadline covers blob load + stream setup on the sidecar:
+            // same generous budget as a JSON prefill.
+            stream_open: std::time::Duration::from_secs(timeout_s),
+            stream_idle: std::time::Duration::from_secs(stream_idle_s.max(1)),
+        })
     }
 
-    pub async fn prefill(&self, tokens: &[u32]) -> Result<Vec<u8>, SidecarError> {
+    /// Max wall time with NO bytes arriving from a live generation stream
+    /// before the daemon terminates it with an explicit upstream error.
+    pub fn stream_idle_timeout(&self) -> std::time::Duration {
+        self.stream_idle
+    }
+
+    pub async fn prefill(
+        &self,
+        tokens: &[u32],
+        ancestor_blob_path: Option<&str>,
+    ) -> Result<Vec<u8>, SidecarError> {
         let url = format!("{}/prefill", self.config.base_url);
         let resp = self
             .http
             .post(&url)
-            .json(&serde_json::json!({ "tokens": tokens }))
+            .json(&serde_json::json!({
+                "tokens": tokens,
+                // Delta prefill (OV3): the matched ancestor checkpoint to
+                // adopt KV from. None = full scratch prefill.
+                "ancestor_blob_path": ancestor_blob_path,
+            }))
             .send()
             .await
             .map_err(|e| SidecarError::Unreachable {
@@ -173,6 +230,10 @@ impl SidecarClient {
 
     /// Start a streaming generation: returns a byte stream of NDJSON from the
     /// sidecar (one `{"token":..,"text":..}` per token, then `{"done":true}`).
+    ///
+    /// The stream-open phase (connect → response headers) is bounded by the
+    /// same budget as a JSON request. After that the stream's wall time is
+    /// unbounded — the CALLER enforces an idle budget between chunks.
     pub async fn generate_stream(
         &self,
         tokens: &[u32],
@@ -180,21 +241,32 @@ impl SidecarClient {
         blob_path: Option<&str>,
     ) -> Result<reqwest::Response, SidecarError> {
         let url = format!("{}/generate", self.config.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .json(&serde_json::json!({
-                "tokens": tokens,
-                "max_tokens": max_tokens,
-                "blob_path": blob_path,
-                "stream": true,
-            }))
-            .send()
-            .await
-            .map_err(|e| SidecarError::Unreachable {
+        let open = self.stream_open;
+        let fut = async {
+            self.stream_http
+                .post(&url)
+                .json(&serde_json::json!({
+                    "tokens": tokens,
+                    "max_tokens": max_tokens,
+                    "blob_path": blob_path,
+                    "stream": true,
+                }))
+                .send()
+                .await
+        };
+        let resp = match tokio::time::timeout(open, fut).await {
+            // Elapsed before headers: the sidecar wedged opening the stream.
+            Err(_elapsed) => {
+                return Err(SidecarError::StreamOpenTimeout {
+                    url,
+                    secs: open.as_secs(),
+                })
+            }
+            Ok(inner) => inner.map_err(|e| SidecarError::Unreachable {
                 url: url.clone(),
                 source: e,
-            })?;
+            })?,
+        };
         let status = resp.status();
         if !status.is_success() {
             return Err(classify_http_error(resp).await);

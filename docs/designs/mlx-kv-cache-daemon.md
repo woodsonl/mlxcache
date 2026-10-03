@@ -213,7 +213,7 @@ This plan takes us from "no KV cache layer for MLX; every process re-prefills" t
 | adapter#prefill | mlx-lm internal error | Y | 502 with engine detail | error message |
 | index#lookup | SQLite locked | Y | retry once, then 503 | error after retry |
 | index#lookup | SQLite corrupt | Y | rebuild index from checkpoint metadata; log | transparent (slower first lookups) |
-| persistence#save | disk full (ENOSPC) | Y | catch OSError, log path+bytes, 503 warming path only | warming fails, real requests proceed |
+| persistence#save | disk full (ENOSPC) | Y | catch OSError, log path+bytes, serve uncached (leader + single-flight followers; verified by e2e fault injection) | checkpoint is skipped, real requests proceed normally |
 | persistence#save | crash mid-write | Y | atomic write-temp-rename (R1-3) | transparent |
 | persistence#load | corrupt blob | Y | quarantine + miss (R1-1) | transparent (slower turn) |
 | persistence#load | version mismatch | Y | quarantine + miss (R1-1) | transparent (slower turn) |
@@ -227,7 +227,8 @@ CRITICAL GAPS: 0 (all rows rescued or explicitly stated).
 ```
 CODEPATH              | FAILURE MODE         | RESCUED? | TEST? | USER SEES?     | LOGGED?
 ----------------------|----------------------|----------|-------|----------------|----------
-checkpoint write      | ENOSPC               | Y        | TBD   | warming 503    | Y
+checkpoint write      | ENOSPC/EACCES        | Y        | e2e   | uncached 200   | Y
+leader publish fail   | followers coalesced  | Y        | e2e   | uncached 200   | Y
 checkpoint write      | crash mid-write      | Y        | TBD   | transparent    | Y
 checkpoint load       | corrupt blob         | Y        | TBD   | transparent    | Y
 index                 | SQLite corrupt       | Y        | TBD   | transparent    | Y
