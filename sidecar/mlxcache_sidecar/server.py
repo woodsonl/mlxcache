@@ -736,6 +736,20 @@ def make_engine(model_id: str) -> SyntheticEngine | MlxLmEngine:
 class Handler(BaseHTTPRequestHandler):
     engine: object = None  # set by serve()
 
+    # HTTP/1.1 keep-alive (Content-Length is always set on every response,
+    # including errors — see _json/_binary). The daemon's reqwest pool REUSES
+    # connections; with the HTTP/1.0 default each response closed the socket
+    # while the pool raced the next request onto it, surfacing as spurious
+    # ConnectionReset/500s under concurrent load (the e2e coalescing tests
+    # tripped this flakily in release builds).
+    protocol_version = "HTTP/1.1"
+
+    # A pooled keep-alive socket that sits idle between bursts must not die
+    # mid-teardown when the next request lands: None disables the socket
+    # timeout (BaseHTTPRequestHandler's default), relying on the daemon's own
+    # budgets (JSON total timeout, stream open/idle) for liveness.
+    timeout = None
+
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("sidecar: %s\n" % (fmt % args))
 
@@ -945,7 +959,14 @@ class Handler(BaseHTTPRequestHandler):
 def serve(addr: str = "127.0.0.1", port: int = 8421) -> None:
     model_id = os.environ.get("MLXCACHE_MODEL", "synthetic-model")
     Handler.engine = make_engine(model_id)
-    server = ThreadingHTTPServer((addr, port), Handler)
+    # Backlog sized for the daemon's burst load: single-flight releases a
+    # coalesced burst at once, and the default listen backlog of 5 resets
+    # excess simultaneous connections under HTTP/1.1 keep-alive.
+    class _Server(ThreadingHTTPServer):
+        request_queue_size = 128
+        daemon_threads = True
+
+    server = _Server((addr, port), Handler)
     print(f"sidecar: {Handler.engine.name} engine on {addr}:{port}", flush=True)
     server.serve_forever()
 
