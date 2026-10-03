@@ -59,13 +59,14 @@ def test_roundtrip_logits_identical(engine):
     from mlx_lm import stream_generate
     from mlx_lm.models.cache import load_prompt_cache, make_prompt_cache, save_prompt_cache
 
+    # 64 generated tokens (not 16): a short oracle can pass on coincidence —
+    # identical prefixes diverge later; 64 tokens of equality is parity.
     tokens = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 4)
 
-    # Baseline: scratch generation continuing from the full prompt.
     scratch = [
         r.token
         for r in stream_generate(
-            engine.model, engine.tokenizer, prompt=mx.array(tokens), max_tokens=16
+            engine.model, engine.tokenizer, prompt=mx.array(tokens), max_tokens=64
         )
     ]
 
@@ -82,7 +83,7 @@ def test_roundtrip_logits_identical(engine):
                 engine.model,
                 engine.tokenizer,
                 prompt=mx.array(tokens[-1:]),
-                max_tokens=16,
+                max_tokens=64,
                 prompt_cache=resumed_cache,
             )
         ]
@@ -105,10 +106,11 @@ def test_adapter_prefill_resume_matches_scratch(engine):
 
     tokens = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 4)
 
+    # 64 generated tokens: see the oracle-width note in the raw test above.
     scratch = [
         r.token
         for r in stream_generate(
-            engine.model, engine.tokenizer, prompt=mx.array(tokens), max_tokens=16
+            engine.model, engine.tokenizer, prompt=mx.array(tokens), max_tokens=64
         )
     ]
 
@@ -130,10 +132,79 @@ def test_adapter_prefill_resume_matches_scratch(engine):
         with open(path, "wb") as fh:
             fh.write(blob)
         # Hit path: resume from the persisted blob exactly as the daemon does.
-        resumed = engine.generate_from_blob(tokens, path, max_tokens=16)
+        resumed = engine.generate_from_blob(tokens, path, max_tokens=64)
 
     assert resumed == scratch, (
         "adapter resume diverged from scratch (cache convention bug):\n"
+        f"  resumed={resumed[:8]}\n  scratch={scratch[:8]}"
+    )
+
+
+def test_adapter_delta_prefill_matches_scratch(engine):
+    """OV3 parity on the REAL engine: generation resumed from a blob whose KV
+    was built by DELTA prefill (ancestor KV + only the uncovered tokens) must
+    be token-identical to scratch. This is the shipped fast path for a growing
+    conversation — if adopting ancestor KV diverges, every partial hit after
+    this change is silently wrong, so it is pinned here at oracle width."""
+    import mlx.core as mx
+    from mlx_lm import stream_generate
+    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+
+    base = engine.tokenize("The quick brown fox jumps over the lazy dog.")
+    grown = engine.tokenize(
+        "The quick brown fox jumps over the lazy dog. " * 4
+    )
+    assert len(grown) > len(base) and grown[: len(base)] == base, (
+        "test premise: the grown prompt must extend the base token-for-token"
+    )
+
+    scratch = [
+        r.token
+        for r in stream_generate(
+            engine.model, engine.tokenizer, prompt=mx.array(grown), max_tokens=64
+        )
+    ]
+
+    # Step 1: publish the ancestor (full prefill of the short prompt).
+    ancestor_payload = engine.prefill(base)
+    with TempSafetensors() as ancestor_path:
+        meta = CheckpointMeta(
+            fingerprint=Fingerprint(
+                model_id=engine.model_id,
+                tokenizer_hash=engine.tokenizer_hash,
+                kv_dtype=engine.kv_dtype,
+                kv_layout_version=1,
+            ),
+            token_count=len(base),
+            tokens=base,
+        )
+        with open(ancestor_path, "wb") as fh:
+            fh.write(encode(meta, ancestor_payload))
+
+        # Step 2: delta prefill of the grown prompt from the ancestor.
+        delta_payload = engine.prefill(grown, ancestor_blob_path=ancestor_path)
+        assert engine.last_prefill_delta_tokens < len(grown) - 1, (
+            "delta prefill recomputed the whole prompt "
+            f"({engine.last_prefill_delta_tokens} of {len(grown) - 1} steps)"
+        )
+        meta = CheckpointMeta(
+            fingerprint=Fingerprint(
+                model_id=engine.model_id,
+                tokenizer_hash=engine.tokenizer_hash,
+                kv_dtype=engine.kv_dtype,
+                kv_layout_version=1,
+            ),
+            token_count=len(grown),
+            tokens=grown,
+        )
+        with TempSafetensors() as delta_path:
+            with open(delta_path, "wb") as fh:
+                fh.write(encode(meta, delta_payload))
+            # Step 3: resume generation from the delta-prefilled blob.
+            resumed = engine.generate_from_blob(grown, delta_path, max_tokens=64)
+
+    assert resumed == scratch, (
+        "delta-prefill resume diverged from scratch:\n"
         f"  resumed={resumed[:8]}\n  scratch={scratch[:8]}"
     )
 
