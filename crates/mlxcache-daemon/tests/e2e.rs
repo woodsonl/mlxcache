@@ -780,6 +780,156 @@ async fn concurrent_identical_requests_share_one_prefill() {
     child.wait().expect("reap sidecar");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn publish_failure_serves_leader_and_followers_from_scratch() {
+    // OV6/D2 fault injection: the checkpoint WRITE fails (read-only blob dir →
+    // EACCES, the same DiskFull path ENOSPC takes) while requests are in
+    // flight. The contract: the LEADER continues from scratch (it already
+    // prefilled), and every coalesced FOLLOWER is served too — never a 502.
+    // Before the fix the leader signalled Err into single-flight and every
+    // follower 502ed even though nothing was wrong with their request.
+    use std::os::unix::fs::PermissionsExt;
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "2.0")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    // Read-only BEFORE any request: prefill succeeds (sidecar-side), the
+    // daemon-side publish fails on temp-file creation.
+    let mut perms = std::fs::metadata(blobs.path()).unwrap().permissions();
+    let orig = perms.mode();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(blobs.path(), perms).unwrap();
+
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "write me if you can"}],
+        "stream": false,
+    })
+    .to_string();
+
+    const N: usize = 8;
+    let (start_followers_tx, start_followers_rx) = tokio::sync::watch::channel(false);
+    let mut handles = Vec::new();
+    for i in 0..N {
+        let app = router(state.clone());
+        let body = body.clone();
+        let mut gate = start_followers_rx.clone();
+        handles.push(tokio::spawn(async move {
+            if i != 0 {
+                while !*gate.borrow() {
+                    if gate.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            let res = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (status, v["mlxcache"]["verdict"].as_str().unwrap().to_string())
+        }));
+    }
+
+    // Release followers once the leader is mid-prefill (held open by
+    // MLXCACHE_PREFILL_DELAY), so they coalesce behind it deterministically.
+    let mut leader_started = false;
+    for _ in 0..200 {
+        let stats: serde_json::Value =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                reqwest::get(format!("{sidecar_url}/stats"))
+                    .await?
+                    .json()
+                    .await
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                _ => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
+        if stats["prefill_count"].as_u64().unwrap_or(0) >= 1 {
+            leader_started = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        leader_started,
+        "leader never began prefilling; cannot test the publish fault"
+    );
+    start_followers_tx.send_replace(true);
+
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+
+    // EVERY request — leader and followers alike — must be served, from
+    // scratch, with a miss verdict. Not one 502.
+    let bad: Vec<_> = results.iter().filter(|(s, _)| *s != 200).collect();
+    assert!(
+        bad.is_empty(),
+        "a failed checkpoint write must never fail a request: {bad:?}"
+    );
+    let leader_verdict = &results[0].1;
+    assert_eq!(
+        leader_verdict, "miss",
+        "leader served from scratch after publish failure"
+    );
+    assert!(
+        results.iter().all(|(_, v)| v == "miss"),
+        "all requests report scratch: {results:?}"
+    );
+
+    // The prefill itself ran exactly once (the leader's), and nothing was
+    // published or indexed.
+    let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["prefill_count"].as_u64(), Some(1));
+    assert_eq!(state.orchestrator.published_count(), 0);
+    assert_eq!(state.orchestrator.quarantined_count(), 0);
+
+    // Restore permissions so the tempdir can be cleaned up.
+    let mut perms = std::fs::metadata(blobs.path()).unwrap().permissions();
+    perms.set_mode(orig);
+    std::fs::set_permissions(blobs.path(), perms).unwrap();
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
 #[tokio::test]
 async fn end_to_end_restart_resumes_from_disk() {
     // R1-4 across the REAL HTTP path: request 1 publishes a checkpoint; a fresh
@@ -1003,6 +1153,309 @@ async fn end_to_end_streaming_sse() {
     assert!(
         text.contains("\"tokens_cached\":7") && text.contains("\"prefill_from\":7"),
         "hit stream must report covered KV (7), not matched prefix (8): {text}"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn partial_hit_delta_prefills_only_the_delta() {
+    // OV3: a growing conversation must NOT re-prefill the whole prompt. Request
+    // 2 extends request 1's token prefix, so the daemon passes the matched
+    // ancestor blob to /prefill and the adapter prefills ONLY the uncovered
+    // delta. Proven through the sidecar's phase accounting: the second prefill
+    // processes 8 model steps (16 tokens, 7 covered by the ancestor, minus the
+    // final token) instead of the 15 a scratch prefill would.
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "grow me")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+
+    let post = |body: String| {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Request 1: the base prompt — a full miss, publishes the 8-token ancestor.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me"}],
+            "stream": false,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "miss");
+    assert_eq!(state.persistence.list_blobs().unwrap().len(), 1);
+
+    // Request 2: the SAME conversation grown by 8 more tokens. Longest match is
+    // the ancestor (8 tokens) → partial → delta prefill.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me more"}],
+            "stream": false,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v["mlxcache"]["verdict"], "partial",
+        "grown prompt must classify as a partial against the ancestor: {v}"
+    );
+    assert_eq!(
+        v["mlxcache"]["prefill_from"], 7,
+        "the leader reused the ancestor's 7 tokens of covered KV (matched 8 - 1): {v}"
+    );
+    assert_eq!(
+        v["mlxcache"]["tokens_cached"], 7,
+        "tokens_cached must equal prefill_from (the single covered-KV definition): {v}"
+    );
+    // Both the ancestor (8-token) and the new (16-token) checkpoint exist.
+    assert_eq!(state.persistence.list_blobs().unwrap().len(), 2);
+
+    // The sidecar's phase accounting proves the delta path ran: the second
+    // prefill covered a 16-token prompt but only processed the 8-step delta
+    // (16 - 7 covered - 1 final token), not the 15 steps of a scratch prefill.
+    let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["prefill_count"].as_u64(), Some(2));
+    assert_eq!(stats["last_prefill_tokens"].as_u64(), Some(16));
+    assert_eq!(
+        stats["last_prefill_delta_tokens"].as_u64(),
+        Some(8),
+        "delta prefill must process only the uncovered delta (8 steps, not 15): {stats}"
+    );
+
+    // Request 3: the grown prompt again — a full hit on the new checkpoint.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me more"}],
+            "stream": false,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "hit");
+    assert_eq!(
+        v["mlxcache"]["prefill_from"], 15,
+        "hit on the 16-token checkpoint covers 15 tokens: {v}"
+    );
+    assert_eq!(
+        state.stats.snapshot().partials,
+        1,
+        "exactly one partial (the delta-prefill leader) was recorded"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn corrupt_ancestor_quarantines_and_prefills_from_scratch() {
+    // A partial hit whose ANCESTOR blob is corrupt must not wedge the request:
+    // the adapter 422s the delta prefill, the daemon quarantines the ancestor
+    // and retries the prefill from full scratch → 200 with a miss verdict.
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "grow me")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+    let post = |body: String| {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Base request publishes the ancestor.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me"}],
+            "stream": false,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+
+    // Corrupt the ancestor in place: a truncation the wire decoder rejects.
+    let ancestor = state.persistence.list_blobs().unwrap().pop().unwrap();
+    std::fs::write(&ancestor, b"JUNK").unwrap();
+
+    // A different extension of the same base: its longest match IS the
+    // (now corrupt) ancestor → delta prefill 422s → quarantine + scratch.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me differently"}],
+            "stream": false,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        200,
+        "a corrupt ancestor must never fail the request"
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v["mlxcache"]["verdict"], "miss",
+        "after the ancestor was rejected the request ran from scratch: {v}"
+    );
+    assert_eq!(
+        state.orchestrator.quarantined_count(),
+        1,
+        "the corrupt ancestor must be quarantined"
+    );
+
+    // Three prefills ran across the whole test: the base publish (1), the
+    // rejected delta attempt (2), and the scratch retry (3). The retry's
+    // accounting shows a FULL 15-step prefill (16 tokens, nothing covered).
+    let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["prefill_count"].as_u64(), Some(3), "{stats}");
+    assert_eq!(stats["last_prefill_tokens"].as_u64(), Some(16), "{stats}");
+    assert_eq!(
+        stats["last_prefill_delta_tokens"].as_u64(),
+        Some(15),
+        "the scratch retry must have prefilled the whole prompt: {stats}"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn stalled_stream_is_cut_by_the_idle_budget_with_an_explicit_error() {
+    // Streams carry NO total timeout (a decode's wall time is unbounded by
+    // design). Instead the daemon enforces an idle budget between bytes: a
+    // sidecar that stalls before the first token is cut with an explicit
+    // upstream_error frame + [DONE], never a silent hang.
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_FIRST_TOKEN_DELAY", "5")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    // stream_idle = 1s, far below the sidecar's 5s first-token stall.
+    let sidecar_client =
+        SidecarClient::with_timeouts(SidecarConfig::new(sidecar_url, "e2e-model".into()), 120, 1)
+            .unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(sidecar_client),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+    let started = std::time::Instant::now();
+    let res = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "e2e-model",
+                        "messages": [{"role": "user", "content": "stall please"}],
+                        "stream": true,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "SSE headers arrive before the first token");
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let elapsed = started.elapsed();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "the idle budget (1s) must cut the stalled stream promptly, took {elapsed:?}"
+    );
+    assert!(
+        text.contains("upstream idle timeout"),
+        "an explicit upstream error frame must be emitted: {text}"
+    );
+    assert!(
+        text.contains("data: [DONE]"),
+        "the stream must still be terminated with [DONE]: {text}"
     );
 
     child.kill().expect("kill sidecar");
