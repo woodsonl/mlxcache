@@ -414,6 +414,17 @@ class MlxLmEngine:
         self.tokenizer_hash = self._hash_vocab()
         self.kv_dtype = self._kv_dtype()
         self.prefill_count = 0
+        # T21 (lean decode): skip stream_generate's per-token machinery —
+        # the full-vocab logsumexp (pure GPU waste when we only argmax), a
+        # GenerationResponse dataclass built per token (with get_peak_memory +
+        # wall-clock math), and two nested generators — while keeping the
+        # async_eval pipeline that overlaps GPU step i+1 with Python step i.
+        # Opt-in until the parity gate proves it everywhere.
+        self._lean_decode = os.environ.get("MLXCACHE_LEAN_DECODE") == "1"
+        # EOS for THIS tokenizer artifact (identity-pinned alongside it).
+        self._eos_ids = getattr(self.tokenizer, "_eos_token_ids", None) or {
+            self.tokenizer.eos_token_id
+        }
 
     def _kv_dtype(self) -> str:
         """The KV/compute dtype this model will cache in (bf16 vs f16 changes the
@@ -591,8 +602,61 @@ class MlxLmEngine:
     def _stream_with_cache(self, prompt, cache):
         yield from self.stream_with_cache(prompt, cache)
 
+    def _lean_greedy_stream(self, prompt, cache):
+        """T21 lean decode: argmax-only generation with no per-token fluff.
+
+        Yields (token_id, text_piece) exactly like stream_with_cache. Keeps
+        the async_eval pipeline (queue step i+1 before materializing step i)
+        but skips: the full-vocab logsumexp (we only need argmax of logits),
+        the GenerationResponse dataclass + peak-memory + TPS accounting per
+        token, two levels of generator wrapping, and the wired_limit context.
+        GREEDY only: any sampling (temperature/top_p) routes to the mlx-lm
+        path, where the softmax weights matter.
+        """
+        import mlx.core as mx  # noqa: PLC0415
+
+        # A detokenizer is STATEFUL per stream: create one per call, never
+        # cache it on the engine (ThreadingHTTPServer interleaves streams).
+        detok = self.tokenizer.detokenizer
+        eos = self._eos_ids
+        stream = mx.new_thread_local_stream(mx.default_device())
+
+        with mx.stream(stream):
+            y = mx.array(prompt)[None]
+            logits = self.model(y, cache=cache)
+            y = mx.argmax(logits[:, -1, :], axis=-1)
+
+            n = 0
+            while True:
+                # Queue the next step before materializing this token: the
+                # GPU works on step i+1 while Python detokenizes step i.
+                next_logits = self.model(y[None], cache=cache)
+                next_y = mx.argmax(next_logits[:, -1, :], axis=-1)
+                mx.async_eval(next_y)
+
+                token = int(y.item())
+                detok.add_token(token)
+                # Yield EVERY token including EOS, mirroring stream_generate
+                # (its final frame carries the EOS token; parity tests diff
+                # full token lists, so the stream shapes must match).
+                yield token, detok.last_segment
+                if token in eos:
+                    break
+
+                y = next_y
+                n += 1
+                if n >= 256:
+                    break
+        detok.finalize()
+
     def stream_with_cache(self, tokens, cache):
-        """Yield (token_id, text_piece) per decode step from mlx-lm."""
+        """Yield (token_id, text_piece) per decode step from mlx-lm.
+
+        T21: the lean argmax loop when enabled (and always when the caller
+        pinned greedy), the full mlx-lm path otherwise."""
+        if self._lean_decode:
+            yield from self._lean_greedy_stream(tokens, cache)
+            return
         import mlx.core as mx  # noqa: PLC0415
         from mlx_lm import stream_generate  # noqa: PLC0415
 
