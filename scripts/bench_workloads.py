@@ -30,11 +30,10 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
-
-BLOB_DIR_DEFAULT = "/tmp/mlxcache-bench-blobs"
 
 
 def http_json(url: str, payload: dict, timeout: float = 60.0) -> dict:
@@ -99,9 +98,7 @@ def pct(values: list[float], p: float) -> float:
 
 
 def report(name: str, ttfts: list[float], totals: list[float], tokens_per_req: int) -> dict:
-    tpots = [
-        (t - ttft) / max(tokens_per_req - 1, 1) for ttft, t in zip(ttfts, totals)
-    ]
+    tpots = [(t - ttft) / max(tokens_per_req - 1, 1) for ttft, t in zip(ttfts, totals, strict=True)]
     row = {
         "workload": name,
         "n": len(ttfts),
@@ -113,7 +110,8 @@ def report(name: str, ttfts: list[float], totals: list[float], tokens_per_req: i
     }
     print(
         f"  {name:<34} TTFT p50 {row['ttft_p50_ms']:>8.2f}ms  p99 {row['ttft_p99_ms']:>8.2f}ms"
-        f"   TPOT p50 {row['tpot_p50_ms']:>6.2f}ms  p99 {row['tpot_p99_ms']:>6.2f}ms  (n={len(ttfts)})"
+        f"   TPOT p50 {row['tpot_p50_ms']:>6.2f}ms  p99 {row['tpot_p99_ms']:>6.2f}ms"
+        f"  (n={len(ttfts)})"
     )
     return row
 
@@ -140,7 +138,10 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
     env = dict(os.environ, MLXCACHE_TOKENIZE_GROW="growing conversation seed")
     sidecar = subprocess.Popen(
         [
-            "uv", "run", "python", "-c",
+            "uv",
+            "run",
+            "python",
+            "-c",
             "import sys; sys.path.insert(0, 'sidecar'); "
             "from mlxcache_sidecar import server; "
             "server.Handler.engine = server.make_engine('bench-model'); "
@@ -152,7 +153,14 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
     daemon_port = 8420
     daemon = subprocess.Popen(
         [
-            "uv", "run", "cargo", "run", "--release", "-p", "mlxcache-daemon", "--",
+            "uv",
+            "run",
+            "cargo",
+            "run",
+            "--release",
+            "-p",
+            "mlxcache-daemon",
+            "--",
         ],
         env=dict(
             env,
@@ -171,12 +179,18 @@ def main() -> int:
     ap.add_argument("--requests", type=int, default=30, help="per-workload sample count")
     ap.add_argument("--concurrency", type=int, default=8, help="concurrent workers")
     ap.add_argument("--grow-rounds", type=int, default=8, help="conversation growth rounds")
+    ap.add_argument(
+        "--blobs",
+        default=None,
+        help="blob dir to REUSE (default: a fresh temp dir per run — a warm disk "
+        "from a previous run turns the growing workload's partials into hits)",
+    )
     ap.add_argument("--json", help="write results to this file")
     args = ap.parse_args()
 
     procs: list[subprocess.Popen] = []
     url = args.daemon
-    blob_dir = BLOB_DIR_DEFAULT
+    blob_dir = args.blobs or tempfile.mkdtemp(prefix="mlxcache-bench-blobs-")
     if url is None:
         os.makedirs(blob_dir, exist_ok=True)
         sidecar, daemon, port = start_stack(blob_dir)
@@ -210,8 +224,10 @@ def run_workloads(url: str, args) -> list[dict]:
     for i in range(args.requests):
         ttft, total, ntok = stream_chat(
             url,
-            {"model": "bench-model", "messages": [
-                {"role": "user", "content": f"cold prompt number {i}"}]},
+            {
+                "model": "bench-model",
+                "messages": [{"role": "user", "content": f"cold prompt number {i}"}],
+            },
         )
         ttfts.append(ttft)
         totals.append(total)
@@ -219,8 +235,10 @@ def run_workloads(url: str, args) -> list[dict]:
     rows.append(report("cold_prefill", ttfts, totals, 64))
 
     # 2. Warm exact hit: the same prompt twice; the 2nd+ go through the index.
-    prompt = {"model": "bench-model", "messages": [
-        {"role": "user", "content": "warm exact hit prompt"}]}
+    prompt = {
+        "model": "bench-model",
+        "messages": [{"role": "user", "content": "warm exact hit prompt"}],
+    }
     stream_chat(url, prompt)  # prime (cold, discarded)
     ttfts, totals = [], []
     for _ in range(args.requests):
@@ -263,8 +281,10 @@ def run_workloads(url: str, args) -> list[dict]:
     def worker(shared: dict, idx: int) -> None:
         ttft, total, ntok = stream_chat(
             url,
-            {"model": "bench-model", "messages": [
-                {"role": "user", "content": f"concurrent burst {shared['burst']}"}]},
+            {
+                "model": "bench-model",
+                "messages": [{"role": "user", "content": f"concurrent burst {shared['burst']}"}],
+            },
         )
         shared["ttfts"].append(ttft)
         shared["totals"].append(total)
@@ -275,8 +295,7 @@ def run_workloads(url: str, args) -> list[dict]:
         import threading
 
         threads = [
-            threading.Thread(target=worker, args=(shared, i))
-            for i in range(args.concurrency)
+            threading.Thread(target=worker, args=(shared, i)) for i in range(args.concurrency)
         ]
         for t in threads:
             t.start()
@@ -291,18 +310,21 @@ def run_workloads(url: str, args) -> list[dict]:
     ttfts, totals = [], []
     for burst in range(max(1, args.requests // args.concurrency)):
         shared = {"ttfts": [], "totals": []}
-        import threading
 
-        def worker_distinct(i: int, shared=shared) -> None:
+        def worker_distinct(i: int, burst: int = burst, shared: dict = shared) -> None:
             ttft, total, ntok = stream_chat(
                 url,
-                {"model": "bench-model", "messages": [
-                    {"role": "user", "content": f"distinct burst {burst}-{i}"}]},
+                {
+                    "model": "bench-model",
+                    "messages": [{"role": "user", "content": f"distinct burst {burst}-{i}"}],
+                },
             )
             shared["ttfts"].append(ttft)
             shared["totals"].append(total)
 
-        threads = [threading.Thread(target=worker_distinct, args=(i,)) for i in range(args.concurrency)]
+        threads = [
+            threading.Thread(target=worker_distinct, args=(i,)) for i in range(args.concurrency)
+        ]
         for t in threads:
             t.start()
         for t in threads:
