@@ -25,6 +25,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Runtime-independent signal handling for graceful shutdown (see main.rs).
 signal-hook = "0.3"
 libc = "0.2"
+# T13: native tokenization (R4 endgame — zero Python on the hot path). Loads
+# the model's tokenizer.json directly; opt-in per model via
+# MLXCACHE_NATIVE_TOKENIZER. No hf-hub feature: the daemon never downloads.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# tokenizer.json artifact identity (R1-2): sha256 of the file bytes.
+sha2 = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

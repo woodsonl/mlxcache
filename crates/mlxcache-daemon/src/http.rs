@@ -20,6 +20,7 @@ use mlxcache_core::policy::{covered_kv_tokens, CacheVerdict, PolicyDecision};
 use mlxcache_core::singleflight::SingleFlight;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -216,33 +217,48 @@ async fn chat_completions(
         )
     })?;
 
-    // Tokenize via adapter (R1-2). Sidecar unavailable → 503 naming it.
-    let (tokens, tokenizer_hash, kv_dtype) = match &state.sidecar {
-        Some(client) => match client.tokenize(&prompt).await {
-            Ok(r) => (r.tokens, r.tokenizer_hash, r.kv_dtype),
-            Err(SidecarError::Unreachable { url, .. }) => {
-                return Err(err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("adapter (sidecar) unreachable at {url}").as_str(),
-                    "adapter_unavailable",
-                ));
+    // Tokenize (R1-2). T13: when a native tokenizer is configured the daemon
+    // encodes in-process — no HTTP hop. Before the first native encode, the
+    // daemon proves the configured tokenizer.json IS the engine's tokenizer:
+    // one probe prompt is encoded both ways and the ids must match, or the
+    // daemon refuses to serve (a mismatched artifact would corrupt routing).
+    // On match it adopts the sidecar-reported tokenizer_hash + kv_dtype, so
+    // fingerprints are IDENTICAL to the pure-sidecar path — native tokenize
+    // is a pure latency optimization, invisible to the cache.
+    let (tokens, tokenizer_hash, kv_dtype) =
+        if let Some((_path, native)) = crate::native_tokenizer::from_env() {
+            match resolve_native_identity(&prompt, native, state.sidecar.as_ref()).await {
+                Ok(identity) => (native.encode(&prompt), identity.0, identity.1),
+                Err(e) => return Err(e),
             }
-            Err(e) => {
-                return Err(err(
-                    StatusCode::BAD_GATEWAY,
-                    &e.to_string(),
-                    "adapter_error",
-                ));
+        } else {
+            match &state.sidecar {
+                Some(client) => match client.tokenize(&prompt).await {
+                    Ok(r) => (r.tokens, r.tokenizer_hash, r.kv_dtype),
+                    Err(SidecarError::Unreachable { url, .. }) => {
+                        return Err(err(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("adapter (sidecar) unreachable at {url}").as_str(),
+                            "adapter_unavailable",
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(err(
+                            StatusCode::BAD_GATEWAY,
+                            &e.to_string(),
+                            "adapter_error",
+                        ));
+                    }
+                },
+                None => {
+                    return Err(err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "no adapter configured",
+                        "adapter_unavailable",
+                    ));
+                }
             }
-        },
-        None => {
-            return Err(err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no adapter configured",
-                "adapter_unavailable",
-            ));
-        }
-    };
+        };
 
     // A tokenizer can return zero tokens (e.g. an empty string for HF
     // tokenizers). An empty prefix has no KV to cache and its hash is a shared
@@ -700,6 +716,80 @@ async fn publish_leader_blob(
 /// The token-only prefix hash for the request log line. Public for the B1
 /// criterion bench; the blob filename uses a DIFFERENT key (`blob_key` =
 /// fingerprint + tokens) — the two are not equal.
+/// T13 identity resolution: prove the native tokenizer IS the engine's, once,
+/// then reuse the verdict forever (the artifact cannot change mid-process).
+///
+/// The probe encodes a fixed prompt natively and via the sidecar and requires
+/// exact id equality plus the same prompt hashed to the same prefix hash. On
+/// success the sidecar-reported (tokenizer_hash, kv_dtype) is cached and
+/// adopted for every later request — fingerprints are byte-identical to the
+/// pure-sidecar path. On mismatch the error is 503 (fail closed): serving
+/// with the wrong tokenizer would mis-route every checkpoint.
+async fn resolve_native_identity(
+    prompt: &str,
+    native: &crate::native_tokenizer::NativeTokenizer,
+    sidecar: Option<&SidecarClient>,
+) -> Result<(String, String), (StatusCode, Json<ErrorResponse>)> {
+    static VERIFIED: OnceLock<Result<(String, String), String>> = OnceLock::new();
+    if let Some(Ok(identity)) = VERIFIED.get() {
+        return Ok(identity.clone());
+    }
+    if let Some(Err(reason)) = VERIFIED.get() {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            reason.as_str(),
+            "adapter_unavailable",
+        ));
+    }
+
+    let Some(client) = sidecar else {
+        // No sidecar at all: there is nothing to verify against and no engine
+        // to prefill with either, so the standard no-adapter error applies.
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no adapter configured",
+            "adapter_unavailable",
+        ));
+    };
+    let probe = format!("mlxcache native-tokenizer parity probe: {prompt}");
+    let reference = match client.tokenize(&probe).await {
+        Ok(r) => r,
+        Err(SidecarError::Unreachable { url, .. }) => {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("adapter (sidecar) unreachable at {url}").as_str(),
+                "adapter_unavailable",
+            ));
+        }
+        Err(e) => {
+            return Err(err(
+                StatusCode::BAD_GATEWAY,
+                &e.to_string(),
+                "adapter_error",
+            ));
+        }
+    };
+    let local = native.encode(&probe);
+    if local != reference.tokens {
+        let reason = format!(
+            "native tokenizer does not match the engine's tokenizer \
+             (probe encode: {n} native ids vs {m} sidecar ids) — refusing to serve; \
+             fix MLXCACHE_NATIVE_TOKENIZER",
+            n = local.len(),
+            m = reference.tokens.len()
+        );
+        let _ = VERIFIED.set(Err(reason.clone()));
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &reason,
+            "adapter_unavailable",
+        ));
+    }
+    let identity = (reference.tokenizer_hash, reference.kv_dtype);
+    let _ = VERIFIED.set(Ok(identity.clone()));
+    Ok(identity)
+}
+
 pub fn prefix_hash(tokens: &[u32]) -> u128 {
     fn fnv1a(seed: u64, prime: u64, tokens: &[u32]) -> u64 {
         let mut h = seed;
