@@ -97,6 +97,19 @@ Before committing to checkpoint persistence: measure bytes/token for one represe
 - **Real daemon end-to-end verified** (7B-4bit): request 1 miss → checkpoint persisted (957 KB, 56 safetensors tensors = 28 layers × K,V) → request 2 hit reuses it. No errors.
 - Caveat: byte/token scales with layer count × hidden size. At 32B-4bit, a 50K-token prefix is ~13 GB, beyond the 1-5 GB envelope the design assumed for a mid-size model; long-context 32B persistence needs the compression tier (fp8/quantized KV) rather than raw f16 KV. Identity + sub-ms deserialize hold structurally at every size.
 
+**Quantized-KV probe MEASURED (2026-10-03, mlx-lm 0.31.3 / mlx 0.32.2, Qwen2-0.5B-Instruct, Metal; `sidecar/probes/quantized_kv_probe.py`):**
+
+| config | bytes/token | 50K-token blob | greedy parity vs f16 (32 tokens) |
+|---|---|---|---|
+| f16 KV | 12,288 | 0.61 GB | baseline |
+| 8-bit, group 64 | 6,529 (−47%) | 0.33 GB | **IDENTICAL 32/32** |
+| 4-bit, group 64 | 3,457 (−72%) | 0.17 GB | diverges at token 0 (32/32 differ) |
+| 4-bit, group 32 | 3,457 (−72%) | 0.17 GB | diverges at token 2 (30/32 differ) |
+
+- **8-bit quantized KV is parity-safe AND persistence-safe**: `QuantizedKVCache.to_quantized(group_size=64, bits=8)` then `save_prompt_cache`/`load_prompt_cache` round-trips, and greedy generation from the reloaded quantized cache is token-for-token identical to the f16 run. 4-bit does NOT preserve greedy parity on this model — it is a sampled-decoding-only option, not a drop-in tier.
+- **Resume budget at 8-bit (18,191-token prefix): load 0.6 ms + delta prefill 75 ms — the 2s budget holds with 25x margin.** The compression tier the caveat calls for is viable at 8-bit today; adopt by adding `bits=8, group=64` to the checkpoint fingerprint so f16 and q8 blobs can never cross-serve.
+- Capability probe (`sidecar/probes/mlx_capability_probe.py`): prefill 9,908 tok/s (f16, 471 tokens), f16 KV round trip 12,305 bytes/token, `mx.compile` cannot wrap a model call that takes an MLX cache object (T14's FFI path must beat 9.9k tok/s eager, not a compiled number), tokenizer.encode ≈ 181 µs per ~930-char chat payload (T13 native-tokenize baseline).
+
 ### Success-criteria gating (R1-6, R1-7)
 
 Criteria 1-2 hold only if the adapter round-trip benchmark (Next Steps #3) demonstrates adoption at the required speed — record the benchmark result before treating them as targets. Criterion 3's ≥80% target assumes adapter-based cross-process reuse works (which is what clears Approach A's ~60-80% proxy-only ceiling); if the mlx-lm adapter proves too lossy, the v1 target drops to the proxy-layer ceiling and 80% becomes the stretch goal.
