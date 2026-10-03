@@ -57,48 +57,73 @@ pub struct AppState {
     pub persistence: crate::persistence::Persistence,
 }
 
-/// Hit-rate counters (D3). Mutex over a small struct is fine at v1 scale.
+/// Hit-rate counters (D3). Per-counter atomics instead of a Mutex: `record`
+/// runs on every request, and under concurrent streaming the lock is a
+/// cross-core contention point on the hot path for no benefit — the counters
+/// are independent monotonic (or correcting) totals that never need to be
+/// read and written transactionally together.
 #[derive(Debug, Default)]
 pub struct Stats {
-    inner: std::sync::Mutex<StatsInner>,
-}
-
-#[derive(Debug, Default)]
-pub struct StatsInner {
-    pub requests: u64,
-    pub hits: u64,
-    pub misses: u64,
-    pub partials: u64,
+    requests: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+    partials: std::sync::atomic::AtomicU64,
     /// Sum of covered KV across requests. On a retire, `correct_retire` subtracts
     /// the entry's covered count, so this reflects KV actually in hand.
-    pub tokens_cached: u64,
+    tokens_cached: std::sync::atomic::AtomicU64,
     /// Sum of request lengths. `hit_rate = tokens_cached / tokens_total` is a
     /// coarse reuse diagnostic, not a true per-request fraction: a retire lowers
     /// the numerator without lowering this, so the ratio can dip below the
     /// fraction of requests that hit. Read it as a trend, not an exact rate.
+    tokens_total: std::sync::atomic::AtomicU64,
+}
+
+/// Point-in-time read of every counter, for /stats and tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub requests: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub partials: u64,
+    pub tokens_cached: u64,
     pub tokens_total: u64,
 }
 
 impl Stats {
-    /// Recover a poisoned lock instead of panicking: counters are diagnostic,
-    /// never worth failing a request over (error-registry principle).
-    fn lock(&self) -> std::sync::MutexGuard<'_, StatsInner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    fn get(c: &std::sync::atomic::AtomicU64) -> u64 {
+        c.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Decremented-by-one, saturating at zero (a retire racing a concurrent
+    /// record can observe a transient zero; counters are diagnostic).
+    fn sub_one(c: &std::sync::atomic::AtomicU64) {
+        let _ = c.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| v.checked_sub(1),
+        );
+    }
+    fn sub(c: &std::sync::atomic::AtomicU64, n: u64) {
+        let _ = c.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| v.checked_sub(n),
+        );
     }
 
     pub fn record(&self, d: &PolicyDecision) {
-        let mut s = self.lock();
-        s.requests += 1;
+        use std::sync::atomic::Ordering::Relaxed;
+        self.requests.fetch_add(1, Relaxed);
         match d.verdict {
-            CacheVerdict::Hit => s.hits += 1,
-            CacheVerdict::Miss => s.misses += 1,
-            CacheVerdict::Partial => s.partials += 1,
-        }
+            CacheVerdict::Hit => self.hits.fetch_add(1, Relaxed),
+            CacheVerdict::Miss => self.misses.fetch_add(1, Relaxed),
+            CacheVerdict::Partial => self.partials.fetch_add(1, Relaxed),
+        };
         // tokens_cached counts KV actually in hand (covered = matched-1), the
         // same value the response reports as tokens_cached/prefill_from. Counting
         // matched_tokens here would overstate reuse by one per hit.
-        s.tokens_cached += covered_kv_tokens(d.verdict, d.matched_tokens) as u64;
-        s.tokens_total += d.request_tokens as u64;
+        self.tokens_cached
+            .fetch_add(covered_kv_tokens(d.verdict, d.matched_tokens) as u64, Relaxed);
+        self.tokens_total.fetch_add(d.request_tokens as u64, Relaxed);
     }
 
     /// Correct a decision whose checkpoint was retired (quarantined) after
@@ -111,19 +136,31 @@ impl Stats {
     /// its miss verdict while adopting the blob it just published, and retiring
     /// that blob must not count a second miss for the one request.
     pub fn correct_retire(&self, d: &PolicyDecision) {
+        use std::sync::atomic::Ordering::Relaxed;
         if d.verdict == CacheVerdict::Miss {
             return;
         }
-        let mut s = self.lock();
         match d.verdict {
-            CacheVerdict::Hit => s.hits = s.hits.saturating_sub(1),
-            CacheVerdict::Partial => s.partials = s.partials.saturating_sub(1),
+            CacheVerdict::Hit => Self::sub_one(&self.hits),
+            CacheVerdict::Partial => Self::sub_one(&self.partials),
             CacheVerdict::Miss => {}
         }
-        s.misses += 1;
-        s.tokens_cached = s
-            .tokens_cached
-            .saturating_sub(covered_kv_tokens(d.verdict, d.matched_tokens) as u64);
+        self.misses.fetch_add(1, Relaxed);
+        Self::sub(
+            &self.tokens_cached,
+            covered_kv_tokens(d.verdict, d.matched_tokens) as u64,
+        );
+    }
+
+    pub fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            requests: Self::get(&self.requests),
+            hits: Self::get(&self.hits),
+            misses: Self::get(&self.misses),
+            partials: Self::get(&self.partials),
+            tokens_cached: Self::get(&self.tokens_cached),
+            tokens_total: Self::get(&self.tokens_total),
+        }
     }
 }
 
@@ -243,9 +280,23 @@ async fn chat_completions(
         ));
     };
     if outcome.decision.verdict != CacheVerdict::Hit {
-        match state.singleflight.enter(tokens.clone()).await {
+        match state.singleflight.enter(&tokens).await {
             mlxcache_core::singleflight::Role::Leader(lead) => {
-                match client.prefill(&tokens).await {
+                // Delta prefill (OV3): on a PARTIAL match the route already
+                // found an ancestor checkpoint covering tokens[:matched-1] of
+                // KV. Pass its absolute path so the adapter loads that KV and
+                // prefills only the uncovered delta, instead of recomputing
+                // the whole prefix (the single biggest TTFT lever on growing
+                // conversations). A full miss has no ancestor.
+                let ancestor = outcome.blob.as_ref().map(|(name, _, _)| {
+                    state
+                        .persistence
+                        .blob_dir
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                match client.prefill(&tokens, ancestor.as_deref()).await {
                     // An empty payload means the adapter cached nothing (e.g. a
                     // one-token prompt). Publishing would index a checkpoint with
                     // no KV. The leader's publish result is an `Ok(blob_name)`, and
@@ -262,97 +313,82 @@ async fn chat_completions(
                         // follower report the same verdict: nothing was cached,
                         // so no blob may be resumed from even if a shorter
                         // ancestor had been matched.
-                        outcome.decision = mlxcache_core::policy::PolicyDecision {
-                            verdict: mlxcache_core::policy::CacheVerdict::Miss,
-                            matched_tokens: 0,
-                            request_tokens: tokens.len(),
-                        };
+                        outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
                         outcome.blob = None;
                         outcome.prefill_from = 0;
                         lead.complete(Ok(String::new()));
                     }
                     Ok(blob) => {
-                        let meta = mlxcache_core::contract::CheckpointMeta {
-                            fingerprint: fingerprint.clone(),
-                            token_count: tokens.len() as u64,
-                            tokens: tokens.clone(),
-                            format_version: 1,
-                        };
-                        let key = blob_key(&fingerprint, &tokens);
-                        // Refuse before writing if the generation floor is unknown
-                        // (a failed startup scan): writing first would leak an
-                        // unindexed file on every request. Serve from scratch.
-                        if !state.orchestrator.can_publish() {
-                            // Floor unknown: don't write. Report a plain miss so
-                            // followers also serve from scratch (an empty name is
-                            // the "not cached" signal, not an error).
-                            tracing::warn!("not caching: startup recovery incomplete");
-                            outcome.decision = mlxcache_core::policy::PolicyDecision {
-                                verdict: mlxcache_core::policy::CacheVerdict::Miss,
-                                matched_tokens: 0,
-                                request_tokens: tokens.len(),
-                            };
-                            outcome.blob = None;
-                            outcome.prefill_from = 0;
-                            lead.complete(Ok(String::new()));
-                        } else {
-                            // Reserve the generation BEFORE writing so the on-disk
-                            // name is generation-specific (immutable). A republish
-                            // then never overwrites an earlier generation's file, so
-                            // a delayed retirement cannot delete a healthy
-                            // replacement.
-                            let generation = state.orchestrator.reserve_generation();
-                            let blob_name = format!("{:032x}-{:016x}.ckpt", key, generation);
-                            match state
-                                .persistence
-                                .publish_atomic(key, generation, &meta, &blob)
-                            {
-                                // ENOSPC rescue (registry): log and continue uncached.
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
-                                    lead.complete(Err(e.to_string()));
-                                }
-                                Ok(_) => {
-                                    let published = state.orchestrator.publish_checkpoint(
-                                        &state.persistence,
-                                        &tokens,
-                                        meta,
-                                        blob_name.clone(),
-                                        generation,
-                                    );
-                                    // publish_checkpoint is expected to succeed (we
-                                    // checked can_publish), but if the index rejected
-                                    // it, remove the now-unindexed file so it cannot
-                                    // leak.
-                                    if !published {
-                                        if let Err(e) = state.persistence.remove(&blob_name) {
-                                            tracing::warn!(error = %e, "could not remove unindexed blob");
-                                        }
-                                    }
-                                    // The leader ran a FRESH prefill over the whole
-                                    // prompt (the ancestor blob was not passed to the
-                                    // adapter), so no prior-request KV was reused, even
-                                    // on a partial. Report a miss with zero covered KV
-                                    // so response, /stats, and the log agree on what
-                                    // actually happened. Only generation resumes from
-                                    // the blob just written; that is not reuse.
-                                    outcome.decision = mlxcache_core::policy::PolicyDecision {
-                                        verdict: mlxcache_core::policy::CacheVerdict::Miss,
-                                        matched_tokens: 0,
-                                        request_tokens: tokens.len(),
-                                    };
-                                    outcome.prefill_from = 0;
-                                    outcome.blob =
-                                        Some((blob_name.clone(), generation, tokens.clone()));
-                                    lead.complete(Ok(blob_name));
-                                }
-                            }
-                        }
+                        publish_leader_blob(
+                            state.clone(),
+                            client,
+                            lead,
+                            &mut outcome,
+                            &fingerprint,
+                            &tokens,
+                            blob,
+                        )
+                        .await?;
                     }
                     Err(e) => {
-                        let msg = e.to_string();
-                        lead.complete(Err(msg.clone()));
-                        return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
+                        // A rejected ANCESTOR (the adapter 422s when the blob it
+                        // was told to resume from is bad) must not wedge the
+                        // partial path: quarantine the ancestor exactly like the
+                        // generate path does, then retry once from full scratch.
+                        // Any other error (or a failed scratch retry) is an
+                        // adapter failure: 502, no quarantine — same contract
+                        // as the generate path's open failure.
+                        if e.is_checkpoint_rejected() {
+                            if let Some((name, generation, prefix)) = outcome.blob.take() {
+                                state.orchestrator.quarantine_checkpoint(
+                                    &state.persistence,
+                                    &name,
+                                    generation,
+                                    &prefix,
+                                );
+                                tracing::warn!(
+                                    blob = %name,
+                                    error = %e,
+                                    "ancestor rejected by adapter during prefill; quarantined, retrying from scratch"
+                                );
+                            }
+                            outcome.decision =
+                                mlxcache_core::policy::scratch_decision(tokens.len());
+                            outcome.prefill_from = 0;
+                            // The retry below re-derives blob state from the
+                            // scratch prefill.
+                            match client.prefill(&tokens, None).await {
+                                Ok(blob) if !blob.is_empty() && tokens.len() >= 2 => {
+                                    publish_leader_blob(
+                                        state.clone(),
+                                        client,
+                                        lead,
+                                        &mut outcome,
+                                        &fingerprint,
+                                        &tokens,
+                                        blob,
+                                    )
+                                    .await?;
+                                }
+                                Ok(_) => {
+                                    outcome.blob = None;
+                                    lead.complete(Ok(String::new()));
+                                }
+                                Err(e2) => {
+                                    let msg = e2.to_string();
+                                    lead.complete(Err(msg.clone()));
+                                    return Err(err(
+                                        StatusCode::BAD_GATEWAY,
+                                        &msg,
+                                        "adapter_error",
+                                    ));
+                                }
+                            }
+                        } else {
+                            let msg = e.to_string();
+                            lead.complete(Err(msg.clone()));
+                            return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
+                        }
                     }
                 }
             }
@@ -370,13 +406,13 @@ async fn chat_completions(
                         outcome = state.orchestrator.route(&tokens, &fingerprint);
                     }
                     Some(Ok(_)) => {
-                        // Leader cached nothing (empty blob): run from scratch and
-                        // report the same scratch verdict as the leader.
-                        outcome.decision = mlxcache_core::policy::PolicyDecision {
-                            verdict: mlxcache_core::policy::CacheVerdict::Miss,
-                            matched_tokens: 0,
-                            request_tokens: tokens.len(),
-                        };
+                        // Leader cached nothing (empty blob: a one-token prompt,
+                        // a publish refusal, or a publish failure): run from
+                        // scratch and report the same scratch verdict as the
+                        // leader. D2: a full disk must never turn a follower's
+                        // working completion into a 502.
+                        outcome.decision =
+                            mlxcache_core::policy::scratch_decision(tokens.len());
                         outcome.blob = None;
                         outcome.prefill_from = 0;
                     }
@@ -507,12 +543,156 @@ async fn chat_completions(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
-/// Stable blob key for a token prefix: 128 bits from two FNV-1a passes with
-/// different seeds and different primes, so a collision in one lane does not
-/// correlate with the other. 64 bits is too thin as the store grows; a filename
-/// collision would alias two distinct KV states. (The index is exact and keyed
-/// by token ids; this only names the blob on disk.)
-fn prefix_hash(tokens: &[u32]) -> u128 {
+/// Publish the leader's freshly prefilled checkpoint (shared by the plain
+/// prefill path and the rejected-ancestor scratch retry) and settle the
+/// leader's route outcome.
+///
+/// Delta-prefill-aware accounting: when the leader adopted an ancestor's KV
+/// (`adopted_from = Some(matched)`), the prefill DID reuse `matched - 1`
+/// tokens of cached KV, so the Partial verdict and its prefill_from stand —
+/// reporting a miss would hide real reuse from /stats and hit_rate. When no
+/// ancestor was adopted, the leader ran a fresh full prefill and reports a
+/// plain miss with zero covered KV (generation resuming from the blob just
+/// written is not reuse). On any write/refusal failure the outcome is forced
+/// to scratch and single-flight is completed with the empty-name sentinel so
+/// followers run from scratch too (OV6: a failed publish must never 502 a
+/// follower whose request was fine).
+#[allow(clippy::too_many_arguments)]
+async fn publish_leader_blob(
+    state: Arc<AppState>,
+    _client: &SidecarClient,
+    lead: mlxcache_core::singleflight::Leadership,
+    outcome: &mut crate::orchestrator::RouteOutcome,
+    fingerprint: &ModelFingerprint,
+    tokens: &[u32],
+    blob: Vec<u8>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let adopted_from = outcome.blob.as_ref().map(|(_, _, prefix)| prefix.len());
+    let meta = mlxcache_core::contract::CheckpointMeta {
+        fingerprint: fingerprint.clone(),
+        token_count: tokens.len() as u64,
+        tokens: tokens.to_vec(),
+        format_version: 1,
+    };
+    let key = blob_key(fingerprint, tokens);
+    // Refuse before writing if the generation floor is unknown (a failed
+    // startup scan): writing first would leak an unindexed file on every
+    // request. Serve from scratch.
+    if !state.orchestrator.can_publish() {
+        // Floor unknown: don't write. Report a plain miss so followers also
+        // serve from scratch (an empty name is the "not cached" signal, not an
+        // error). An adopted ancestor's KV was still real reuse, but the
+        // recovery-blocked daemon reports conservatively: scratch.
+        tracing::warn!("not caching: startup recovery incomplete");
+        outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
+        outcome.blob = None;
+        outcome.prefill_from = 0;
+        lead.complete(Ok(String::new()));
+        return Ok(());
+    }
+    // Reserve the generation BEFORE writing so the on-disk name is
+    // generation-specific (immutable). A republish then never overwrites an
+    // earlier generation's file, so a delayed retirement cannot delete a
+    // healthy replacement.
+    let generation = state.orchestrator.reserve_generation();
+    let blob_name = format!("{:032x}-{:016x}.ckpt", key, generation);
+    // The write + fsync + rename runs on the blocking pool, not a runtime
+    // worker: an fsync is milliseconds of disk latency, and blocking a worker
+    // here stalls every OTHER request scheduled on it, including live streams
+    // (A3). The payload MOVES into the closure (nothing needs it after
+    // publish) and meta is cloned (publish_checkpoint still consumes it
+    // below) — one memcpy vs. an ms-scale runtime stall.
+    let persistence = state.persistence.clone();
+    let meta_for_write = meta.clone();
+    let write_result = tokio::task::spawn_blocking(move || {
+        persistence.publish_atomic(key, generation, &meta_for_write, &blob)
+    })
+    .await
+    .unwrap_or_else(|join| {
+        // A panic inside publish_atomic is a daemon bug, not a request error:
+        // treat it exactly like a failed write (serve uncached) and log it at
+        // error level, loudly.
+        tracing::error!(error = %join, "checkpoint publish task panicked");
+        Err(crate::persistence::PersistError::Io(std::io::Error::other(
+            "checkpoint publish task panicked",
+        )))
+    });
+    match write_result {
+        // ENOSPC rescue (registry): log and continue uncached. The LEADER
+        // continues AND the single-flight result is the empty-name sentinel,
+        // so coalesced followers also run from scratch instead of 502ing (D2
+        // serve-uncached must hold for every request the disk failed under,
+        // not just the leader).
+        //
+        // One refinement (delta prefill): when this leader ADOPTED an
+        // ancestor's KV, that KV was loaded and verified by the adapter
+        // moments ago and the ancestor is still published — so the leader
+        // keeps generating from it (real reuse) while followers re-route onto
+        // the same ancestor. Only a leader with no adopted ancestor falls
+        // back to a plain scratch miss.
+        Err(e) => {
+            tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
+            if let Some(matched) = adopted_from {
+                // The ancestor KV was loaded and verified by the adapter
+                // moments ago and the ancestor is still published: the leader
+                // keeps generating from it (real reuse), and completing with
+                // its name lets followers RE-ROUTE onto it (a Partial hit)
+                // instead of forcing them to scratch.
+                let ancestor_name = outcome
+                    .blob
+                    .as_ref()
+                    .map(|(name, _, _)| name.clone())
+                    .unwrap_or_default();
+                outcome.decision.verdict = CacheVerdict::Partial;
+                outcome.decision.matched_tokens = matched;
+                outcome.prefill_from = covered_kv_tokens(CacheVerdict::Partial, matched);
+                lead.complete(Ok(ancestor_name));
+            } else {
+                outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
+                outcome.blob = None;
+                outcome.prefill_from = 0;
+                lead.complete(Ok(String::new()));
+            }
+        }
+        Ok(_) => {
+            let published = state.orchestrator.publish_checkpoint(
+                &state.persistence,
+                tokens,
+                meta,
+                blob_name.clone(),
+                generation,
+            );
+            // publish_checkpoint is expected to succeed (we checked
+            // can_publish), but if the index rejected it, remove the
+            // now-unindexed file so it cannot leak.
+            if !published {
+                if let Err(e) = state.persistence.remove(&blob_name) {
+                    tracing::warn!(error = %e, "could not remove unindexed blob");
+                }
+            }
+            if adopted_from.is_some() {
+                // Delta prefill reused the ancestor's KV: keep the Partial
+                // verdict + its covered count (prefill_from = matched-1) so
+                // stats/reporting reflect the reuse. Generation resumes from
+                // the NEW blob (which covers tokens[:-1]).
+                outcome.blob = Some((blob_name.clone(), generation, tokens.to_vec()));
+            } else {
+                // Fresh full prefill: report a miss with zero covered KV so
+                // response, /stats, and the log agree on what happened.
+                outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
+                outcome.prefill_from = 0;
+                outcome.blob = Some((blob_name.clone(), generation, tokens.to_vec()));
+            }
+            lead.complete(Ok(blob_name));
+        }
+    }
+    Ok(())
+}
+
+/// The token-only prefix hash for the request log line. Public for the B1
+/// criterion bench; the blob filename uses a DIFFERENT key (`blob_key` =
+/// fingerprint + tokens) — the two are not equal.
+pub fn prefix_hash(tokens: &[u32]) -> u128 {
     fn fnv1a(seed: u64, prime: u64, tokens: &[u32]) -> u64 {
         let mut h = seed;
         for t in tokens {
@@ -537,7 +717,8 @@ fn prefix_hash(tokens: &[u32]) -> u128 {
 /// prefill would overwrite the first model's blob in place, and the first
 /// model's still-valid index entry would load foreign KV on its next hit:
 /// silent wrong output. Prepending the fingerprint keeps the two files apart.
-fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u32]) -> u128 {
+/// Public for the B1 criterion bench.
+pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u32]) -> u128 {
     // Length-prefix each field so no field's bytes can be re-split across the
     // boundaries: joining with a separator is ambiguous when model_id itself
     // (request-controlled) contains the separator, which would alias two
@@ -572,15 +753,45 @@ fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u
 /// Map one raw NDJSON line from the sidecar into zero or more SSE frames.
 /// `{"done":true}` becomes `[DONE]`; a token line becomes `data: {...}`; a
 /// non-JSON line is a protocol violation and surfaces as a stream error.
+///
+/// Hot-path shape (P2b): the line is validated with a two-field typed struct —
+/// serde skips every other field without allocating — and the frame is emitted
+/// by forwarding the engine's OWN bytes. The old path built a full
+/// `serde_json::Value` tree per token and re-serialized it; at 64+ tokens per
+/// stream that is a tree alloc + string churn per token for zero gain. Key
+/// order and spacing now come straight from the sidecar instead of serde's
+/// normalization — both are valid JSON and clients parse by key, not layout.
 fn push_frame(frames: &mut Vec<Result<Vec<u8>, std::io::Error>>, raw: &[u8]) {
-    let line = String::from_utf8_lossy(raw);
-    let line = line.trim();
+    /// A done marker may carry any JSON value (`true`, `1`, …); presence of
+    /// the key is the signal, matching the previous Value-based behavior.
+    #[derive(serde::Deserialize)]
+    struct SidecarStreamFrame {
+        #[serde(default)]
+        done: Option<serde::de::IgnoredAny>,
+    }
+    let line = match std::str::from_utf8(raw) {
+        Ok(s) => s.trim(),
+        // Invalid UTF-8 from the sidecar is a protocol violation (it must be,
+        // because the SSE body is a text/event-stream).
+        Err(_) => {
+            frames.push(Err(std::io::Error::other(
+                "sidecar emitted a non-UTF-8 stream line",
+            )));
+            return;
+        }
+    };
     if line.is_empty() {
         return;
     }
-    match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(v) if v.get("done").is_some() => frames.push(Ok(b"data: [DONE]\n\n".to_vec())),
-        Ok(v) => frames.push(Ok(format!("data: {v}\n\n").into_bytes())),
+    match serde_json::from_str::<SidecarStreamFrame>(line) {
+        Ok(f) if f.done.is_some() => frames.push(Ok(b"data: [DONE]\n\n".to_vec())),
+        Ok(_) => {
+            let mut frame = Vec::with_capacity(line.len() + 8);
+            frame.extend_from_slice(b"data: ");
+            frame.extend_from_slice(line.as_bytes());
+            frame.extend_from_slice(b"\n\n");
+            frames.push(Ok(frame));
+        }
         Err(_) => frames.push(Err(std::io::Error::other(
             "sidecar emitted a non-JSON stream line",
         ))),
@@ -708,19 +919,27 @@ async fn stream_response(
         upstream: std::pin::Pin<
             Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         >,
-        buf: Vec<u8>,
+        /// Line buffer. BytesMut, not Vec<u8>: `split_to` hands out a line as
+        /// an O(1) view — the old `drain(..=pos).collect()` memmoved the whole
+        /// remaining buffer once per token (quadratic over a stream).
+        buf: bytes::BytesMut,
         done: bool,
         terminated: bool,
         started: std::time::Instant,
         ttft_ms: Option<u64>,
+        /// Max gap with no bytes from the sidecar before the stream is cut
+        /// with an explicit error (the sidecar stalling must not wedge a
+        /// client forever now that streams carry no total timeout).
+        idle: std::time::Duration,
     }
     let state = StreamState {
         upstream: Box::pin(upstream.bytes_stream()),
-        buf: Vec::new(),
+        buf: bytes::BytesMut::with_capacity(8 * 1024),
         done: false,
         terminated: false,
         started,
         ttft_ms: None,
+        idle: client.stream_idle_timeout(),
     };
     let body_stream = futures_util::stream::unfold(state, |mut st| async move {
         use futures_util::StreamExt;
@@ -729,11 +948,30 @@ async fn stream_response(
             if st.done {
                 return None;
             }
-            match st.upstream.next().await {
-                Some(Ok(bytes)) => {
+            match tokio::time::timeout(st.idle, st.upstream.next()).await {
+                // The sidecar stopped producing tokens mid-stream: emit the
+                // same explicit-error + [DONE] treatment as a truncated
+                // upstream so the client sees a failure, not a hang.
+                Err(_elapsed) => {
+                    if let Some(ttft) = st.ttft_ms {
+                        let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
+                        frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
+                    }
+                    let err = serde_json::json!({
+                        "error": {
+                            "message": "upstream idle timeout: no tokens within the streaming budget",
+                            "type": "upstream_error",
+                        }
+                    });
+                    frames.push(Ok(format!("data: {err}\n\n").into_bytes()));
+                    frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
+                    st.done = true;
+                    break;
+                }
+                Ok(Some(Ok(bytes))) => {
                     st.buf.extend_from_slice(&bytes);
                     while let Some(pos) = st.buf.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = st.buf.drain(..=pos).collect();
+                        let line = st.buf.split_to(pos + 1);
                         push_frame(&mut frames, &line);
                         let last_done = frames.last().is_some_and(|f| {
                             f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
@@ -764,11 +1002,11 @@ async fn stream_response(
                         break;
                     }
                 }
-                Some(Err(e)) => {
+                Ok(Some(Err(e))) => {
                     frames.push(Err(std::io::Error::other(e.to_string())));
                     break;
                 }
-                None => {
+                Ok(None) => {
                     // Upstream ended: flush a trailing line with no newline, then
                     // terminate. A clean end is the sidecar's `{"done":true}` line
                     // (already mapped to `[DONE]` by push_frame). If EOF arrives
@@ -819,7 +1057,7 @@ async fn stream_response(
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let s = state.stats.lock();
+    let s = state.stats.snapshot();
     Json(serde_json::json!({
         "requests": s.requests,
         "hits": s.hits,
@@ -1071,12 +1309,12 @@ mod tests {
         };
         stats.record(&hit);
         {
-            let s = stats.lock();
+            let s = stats.snapshot();
             assert_eq!(s.hits, 1);
             assert_eq!(s.tokens_cached, 7);
         }
         stats.correct_retire(&hit);
-        let s = stats.lock();
+        let s = stats.snapshot();
         assert_eq!(s.hits, 0, "retired hit must not remain a hit");
         assert_eq!(s.misses, 1, "retired hit is an effective miss");
         assert_eq!(s.tokens_cached, 0, "no KV was actually reused");
@@ -1094,13 +1332,13 @@ mod tests {
         };
         stats.record(&partial);
         {
-            let s = stats.lock();
+            let s = stats.snapshot();
             assert_eq!(s.partials, 1);
             assert_eq!(s.tokens_cached, 5);
         }
         stats.correct_retire(&partial);
         {
-            let s = stats.lock();
+            let s = stats.snapshot();
             assert_eq!(s.partials, 0, "retired partial must not remain a partial");
             assert_eq!(s.misses, 1);
             assert_eq!(s.tokens_cached, 0, "no KV was actually reused");
@@ -1115,7 +1353,39 @@ mod tests {
         };
         stats.record(&miss);
         stats.correct_retire(&miss);
-        let s = stats.lock();
+        let s = stats.snapshot();
         assert_eq!(s.misses, 2, "the miss is not double-counted");
+    }
+
+    #[test]
+    fn stats_record_is_lock_free_and_concurrent() {
+        // The atomics-backed counters must survive concurrent record/retire from
+        // many tasks without deadlock, poisoning, or lost updates.
+        let stats = Stats::default();
+        let stats = std::sync::Arc::new(stats);
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let stats = stats.clone();
+            handles.push(std::thread::spawn(move || {
+                let hit = PolicyDecision {
+                    verdict: CacheVerdict::Hit,
+                    matched_tokens: 8,
+                    request_tokens: 8,
+                };
+                for _ in 0..1000 {
+                    stats.record(&hit);
+                    // No retire here: retires would legitimately move verdicts
+                    // and make totals order-dependent; record is the hot path.
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let s = stats.snapshot();
+        assert_eq!(s.requests, 16_000);
+        assert_eq!(s.hits, 16_000);
+        assert_eq!(s.tokens_cached, 112_000);
+        assert_eq!(s.tokens_total, 128_000);
     }
 }
