@@ -37,6 +37,11 @@ jobs:
           MLXCACHE_BENCH_REAL: "0"
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Hot-path alloc gate (SSE framer ≤ 1 alloc/frame)
+        # Single-threaded on purpose: the counting allocator is process-global,
+        # so parallel test-harness threads would leak allocations into the
+        # measurement window and flake the tight budgets.
+        run: cargo test -p mlxcache-daemon --test alloc_gate --release -- --test-threads=1
 
   python:
     runs-on: macos-14

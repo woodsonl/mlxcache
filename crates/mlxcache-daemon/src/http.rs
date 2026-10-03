@@ -121,9 +121,12 @@ impl Stats {
         // tokens_cached counts KV actually in hand (covered = matched-1), the
         // same value the response reports as tokens_cached/prefill_from. Counting
         // matched_tokens here would overstate reuse by one per hit.
-        self.tokens_cached
-            .fetch_add(covered_kv_tokens(d.verdict, d.matched_tokens) as u64, Relaxed);
-        self.tokens_total.fetch_add(d.request_tokens as u64, Relaxed);
+        self.tokens_cached.fetch_add(
+            covered_kv_tokens(d.verdict, d.matched_tokens) as u64,
+            Relaxed,
+        );
+        self.tokens_total
+            .fetch_add(d.request_tokens as u64, Relaxed);
     }
 
     /// Correct a decision whose checkpoint was retired (quarantined) after
@@ -411,8 +414,7 @@ async fn chat_completions(
                         // scratch and report the same scratch verdict as the
                         // leader. D2: a full disk must never turn a follower's
                         // working completion into a 502.
-                        outcome.decision =
-                            mlxcache_core::policy::scratch_decision(tokens.len());
+                        outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
                         outcome.blob = None;
                         outcome.prefill_from = 0;
                     }
@@ -689,6 +691,12 @@ async fn publish_leader_blob(
     Ok(())
 }
 
+/// Stable blob key for a token prefix: 128 bits from two FNV-1a passes with
+/// different seeds and different primes, so a collision in one lane does not
+/// correlate with the other. 64 bits is too thin as the store grows; a filename
+/// collision would alias two distinct KV states. (The index is exact and keyed
+/// by token ids; this only names the blob on disk.)
+///
 /// The token-only prefix hash for the request log line. Public for the B1
 /// criterion bench; the blob filename uses a DIFFERENT key (`blob_key` =
 /// fingerprint + tokens) — the two are not equal.
@@ -761,7 +769,7 @@ pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens:
 /// stream that is a tree alloc + string churn per token for zero gain. Key
 /// order and spacing now come straight from the sidecar instead of serde's
 /// normalization — both are valid JSON and clients parse by key, not layout.
-fn push_frame(frames: &mut Vec<Result<Vec<u8>, std::io::Error>>, raw: &[u8]) {
+fn push_frame(frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]) {
     /// A done marker may carry any JSON value (`true`, `1`, …); presence of
     /// the key is the signal, matching the previous Value-based behavior.
     #[derive(serde::Deserialize)]
@@ -772,7 +780,9 @@ fn push_frame(frames: &mut Vec<Result<Vec<u8>, std::io::Error>>, raw: &[u8]) {
     let line = match std::str::from_utf8(raw) {
         Ok(s) => s.trim(),
         // Invalid UTF-8 from the sidecar is a protocol violation (it must be,
-        // because the SSE body is a text/event-stream).
+        // because the SSE body is a text/event-stream). Heap-building the
+        // error is fine: this is a fatal one-time stream abort, not a
+        // per-token cost.
         Err(_) => {
             frames.push(Err(std::io::Error::other(
                 "sidecar emitted a non-UTF-8 stream line",
@@ -784,13 +794,15 @@ fn push_frame(frames: &mut Vec<Result<Vec<u8>, std::io::Error>>, raw: &[u8]) {
         return;
     }
     match serde_json::from_str::<SidecarStreamFrame>(line) {
-        Ok(f) if f.done.is_some() => frames.push(Ok(b"data: [DONE]\n\n".to_vec())),
+        Ok(f) if f.done.is_some() => {
+            frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")))
+        }
         Ok(_) => {
             let mut frame = Vec::with_capacity(line.len() + 8);
             frame.extend_from_slice(b"data: ");
             frame.extend_from_slice(line.as_bytes());
             frame.extend_from_slice(b"\n\n");
-            frames.push(Ok(frame));
+            frames.push(Ok(bytes::Bytes::from(frame)));
         }
         Err(_) => frames.push(Err(std::io::Error::other(
             "sidecar emitted a non-JSON stream line",
@@ -911,9 +923,9 @@ async fn stream_response(
     // a final flush handles a trailing line with no newline plus a guaranteed
     // [DONE] terminator (SSE clients wait for it; an early close must not leave
     // them hanging or silently truncate the completion).
-    let meta_bytes = format!("data: {meta_line}\n\n").into_bytes();
+    let meta_bytes = bytes::Bytes::from(format!("data: {meta_line}\n\n"));
     let first =
-        futures_util::stream::once(async move { Ok::<Vec<u8>, std::io::Error>(meta_bytes) });
+        futures_util::stream::once(async move { Ok::<bytes::Bytes, std::io::Error>(meta_bytes) });
 
     struct StreamState {
         upstream: std::pin::Pin<
@@ -943,7 +955,7 @@ async fn stream_response(
     };
     let body_stream = futures_util::stream::unfold(state, |mut st| async move {
         use futures_util::StreamExt;
-        let mut frames: Vec<Result<Vec<u8>, std::io::Error>> = Vec::new();
+        let mut frames: Vec<Result<bytes::Bytes, std::io::Error>> = Vec::new();
         loop {
             if st.done {
                 return None;
@@ -955,7 +967,7 @@ async fn stream_response(
                 Err(_elapsed) => {
                     if let Some(ttft) = st.ttft_ms {
                         let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
-                        frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
+                        frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
                     }
                     let err = serde_json::json!({
                         "error": {
@@ -963,8 +975,8 @@ async fn stream_response(
                             "type": "upstream_error",
                         }
                     });
-                    frames.push(Ok(format!("data: {err}\n\n").into_bytes()));
-                    frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
+                    frames.push(Ok(bytes::Bytes::from(format!("data: {err}\n\n"))));
+                    frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
                     st.done = true;
                     break;
                 }
@@ -992,7 +1004,7 @@ async fn stream_response(
                             let done = frames.pop().expect("just pushed [DONE]");
                             if let Some(ttft) = st.ttft_ms {
                                 let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
-                                frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
+                                frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
                             }
                             frames.push(done);
                             st.terminated = true;
@@ -1025,7 +1037,7 @@ async fn stream_response(
                     if !st.terminated {
                         if let Some(ttft) = st.ttft_ms {
                             let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
-                            frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
+                            frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
                         }
                         // Truncated upstream: an explicit error, not a success.
                         let err = serde_json::json!({
@@ -1034,8 +1046,8 @@ async fn stream_response(
                                 "type": "upstream_error",
                             }
                         });
-                        frames.push(Ok(format!("data: {err}\n\n").into_bytes()));
-                        frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
+                        frames.push(Ok(bytes::Bytes::from(format!("data: {err}\n\n"))));
+                        frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
                     }
                     st.done = true;
                     break;
@@ -1087,13 +1099,16 @@ mod tests {
         let mut frames = Vec::new();
         push_frame(&mut frames, b"{\"token\":5,\"text\":\"hi\"}\n");
         assert_eq!(frames.len(), 1);
-        let text = String::from_utf8(frames[0].as_ref().unwrap().clone()).unwrap();
+        let text = std::string::String::from_utf8(frames[0].as_ref().unwrap().to_vec()).unwrap();
         assert!(text.starts_with("data: {"));
         assert!(text.ends_with("\n\n"));
 
         frames.clear();
         push_frame(&mut frames, b"{\"done\":true}\n");
-        assert_eq!(frames[0].as_ref().unwrap(), b"data: [DONE]\n\n");
+        assert_eq!(
+            frames[0].as_ref().unwrap().as_ref(),
+            b"data: [DONE]\n\n".as_slice()
+        );
 
         // Blank lines and whitespace are ignored, not turned into frames.
         frames.clear();
@@ -1387,5 +1402,14 @@ mod tests {
         assert_eq!(s.hits, 16_000);
         assert_eq!(s.tokens_cached, 112_000);
         assert_eq!(s.tokens_total, 128_000);
+    }
+}
+
+/// Public surface for the allocation gate (`tests/alloc_gate.rs`). The gate
+/// runs in its own test binary (a counting global allocator is process-wide)
+/// and needs to exercise the REAL framer, not a copy of it.
+pub mod test_support {
+    pub fn push_frame_for_gate(frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]) {
+        super::push_frame(frames, raw);
     }
 }

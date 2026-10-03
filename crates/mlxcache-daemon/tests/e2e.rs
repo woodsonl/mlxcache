@@ -852,7 +852,10 @@ async fn publish_failure_serves_leader_and_followers_from_scratch() {
             let status = res.status();
             let bytes = res.into_body().collect().await.unwrap().to_bytes();
             let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            (status, v["mlxcache"]["verdict"].as_str().unwrap().to_string())
+            (
+                status,
+                v["mlxcache"]["verdict"].as_str().unwrap().to_string(),
+            )
         }));
     }
 
@@ -1441,7 +1444,11 @@ async fn stalled_stream_is_cut_by_the_idle_budget_with_an_explicit_error() {
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), 200, "SSE headers arrive before the first token");
+    assert_eq!(
+        res.status(),
+        200,
+        "SSE headers arrive before the first token"
+    );
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let elapsed = started.elapsed();
     let text = String::from_utf8_lossy(&bytes);
