@@ -292,9 +292,13 @@ class SyntheticEngine:
             # user content appears VERBATIM between JSON quotes. Emulate a
             # real tokenizer over the CONTENT: the first occurrence of the
             # grow base starts the token stream, and the content runs to the
-            # closing JSON quote. tokenize(base) is then a strict prefix of
-            # tokenize(base + extension) — the property delta prefill needs —
-            # while the base request itself tokenizes to exactly the base.
+            # closing JSON quote. The remainder is split on " | " separators
+            # and each segment hashed independently, so appending a new
+            # segment EXTENDS the token stream: tokenize(round r) is a strict
+            # token-prefix of tokenize(round r+1) — the property that makes a
+            # growing conversation partial-match at every round (delta
+            # prefill's OV3 showcase), the way real BPE keeps deep prefix
+            # matches on appended text.
             idx = prompt.find(self._grow_base)
             if idx >= 0:
                 end = prompt.find('"', idx + len(self._grow_base))
@@ -302,7 +306,14 @@ class SyntheticEngine:
                 base = self._hash_tokens(self._grow_base)
                 if len(content) == len(self._grow_base):
                     return base
-                return base + self._hash_tokens(content[len(self._grow_base) :])
+                segments = (
+                    content[len(self._grow_base) :]
+                    .removeprefix(" | ")
+                    .split(" | ")
+                )
+                return base + [
+                    t for seg in segments for t in self._hash_tokens(seg)
+                ]
         return self._hash_tokens(prompt)
 
     @staticmethod
