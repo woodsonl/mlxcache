@@ -65,6 +65,9 @@ fn build_index(count: usize, chain_len: usize) -> PrefixIndex {
 
 fn bench_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefix_index");
+    // Tight budgets: this is a REGRESSION gate, not a publication dataset.
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_millis(700));
     // Index shapes: 1k and 10k unrelated conversations, all with the same
     // 128-token query — lookup cost must NOT grow with index size.
     for count in [1_000usize, 10_000] {
@@ -98,9 +101,11 @@ fn bench_lookup(c: &mut Criterion) {
 
 fn bench_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefix_index");
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_millis(700));
     group.bench_function("publish_2048tok_checkpoint", |b| {
         b.iter_batched(
-            || PrefixIndex::new(),
+            PrefixIndex::new,
             |index| {
                 let fp = fingerprint();
                 let tokens: Vec<u32> = (0..2048).collect();
