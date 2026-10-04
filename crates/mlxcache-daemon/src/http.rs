@@ -248,43 +248,51 @@ async fn chat_completions(
     // daemon proves the configured tokenizer.json IS the engine's tokenizer:
     // one probe prompt is encoded both ways and the ids must match, or the
     // daemon refuses to serve (a mismatched artifact would corrupt routing).
-    // On match it adopts the sidecar-reported tokenizer_hash + kv_dtype, so
-    // fingerprints are IDENTICAL to the pure-sidecar path — native tokenize
-    // is a pure latency optimization, invisible to the cache.
-    let (tokens, tokenizer_hash, kv_dtype) =
-        if let Some((_path, native)) = crate::native_tokenizer::from_env() {
-            match resolve_native_identity(&prompt, native, state.sidecar.as_ref()).await {
-                Ok(identity) => (native.encode(&prompt), identity.0, identity.1),
-                Err(e) => return Err(e),
-            }
-        } else {
-            match &state.sidecar {
-                Some(client) => match client.tokenize(&prompt).await {
-                    Ok(r) => (r.tokens, r.tokenizer_hash, r.kv_dtype),
-                    Err(SidecarError::Unreachable { url, .. }) => {
-                        return Err(err(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("adapter (sidecar) unreachable at {url}").as_str(),
-                            "adapter_unavailable",
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(err(
-                            StatusCode::BAD_GATEWAY,
-                            &e.to_string(),
-                            "adapter_error",
-                        ));
-                    }
-                },
-                None => {
+    // On match it adopts the sidecar-reported tokenizer_hash + kv_dtype (+
+    // kv quantization config), so fingerprints are IDENTICAL to the
+    // pure-sidecar path — native tokenize is a pure latency optimization,
+    // invisible to the cache.
+    let (identity, tokens) = if let Some((_path, native)) = crate::native_tokenizer::from_env() {
+        match resolve_native_identity(&prompt, native, state.sidecar.as_ref()).await {
+            Ok(identity) => (identity, native.encode(&prompt)),
+            Err(e) => return Err(e),
+        }
+    } else {
+        match &state.sidecar {
+            Some(client) => match client.tokenize(&prompt).await {
+                Ok(r) => (
+                    Identity {
+                        tokenizer_hash: r.tokenizer_hash,
+                        kv_dtype: r.kv_dtype,
+                        kv_bits: r.kv_bits,
+                        kv_group_size: r.kv_group_size,
+                    },
+                    r.tokens,
+                ),
+                Err(SidecarError::Unreachable { url, .. }) => {
                     return Err(err(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "no adapter configured",
+                        format!("adapter (sidecar) unreachable at {url}").as_str(),
                         "adapter_unavailable",
                     ));
                 }
+                Err(e) => {
+                    return Err(err(
+                        StatusCode::BAD_GATEWAY,
+                        &e.to_string(),
+                        "adapter_error",
+                    ));
+                }
+            },
+            None => {
+                return Err(err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no adapter configured",
+                    "adapter_unavailable",
+                ));
             }
-        };
+        }
+    };
 
     // A tokenizer can return zero tokens (e.g. an empty string for HF
     // tokenizers). An empty prefix has no KV to cache and its hash is a shared
@@ -297,14 +305,17 @@ async fn chat_completions(
         ));
     }
 
-    // Route + classify (R1-1 fingerprint check inside classify). The tokenizer
-    // hash comes from the adapter (R1-2): a constant here would let checkpoints
-    // from different tokenizers share a fingerprint and be served wrongly.
+    // Route + classify (R1-1 fingerprint check inside classify). The identity
+    // comes from the adapter (R1-2): a constant here would let checkpoints
+    // from different tokenizers/dtypes/quantization share a fingerprint and
+    // be served wrongly.
     let fingerprint = ModelFingerprint {
         model_id: req.model.clone(),
-        tokenizer_hash,
-        kv_dtype,
+        tokenizer_hash: identity.tokenizer_hash,
+        kv_dtype: identity.kv_dtype,
         kv_layout_version: 1,
+        kv_bits: identity.kv_bits,
+        kv_group_size: identity.kv_group_size,
     };
     let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
     // The token-only prefix hash for the request log line. The blob filename
@@ -741,6 +752,18 @@ async fn publish_leader_blob(
 ///
 /// The token-only prefix hash for the request log line. Public for the B1
 /// criterion bench; the blob filename uses a DIFFERENT key (`blob_key` =
+/// Adapter-reported cache identity (R1-1/R1-2): everything the fingerprint
+/// pins that the sidecar owns. The native-tokenize path adopts it wholesale
+/// after the parity probe so fingerprints stay byte-identical to the
+/// pure-sidecar path.
+#[derive(Debug, Clone)]
+struct Identity {
+    tokenizer_hash: String,
+    kv_dtype: String,
+    kv_bits: u8,
+    kv_group_size: u32,
+}
+
 /// fingerprint + tokens) — the two are not equal.
 /// T13 identity resolution: prove the native tokenizer IS the engine's, once,
 /// then reuse the verdict forever (the artifact cannot change mid-process).
@@ -755,8 +778,8 @@ async fn resolve_native_identity(
     prompt: &str,
     native: &crate::native_tokenizer::NativeTokenizer,
     sidecar: Option<&SidecarClient>,
-) -> Result<(String, String), (StatusCode, Json<ErrorResponse>)> {
-    static VERIFIED: OnceLock<Result<(String, String), String>> = OnceLock::new();
+) -> Result<Identity, (StatusCode, Json<ErrorResponse>)> {
+    static VERIFIED: OnceLock<Result<Identity, String>> = OnceLock::new();
     if let Some(Ok(identity)) = VERIFIED.get() {
         return Ok(identity.clone());
     }
@@ -811,7 +834,12 @@ async fn resolve_native_identity(
             "adapter_unavailable",
         ));
     }
-    let identity = (reference.tokenizer_hash, reference.kv_dtype);
+    let identity = Identity {
+        tokenizer_hash: reference.tokenizer_hash,
+        kv_dtype: reference.kv_dtype,
+        kv_bits: reference.kv_bits,
+        kv_group_size: reference.kv_group_size,
+    };
     let _ = VERIFIED.set(Ok(identity.clone()));
     Ok(identity)
 }
@@ -857,6 +885,12 @@ pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens:
     put(&mut f, &fingerprint.tokenizer_hash);
     put(&mut f, &fingerprint.kv_dtype);
     put(&mut f, &fingerprint.kv_layout_version.to_string());
+    // KV quantization config (T12): an 8-bit checkpoint of the same model must
+    // never share a filename with the f16 one — a republish at the same name
+    // would unlink the other tier's blob (index replacement reclaims the old
+    // file), ping-ponging the two tiers on every alternating request.
+    put(&mut f, &fingerprint.kv_bits.to_string());
+    put(&mut f, &fingerprint.kv_group_size.to_string());
     // Fold the fingerprint into the token hash: hash the fingerprint bytes into
     // both lanes first, then continue with the tokens.
     let fp_bytes: Vec<u32> = f
@@ -1341,12 +1375,16 @@ mod tests {
             tokenizer_hash: "tok-a".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "model-b".into(),
             tokenizer_hash: "tok-a".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         assert_ne!(blob_key(&a, &tokens), blob_key(&b, &tokens));
         // Tokenizer-only difference must also separate.
@@ -1355,6 +1393,8 @@ mod tests {
             tokenizer_hash: "tok-b".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         assert_ne!(blob_key(&a, &tokens), blob_key(&c, &tokens));
         // Deterministic and distinct from the bare token hash.
@@ -1374,12 +1414,16 @@ mod tests {
             tokenizer_hash: "x".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "m".into(),
             tokenizer_hash: "tok\u{1f}x".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         assert_ne!(blob_key(&a, &tokens), blob_key(&b, &tokens));
     }

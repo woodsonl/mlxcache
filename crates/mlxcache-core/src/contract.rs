@@ -9,13 +9,30 @@
 use serde::{Deserialize, Serialize};
 
 /// Fingerprint pinned in every checkpoint's metadata. Any mismatch is a miss (R1-1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `kv_bits`/`kv_group_size` pin the KV quantization config (T12): an 8-bit
+/// group-64 cache holds different bytes than the f16 cache of the same model,
+/// so the two must never cross-serve. Zero bits means "not quantized" (f16)
+/// and is also what pre-T12 blobs deserialize to via the serde defaults — old
+/// f16 checkpoints remain loadable and servable, still distinct from any q8
+/// checkpoint. Only a parity-proven config (8/64 on the target model) may be
+/// enabled via the sidecar's MLXCACHE_KV_BITS knob; 4-bit breaks greedy parity.
+/// Default for test/bench constructors: an unquantized f16 fingerprint
+/// (`kv_bits: 0`, `kv_group_size: 0`), matching the pre-quantization era.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelFingerprint {
     pub model_id: String,
     /// Hash of the tokenizer artifact (file bytes), not a version string.
     pub tokenizer_hash: String,
     pub kv_dtype: String,
     pub kv_layout_version: u32,
+    /// KV quantization bits; 0 = f16 (unquantized). Part of R1-1 equality.
+    #[serde(default)]
+    pub kv_bits: u8,
+    /// Group size used with `kv_bits` (0 when unquantized). Two q8 configs
+    /// with different group sizes are different formats, not variants.
+    #[serde(default)]
+    pub kv_group_size: u32,
 }
 
 /// Metadata header for a checkpoint blob. Stored alongside the KV tensors.
