@@ -225,8 +225,17 @@ impl Orchestrator {
         // Reap tombstones FIRST and unconditionally: the published-cap early
         // return below fires in the common under-cap steady state, and burial
         // behind it made the tombstone cap dead code exactly where unbounded
-        // tombstone growth was possible (red-team 2026-10-04).
-        let reaped = self.reap_quarantined(max_entries);
+        // tombstone growth was possible (red-team 2026-10-04). usize::MAX
+        // (the env-layer translation of "no entry cap") would make the
+        // tombstone cap unbounded too — the same resurrection — so it maps
+        // to 0, the aggressive full reap: tombstones are diagnostic records,
+        // never serveable, and the default config must still bound them.
+        let tombstone_cap = if max_entries == usize::MAX {
+            0
+        } else {
+            max_entries
+        };
+        let reaped = self.reap_quarantined(tombstone_cap);
         let candidates = self.index.eviction_candidates();
         // File sizes for the byte budget (D-eviction): a missing file scores
         // 0 bytes — remove_published + the unlink reconcile it regardless.
@@ -582,6 +591,27 @@ mod tests {
             "tombstones must reap to the cap even with published entries under cap"
         );
         assert_eq!(orch.published_count(), 1, "reaping never touches published");
+    }
+
+    #[test]
+    fn tombstones_reap_under_the_default_no_entry_cap() {
+        // The default reaper config translates "no entry cap" (knob 0) to
+        // usize::MAX — which must NOT flow into the tombstone cap (an
+        // unbounded cap is the dead-reap resurrection). Stones must fully
+        // reap on the default shape: byte budget only, entry cap MAX.
+        let orch = Orchestrator::new();
+        let p = persist();
+        for (tokens, name, gen) in [
+            (&[20u32, 21, 22, 23][..], "q-a", 2),
+            (&[30u32, 31, 32, 33][..], "q-b", 3),
+        ] {
+            publish(&orch, tokens, meta("m", 6), name, gen);
+            assert!(orch.quarantine_checkpoint(&p, name, gen, tokens));
+        }
+        assert_eq!(orch.quarantined_count(), 2);
+        let evicted = orch.evict_cold(&p, usize::MAX, 0, std::time::Duration::ZERO);
+        assert_eq!(evicted, 2, "entry-cap MAX must reap tombstones fully");
+        assert_eq!(orch.quarantined_count(), 0);
     }
 
     #[test]
