@@ -120,7 +120,63 @@ def _write_blob(path, tokens):
     return path
 
 
-def test_prefill_seeds_the_cache_with_tokens_minus_one(monkeypatch):
+def test_end_divergent_prefix_is_adopted_t22(monkeypatch, tmp_path):
+    # T22 serve rule at the adapter trust boundary: a blob recorded with
+    # prefix P may serve a request R that diverges from P at P's LAST token
+    # (the multi-turn wire shape: turn 2 replaced turn 1's closing bracket).
+    # The covered KV holds P[:-1] positions; the request's delta feed starts
+    # at len(P)-1 (absorbing the position that differs) — KV at every
+    # covered position is byte-identical for R, so the run stays
+    # identical-to-scratch.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    key = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "turn1.ckpt"), key)
+    # Divergence exactly at the key's last token, request longer than key.
+    _cache, prompt = eng._load_cache_delta([1, 2, 9, 9], path)
+    assert prompt == [9, 9], "adopted: delta feeds from len(key)-1 = 2"
+    # Same divergence with an exactly-key-length request: delta = [9].
+    _cache, prompt = eng._load_cache_delta([1, 2, 9], path)
+    assert prompt == [9]
+
+
+def test_end_divergent_prefix_short_request_not_adopted_t22(monkeypatch, tmp_path):
+    # The concentric boundary: a request SHORTER than len(key)-1 cannot be
+    # verified against the blob (the divergence reaches INTO the covered
+    # region) — read_wire_checkpoint must NOT adopt it (returns usable=False
+    # upstream; _load_cache_delta runs from scratch entirely), never 422.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    key = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "turn1.ckpt"), key)
+    cache, prompt = eng._load_cache_delta([1], path)
+    assert cache is None
+    assert prompt == [1]
+
+
+def test_mid_prefix_divergence_is_rejected_not_adopted_t22(monkeypatch, tmp_path):
+    # Divergence BEFORE the key's last token: the KV past the LCP differs for
+    # the diverging request (the T22 serve rule never covers this) — the
+    # trust boundary must REJECT (422 -> daemon quarantines), not adopt.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    key = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "turn1.ckpt"), key)
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta([1, 9, 3, 3], path)
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta([9, 2, 3, 3], path)
+
+
+def test_exact_equivalence_still_adopts_t22(monkeypatch, tmp_path):
+    # Pre-T22 behavior unchanged: exact prefix equality adopts (the special
+    # case of the widened rule where the last key token also matches).
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    key = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "turn1.ckpt"), key)
+    _cache, prompt = eng._load_cache_delta([1, 2, 3, 4], path)
+    assert prompt == [3, 4]
     # The saved cache must cover tokens[:-1]. Caching all tokens makes the hit
     # path re-feed the last token and diverge from a scratch run.
     prefilled, model = _install_fake_mlx(monkeypatch)
