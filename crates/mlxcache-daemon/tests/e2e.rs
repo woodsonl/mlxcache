@@ -439,6 +439,152 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
 }
 
 #[tokio::test]
+async fn nonstream_response_decodes_with_stock_openai_sdk_shape() {
+    // The choices[] compatibility layer: id/object/created/model/choices/usage
+    // are REQUIRED by stock SDK response models (missing-required fails
+    // validation; extras like `mlxcache` are allowed). A client doing
+    // `response.choices[0].message.content` must get the sidecar's
+    // detokenized text — identical to what the streaming path emits.
+    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&sidecar_url, &blobs);
+    let res = router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "e2e-model",
+                        "messages": [{"role": "user", "content": "sdk shape please"}],
+                        "max_tokens": 4,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["object"], "chat.completion", "{v}");
+    assert!(
+        v["id"].as_str().unwrap_or("").starts_with("chatcmpl-"),
+        "{v}"
+    );
+    assert!(v["created"].as_u64().is_some(), "{v}");
+    assert_eq!(v["model"], "e2e-model", "{v}");
+    assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+    assert_eq!(v["choices"][0]["message"]["role"], "assistant", "{v}");
+    assert_eq!(
+        v["choices"][0]["message"]["content"], "tok0 tok1 tok2 tok3 ",
+        "decoded text must match the stream path's pieces: {v}"
+    );
+    assert_eq!(v["usage"]["completion_tokens"], 4, "{v}");
+    assert!(v["usage"]["prompt_tokens"].as_u64().unwrap() > 0, "{v}");
+    // Additive: the raw fields stay for existing consumers.
+    assert!(v["generated_tokens"].as_array().unwrap().len() == 4, "{v}");
+    assert!(v["mlxcache"]["verdict"].is_string(), "{v}");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn stream_chunks_decode_with_stock_openai_sdk_shape() {
+    // Every SSE frame a parser sees must be a valid chat.completion.chunk
+    // (id/object/created/model/choices required) EXCEPT the error frames,
+    // which follow OpenAI's own error-stream shape. Deltas accumulate into
+    // the same text the non-stream body returns; the verdict rides as a
+    // top-level extra on the first chunk.
+    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&sidecar_url, &blobs);
+    let res = router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "e2e-model",
+                        "messages": [{"role": "user", "content": "sdk shape stream"}],
+                        "stream": true,
+                        "max_tokens": 3,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+
+    // Walk every data: frame like an SDK would.
+    let mut deltas = String::new();
+    let mut saw_first = false;
+    let mut saw_stop = false;
+    let mut last_was_done = false;
+    for line in text.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if payload.trim() == "[DONE]" {
+            assert!(saw_stop, "finish_reason=stop must precede [DONE]: {text}");
+            last_was_done = true;
+            continue;
+        }
+        let c: serde_json::Value = serde_json::from_str(payload)
+            .unwrap_or_else(|e| panic!("every frame must be valid JSON ({e}): {payload}"));
+        if c.get("error").is_some() {
+            continue; // OpenAI's error-stream shape — allowed
+        }
+        assert_eq!(c["object"], "chat.completion.chunk", "{payload}");
+        assert!(
+            c["id"].as_str().unwrap_or("").starts_with("chatcmpl-"),
+            "{payload}"
+        );
+        assert!(c["created"].as_u64().is_some(), "{payload}");
+        assert_eq!(c["model"], "e2e-model", "{payload}");
+        let choice = &c["choices"][0];
+        assert!(choice.is_object(), "every chunk carries choices: {payload}");
+        if !saw_first {
+            saw_first = true;
+            assert_eq!(choice["delta"]["role"], "assistant", "{payload}");
+            assert!(
+                c["mlxcache"]["verdict"].is_string(),
+                "verdict rides the first chunk: {payload}"
+            );
+        }
+        if let Some(piece) = choice["delta"]["content"].as_str() {
+            deltas.push_str(piece);
+        }
+        if choice["finish_reason"] == "stop" {
+            saw_stop = true;
+        }
+    }
+    assert!(last_was_done, "stream must end with [DONE]: {text}");
+    assert_eq!(
+        deltas, "tok0 tok1 tok2 ",
+        "deltas must accumulate to the detokenized text: {text}"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
 async fn one_token_streaming_serves_and_publishes_no_blob() {
     // The streaming path for the no-publish case: a one-token prompt must stream
     // a 200 SSE with a miss verdict and publish nothing.
