@@ -12,12 +12,12 @@ tokens), then drives three legs against the daemon at MLXCACHE_BASE:
             -> the freshly-rebuilt index must serve the persisted checkpoint
             as a hit with prefill_from == tokens-1, sub-second wall.
 
-NOTE (T22 wiring): multi-turn GROWTH is not part of this demo. Under the
-current wire contract (prompt = JSON-serialized messages encoded literally)
-real BPE diverges at the closing bracket within a few tokens of the prior
-turn's published depth, so exact-depth lookup correctly never fires. Real
-tokenization via the chat template (sidecar T22) restores turn growth; the
-synthetic-engine delta-prefill suite covers that behavior until then.
+NOTE (T22 wiring): multi-turn GROWTH is not part of this demo. This script
+drives one request three ways (cold/warm/resume). Multi-turn divergent-serve
+behavior — a follow-up request that shares the first len(key)-1 tokens with a
+published key — is covered by the T22 suites: the synthetic-engine e2e tests
+and the real-engine parity driver (scripts/t22_multiturn_verify.py), which
+verified the serve at ~20K tokens (LCP = len(key)-1, prefill_from = covered).
 
 Every leg appends {"leg","wall_ms","verdict","tokens_total","tokens_cached",
 "prefill_from","lookup_ms","total_ms","gen_n"} to the output JSONL.

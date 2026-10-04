@@ -18,6 +18,11 @@ Three experiments, each printing JSON:
 
 Run: uv run --extra mlx python sidecar/probes/quantized_kv_probe.py \
         [--model Qwen/Qwen2-0.5B-Instruct]
+
+Caveat: the parity check prefills the full prompt on both paths and feeds the
+final token again — it validates argmax parity only, NOT the shipped
+save/reload delta-prefill convention end-to-end; the authoritative byte-parity
+proofs are sidecar/tests/test_roundtrip_real.py and the daemon e2e suite.
 """
 
 from __future__ import annotations

@@ -31,7 +31,13 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Record depth: a burst of in-flight requests is bounded by the daemon's own
-/// concurrency; 4096 is generous headroom and keeps memory at ~1 MB.
+/// concurrency; 4096 is generous headroom. Memory bound is records, not bytes:
+/// each record embeds the verbatim messages payload (a 20K-token conversation
+/// is ~0.1–1 MB), so a stalled writer can buffer up to a few GB in the worst
+/// case. Accepted: traces are an opt-in diagnostic (MLXCACHE_TRACE unset pays
+/// nothing), the writer's only slow step is a userspace flush per record, and
+/// byte-budgeting the channel would drop whole conversations mid-word —
+/// a much worse replay story than late delivery.
 const CHANNEL_BOUND: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +222,22 @@ impl TraceWriter {
     /// ing, loud-on-failure contract as `from_env`.
     pub fn from_path(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
         let path = path.as_ref();
+        // 0600, not File::create's umask-dependent 0644: the trace embeds the
+        // full request payload (user prompts), so it must be owner-readable
+        // only. create+write+truncate keeps the from_env truncating contract
+        // (a trace is a session's story, not an append log).
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| format!("MLXCACHE_TRACE {}: {e}", path.display()))?
+        };
+        #[cfg(not(unix))]
         let file = std::fs::File::create(path)
             .map_err(|e| format!("MLXCACHE_TRACE {}: {e}", path.display()))?;
         let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_BOUND);
@@ -273,6 +295,12 @@ mod tests {
     use super::*;
     use crate::observability::tests::decision;
 
+    /// Serializes every test that reads or writes MLXCACHE_TRACE: the env is
+    /// process-global and the test harness runs this module's tests on
+    /// parallel threads, so an unguarded mutation races any other test's
+    /// `from_env` read (flaky pass/fail by interleaving).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn record_shape_is_stable_jsonl() {
         let d = decision(CacheVerdict::Hit, 50, 60);
@@ -325,7 +353,9 @@ mod tests {
 
     #[test]
     fn from_env_disabled_by_default() {
-        // No MLXCACHE_TRACE -> no writer (run in a snapshot of the env).
+        // No MLXCACHE_TRACE -> no writer. The lock guards the env against the
+        // other env-mutating tests on parallel threads.
+        let _env = ENV_LOCK.lock().unwrap();
         let old = std::env::var("MLXCACHE_TRACE").ok();
         unsafe { std::env::remove_var("MLXCACHE_TRACE") };
         assert!(TraceWriter::from_env().unwrap().is_none());
@@ -363,10 +393,13 @@ mod tests {
 
     #[test]
     fn trace_writer_end_to_end_via_env() {
+        // Mutates MLXCACHE_TRACE: hold the env lock for the whole body so
+        // parallel tests cannot observe or clobber the value mid-run.
+        let _env = ENV_LOCK.lock().unwrap();
+        let old = std::env::var("MLXCACHE_TRACE").ok();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trace.jsonl");
-        // SAFETY (tests only): single-threaded test process guarantees no
-        // concurrent reader of the env.
+        // SAFETY (tests only): the env lock above serializes every reader.
         unsafe { std::env::set_var("MLXCACHE_TRACE", &path) };
         let w = TraceWriter::from_env().unwrap().unwrap();
         let d = decision(CacheVerdict::Partial, 20, 40);
@@ -389,5 +422,37 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         unsafe { std::env::remove_var("MLXCACHE_TRACE") };
+        // Restore whatever the environment had before this test touched it.
+        if let Some(v) = old {
+            unsafe { std::env::set_var("MLXCACHE_TRACE", v) };
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_is_owner_only() {
+        // The trace embeds full prompts, so from_path must create 0600 —
+        // File::create's umask-dependent 0644 would expose them to other
+        // local users. Unique name; cleaned up after the assertion.
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "mlxcache-trace-mode-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let w = TraceWriter::from_path(&path).expect("trace writer builds");
+        w.flush();
+        drop(w);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "trace file must be owner-only: {:o}",
+            mode
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
