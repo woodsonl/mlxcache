@@ -14,6 +14,28 @@ use mlxcache_daemon::http::{router, AppState};
 use mlxcache_daemon::orchestrator::Orchestrator;
 use mlxcache_daemon::sidecar::{SidecarClient, SidecarConfig};
 
+/// Standard e2e harness state: one served model, a sidecar client for it, a
+/// fresh blob store. Tests needing special clients (timeouts, trace) build
+/// their own literal — everything else routes through here so the AppState
+/// shape has exactly one canonical construction site.
+fn app_state(sidecar_url: &str, blobs: &tempfile::TempDir) -> Arc<AppState> {
+    Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(
+                sidecar_url.to_owned(),
+                "e2e-model".into(),
+            ))
+            .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
+    })
+}
+
 #[tokio::test]
 async fn unusable_blob_is_quarantined_and_served_from_scratch() {
     // A published checkpoint whose blob vanished (deleted, disk fault) must not
@@ -24,17 +46,7 @@ async fn unusable_blob_is_quarantined_and_served_from_scratch() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
         "model": "e2e-model",
         "messages": [{"role": "user", "content": "quarantine me"}],
@@ -110,17 +122,7 @@ async fn eviction_reaper_unlinks_and_stats_and_next_request_misses() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
         "model": "e2e-model",
         "messages": [{"role": "user", "content": "evict me"}],
@@ -290,17 +292,7 @@ async fn one_token_prompt_serves_and_publishes_no_blob() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
         "model": "e2e-model",
         "messages": [{"role": "user", "content": "hi"}],
@@ -359,18 +351,7 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
-                .unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
         "model": "e2e-model",
         "messages": [{"role": "user", "content": "hi"}],
@@ -468,17 +449,7 @@ async fn one_token_streaming_serves_and_publishes_no_blob() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
         "model": "e2e-model",
         "messages": [{"role": "user", "content": "hi"}],
@@ -523,17 +494,7 @@ async fn end_to_end_miss_then_hit() {
     };
     let blobs = tempfile::tempdir().unwrap();
 
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
     let make_app = || router(state.clone());
 
     let body = serde_json::json!({
@@ -1038,18 +999,7 @@ async fn concurrent_identical_requests_share_one_prefill() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
-                .unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
 
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -1198,18 +1148,7 @@ async fn publish_failure_serves_leader_and_followers_from_scratch() {
     perms.set_mode(0o555);
     std::fs::set_permissions(blobs.path(), perms).unwrap();
 
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
-                .unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
 
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -1339,18 +1278,7 @@ async fn end_to_end_restart_resumes_from_disk() {
     };
     let blobs = tempfile::tempdir().unwrap();
     let make_state = || {
-        let state = Arc::new(AppState {
-            orchestrator: Orchestrator::new(),
-            singleflight: SingleFlight::new(),
-            stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-            served_models: vec!["e2e-model".into()],
-            sidecar: Some(
-                SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
-                    .unwrap(),
-            ),
-            persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-            trace: None,
-        });
+        let state = app_state(&sidecar_url, &blobs);
         state.orchestrator.rebuild_from_disk(&state.persistence);
         state
     };
@@ -1417,17 +1345,7 @@ async fn empty_tokenization_is_rejected() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
         "model": "e2e-model",
         "messages": [{"role": "user", "content": "hi"}],
@@ -1462,17 +1380,7 @@ async fn end_to_end_streaming_sse() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
     let make_app = || router(state.clone());
 
     let body = serde_json::json!({
@@ -1575,18 +1483,7 @@ async fn partial_hit_delta_prefills_only_the_delta() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
-                .unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
 
     let post = |body: String| {
         let app = router(state.clone());
@@ -1712,18 +1609,7 @@ async fn transient_prefill_failure_keeps_ancestor_and_recovers() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
-                .unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
 
     let post = |body: String| {
         let app = router(state.clone());
@@ -1836,18 +1722,7 @@ async fn newline_free_flood_is_cut_by_the_partial_line_cap() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
-                .unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
 
     let res = router(state)
         .oneshot(
@@ -1908,18 +1783,7 @@ async fn multi_turn_end_divergent_serves_t22() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
-                .unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
 
     let post = |body: String| {
         let app = router(state.clone());
@@ -2031,18 +1895,7 @@ async fn corrupt_ancestor_quarantines_and_prefills_from_scratch() {
         return;
     };
     let blobs = tempfile::tempdir().unwrap();
-    let state = Arc::new(AppState {
-        orchestrator: Orchestrator::new(),
-        singleflight: SingleFlight::new(),
-        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
-        served_models: vec!["e2e-model".into()],
-        sidecar: Some(
-            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
-                .unwrap(),
-        ),
-        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
-        trace: None,
-    });
+    let state = app_state(&sidecar_url, &blobs);
     let post = |body: String| {
         let app = router(state.clone());
         async move {
