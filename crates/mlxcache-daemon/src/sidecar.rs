@@ -395,4 +395,154 @@ mod tests {
             start.elapsed()
         );
     }
+
+    /// Find the end of the HTTP request head (past the blank line).
+    fn header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    }
+
+    fn content_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.eq_ignore_ascii_case("content-length") {
+                    v.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    /// Minimal HTTP stub for fault-injection tests: accepts connections
+    /// forever, fully drains each request (head + Content-Length body), then
+    /// answers via the responder (request path → raw response bytes). Returns
+    /// the stub's base URL.
+    async fn http_stub(respond: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub binds");
+        let addr = listener.local_addr().unwrap();
+        let respond = std::sync::Arc::new(respond);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // Drain until the full request (head + body) has arrived.
+                    loop {
+                        let end = match header_end(&buf) {
+                            Some(end) => end,
+                            None => {
+                                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                                if n == 0 {
+                                    return;
+                                }
+                                buf.extend_from_slice(&chunk[..n]);
+                                continue;
+                            }
+                        };
+                        if buf.len() >= end + content_length(&buf[..end]) {
+                            break;
+                        }
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let response = respond(&path);
+                    let _ = sock.write_all(&response).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn stream_open_timeout_fires_when_sidecar_stalls() {
+        // Stream-open contract (api-contract 2026-10-04): connect + response
+        // headers are bounded by `stream_open`. A sidecar that accepts the
+        // request but never answers must yield StreamOpenTimeout (which the
+        // daemon maps to 503 adapter_unavailable), not a hang.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stall stub binds");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // Drain the request, then stall forever.
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        if sock.read(&mut chunk).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let c = SidecarClient::with_timeouts(
+            SidecarConfig::new(format!("http://{addr}"), "m".into()),
+            1,
+            1,
+        )
+        .expect("client builds");
+        let start = std::time::Instant::now();
+        let e = c
+            .generate_stream(&[1, 2, 3], 4, None)
+            .await
+            .expect_err("stalled stream open must error");
+        assert!(
+            matches!(e, SidecarError::StreamOpenTimeout { secs: 1, .. }),
+            "expected StreamOpenTimeout, got {e:?}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "must give up promptly, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn error_body_read_is_capped() {
+        // classify_http_error bounds what it reads: a misbehaving sidecar
+        // answering 422 with a huge body cannot grow daemon memory past the
+        // cap (api-contract/red-team 2026-10-04), and the classification is
+        // still the explicit rejection (422 → CheckpointRejected).
+        let flood = "x".repeat(200_000);
+        let response = format!(
+            "HTTP/1.1 422 Unprocessable\r\nContent-Length: {}\r\n\r\n{flood}",
+            flood.len()
+        )
+        .into_bytes();
+        let url = http_stub(move |_path| response.clone()).await;
+        let c = SidecarClient::with_timeout(SidecarConfig::new(url, "m".into()), 5)
+            .expect("client builds");
+        let e = c.tokenize("hi").await.expect_err("422 must error");
+        match e {
+            SidecarError::CheckpointRejected { body } => {
+                assert!(!body.is_empty());
+                assert!(
+                    body.len() <= ERROR_BODY_MAX_BYTES,
+                    "error body must be capped at {ERROR_BODY_MAX_BYTES}, got {}",
+                    body.len()
+                );
+            }
+            other => panic!("expected CheckpointRejected, got {other:?}"),
+        }
+    }
 }

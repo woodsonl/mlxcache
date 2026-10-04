@@ -1695,6 +1695,199 @@ async fn partial_hit_delta_prefills_only_the_delta() {
 }
 
 #[tokio::test]
+async fn transient_prefill_failure_keeps_ancestor_and_recovers() {
+    // Fault path with an ADOPTED ancestor (api-contract 2026-10-04): the
+    // delta prefill over the ancestor fails with a transient sidecar 500
+    // (MLXCACHE_PREFILL_FAIL_AT=2 fails exactly the 2nd /prefill call).
+    // Contract: a 500 is NOT a checkpoint rejection — no quarantine, the
+    // ancestor stays published — the client gets 502 adapter_error, and the
+    // next identical request retries the delta prefill and succeeds.
+    let Some((sidecar_url, mut child)) = spawn_sidecar_with_env(&[
+        ("MLXCACHE_TOKENIZE_GROW", "grow me"),
+        ("MLXCACHE_PREFILL_FAIL_AT", "2"),
+    ])
+    .await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
+    });
+
+    let post = |body: String| {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Request 1: full miss — prefill call #1 succeeds, publishes the ancestor.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me"}],
+            "stream": false,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "miss");
+    assert_eq!(state.persistence.list_blobs().unwrap().len(), 1);
+
+    // Request 2: grown prompt → partial → delta prefill is call #2 → 500.
+    // The 502 envelope must carry the adapter_error kind (a genuine adapter
+    // failure, not a transport-level 503), and the ancestor must survive.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me more"}],
+            "stream": false,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        502,
+        "a transient sidecar 500 maps to 502 adapter_error"
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v["error"]["type"], "adapter_error",
+        "500 is an adapter failure, not a checkpoint rejection: {v}"
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .expect("message is a string")
+            .contains("synthetic induced prefill failure"),
+        "the induced failure must be surfaced verbatim: {v}"
+    );
+    assert_eq!(
+        state.persistence.list_blobs().unwrap().len(),
+        1,
+        "no quarantine and no new publish: the ancestor stays exactly as-is"
+    );
+
+    // Request 3: identical to request 2 — prefill call #3 succeeds now, so
+    // the delta prefill publishes and the request is served from the ancestor.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me more"}],
+            "stream": false,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        200,
+        "the failure was transient: the next request must recover"
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "partial", "recovered: {v}");
+    assert_eq!(
+        state.persistence.list_blobs().unwrap().len(),
+        2,
+        "ancestor + the recovered delta checkpoint"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn newline_free_flood_is_cut_by_the_partial_line_cap() {
+    // MAX_PARTIAL_LINE (1 MiB): the idle budget only governs byte ARRIVALS,
+    // so a fast flood with no newline would otherwise grow the bridge buffer
+    // without bound (api-contract/red-team 2026-10-04). The sidecar floods
+    // 2 MiB of newline-free bytes; the stream must end with the explicit
+    // "unbounded line" upstream error frame + [DONE], not unbounded memory.
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_STREAM_FLOOD", "2097152")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
+    });
+
+    let res = router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "e2e-model",
+                        "messages": [{"role": "user", "content": "flood me"}],
+                        "stream": true,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        200,
+        "SSE headers arrive before the flood is cut"
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("unbounded line"),
+        "the flood must trip the explicit upstream error, got: {text}"
+    );
+    assert!(
+        text.contains("data: [DONE]"),
+        "the stream must terminate cleanly after the error: {text}"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
 async fn multi_turn_end_divergent_serves_t22() {
     // T22: a growing MULTI-TURN conversation whose turn-2 token stream
     // diverges from turn-1's checkpoint key at its LAST token must reuse

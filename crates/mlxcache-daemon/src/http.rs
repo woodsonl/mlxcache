@@ -28,12 +28,23 @@ use std::sync::OnceLock;
 /// explicit upstream error (no legitimate token frame approaches it).
 const MAX_PARTIAL_LINE: usize = 1024 * 1024;
 
+/// Default generation budget when the client omits `max_tokens`; kept at the
+/// historical hardcoded value so existing clients see zero behavior change.
+const MAX_TOKENS_DEFAULT: usize = 64;
+/// Upper bound on a client-requested generation budget: a typo'd 100M must
+/// not translate into unbounded adapter work (api-contract 2026-10-04).
+const MAX_TOKENS_LIMIT: usize = 8192;
+
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
+    /// OpenAI `max_tokens`: forwarded to the adapter's /generate. Absent
+    /// keeps the historical 64. Capped by [`MAX_TOKENS_LIMIT`] (400 above).
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -207,7 +218,53 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/stats", get(stats))
+        // Liveness probe (api-contract 2026-10-04): deliberately
+        // dependency-free — it answers "is the process up", NOT "is the
+        // adapter reachable" (that is /stats' job, which reports adapter
+        // state and cache counters). A healthz that probed the sidecar would
+        // flap 503 whenever the engine restarts, evicting the daemon from
+        // load balancer pools that are perfectly healthy to 404/502.
+        .route("/healthz", get(healthz))
         .with_state(state)
+}
+
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// `Json<T>` with rejections mapped into the documented error envelope.
+/// axum's built-in Json rejections emit bare bodies (plain text for a
+/// missing content-type, its own JSON shape for syntax errors) that bypass
+/// the error registry — a client could not parse them with the same code
+/// path it uses for every other daemon error (api-contract 2026-10-04).
+struct ValidJson<T>(T);
+
+impl<S, T> axum::extract::FromRequest<S> for ValidJson<T>
+where
+    Json<T>: axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+
+    async fn from_request(
+        req: axum::http::Request<axum::body::Body>,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let rejection = match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => return Ok(ValidJson(value)),
+            Err(rejection) => rejection,
+        };
+        let (status, kind) = match &rejection {
+            axum::extract::rejection::JsonRejection::MissingJsonContentType(_) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+            }
+            _ => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        };
+        // Rejection strings embed a bounded body snippet by construction;
+        // the truncation is belt-and-braces against a future axum change.
+        let message: String = rejection.to_string().chars().take(300).collect();
+        Err(err(status, &message, kind))
+    }
 }
 
 fn err(status: StatusCode, message: &str, kind: &str) -> (StatusCode, Json<ErrorResponse>) {
@@ -222,9 +279,25 @@ fn err(status: StatusCode, message: &str, kind: &str) -> (StatusCode, Json<Error
     )
 }
 
+/// Transport-level sidecar failures (unreachable, stream-open timeout) mean
+/// the adapter is DOWN: 503 `adapter_unavailable`, consistently on every leg
+/// (tokenize, prefill, generate, stream-open). Everything else — an HTTP
+/// error the adapter returned, a protocol violation, a decode failure — is
+/// 502 `adapter_error`. Before this split the same sidecar-down condition
+/// mapped to 503 on one leg and 502 on another, so a client retry policy
+/// could not trust the code (api-contract review 2026-10-04).
+fn sidecar_http_err(e: &SidecarError) -> (StatusCode, &'static str) {
+    match e {
+        SidecarError::Unreachable { .. } | SidecarError::StreamOpenTimeout { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "adapter_unavailable")
+        }
+        _ => (StatusCode::BAD_GATEWAY, "adapter_error"),
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatRequest>,
+    ValidJson(req): ValidJson<ChatRequest>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     // Validation order per error registry: malformed → 400; unknown model →
     // 404 BEFORE any cache lookup (Section 3 finding).
@@ -242,6 +315,20 @@ async fn chat_completions(
             "invalid_request_error",
         ));
     }
+    // Resolve the generation budget once, for both the JSON and stream legs.
+    // Some(0) passes through (a client asking for zero tokens gets zero);
+    // only a value above the cap is refused.
+    let max_tokens = match req.max_tokens {
+        None => MAX_TOKENS_DEFAULT,
+        Some(n) if n > MAX_TOKENS_LIMIT => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("max_tokens must be <= {MAX_TOKENS_LIMIT}").as_str(),
+                "invalid_request_error",
+            ));
+        }
+        Some(n) => n,
+    };
 
     let started = std::time::Instant::now();
     let prompt = serde_json::to_string(&req.messages).map_err(|_| {
@@ -451,17 +538,15 @@ async fn chat_completions(
                                 Err(e2) => {
                                     let msg = e2.to_string();
                                     lead.complete(Err(msg.clone()));
-                                    return Err(err(
-                                        StatusCode::BAD_GATEWAY,
-                                        &msg,
-                                        "adapter_error",
-                                    ));
+                                    let (status, kind) = sidecar_http_err(&e2);
+                                    return Err(err(status, &msg, kind));
                                 }
                             }
                         } else {
                             let msg = e.to_string();
                             lead.complete(Err(msg.clone()));
-                            return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
+                            let (status, kind) = sidecar_http_err(&e);
+                            return Err(err(status, &msg, kind));
                         }
                     }
                 }
@@ -471,7 +556,12 @@ async fn chat_completions(
                 // publishing, so fall through to our own (uncached) path.
                 match mlxcache_core::singleflight::await_result(&mut follower).await {
                     Some(Err(msg)) => {
-                        // Leader failed too; surface the same adapter error.
+                        // Leader failed too; surface its error. The
+                        // single-flight channel carries a lossy STRING (no
+                        // typed SidecarError), so the transport-vs-adapter
+                        // split of `sidecar_http_err` cannot apply here;
+                        // 502 is the conservative classification. Rare
+                        // path: the leader must have died mid-flight.
                         return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
                     }
                     Some(Ok(name)) if !name.is_empty() => {
@@ -536,7 +626,16 @@ async fn chat_completions(
     };
 
     if req.stream {
-        return stream_response(state.clone(), client, tokens, outcome, blob_arg, started).await;
+        return stream_response(
+            state.clone(),
+            client,
+            tokens,
+            outcome,
+            blob_arg,
+            max_tokens,
+            started,
+        )
+        .await;
     }
 
     // Generate: full context tokens, continuation from the request length.
@@ -546,7 +645,7 @@ async fn chat_completions(
     // report a scratch run: no prior KV was reused. Quarantine is a separate
     // decision, taken only on an explicit adapter rejection.
     let mut blob_unused = false;
-    let generated = match client.generate(&tokens, 64, blob_arg).await {
+    let generated = match client.generate(&tokens, max_tokens, blob_arg).await {
         Ok(t) => t,
         Err(e) => {
             // If this request leaned on a blob and the request failed, retry
@@ -577,7 +676,7 @@ async fn chat_completions(
                         "blob run failed with a non-rejection error; retrying from scratch without quarantine (effective prefill_from=0)"
                     );
                 }
-                match client.generate(&tokens, 64, None).await {
+                match client.generate(&tokens, max_tokens, None).await {
                     Ok(t) => {
                         // Correct the aggregate only after the scratch retry
                         // succeeds: the covered KV counted at record() was never
@@ -586,19 +685,13 @@ async fn chat_completions(
                         t
                     }
                     Err(e2) => {
-                        return Err(err(
-                            StatusCode::BAD_GATEWAY,
-                            &e2.to_string(),
-                            "adapter_error",
-                        ))
+                        let (status, kind) = sidecar_http_err(&e2);
+                        return Err(err(status, &e2.to_string(), kind));
                     }
                 }
             } else {
-                return Err(err(
-                    StatusCode::BAD_GATEWAY,
-                    &e.to_string(),
-                    "adapter_error",
-                ));
+                let (status, kind) = sidecar_http_err(&e);
+                return Err(err(status, &e.to_string(), kind));
             }
         }
     };
@@ -793,12 +886,12 @@ struct Identity {
 /// T13 identity resolution: prove the native tokenizer IS the engine's, once,
 /// then reuse the verdict forever (the artifact cannot change mid-process).
 ///
-/// The probe encodes a fixed prompt natively and via the sidecar and requires
-/// exact id equality. On success the sidecar-reported (tokenizer_hash,
-/// kv_dtype) is cached and adopted for every later request — fingerprints are
-/// byte-identical to the pure-sidecar path. On mismatch the error is 503
-/// (fail closed): serving with the wrong tokenizer would mis-route every
-/// checkpoint.
+/// The probe SET (request prompt + fixed adversarial prompts) is encoded
+/// natively and via the sidecar; every probe requires exact id equality. On
+/// success the sidecar-reported (tokenizer_hash, kv_dtype) is cached and
+/// adopted for every later request — fingerprints are byte-identical to the
+/// pure-sidecar path. On mismatch the error is 503 (fail closed): serving
+/// with the wrong tokenizer would mis-route every checkpoint.
 async fn resolve_native_identity(
     prompt: &str,
     native: &crate::native_tokenizer::NativeTokenizer,
@@ -825,48 +918,70 @@ async fn resolve_native_identity(
             "adapter_unavailable",
         ));
     };
-    let probe = format!("mlxcache native-tokenizer parity probe: {prompt}");
-    let reference = match client.tokenize(&probe).await {
-        Ok(r) => r,
-        Err(SidecarError::Unreachable { url, .. }) => {
+    // Probe SET, not one sample (red-team 2026-10-04): a pathological
+    // artifact could agree on one prompt and diverge elsewhere. The fixed
+    // probes cross pre-tokenizer boundaries (whitespace runs, unicode,
+    // CJK, emoji); the request prompt leads so the most representative
+    // case reports first on failure. The EMPTY string is deliberately
+    // excluded: specials-on-empty-input differs across engine versions,
+    // and failing closed over that cosmetic difference would brick native
+    // mode for real deployments (T13 verified parity live on non-empty).
+    const PARITY_PROBES: &[&str] = &[" ", "hello world", "héllo wörld — 你好世界 🚀 tab\tsep"];
+    let probes: Vec<String> =
+        std::iter::once(format!("mlxcache native-tokenizer parity probe: {prompt}"))
+            .chain(PARITY_PROBES.iter().map(|s| (*s).to_string()))
+            .collect();
+
+    let mut identity = None;
+    for (i, probe) in probes.iter().enumerate() {
+        let reference = match client.tokenize(probe).await {
+            Ok(r) => r,
+            Err(SidecarError::Unreachable { url, .. }) => {
+                return Err(err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("adapter (sidecar) unreachable at {url}").as_str(),
+                    "adapter_unavailable",
+                ));
+            }
+            Err(e) => {
+                return Err(err(
+                    StatusCode::BAD_GATEWAY,
+                    &e.to_string(),
+                    "adapter_error",
+                ));
+            }
+        };
+        // A failed probe encode is parity-unprovable: treat it exactly like
+        // a mismatch and fail closed (the verdict is cached either way).
+        let local = native.encode(probe);
+        if local.as_ref() != Some(&reference.tokens) {
+            let reason = format!(
+                "native tokenizer does not match the engine's tokenizer \
+                 (probe {i}/{n}: {a} native ids vs {m} sidecar ids) — refusing to serve; \
+                 fix MLXCACHE_NATIVE_TOKENIZER",
+                n = probes.len(),
+                a = local.as_ref().map_or(0, Vec::len),
+                m = reference.tokens.len()
+            );
+            let _ = VERIFIED.set(Err(reason.clone()));
             return Err(err(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("adapter (sidecar) unreachable at {url}").as_str(),
+                &reason,
                 "adapter_unavailable",
             ));
         }
-        Err(e) => {
-            return Err(err(
-                StatusCode::BAD_GATEWAY,
-                &e.to_string(),
-                "adapter_error",
-            ));
+        if identity.is_none() {
+            // Identity fields are constant across probes (same engine);
+            // adopt them from the first answer.
+            identity = Some(Identity {
+                tokenizer_hash: reference.tokenizer_hash,
+                kv_dtype: reference.kv_dtype,
+                kv_bits: reference.kv_bits,
+                kv_group_size: reference.kv_group_size,
+            });
         }
-    };
-    // A failed probe encode is parity-unprovable: treat it exactly like a
-    // mismatch and fail closed (the verdict is cached either way).
-    let local = native.encode(&probe);
-    if local.as_ref() != Some(&reference.tokens) {
-        let reason = format!(
-            "native tokenizer does not match the engine's tokenizer \
-             (probe encode: {n} native ids vs {m} sidecar ids) — refusing to serve; \
-             fix MLXCACHE_NATIVE_TOKENIZER",
-            n = local.as_ref().map_or(0, Vec::len),
-            m = reference.tokens.len()
-        );
-        let _ = VERIFIED.set(Err(reason.clone()));
-        return Err(err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &reason,
-            "adapter_unavailable",
-        ));
     }
-    let identity = Identity {
-        tokenizer_hash: reference.tokenizer_hash,
-        kv_dtype: reference.kv_dtype,
-        kv_bits: reference.kv_bits,
-        kv_group_size: reference.kv_group_size,
-    };
+    let identity = identity.expect("probes is non-empty by construction");
     let _ = VERIFIED.set(Ok(identity.clone()));
     Ok(identity)
 }
@@ -1009,6 +1124,7 @@ async fn stream_response(
     tokens: Vec<u32>,
     outcome: crate::orchestrator::RouteOutcome,
     blob_arg: Option<&str>,
+    max_tokens: usize,
     started: std::time::Instant,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     use futures_util::StreamExt;
@@ -1024,7 +1140,7 @@ async fn stream_response(
     // (rejection OR transient failure): the meta frame and aggregate must then
     // report a miss. Quarantine stays conditional on an explicit rejection.
     let blob_unused = std::cell::Cell::new(false);
-    let upstream = match client.generate_stream(&tokens, 64, blob_arg).await {
+    let upstream = match client.generate_stream(&tokens, max_tokens, blob_arg).await {
         Ok(u) => u,
         Err(e) if blob_for_open.is_some() => {
             // The stream could not be opened. Retry from scratch so the stream
@@ -1054,20 +1170,20 @@ async fn stream_response(
             prefill_from = 0;
             blob_unused.set(true);
             let upstream = client
-                .generate_stream(&tokens, 64, None)
+                .generate_stream(&tokens, max_tokens, None)
                 .await
-                .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?;
+                .map_err(|e| {
+                    let (status, kind) = sidecar_http_err(&e);
+                    err(status, &e.to_string(), kind)
+                })?;
             // Correct the aggregate only after the scratch retry succeeded: a
             // 502 must not be counted as a served miss.
             state.stats.correct_retire(&outcome.decision);
             upstream
         }
         Err(e) => {
-            return Err(err(
-                StatusCode::BAD_GATEWAY,
-                &e.to_string(),
-                "adapter_error",
-            ))
+            let (status, kind) = sidecar_http_err(&e);
+            return Err(err(status, &e.to_string(), kind));
         }
     };
 
@@ -1309,6 +1425,136 @@ mod tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
+
+    /// Native-tokenizer parity is proven against a probe SET and cached:
+    /// once a mismatch fails the probe closed, later requests must reuse the
+    /// cached verdict — the stub sidecar must see exactly ONE probe batch
+    /// (testing-critical gap, 2026-10-04). This is the only test in the
+    /// binary that may call resolve_native_identity: VERIFIED is
+    /// process-global and a poisoned cache would fail-close every other
+    /// caller.
+    #[tokio::test]
+    async fn native_parity_mismatch_is_cached_fail_closed() {
+        use crate::native_tokenizer::NativeTokenizer;
+        use crate::sidecar::SidecarConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A real word-level artifact: encodes "hello world" to [0, 1].
+        const WORDLEVEL_JSON: &str = r#"{
+          "version": "1.0",
+          "truncation": null,
+          "padding": null,
+          "added_tokens": [],
+          "normalizer": null,
+          "pre_tokenizer": { "type": "Whitespace" },
+          "post_processor": null,
+          "decoder": null,
+          "model": {
+            "type": "WordLevel",
+            "vocab": { "hello": 0, "world": 1, "the": 2, "fox": 3, "[UNK]": 4 },
+            "unk_token": "[UNK]"
+          }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, WORDLEVEL_JSON).unwrap();
+        let native = NativeTokenizer::load(&path).unwrap();
+
+        // Stub sidecar: answers /tokenize with ids that CANNOT match the
+        // artifact (all 999s), and counts every request it answers.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // Drain head + body (requests are small JSON posts).
+                    loop {
+                        let end = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            Some(p) => p + 4,
+                            None => {
+                                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                                if n == 0 {
+                                    return;
+                                }
+                                buf.extend_from_slice(&chunk[..n]);
+                                continue;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let body_len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + body_len {
+                            break;
+                        }
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let body = "{\"tokens\":[999,999,999],\"tokenizer_hash\":\"h\",\
+                                \"kv_dtype\":\"f16\",\"kv_bits\":0,\"kv_group_size\":0}";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let client =
+            SidecarClient::new(SidecarConfig::new(format!("http://{addr}"), "m".into())).unwrap();
+
+        // First call: probe #0 mismatches → fail-closed 503.
+        let (status1, body1) =
+            match resolve_native_identity("probe text", &native, Some(&client)).await {
+                Err(e) => e,
+                Ok(_) => panic!("mismatched tokenizer must fail closed"),
+            };
+        assert_eq!(status1, StatusCode::SERVICE_UNAVAILABLE);
+        let msg1 = serde_json::to_string(&body1.0).unwrap();
+        assert!(
+            msg1.contains("does not match"),
+            "error should name the parity failure: {msg1}"
+        );
+
+        // Second call: the SAME error must come from the cache — the stub
+        // served one probe and must not be probed again.
+        let (status2, body2) =
+            match resolve_native_identity("probe text", &native, Some(&client)).await {
+                Err(e) => e,
+                Ok(_) => panic!("cached failure must stay failed"),
+            };
+        assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::to_string(&body2.0).unwrap(),
+            msg1,
+            "cached verdict must be byte-identical"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "exactly one probe round-trip, ever"
+        );
+    }
 
     #[test]
     fn push_frame_maps_ndjson_to_sse() {
