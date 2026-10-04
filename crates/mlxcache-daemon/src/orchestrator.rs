@@ -25,6 +25,76 @@ pub struct RouteOutcome {
     pub blob: Option<(String, u64, Vec<u32>)>,
 }
 
+/// Reaper knob translation, extracted from main.rs so the semantics are
+/// unit-testable (testing review 2026-10-04: the inline version was
+/// untestable, and its subtleties — entry-knob 0 → `usize::MAX`, the
+/// disable gate — already caused one regression).
+///
+/// Knobs:
+/// - `MLXCACHE_EVICT_INTERVAL_S` — sweep cadence; `0` disables the reaper
+///   entirely (default 60).
+/// - `MLXCACHE_EVICT_MAX_ENTRIES` — published-entry cap; `0` disables the
+///   ENTRY cap (the byte budget below still applies).
+/// - `MLXCACHE_EVICT_MAX_BYTES` — published-store byte budget (default
+///   32 GiB; the launch-config decision the design doc deferred). `0`
+///   disables the byte cap. Eviction stays best-effort: anchors are never
+///   evicted, so a store held above budget by live anchors only warns.
+/// - `MLXCACHE_EVICT_ANCHOR_WINDOW_S` — how long a served checkpoint stays an
+///   anchor (default 900 = 15 min).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvictConfig {
+    pub interval_s: u64,
+    /// Pass-level entry cap. `usize::MAX` = no entry cap (the env knob's 0,
+    /// translated: pass-level 0 is the aggressive zero-entries sweep and
+    /// must never receive a knob-0 directly).
+    pub entry_cap: usize,
+    pub max_bytes: u64,
+    pub anchor_window_s: u64,
+}
+
+impl EvictConfig {
+    pub fn from_env() -> Self {
+        Self::translate(
+            env_num("MLXCACHE_EVICT_INTERVAL_S", 60),
+            env_num::<usize>("MLXCACHE_EVICT_MAX_ENTRIES", 0),
+            env_num("MLXCACHE_EVICT_MAX_BYTES", 32 * 1024 * 1024 * 1024),
+            env_num("MLXCACHE_EVICT_ANCHOR_WINDOW_S", 900),
+        )
+    }
+
+    /// The knob translation, isolated from the process env so tests are not
+    /// racy (env mutation is process-global under the parallel harness).
+    pub fn translate(
+        interval_s: u64,
+        max_entries: usize,
+        max_bytes: u64,
+        anchor_window_s: u64,
+    ) -> Self {
+        EvictConfig {
+            interval_s,
+            entry_cap: if max_entries == 0 {
+                usize::MAX
+            } else {
+                max_entries
+            },
+            max_bytes,
+            anchor_window_s,
+        }
+    }
+
+    /// The reaper arms when the interval is on AND at least one cap is set.
+    pub fn enabled(&self) -> bool {
+        self.interval_s > 0 && (self.entry_cap != usize::MAX || self.max_bytes > 0)
+    }
+}
+
+fn env_num<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 pub struct Orchestrator {
     pub index: Arc<PrefixIndex>,
     pub singleflight: Arc<SingleFlight>,
@@ -237,14 +307,23 @@ impl Orchestrator {
         };
         let reaped = self.reap_quarantined(tombstone_cap);
         let candidates = self.index.eviction_candidates();
-        // File sizes for the byte budget (D-eviction): a missing file scores
-        // 0 bytes — remove_published + the unlink reconcile it regardless.
-        let size_of = |name: &str| -> u64 {
-            std::fs::metadata(persistence.blob_dir.join(name))
-                .map(|m| m.len())
-                .unwrap_or(0)
-        };
-        let total_bytes: u64 = candidates.iter().map(|c| size_of(&c.blob_path)).sum();
+        // File sizes for the byte budget (D-eviction), computed ONCE per
+        // candidate (perf review: the total pass + scoring pass used to
+        // stat every file twice). A missing file scores 0 bytes —
+        // remove_published + the unlink reconcile it regardless.
+        let sizes: std::collections::HashMap<String, u64> = candidates
+            .iter()
+            .map(|c| {
+                (
+                    c.blob_path.clone(),
+                    std::fs::metadata(persistence.blob_dir.join(&c.blob_path))
+                        .map(|m| m.len())
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
+        let size_of = |name: &str| -> u64 { sizes.get(name).copied().unwrap_or(0) };
+        let total_bytes: u64 = sizes.values().sum();
         // Entry-cap semantics at the PASS level: `max_entries` is a hard cap,
         // 0 = allow zero published entries (evict everything evictable). The
         // "0 disables the knob" convention lives at the env layer (main.rs
@@ -464,7 +543,25 @@ impl Orchestrator {
                 }
                 Err(e) => {
                     report.skipped += 1;
-                    report.errors.push(format!("{}: {e}", blob.display()));
+                    // A DETERMINISTICALLY corrupt blob (digest mismatch, bad
+                    // version, malformed header) is provably bad: delete it at
+                    // the sweep, matching quarantine's unlink semantics.
+                    // Skipping without deleting strands the file forever — it
+                    // is invisible to the eviction byte budget (which sums
+                    // INDEXED candidates only) and the store can sit above
+                    // budget with no signal (red-team + testing 2026-10-04).
+                    // I/O errors stay untouched: a transient read failure is
+                    // not proof of corruption, and the next boot retries.
+                    if matches!(e, crate::persistence::PersistError::Corrupt { .. }) {
+                        match persistence.remove(&name) {
+                            Ok(()) => report.reclaimed_corrupt += 1,
+                            Err(rm) => report
+                                .errors
+                                .push(format!("{name}: corrupt ({e}) but could not remove: {rm}")),
+                        }
+                    } else {
+                        report.errors.push(format!("{}: {e}", blob.display()));
+                    }
                 }
             }
         }
@@ -506,6 +603,10 @@ fn parse_generation(name: &str) -> Option<u64> {
 pub struct RebuildReport {
     pub rebuilt: usize,
     pub skipped: usize,
+    /// Deterministically-corrupt blobs deleted at the sweep (digest
+    /// mismatch, foreign version, malformed header) — they would otherwise
+    /// strand on disk invisible to the eviction byte budget.
+    pub reclaimed_corrupt: usize,
     pub errors: Vec<String>,
 }
 
@@ -558,6 +659,53 @@ mod tests {
     /// Publish in a test (publishing is allowed until a scan FAILS).
     fn publish(orch: &Orchestrator, tokens: &[u32], meta: CheckpointMeta, name: &str, gen: u64) {
         orch.publish_checkpoint(&persist(), tokens, meta, name.into(), gen);
+    }
+
+    #[test]
+    fn evict_config_translates_the_knobs() {
+        use super::EvictConfig;
+        // Default shape: interval on, entry knob 0 (no entry cap), 32 GiB
+        // byte budget — the reaper is ARMED with bytes only.
+        let d = EvictConfig::translate(60, 0, 32 * 1024 * 1024 * 1024, 900);
+        assert_eq!(d.entry_cap, usize::MAX, "entry knob 0 = no entry cap");
+        assert!(d.enabled(), "default shape arms the reaper");
+
+        // Explicit caps pass through untouched.
+        let e = EvictConfig::translate(30, 5, 1024, 60);
+        assert_eq!((e.entry_cap, e.max_bytes, e.interval_s), (5, 1024, 30));
+        assert!(e.enabled());
+
+        // Full opt-out: interval 0 OR both caps off.
+        assert!(!EvictConfig::translate(0, 5, 1024, 60).enabled());
+        assert!(
+            !EvictConfig::translate(60, 0, 0, 60).enabled(),
+            "both caps off disables"
+        );
+
+        // Entry cap alone still arms (bytes off).
+        assert!(EvictConfig::translate(60, 4, 0, 60).enabled());
+    }
+
+    #[test]
+    fn rebuild_deletes_deterministically_corrupt_blobs() {
+        // Testing + red-team 2026-10-04: a digest-corrupt blob used to be
+        // skipped at the boot sweep WITHOUT deleting — stranded forever,
+        // invisible to the eviction byte budget (which sums indexed
+        // candidates only). It must be reclaimed at the sweep.
+        let orch = Orchestrator::new();
+        let p = persist();
+        let path = p
+            .publish_atomic(0xabc, 1, meta("m", 6), b"kv-payload")
+            .unwrap();
+        // Tamper one payload byte in place: framing intact, digest broken.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let report = orch.rebuild_from_disk(&p);
+        assert_eq!(report.reclaimed_corrupt, 1, "{report:?}");
+        assert!(!path.exists(), "the corrupt blob must be unlinked");
+        assert_eq!(orch.published_count(), 0, "nothing rebuilt from it");
     }
 
     #[test]

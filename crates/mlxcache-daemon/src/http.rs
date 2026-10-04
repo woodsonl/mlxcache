@@ -687,10 +687,7 @@ async fn chat_completions(
     // parsers require id/created/model on the non-stream body AND on every
     // SSE chunk).
     let completion_id = format!("chatcmpl-{:032x}", prefix_hash);
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let created = created_stamp();
 
     if req.stream {
         return stream_response(
@@ -800,7 +797,14 @@ async fn chat_completions(
                 "role": "assistant",
                 "content": generated_text,
             },
-            "finish_reason": "stop",
+            // OpenAI semantics (api-contract review): a completion cut at
+            // the max_tokens cap ends "length", not "stop" — SDK consumers
+            // that loop-until-stop must see capped output as truncated.
+            "finish_reason": if max_tokens > 0 && generated.len() >= max_tokens {
+                "length"
+            } else {
+                "stop"
+            },
         }],
         "usage": {
             "prompt_tokens": tokens.len(),
@@ -1183,10 +1187,14 @@ pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens:
 pub struct ChunkFramer {
     /// `{"id":"…","object":"chat.completion.chunk","created":N,"model":"…",`
     head: String,
+    /// The request's generation cap: a stream whose done-line token count
+    /// reached it ends `finish_reason:"length"` (OpenAI semantics for a
+    /// max_tokens truncation), otherwise "stop".
+    max_tokens: usize,
 }
 
 impl ChunkFramer {
-    pub fn new(id: &str, created: u64, model: &str) -> Self {
+    pub fn new(id: &str, created: u64, model: &str, max_tokens: usize) -> Self {
         // Escape the model once (it is client-supplied and may contain
         // quotes); the id is daemon-generated hex and needs no escaping.
         let model_json = serde_json::to_string(model).unwrap_or_else(|_| "\"\"".into());
@@ -1195,23 +1203,32 @@ impl ChunkFramer {
                 "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\
                  \"created\":{created},\"model\":{model_json},"
             ),
+            max_tokens,
         }
     }
 
-    /// The leading chunk as a standalone frame: assistant role delta + the
-    /// cache verdict as a top-level extra (SDKs ignore extras).
-    /// `mlxcache_json` is a pre-built `"mlxcache":{...}` fragment.
-    fn first_chunk(&self, mlxcache_json: &str) -> bytes::Bytes {
-        let mut frame = Vec::with_capacity(self.head.len() + mlxcache_json.len() + 128);
+    /// Build one complete chunk frame: `choices` segment + optional
+    /// top-level extra fragment. Single builder for the first (role-delta)
+    /// and stats (empty-delta) chunks — they differ only in the segment.
+    fn chunk_with_extra(&self, choices: &[u8], extra: &[u8]) -> bytes::Bytes {
+        let mut frame = Vec::with_capacity(
+            b"data: ".len() + self.head.len() + choices.len() + extra.len() + b"}\n\n".len(),
+        );
         frame.extend_from_slice(b"data: ");
         frame.extend_from_slice(self.head.as_bytes());
-        frame.extend_from_slice(
-            b"\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\
-             \"finish_reason\":null}],",
-        );
-        frame.extend_from_slice(mlxcache_json.as_bytes());
+        frame.extend_from_slice(choices);
+        frame.extend_from_slice(extra);
         frame.extend_from_slice(b"}\n\n");
         bytes::Bytes::from(frame)
+    }
+
+    /// The leading chunk: assistant role delta + the cache verdict as a
+    /// top-level extra (SDKs ignore extras).
+    fn first_chunk(&self, mlxcache_json: &str) -> bytes::Bytes {
+        self.chunk_with_extra(
+            b"\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}],",
+            mlxcache_json.as_bytes(),
+        )
     }
 
     /// Map one raw NDJSON line from the sidecar into zero or more SSE frames.
@@ -1248,16 +1265,30 @@ impl ChunkFramer {
         }
         match serde_json::from_str::<SidecarStreamFrame>(line) {
             Ok(f) if f.done.is_some() => {
-                // Final chunk (empty delta + stop), then the protocol
-                // terminator. Two frames: the chunk buffer sized exactly
-                // (zero-alloc Bytes::from), and a static [DONE].
+                // Final chunk (empty delta + finish_reason), then the
+                // protocol terminator. OpenAI semantics (api-contract
+                // review): a stream that generated exactly max_tokens ends
+                // "length" (truncated by cap), otherwise "stop". The done
+                // line carries the generated count as "tokens".
+                let finish = {
+                    let count = scan_json_number_value(line, "\"tokens\"")
+                        .and_then(|n| n.parse::<usize>().ok());
+                    match count {
+                        Some(n) if self.max_tokens > 0 && n >= self.max_tokens => "length",
+                        _ => "stop",
+                    }
+                };
                 const SSE: &[u8] = b"data: ";
-                const DONE_CHUNK: &[u8] =
-                    b"\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
-                let mut frame = Vec::with_capacity(SSE.len() + self.head.len() + DONE_CHUNK.len());
+                const OPEN: &[u8] = b"\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"";
+                const TAIL: &[u8] = b"\"}]}\n\n";
+                let mut frame = Vec::with_capacity(
+                    SSE.len() + self.head.len() + OPEN.len() + finish.len() + TAIL.len(),
+                );
                 frame.extend_from_slice(SSE);
                 frame.extend_from_slice(self.head.as_bytes());
-                frame.extend_from_slice(DONE_CHUNK);
+                frame.extend_from_slice(OPEN);
+                frame.extend_from_slice(finish.as_bytes());
+                frame.extend_from_slice(TAIL);
                 debug_assert_eq!(frame.len(), frame.capacity());
                 frames.push(Ok(bytes::Bytes::from(frame)));
                 frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
@@ -1327,14 +1358,10 @@ impl ChunkFramer {
         frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>,
         mlxcache_json: &str,
     ) {
-        let mut frame = Vec::with_capacity(self.head.len() + mlxcache_json.len() + 96);
-        frame.extend_from_slice(b"data: ");
-        frame.extend_from_slice(self.head.as_bytes());
-        frame
-            .extend_from_slice(b"\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}],");
-        frame.extend_from_slice(mlxcache_json.as_bytes());
-        frame.extend_from_slice(b"}\n\n");
-        frames.push(Ok(bytes::Bytes::from(frame)));
+        frames.push(Ok(self.chunk_with_extra(
+            b"\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}],",
+            mlxcache_json.as_bytes(),
+        )));
     }
 }
 
@@ -1646,7 +1673,12 @@ async fn stream_response(
     // The verdict rides INSIDE the first OpenAI chunk as a top-level extra
     // (SDKs allow extras) instead of a bare leading frame — a frame without
     // id/object/created/model/choices fails strict chunk parsers.
-    let framer = ChunkFramer::new(&req.completion_id, created_stamp(), &req.model);
+    let framer = ChunkFramer::new(
+        &req.completion_id,
+        created_stamp(),
+        &req.model,
+        req.max_tokens,
+    );
     let meta_frag = {
         let m = meta_line.to_string();
         // strip the outer braces: {"mlxcache":{…}} → "mlxcache":{…}
@@ -1957,7 +1989,7 @@ mod tests {
 
     #[test]
     fn push_line_maps_ndjson_to_openai_chunks() {
-        let framer = ChunkFramer::new("chatcmpl-t", 7, "m");
+        let framer = ChunkFramer::new("chatcmpl-t", 7, "m", 64);
         let mut frames = Vec::new();
         framer.push_line(&mut frames, b"{\"token\":5,\"text\":\"hi\"}\n");
         assert_eq!(frames.len(), 1);
@@ -2040,7 +2072,7 @@ mod tests {
         }
 
         // Strictness flows into the framer: a fabricated id aborts the stream.
-        let framer = ChunkFramer::new("chatcmpl-t", 7, "m");
+        let framer = ChunkFramer::new("chatcmpl-t", 7, "m", 64);
         let mut frames = Vec::new();
         framer.push_line(&mut frames, br#"{"token": -1, "text": "x"}"#);
         assert!(frames[0].is_err(), "malformed token id must be a violation");
@@ -2358,7 +2390,7 @@ pub mod test_support {
         // Per-REQUEST cost (head construction), deliberately OUTSIDE the
         // gate's per-frame measurement — the real caller builds one framer
         // per stream and reuses it for every token.
-        super::ChunkFramer::new("chatcmpl-gate", 0, "gate-model")
+        super::ChunkFramer::new("chatcmpl-gate", 0, "gate-model", 64)
     }
 
     pub fn push_line_for_gate(
