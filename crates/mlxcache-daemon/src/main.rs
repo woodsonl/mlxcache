@@ -41,7 +41,20 @@ async fn main() -> Result<()> {
         None => None,
     };
     if served_models.is_empty() {
-        tracing::warn!("MLXCACHE_MODELS is empty: every request will 404");
+        // A daemon with no served models rejects every completion request with
+        // 404 while /stats stays 200 — a misconfigured deploy looks healthy
+        // (QA ISSUE-001). Refuse at boot unless the operator explicitly opted
+        // into a model-less run (dev/test harnesses that only exercise /stats
+        // or the synthetic stack).
+        if std::env::var("MLXCACHE_ALLOW_NO_MODELS").ok().as_deref() != Some("1") {
+            anyhow::bail!(
+                "MLXCACHE_MODELS is empty: this daemon would 404 every request \
+                 while appearing healthy. Set MLXCACHE_MODELS (comma-separated \
+                 model ids), or set MLXCACHE_ALLOW_NO_MODELS=1 to run model-less \
+                 on purpose."
+            );
+        }
+        tracing::warn!("MLXCACHE_MODELS is empty (allowed by MLXCACHE_ALLOW_NO_MODELS=1): every request will 404");
     }
     // Empty values fall back to the default rather than failing on an empty path.
     let blob_dir = std::env::var("MLXCACHE_BLOBS")
