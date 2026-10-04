@@ -246,7 +246,7 @@ impl SidecarClient {
         tokens: &[u32],
         max_tokens: usize,
         blob_path: Option<&str>,
-    ) -> Result<Vec<u32>, SidecarError> {
+    ) -> Result<(Vec<u32>, String), SidecarError> {
         let url = format!("{}/generate", self.config.base_url);
         let resp = self
             .http
@@ -269,10 +269,15 @@ impl SidecarClient {
         #[derive(serde::Deserialize)]
         struct GenResponse {
             tokens: Vec<u32>,
+            /// Detokenized completion (engines with `generate_with_text`);
+            /// absent on older sidecars → empty, and the daemon's
+            /// `choices[].message.content` is then the empty string.
+            #[serde(default)]
+            text: String,
         }
         resp.json::<GenResponse>()
             .await
-            .map(|r| r.tokens)
+            .map(|r| (r.tokens, r.text))
             .map_err(|e| SidecarError::Protocol(format!("bad generate response: {e}")))
     }
 
