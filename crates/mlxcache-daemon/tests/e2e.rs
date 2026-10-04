@@ -171,7 +171,7 @@ async fn eviction_reaper_unlinks_and_stats_and_next_request_misses() {
     // protected (window 0) and has no published extension → evicted. Goes
     // through AppState::evict_pass — the same single path the background
     // reaper uses — so the /stats counter is exercised here too.
-    let evicted = state.evict_pass(0, std::time::Duration::ZERO);
+    let evicted = state.evict_pass(0, 0, std::time::Duration::ZERO);
     assert_eq!(evicted, 1, "the single published entry must be reaped");
     assert_eq!(state.orchestrator.published_count(), 0);
     assert!(
