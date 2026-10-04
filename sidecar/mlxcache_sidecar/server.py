@@ -467,6 +467,12 @@ class SyntheticEngine:
         base = len(tokens)
         return [(base + i) % 2**31 for i in range(max_tokens)]
 
+    def generate_with_text(self, tokens: list[int], max_tokens: int, blob_path: str | None = None):
+        """(token_ids, text) — mirrors the stream path's pieces exactly, so
+        streaming and non-streaming clients see the same detokenization."""
+        out = self.generate(tokens, max_tokens)
+        return out, "".join(f"tok{i} " for i in range(len(out)))
+
     def stream(self, tokens: list[int], blob_path: str | None):
         # Synthetic engine streams its deterministic tokens as text pieces.
         for i, t in enumerate(self.generate(tokens, 64)):
@@ -715,6 +721,30 @@ class MlxLmEngine:
         daemon supplies the blob via the /generate request body; see the handler.
         """
         return self._generate_with_cache(tokens, max_tokens, cache=None)
+
+    def generate_with_text(self, tokens: list[int], max_tokens: int, blob_path: str | None = None):
+        """(token_ids, detokenized_text) for non-streaming callers.
+
+        Collects from the same streaming decode path so token-for-token (and
+        character-for-character) it matches what a streaming client sees; the
+        plain `generate` below discards text for callers that only want ids.
+        """
+        if max_tokens <= 0:
+            return [], ""
+        cache = None
+        prompt = tokens
+        if blob_path:
+            cache, prompt = self._load_cache_delta(tokens, blob_path)
+            if cache is None:
+                prompt = tokens  # unexpectable cache: scratch
+        out: list[int] = []
+        pieces: list[str] = []
+        for token, text in self._stream_with_cache(prompt, cache):
+            out.append(token)
+            pieces.append(text)
+            if len(out) >= max_tokens:
+                break
+        return out, "".join(pieces)
 
     def stream(self, tokens: list[int], blob_path: str | None):
         """Yield (token_id, text) for this request, resuming from `blob_path`
@@ -1037,11 +1067,16 @@ class Handler(BaseHTTPRequestHandler):
                     self._stream_ndjson(tokens, req.get("blob_path"), max_tokens)
                 else:
                     blob_path = req.get("blob_path")
-                    if blob_path and hasattr(self.engine, "generate_from_blob"):
+                    gen = getattr(self.engine, "generate_with_text", None)
+                    if gen is not None:
+                        out, text = gen(tokens, max_tokens, blob_path)
+                    elif blob_path and hasattr(self.engine, "generate_from_blob"):
                         out = self.engine.generate_from_blob(tokens, blob_path, max_tokens)
+                        text = ""
                     else:
                         out = self.engine.generate(tokens, max_tokens)
-                    self._json(200, {"tokens": out})
+                        text = ""
+                    self._json(200, {"tokens": out, "text": text})
             else:
                 self._json(404, {"error": f"unknown path {self.path}"})
         except Handler._BadRequestError as exc:
