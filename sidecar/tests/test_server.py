@@ -309,3 +309,17 @@ def test_prefill_fail_at_knob_fails_exactly_the_nth_call(monkeypatch):
     with pytest.raises(RuntimeError, match="synthetic induced prefill failure"):
         engine.prefill([1, 2, 3, 4, 5, 6], None)  # call #2: induced failure
     engine.prefill([1, 2], None)  # call #3: failures must not persist
+
+
+def test_generate_nonstream_returns_detokenized_text(sidecar_url):
+    # The choices[] compatibility layer: the sidecar detokenizes non-stream
+    # generations (`generate_with_text`), and the text must be exactly the
+    # streaming path's pieces joined — both legs agree char-for-char.
+    r = httpx.post(
+        f"{sidecar_url}/generate",
+        json={"tokens": [1, 2, 3], "max_tokens": 3},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tokens"] == [3, 4, 5], body
+    assert body["text"] == "tok0 tok1 tok2 ", body
