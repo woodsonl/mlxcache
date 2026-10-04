@@ -33,6 +33,7 @@ async fn unusable_blob_is_quarantined_and_served_from_scratch() {
             SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -118,6 +119,7 @@ async fn eviction_reaper_unlinks_and_stats_and_next_request_misses() {
             SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -237,6 +239,7 @@ async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
             SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
         ),
         persistence,
+        trace: None,
     });
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -296,6 +299,7 @@ async fn one_token_prompt_serves_and_publishes_no_blob() {
             SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -365,6 +369,7 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
                 .unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -472,6 +477,7 @@ async fn one_token_streaming_serves_and_publishes_no_blob() {
             SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -526,6 +532,7 @@ async fn end_to_end_miss_then_hit() {
             SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let make_app = || router(state.clone());
 
@@ -689,6 +696,7 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
             SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "model-a".into())).unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
 
     for model in ["model-a", "model-b"] {
@@ -733,6 +741,118 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
 }
 
 #[tokio::test]
+async fn trace_capture_writes_one_jsonl_record_per_request() {
+    // Step 5 (success criteria 3-4): with MLXCACHE_TRACE set, every served
+    // request (warming included) lands as one JSONL record with the verdict
+    // the request actually got — the ground truth the replay harness scores.
+    // Proven end to end over the synthetic engine: miss -> hit -> another
+    // miss = exactly 3 records, verdicts in serve order, prefill_from = the
+    // single covered-KV definition.
+    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let trace_path = dir.path().join("trace.jsonl");
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: Some(mlxcache_daemon::trace::TraceWriter::from_path(&trace_path).unwrap()),
+    });
+    let post = |content: &str| {
+        let body = serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": content}],
+            "stream": false,
+        })
+        .to_string();
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // 1) miss (publishes), 2) hit, 3) miss (distinct prompt).
+    for (res, want_verify) in [
+        (post("trace me").await, "miss"),
+        (post("trace me").await, "hit"),
+        (post("different prompt").await, "miss"),
+    ] {
+        assert_eq!(res.status(), 200);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mlxcache"]["verdict"], want_verify);
+    }
+
+    // Wait for the writer thread to land all three (FIFO channel; the file is
+    // the only side channel we can observe without a join handle).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let body = loop {
+        let body = std::fs::read_to_string(&trace_path).unwrap_or_default();
+        if body.lines().count() >= 3 {
+            break body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "trace file never reached 3 records: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
+
+    let records: Vec<serde_json::Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each trace line is valid JSON"))
+        .collect();
+    assert_eq!(records.len(), 3, "{body}");
+    assert_eq!(records[0]["verdict"], "miss");
+    assert_eq!(records[1]["verdict"], "hit");
+    assert_eq!(records[2]["verdict"], "miss");
+    // The covered-KV definition: hit covered = matched-1 (the checkpoint
+    // caches tokens[:-1]), miss = 0 — the SAME value /stats and prefill_from
+    // report, which is the no-drift guarantee the capture inherits.
+    assert_eq!(records[0]["prefill_from"], 0);
+    assert_eq!(
+        records[1]["prefill_from"],
+        records[0]["n_tokens"].as_i64().unwrap() - 1,
+        "hit covers matched-1 (the tokens[:-1] checkpoint convention)"
+    );
+    assert_eq!(
+        records[1]["matched_tokens"], records[0]["n_tokens"],
+        "the hit matched the entire published prefix"
+    );
+    assert!(
+        records[0]["ts_ms"].as_u64().unwrap() > 0,
+        "records carry unix-ms timestamps for replay ordering"
+    );
+    // Step 5 fidelity: the record embeds the EXACT request payload so a
+    // replay re-sends byte-equivalent requests (same text, same tokenizer,
+    // same tokens).
+    assert_eq!(
+        records[0]["messages"][0]["content"], "trace me",
+        "messages are captured verbatim for replay fidelity"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
 async fn q8_and_f16_blobs_never_share_a_file() {
     // T12 adoption: the same model+prompt under two KV tiers (q8 via the
     // sidecar's MLXCACHE_KV_BITS knob vs f16 knobless) must publish to
@@ -767,6 +887,7 @@ async fn q8_and_f16_blobs_never_share_a_file() {
             served_models: vec!["e2e-model".into()],
             sidecar: Some(SidecarClient::new(SidecarConfig::new(url, "e2e-model".into())).unwrap()),
             persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+            trace: None,
         })
     };
     let post = |state: Arc<AppState>, body: String| async move {
@@ -864,6 +985,7 @@ async fn concurrent_identical_requests_share_one_prefill() {
                 .unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
 
     let body = serde_json::json!({
@@ -1023,6 +1145,7 @@ async fn publish_failure_serves_leader_and_followers_from_scratch() {
                 .unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
 
     let body = serde_json::json!({
@@ -1163,6 +1286,7 @@ async fn end_to_end_restart_resumes_from_disk() {
                     .unwrap(),
             ),
             persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+            trace: None,
         });
         state.orchestrator.rebuild_from_disk(&state.persistence);
         state
@@ -1239,6 +1363,7 @@ async fn empty_tokenization_is_rejected() {
             SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -1283,6 +1408,7 @@ async fn end_to_end_streaming_sse() {
             SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let make_app = || router(state.clone());
 
@@ -1396,6 +1522,7 @@ async fn partial_hit_delta_prefills_only_the_delta() {
                 .unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
 
     let post = |body: String| {
@@ -1527,6 +1654,7 @@ async fn corrupt_ancestor_quarantines_and_prefills_from_scratch() {
                 .unwrap(),
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let post = |body: String| {
         let app = router(state.clone());
@@ -1633,6 +1761,7 @@ async fn stalled_stream_is_cut_by_the_idle_budget_with_an_explicit_error() {
         served_models: vec!["e2e-model".into()],
         sidecar: Some(sidecar_client),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
     });
     let started = std::time::Instant::now();
     let res = router(state.clone())
