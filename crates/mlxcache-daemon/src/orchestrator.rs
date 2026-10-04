@@ -424,6 +424,7 @@ pub mod test_support {
             tokenizer_hash: "h".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            ..Default::default()
         }
     }
 }
@@ -439,6 +440,7 @@ mod tests {
             tokenizer_hash: "h".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            ..Default::default()
         }
     }
 

@@ -108,6 +108,20 @@ Before committing to checkpoint persistence: measure bytes/token for one represe
 
 - **8-bit quantized KV is parity-safe AND persistence-safe**: `QuantizedKVCache.to_quantized(group_size=64, bits=8)` then `save_prompt_cache`/`load_prompt_cache` round-trips, and greedy generation from the reloaded quantized cache is token-for-token identical to the f16 run. 4-bit does NOT preserve greedy parity on this model — it is a sampled-decoding-only option, not a drop-in tier.
 - **Resume budget at 8-bit (18,191-token prefix): load 0.6 ms + delta prefill 75 ms — the 2s budget holds with 25x margin.** The compression tier the caveat calls for is viable at 8-bit today; adopt by adding `bits=8, group=64` to the checkpoint fingerprint so f16 and q8 blobs can never cross-serve.
+
+**7B resume budget MEASURED (2026-10-03, `sidecar/probes/resume_budget_probe.py`, mlx-community/Qwen2.5-7B-Instruct-4bit, Metal, 48 GB):** the step-2 open question is closed — wall-to-first-token after loading a persisted checkpoint at 7B is dominated by the single-token decode step, NOT by blob page-in. `load_prompt_cache` is mmap-lazy and the first forward pass touches state lazily, so TTFT stays ~2 orders of magnitude inside the 2s budget at every length measured, in both tiers:
+
+| prefix | tier | blob size | load (ms) | TTFT (ms) | budget | first-token parity | full-stream parity |
+|---|---|---|---|---|---|---|---|
+| 27,281 | f16 | 1.56 GB | 0.4 / 1.0 | 80 / 145 | ✅ 25x margin | ✅ | ✅ (8 tok) |
+| 27,281 | q8 g64 | 0.83 GB (−47%) | 0.7 / 1.5 | 59 / 111 | ✅ | ✅ | ✅ |
+| 45,461 | f16 | 2.61 GB | 0.3 / 2.5 | 160 / 157 | ✅ 12x margin | ✅ | ✅ |
+| 45,461 | q8 g64 | 1.39 GB (−47%) | 11.2 / 6.5 | 87 / 122 | ✅ | ✅ | ✅ |
+
+- Second column pair = cold-ish load (2s idle gap) vs first load. Bytes/token: f16 = 57,343, q8 = 30,464 (−47%, exactly the T12 ratio — KV quantization cost is layer-count-proportional, not prompt-dependent).
+- Prefill is the price: 51.8s (27K) / 110.5s (45K) one-time f16 publish (~520 tok/s at 7B on this GPU), which is exactly what the cache exists to amortize: a resumed session skips ALL of it.
+- Parity at 7B: the persisted q8 stream matches the f16 in-memory reference token-for-token at both lengths, and every resume's first token matches — the q8 tier is parity-safe at 7B, not just at 0.5B.
+- `load_prompt_cache` itself: 0.3–2.5 ms (f16) / 6.5–11.2 ms (q8) — the mmap-lazy load does NOT page in 1.5–2.6 GB eagerly; the probe's earlier 0.6 ms number was real, not an artifact. The daemon's load path can stay synchronous in the TTFT budget.
 - Capability probe (`sidecar/probes/mlx_capability_probe.py`): prefill 9,908 tok/s (f16, 471 tokens), f16 KV round trip 12,305 bytes/token, `mx.compile` cannot wrap a model call that takes an MLX cache object (T14's FFI path must beat 9.9k tok/s eager, not a compiled number), tokenizer.encode ≈ 181 µs per ~930-char chat payload (T13 native-tokenize baseline).
 - Lean greedy decode (T21, `sidecar/probes/lean_decode_ab.py`, opt-in via `MLXCACHE_LEAN_DECODE=1`): a daemon-owned argmax loop that skips stream_generate's per-token logsumexp, GenerationResponse accounting, and generator nesting is **token- and text-identical** to the stock path, but only **1.01x faster** — decode is GPU-memory-bound (~3.8 ms/token at 0.5B), so Python-side per-token cost is not a TPOT lever on this hardware. Kept default-off: it preserves exact protocol parity (yields EOS as the final frame, same 256-token implicit cap) and serves as the structure T14's native forward pass would slot into; the TPOT levers that remain are GPU-side (speculative decode, batching), not Python-side.
 
