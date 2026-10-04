@@ -86,6 +86,7 @@ fn frames_for(lines: &[&[u8]]) -> usize {
     after.saturating_sub(before)
 }
 
+#[ignore = "counting-allocator gate: run via the dedicated step (cargo test -p mlxcache-daemon --test alloc_gate --release -- --test-threads=1 --include-ignored); the parallel workspace harness contaminates the process-global allocator counters"]
 #[test]
 fn token_frame_allocates_at_most_two_per_frame() {
     let _g = measure();
@@ -99,6 +100,7 @@ fn token_frame_allocates_at_most_two_per_frame() {
     );
 }
 
+#[ignore = "counting-allocator gate: run via the dedicated step (cargo test -p mlxcache-daemon --test alloc_gate --release -- --test-threads=1 --include-ignored); the parallel workspace harness contaminates the process-global allocator counters"]
 #[test]
 fn done_frame_costs_at_most_one_allocation() {
     // The done line emits TWO frames: the final OpenAI chunk (empty delta +
@@ -122,6 +124,7 @@ fn done_frame_costs_at_most_one_allocation() {
     );
 }
 
+#[ignore = "counting-allocator gate: run via the dedicated step (cargo test -p mlxcache-daemon --test alloc_gate --release -- --test-threads=1 --include-ignored); the parallel workspace harness contaminates the process-global allocator counters"]
 #[test]
 fn token_frame_allocates_exactly_one() {
     // The token frame's single allocation is the outgoing chunk buffer itself

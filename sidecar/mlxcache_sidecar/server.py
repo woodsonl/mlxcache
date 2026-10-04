@@ -176,28 +176,26 @@ def _valid_safetensors(payload: bytes) -> bool:
     return all(ranges[i][0] >= ranges[i - 1][1] for i in range(1, len(ranges)))
 
 
-# D1: blob paths whose digest was verified this process. Keyed by PATH, not
-# digest: files are immutable per generation ({hash}-{gen}.ckpt), so a given
-# path's bytes never change — while a rot-damaged COPY under another name
-# still gets its own verification instead of riding a verified digest.
-_DIGEST_VERIFIED: set[str] = set()
-
-
-def _payload_digest_ok(blob_path: str, meta: object, payload: bytes) -> bool:
+def _payload_digest_ok(meta: object, payload: bytes) -> bool:
     """True when the payload matches the daemon-stamped digest (D1).
 
-    Legacy v1 blobs carry no digest and pass unverified; the boot sweep on
-    the daemon side applies the same policy to the whole store.
+    Verified on EVERY load, no per-path caching: the bytes are already in
+    hand here (one hash pass over memory the process already paid to read),
+    and a once-per-process cache would make the check vacuous for exactly the
+    hottest blobs — a blob verified once could rot in place and keep serving
+    corrupt KV with a `hit` verdict until the next daemon restart (red-team
+    2026-10-04). Legacy v1 blobs carry no digest and pass unverified; the
+    daemon's boot sweep applies the same policy to the whole store. A v2+
+    header WITHOUT a digest is corrupt (the field is part of the v2
+    contract, and the daemon refuses the same blob at boot) — reject rather
+    than serve unverified.
     """
+    if getattr(meta, "format_version", 1) >= 2 and getattr(meta, "payload_sha256", None) is None:
+        return False
     expected = getattr(meta, "payload_sha256", None)
-    if expected is None or blob_path in _DIGEST_VERIFIED:
+    if expected is None:
         return True
-    if hashlib.sha256(payload).hexdigest() == expected.lower():
-        if len(_DIGEST_VERIFIED) > 256:
-            _DIGEST_VERIFIED.clear()
-        _DIGEST_VERIFIED.add(blob_path)
-        return True
-    return False
+    return hashlib.sha256(payload).hexdigest() == expected.lower()
 
 
 def read_wire_checkpoint(
@@ -307,7 +305,7 @@ def read_wire_checkpoint(
     # per digest per process — the bytes are already in hand here, but the
     # hash is not free on GB-scale KV, and a blob that verified once does not
     # rot differently on the next load from the same immutable file.
-    if not _payload_digest_ok(blob_path, meta, payload):
+    if not _payload_digest_ok(meta, payload):
         raise CheckpointRejectedError(f"payload digest mismatch (expected {meta.payload_sha256})")
     return meta, payload, True
 
@@ -354,6 +352,11 @@ class SyntheticEngine:
         # path with an ADOPTED ancestor: a 500 must NOT quarantine the
         # ancestor, and the next identical request must retry cleanly.
         self._prefill_fail_at = int(os.environ.get("MLXCACHE_PREFILL_FAIL_AT", "0") or 0)
+        # Test knob: fail every non-stream /generate with a transient 500 from
+        # the first call onward. Exercises the daemon's failed-request path:
+        # 502 to the client, exactly one trace record, and the stats claim
+        # corrected so capture and /stats keep agreeing.
+        self._generate_fail = os.environ.get("MLXCACHE_GENERATE_FAIL") == "1"
         # Phase timers (B2): last prefill's coverage, for the delta-prefill test.
         self.last_prefill_tokens = 0
         self.last_prefill_delta_tokens = 0
@@ -464,6 +467,8 @@ class SyntheticEngine:
 
     def generate(self, tokens: list[int], max_tokens: int) -> list[int]:
         # Deterministic continuation: token ids derived from context length.
+        if self._generate_fail:
+            raise RuntimeError("synthetic induced generate failure (test knob)")
         base = len(tokens)
         return [(base + i) % 2**31 for i in range(max_tokens)]
 

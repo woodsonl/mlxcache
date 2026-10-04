@@ -330,6 +330,32 @@ fn emit_trace(
     }
 }
 
+/// A request that FAILS past routing still gets exactly one trace record,
+/// and /stats must agree with it (testing review 2026-10-04: the error
+/// returns skipped the trace entirely while `stats.record` had already
+/// counted the routing verdict — the capture and /stats disagreed on
+/// exactly the requests that failed, reopening the RT#7 invariant). A blob
+/// that was leaned on but never served corrects its claim and traces as the
+/// scratch run it was; a plain failed miss traces as the miss stats
+/// already counted (nothing to correct).
+fn emit_failed_trace(
+    state: &AppState,
+    ctx: &Option<TraceCtx>,
+    outcome: &crate::orchestrator::RouteOutcome,
+    blob_unused: bool,
+    n_tokens: usize,
+) {
+    if blob_unused {
+        state.stats.correct_retire(&outcome.decision);
+    }
+    let settled = if blob_unused {
+        mlxcache_core::policy::scratch_decision(n_tokens)
+    } else {
+        outcome.decision.clone()
+    };
+    emit_trace(state, ctx, &settled);
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     ValidJson(req): ValidJson<ChatRequest>,
@@ -734,11 +760,13 @@ async fn chat_completions(
                         t
                     }
                     Err(e2) => {
+                        emit_failed_trace(&state, &trace_ctx, &outcome, blob_unused, tokens.len());
                         let (status, kind) = sidecar_http_err(&e2);
                         return Err(err(status, &e2.to_string(), kind));
                     }
                 }
             } else {
+                emit_failed_trace(&state, &trace_ctx, &outcome, blob_unused, tokens.len());
                 let (status, kind) = sidecar_http_err(&e);
                 return Err(err(status, &e.to_string(), kind));
             }
@@ -1251,7 +1279,17 @@ impl ChunkFramer {
                         return;
                     }
                 };
-                let token = scan_json_number_value(line, "\"token\"").unwrap_or("0");
+                let token = match scan_json_number_value(line, "\"token\"") {
+                    Some(t) => t,
+                    None => {
+                        // Red-team 2026-10-04: never fabricate a token id —
+                        // a non-plain-u32 value is a protocol violation.
+                        frames.push(Err(std::io::Error::other(
+                            "sidecar token line lacks a plain u32 token id",
+                        )));
+                        return;
+                    }
+                };
                 const SSE: &[u8] = b"data: ";
                 const OPEN: &[u8] = b"\"choices\":[{\"index\":0,\"delta\":{\"content\":";
                 const CLOSE: &[u8] = b"},\"finish_reason\":null}],\"token\":";
@@ -1308,50 +1346,157 @@ fn created_stamp() -> u64 {
         .unwrap_or(0)
 }
 
-/// Byte-scan a JSON object line for `"key": "<string value>"`, returning the
-/// (start, end) byte range of the value INCLUDING its quotes — already
-/// escaped by the producer, so it can be spliced verbatim. `needle` is the
-/// quoted key literal (e.g. `"\"text\""`). No allocation.
+/// Byte-scan a top-level JSON object line for the needle KEY (`"text"`) and
+/// return its STRING value's byte range INCLUDING quotes — already escaped by
+/// the producer, so it can be spliced verbatim. Depth-1 and key-aware: a
+/// `"text"` key inside a NESTED object, or a bare VALUE that happens to read
+/// `text`, never binds (red-team 2026-10-04). No allocation.
 fn scan_json_string_value(line: &str, needle: &str) -> Option<(usize, usize)> {
     let bytes = line.as_bytes();
-    let key_pos = line.find(needle)?;
-    let mut i = key_pos + needle.len();
-    // skip whitespace and the colon
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b':') {
+    let needle_b = needle.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 2;
+            } else {
+                if b == b'"' {
+                    in_string = false;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        match b {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'"' if depth == 1 && bytes[i..].starts_with(needle_b) => {
+                // Candidate top-level key: walk its closing quote, require a
+                // colon (a VALUE equal to the needle text is not a key), then
+                // require a string value.
+                let after_key = skip_json_string(bytes, i)?;
+                let mut j = after_key;
+                while j < bytes.len() && bytes[j] == b' ' {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b':' {
+                    return parse_json_string_value(bytes, j + 1);
+                }
+                // A value, not a key: keep scanning past it.
+                i = after_key;
+            }
+            b'"' => in_string = true,
+            _ => {}
+        }
         i += 1;
     }
-    if i >= bytes.len() || bytes[i] != b'"' {
-        return None; // not a string value
+    None
+}
+
+/// Byte-scan for the needle KEY's value, requiring a PLAIN u32: digits only,
+/// non-empty, terminated by `,`/`}`/whitespace-then-either. Anything else
+/// (`-1`, `1e3`, `1.5`, `"7"`, `true`) is None — the caller treats a missing
+/// token id as a protocol violation instead of fabricating `0` (red-team
+/// 2026-10-04). No allocation.
+fn scan_json_number_value<'a>(line: &'a str, needle: &str) -> Option<&'a str> {
+    let bytes = line.as_bytes();
+    let needle_b = needle.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i += 2;
+            } else {
+                if b == b'"' {
+                    in_string = false;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        match b {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'"' if depth == 1 && bytes[i..].starts_with(needle_b) => {
+                let after_key = skip_json_string(bytes, i)?;
+                let mut j = after_key;
+                while j < bytes.len() && bytes[j] == b' ' {
+                    j += 1;
+                }
+                if j >= bytes.len() || bytes[j] != b':' {
+                    i = after_key;
+                    continue;
+                }
+                j += 1;
+                while j < bytes.len() && bytes[j] == b' ' {
+                    j += 1;
+                }
+                let start = j;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j == start {
+                    return None; // not a plain number
+                }
+                let mut k = j;
+                while k < bytes.len() && bytes[k] == b' ' {
+                    k += 1;
+                }
+                return if k < bytes.len() && (bytes[k] == b',' || bytes[k] == b'}') {
+                    Some(&line[start..j])
+                } else {
+                    None // 1e3, 1.5, trailing garbage — not a u32
+                };
+            }
+            b'"' => in_string = true,
+            _ => {}
+        }
+        i += 1;
     }
-    let start = i;
-    i += 1;
+    None
+}
+
+/// From an opening quote at `start`, return the index PAST the closing quote
+/// (escape-aware). None if unterminated.
+fn skip_json_string(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
     while i < bytes.len() {
         match bytes[i] {
-            b'\\' => i += 2, // escaped char — skip its partner
-            b'"' => return Some((start, i + 1)),
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
             _ => i += 1,
         }
     }
     None
 }
 
-/// Byte-scan for `"key": <number>`, returning the digits as a &str slice of
-/// the line. `needle` is the quoted key literal. No allocation.
-fn scan_json_number_value<'a>(line: &'a str, needle: &str) -> Option<&'a str> {
-    let key_pos = line.find(needle)?;
-    let mut i = key_pos + needle.len();
-    let bytes = line.as_bytes();
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b':') {
+/// Parse the value starting at `pos` (spaces already allowed): a JSON string,
+/// returning its byte range INCLUDING quotes. None if the value is not a
+/// string.
+fn parse_json_string_value(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let mut i = pos;
+    while i < bytes.len() && bytes[i] == b' ' {
         i += 1;
     }
-    let start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == start {
+    if i >= bytes.len() || bytes[i] != b'"' {
         return None;
     }
-    Some(&line[start..i])
+    let start = i;
+    i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some((start, i + 1)),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Open the sidecar's NDJSON generation stream and re-emit it as SSE.
@@ -1423,19 +1568,30 @@ async fn stream_response(
             }
             prefill_from = 0;
             blob_unused.set(true);
-            let upstream = client
+            let upstream = match client
                 .generate_stream(&req.tokens, req.max_tokens, None)
                 .await
-                .map_err(|e| {
+            {
+                Ok(u) => u,
+                Err(e) => {
+                    emit_failed_trace(&state, &req.trace_ctx, &outcome, true, req.tokens.len());
                     let (status, kind) = sidecar_http_err(&e);
-                    err(status, &e.to_string(), kind)
-                })?;
+                    return Err(err(status, &e.to_string(), kind));
+                }
+            };
             // Correct the aggregate only after the scratch retry succeeded: a
             // 502 must not be counted as a served miss.
             state.stats.correct_retire(&outcome.decision);
             upstream
         }
         Err(e) => {
+            emit_failed_trace(
+                &state,
+                &req.trace_ctx,
+                &outcome,
+                blob_unused.get(),
+                req.tokens.len(),
+            );
             let (status, kind) = sidecar_http_err(&e);
             return Err(err(status, &e.to_string(), kind));
         }
@@ -1577,8 +1733,13 @@ async fn stream_response(
                     // matching the stream-abort shape above.
                     if !st.buf.contains(&b'\n') && st.buf.len() > MAX_PARTIAL_LINE {
                         if let Some(ttft) = st.ttft_ms {
-                            let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
-                            frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
+                            // A VALID chunk (api-contract review: bare
+                            // `{"mlxcache":…}` frames trip strict chunk
+                            // parsers on exactly the abort paths).
+                            st.framer.push_stats(
+                                &mut frames,
+                                &format!("\"mlxcache\":{{\"ttft_ms\":{ttft}}}"),
+                            );
                         }
                         let err = serde_json::json!({
                             "error": {
@@ -1647,8 +1808,12 @@ async fn stream_response(
                     }
                     if !st.terminated {
                         if let Some(ttft) = st.ttft_ms {
-                            let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
-                            frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
+                            // Same as the flood path: a valid chunk, never a
+                            // bare stats frame (api-contract review).
+                            st.framer.push_stats(
+                                &mut frames,
+                                &format!("\"mlxcache\":{{\"ttft_ms\":{ttft}}}"),
+                            );
                         }
                         // Truncated upstream: an explicit error, not a success.
                         let err = serde_json::json!({
@@ -1844,6 +2009,51 @@ mod tests {
         assert_eq!(scan_json_number_value(line, "\"token\""), Some("42"));
         // A non-string text value must not be spliced as one.
         assert!(scan_json_string_value(r#"{"text": 5}"#, "\"text\"").is_none());
+    }
+
+    #[test]
+    fn chunk_scanners_bind_only_top_level_keys() {
+        // Red-team 2026-10-04: a nested "text" key must not shadow the real
+        // one, a VALUE equal to the needle is not a key, and malformed token
+        // ids are violations, never fabricated.
+        let nested = r#"{"meta":{"text":"EVIL"},"token":1,"text":"REAL"}"#;
+        let (s, e) = scan_json_string_value(nested, "\"text\"").expect("top-level text");
+        assert_eq!(&nested[s..e], "\"REAL\"", "nested keys never bind");
+        assert_eq!(scan_json_number_value(nested, "\"token\""), Some("1"));
+
+        // The token VALUE reads "text" — not a key, must not confuse either scan.
+        let tricky = r#"{"token":"text","text":"x"}"#;
+        let (s, e) = scan_json_string_value(tricky, "\"text\"").expect("text after value");
+        assert_eq!(&tricky[s..e], "\"x\"");
+        assert_eq!(
+            scan_json_number_value(tricky, "\"token\""),
+            None,
+            "a string token id is not a plain u32"
+        );
+
+        // Non-u32 numbers never splice.
+        for bad in [
+            r#"{"token": -1, "text": "x"}"#,
+            r#"{"token": 1e3, "text": "x"}"#,
+        ] {
+            assert_eq!(scan_json_number_value(bad, "\"token\""), None, "{bad}");
+        }
+
+        // Strictness flows into the framer: a fabricated id aborts the stream.
+        let framer = ChunkFramer::new("chatcmpl-t", 7, "m");
+        let mut frames = Vec::new();
+        framer.push_line(&mut frames, br#"{"token": -1, "text": "x"}"#);
+        assert!(frames[0].is_err(), "malformed token id must be a violation");
+
+        // Non-UTF-8 bytes are a violation too (previously untested branch).
+        frames.clear();
+        framer.push_line(&mut frames, &[0xff, 0xfe, b'\n']);
+        assert!(frames[0].is_err(), "non-UTF-8 line must be a violation");
+
+        // A token line without a text string is a violation, not a splice.
+        frames.clear();
+        framer.push_line(&mut frames, br#"{"token": 7}"#);
+        assert!(frames[0].is_err(), "missing text must be a violation");
     }
 
     fn app() -> Router {
