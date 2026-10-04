@@ -295,3 +295,17 @@ def test_stream_load_error_not_treated_as_decode_error(sidecar_url, monkeypatch)
         assert '"done"' not in r.text
     finally:
         server.Handler.engine = server.make_engine("test-model")
+
+
+def test_prefill_fail_at_knob_fails_exactly_the_nth_call(monkeypatch):
+    # MLXCACHE_PREFILL_FAIL_AT (test knob): a transient RuntimeError on
+    # exactly the Nth /prefill call — not from-N-onward. The daemon e2e
+    # drives this through HTTP (transient 500 → 502, ancestor intact, next
+    # request recovers); this pins the exact-N semantics at the engine
+    # level, where no HTTP layer can blur it.
+    monkeypatch.setenv("MLXCACHE_PREFILL_FAIL_AT", "2")
+    engine = server.SyntheticEngine("test-model")
+    engine.prefill([1, 2, 3, 4], None)  # call #1: normal
+    with pytest.raises(RuntimeError, match="synthetic induced prefill failure"):
+        engine.prefill([1, 2, 3, 4, 5, 6], None)  # call #2: induced failure
+    engine.prefill([1, 2], None)  # call #3: failures must not persist
