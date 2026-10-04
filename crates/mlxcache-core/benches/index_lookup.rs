@@ -76,7 +76,7 @@ fn bench_lookup(c: &mut Criterion) {
         let query: Vec<u32> = (0..128).collect();
         group.bench_function(format!("lookup_128tok_index_{count}"), |b| {
             b.iter(|| {
-                let (entry, matched) = index.lookup(black_box(&query)).expect("chain hit");
+                let (entry, matched) = index.lookup(black_box(&query), None).expect("chain hit");
                 black_box((entry.blob_path, matched))
             })
         });
@@ -87,7 +87,7 @@ fn bench_lookup(c: &mut Criterion) {
         let query: Vec<u32> = (0..n as u32).collect();
         group.bench_function(format!("lookup_match_{n}_tokens"), |b| {
             b.iter(|| {
-                let (entry, matched) = index.lookup(black_box(&query)).expect("hit");
+                let (entry, matched) = index.lookup(black_box(&query), None).expect("hit");
                 black_box((entry.blob_path, matched))
             })
         });
@@ -95,7 +95,7 @@ fn bench_lookup(c: &mut Criterion) {
     // Full miss on a 128-token query (no shared prefix with anything).
     let miss_query: Vec<u32> = (0..128).map(|t| 0x7F00_0000 + t).collect();
     group.bench_function("lookup_128tok_full_miss", |b| {
-        b.iter(|| black_box(index.lookup(black_box(&miss_query)).is_none()))
+        b.iter(|| black_box(index.lookup(black_box(&miss_query), None).is_none()))
     });
     group.finish();
 }
@@ -118,7 +118,7 @@ fn bench_publish(c: &mut Criterion) {
                 };
                 assert!(index.publish(&tokens, meta, "b".into(), 1, |_| {}));
                 assert_eq!(
-                    index.lookup(&tokens).map(|(_, m)| m),
+                    index.lookup(&tokens, None).map(|(_, m)| m),
                     Some(2048),
                     "published entry must be immediately visible"
                 );

@@ -50,8 +50,12 @@ def http_json(url: str, payload: dict, timeout: float = 60.0) -> dict:
 def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, float, int]:
     """POST a streaming chat completion; return (ttft_ms, total_ms, tokens).
 
-    TTFT = request sent → first `data:` frame received. The per-frame loop
-    reads the raw SSE byte stream like a real client.
+    TTFT = request sent → first token frame received. The daemon can emit an
+    `mlxcache` stats frame or an error frame before the first token, so the
+    stamp waits for a frame that is none of those (and not [DONE]) — stamping
+    on the first `data:` line of any kind would overstate TTFT by the cache
+    decision time. The per-frame loop reads the raw SSE byte stream like a
+    real client.
     """
     body = dict(body, stream=True)
     req = urllib.request.Request(
@@ -68,8 +72,6 @@ def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, fl
             line = raw.decode(errors="replace").strip()
             if not line.startswith("data: "):
                 continue
-            if ttft is None:
-                ttft = (time.perf_counter() - t0) * 1000
             payload = line[len("data: ") :]
             if payload == "[DONE]":
                 break
@@ -79,6 +81,9 @@ def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, fl
                 continue
             if "mlxcache" in frame or "error" in frame:
                 continue  # stats/error frame, not a token
+            # First non-stats, non-error, non-[DONE] frame: the first token.
+            if ttft is None:
+                ttft = (time.perf_counter() - t0) * 1000
             # Token frames forward the sidecar's native NDJSON shape:
             # {"token": id, "text": piece} (see http.rs push_frame).
             if "token" in frame:

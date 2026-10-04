@@ -54,7 +54,7 @@ impl Orchestrator {
     /// Tokenization and fingerprint come from the adapter (R1-2); the daemon
     /// never re-tokenizes.
     pub fn route(&self, tokens: &[u32], request_fingerprint: &ModelFingerprint) -> RouteOutcome {
-        let lookup = self.index.lookup(tokens);
+        let lookup = self.index.lookup(tokens, Some(request_fingerprint));
         let (matched_tokens, matched_fp, blob_path, blob_generation, key) = match &lookup {
             Some((entry, n)) => (
                 Some(*n),
@@ -203,7 +203,9 @@ impl Orchestrator {
     /// Scoring (policy::eviction_score): anchors score 0 and are never evicted;
     /// an entry is an anchor when a longer published checkpoint extends it (a
     /// live chain's base) OR it was served within `anchor_window` (recently
-    /// used). The remainder evict coldest-first until under the cap.
+    /// used). The remainder evict biggest-first (`score = token_count`: most
+    /// bytes freed per unlink — the design doc's intent; "coldest-first" was a
+    /// stale description of the same code).
     ///
     /// Safety: each removal re-verifies blob path + generation at the node, so
     /// an entry republished between the snapshot and the removal is untouched;

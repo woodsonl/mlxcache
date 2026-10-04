@@ -40,7 +40,6 @@ def _known_fields(data: dict) -> dict:
     known = {f.name for f in dataclasses.fields(Fingerprint)}
     return {k: v for k, v in data.items() if k in known}
 
-
 @dataclass
 class CheckpointMeta:
     fingerprint: Fingerprint
@@ -61,6 +60,12 @@ def decode(blob: bytes) -> tuple[CheckpointMeta, bytes]:
     if 4 + header_len > len(blob):
         raise ValueError("header length exceeds blob")
     raw = json.loads(blob[4 : 4 + header_len])
+    # The header is untrusted: a fingerprint of the wrong JSON type (null, a
+    # list, a number) would raise AttributeError from .items() inside
+    # _known_fields — a 500-forever poison instead of a clean rejection.
+    # Validate the shape HERE so every malformed header is a ValueError.
+    if not isinstance(raw["fingerprint"], dict):
+        raise ValueError("fingerprint must be an object")
     meta = CheckpointMeta(
         fingerprint=Fingerprint(**_known_fields(raw["fingerprint"])),
         token_count=raw["token_count"],

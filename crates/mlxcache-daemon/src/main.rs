@@ -62,6 +62,12 @@ async fn main() -> Result<()> {
         trace: mlxcache_daemon::trace::TraceWriter::from_env()
             .map_err(|e| anyhow::anyhow!("{e}"))?,
     });
+    // Warm the native-tokenizer OnceLock NOW, not on the first request: a
+    // bad MLXCACHE_NATIVE_TOKENIZER must kill the boot (the module's
+    // fail-closed contract), not panic mid-traffic inside get_or_init —
+    // there it surfaces as a dropped connection on every request until
+    // restart. When unset, this is a no-op.
+    let _ = mlxcache_daemon::native_tokenizer::from_env();
     // R1-4: rebuild the index from persisted checkpoints so a daemon restart
     // resumes from disk instead of re-prefilling everything.
     let report = state.orchestrator.rebuild_from_disk(&state.persistence);
@@ -74,7 +80,7 @@ async fn main() -> Result<()> {
         );
     }
     spawn_reaper(state.clone());
-    let app = mlxcache_daemon::http::router(state);
+    let app = mlxcache_daemon::http::router(state.clone());
     let addr = std::env::var("MLXCACHE_ADDR").unwrap_or_else(|_| "127.0.0.1:8420".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     // Drain in-flight requests on SIGINT/SIGTERM, bounded by
@@ -104,6 +110,15 @@ async fn main() -> Result<()> {
         let _ = signal_rx.await;
     });
     serve.await?;
+    // Graceful-shutdown trace safety net: records are queued on a bounded
+    // channel and drained by the writer thread, and every record is already
+    // flushed per-write on capture, so a queued record is at most one write
+    // away from disk. This explicit flush is therefore a near-no-op — it only
+    // matters for a record still in flight inside the writer between channel
+    // receipt and file write when the server finished draining.
+    if let Some(tracer) = &state.trace {
+        tracer.flush();
+    }
     tracing::info!("mlxcache daemon stopped");
     Ok(())
 }
@@ -142,13 +157,22 @@ fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(900);
+    let anchor_window = std::time::Duration::from_secs(anchor_window_s);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_s));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // interval fires immediately; skip the no-op tick
         loop {
             ticker.tick().await;
-            state.evict_pass(max_entries, std::time::Duration::from_secs(anchor_window_s));
+            // A3: the sweep takes the index read lock and builds a candidate
+            // snapshot over a trie that can hold ~20K entries — ms-scale
+            // blocking work that must not stall other tasks scheduled on this
+            // runtime worker, including live streams. The Arc is cloned per
+            // pass so the blocking closure can own it.
+            let state = state.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || state.evict_pass(max_entries, anchor_window))
+                    .await;
         }
     });
     tracing::info!(
