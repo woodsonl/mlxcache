@@ -150,7 +150,7 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
             "import sys; sys.path.insert(0, 'sidecar'); "
             "from mlxcache_sidecar import server; "
             "server.Handler.engine = server.make_engine('bench-model'); "
-            f"server.ThreadingHTTPServer(('127.0.0.1', {sidecar_port}), "
+            f"server.BurstServer(('127.0.0.1', {sidecar_port}), "
             "server.Handler).serve_forever()",
         ],
         env=env,

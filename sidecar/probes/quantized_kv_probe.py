@@ -11,7 +11,12 @@ the persistence tier can serve 4-8x longer prefixes within the same budget.
 Three experiments, each printing JSON:
 1. parity_greedy: f16 KV vs quantized KV, greedy decode — must be IDENTICAL
    token streams to ship as a byte-compatible tier (or we pin a known-good
-   (bits, group) with a bounded-delta contract instead).
+   (bits, group) with a bounded-delta contract instead). SCOPE CAVEAT (QA
+   D4): parity is validated at ONE prompt length per run (the --tokens
+   argument, defaulting small). Quantization error is scale-dependent in
+   general; the shipped q8 g64 tier's parity contract is additionally pinned
+   by sidecar/tests at 0.5B and by the 20K-token 7B replay evidence in the
+   design doc, but this probe alone does not prove length-invariance.
 2. sizes: bytes/token f16 vs 8-bit vs 4-bit at a realistic prefix length.
 3. resume_budget: load + delta-prefill wall time at 50K tokens vs the 2s TTFT
    budget (R1-5).

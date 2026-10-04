@@ -277,7 +277,34 @@ impl Orchestrator {
                 "eviction: cold checkpoints reaped"
             );
         }
-        evicted
+        evicted + self.reap_quarantined(max_entries)
+    }
+
+    /// Cap quarantined tombstones at `max_entries` (QA ISSUE-002 follow-up):
+    /// they are diagnostic records, not serveable assets, so the same cap that
+    /// bounds published entries bounds them. Coldest stones go first; the
+    /// exact-identity removal can never touch a published entry or a republish
+    /// that reused a deterministic name. Blob files are already gone (quarantine
+    /// unlinks them), so there is nothing on disk to reclaim.
+    fn reap_quarantined(&self, max_entries: usize) -> usize {
+        let candidates = self.index.quarantine_candidates(max_entries);
+        let mut reaped = 0usize;
+        for (tokens, blob_path, generation) in &candidates {
+            if self
+                .index
+                .remove_quarantined(tokens, blob_path, *generation)
+            {
+                reaped += 1;
+            }
+        }
+        if reaped > 0 {
+            tracing::info!(
+                reaped,
+                cap = max_entries,
+                "eviction: cold quarantine tombstones reaped"
+            );
+        }
+        reaped
     }
 
     /// Rebuild the index from persisted checkpoints at startup (R1-4: persisted

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """T21 A/B: lean greedy decode vs stock stream_generate on the real engine.
 
-Run: MLXCACHE_LEAN_DECODE=1 uv run --extra mlx python sidecar/probes/lean_decode_ab.py
+Self-contained since the D3 cleanup: the lean loop was REMOVED from the
+sidecar (measured 1.01x, default-off — see the design doc T21 note), so its
+implementation lives HERE as the preserved measurement and the resurrection
+template if a native forward pass (T14) ever needs the structure again.
+
+Run: MLXCACHE_BENCH_MODEL=Qwen/Qwen2-0.5B-Instruct uv run --extra mlx python sidecar/probes/lean_decode_ab.py
 """
 
 from __future__ import annotations
@@ -12,6 +17,57 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sidecar"))
+
+
+def _lean_greedy_stream(engine, prompt, cache):
+    """T21 lean decode: argmax-only generation with no per-token fluff.
+
+    Yields (token_id, text_piece) exactly like mlx-lm's stream_generate.
+    Keeps the async_eval pipeline (queue step i+1 before materializing step i)
+    but skips: the full-vocab logsumexp (we only need argmax of logits), the
+    GenerationResponse dataclass + peak-memory + TPS accounting per token, two
+    levels of generator wrapping, and the wired_limit context. GREEDY only:
+    any sampling (temperature/top_p) must use the mlx-lm path, where the
+    softmax weights matter.
+    """
+    import mlx.core as mx  # noqa: PLC0415
+
+    if cache is None:
+        from mlx_lm.models.cache import make_prompt_cache  # noqa: PLC0415
+
+        cache = make_prompt_cache(engine.model)
+
+    # A detokenizer is STATEFUL per stream: one per call, never cached on the
+    # engine (ThreadingHTTPServer interleaves streams).
+    detok = engine.tokenizer.detokenizer
+    eos = engine._eos_ids
+
+    y = mx.array(prompt)[None]
+    logits = engine.model(y, cache=cache)
+    y = mx.argmax(logits[:, -1, :], axis=-1)
+
+    n = 0
+    while True:
+        # Queue the next step before materializing this token: the GPU works
+        # on step i+1 while Python detokenizes step i.
+        next_logits = engine.model(y[None], cache=cache)
+        next_y = mx.argmax(next_logits[:, -1, :], axis=-1)
+        mx.async_eval(next_y)
+
+        token = int(y.item())
+        detok.add_token(token)
+        # Finalize BEFORE the final yield (EOS, or the cap consumed by this
+        # step): the last yielded segment must be the finalized one, or any
+        # text still buffered in the detokenizer is silently dropped.
+        last = token in eos or n + 1 >= 256
+        if last:
+            detok.finalize()
+        yield token, detok.last_segment
+        if last:
+            break
+
+        y = next_y
+        n += 1
 
 
 def main() -> int:
@@ -45,7 +101,7 @@ def main() -> int:
 
     # Lean path tokens.
     cache = make_prompt_cache(engine.model)
-    lean = [t for t, _text in engine._lean_greedy_stream(prompt, cache)]
+    lean = [t for t, _text in _lean_greedy_stream(engine, prompt, cache)]
 
     report["parity"] = lean[: len(stock)] == stock
     report["stock_len"] = len(stock)
@@ -60,7 +116,7 @@ def main() -> int:
     # stock_len tokens (the lean stream may be longer).
     cache = make_prompt_cache(engine.model)
     capped = []
-    for tok, text in engine._lean_greedy_stream(prompt, cache):
+    for tok, text in _lean_greedy_stream(engine, prompt, cache):
         capped.append((tok, text))
         if len(capped) >= len(stock):
             break
@@ -92,7 +148,7 @@ def main() -> int:
         times.sort()
         return times[1], n
 
-    lean_ms, lean_n = bench(engine._lean_greedy_stream)
+    lean_ms, lean_n = bench(lambda p, c: _lean_greedy_stream(engine, p, c))
     report["lean"] = {
         "median_ms": round(lean_ms, 1),
         "tokens": lean_n,

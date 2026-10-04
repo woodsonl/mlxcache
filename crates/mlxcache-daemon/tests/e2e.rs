@@ -645,7 +645,7 @@ async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> Option<(String, std::pr
         "import sys; sys.path.insert(0, {root:?}); \
          from mlxcache_sidecar import server; \
          server.Handler.engine = server.make_engine('e2e-model'); \
-         server.ThreadingHTTPServer(('127.0.0.1', {port}), server.Handler).serve_forever()",
+         server.BurstServer(('127.0.0.1', {port}), server.Handler).serve_forever()",
         root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
         port = port
     );
