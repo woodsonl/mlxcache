@@ -19,6 +19,14 @@ struct Node {
 #[derive(Debug)]
 pub struct IndexEntry {
     pub meta: CheckpointMeta,
+    /// The exact trie key this entry lives at (the path from the root).
+    /// A lookup can serve this entry to a request that diverges from the
+    /// key at its LAST token (T22: the blob holds KV for the key's
+    /// prefix-minus-one, so the final key token's absence is by
+    /// construction), which means the request's own tokens do NOT
+    /// spell the key — callers that need the key (quarantine keying)
+    /// must take it from here, never from the request prefix.
+    pub key: Vec<u32>,
     /// Path of the published blob (post-rename, never a temp path).
     pub blob_path: String,
     /// Monotonic publication generation for this prefix. A blob name is
@@ -40,6 +48,7 @@ impl Clone for IndexEntry {
         use std::sync::atomic::Ordering::Relaxed;
         Self {
             meta: self.meta.clone(),
+            key: self.key.clone(),
             blob_path: self.blob_path.clone(),
             generation: self.generation,
             state: self.state,
@@ -112,6 +121,27 @@ impl PrefixIndex {
 
     /// Longest published prefix match for `tokens`. Returns the entry and the
     /// number of tokens matched.
+    ///
+    /// T22 (prefix-stable multi-turn): an entry serves a request whose token
+    /// stream diverges from the entry's key at the key's LAST token. The
+    /// published blob holds KV for the key's `tokens[:-1]` (adapter
+    /// convention), and the KV at position j depends only on tokens `..=j`,
+    /// so agreement through `len(key) - 1` makes every covered position
+    /// byte-identical for the request too — the same KV the full-containment
+    /// case would have served. Trie-wise the walk breaks one edge short of
+    /// the entry, so serving also considers the deepest-reached node's
+    /// published direct children (key length = depth + 1, LCP = depth =
+    /// len(key) - 1) at a break, and at walk end (request a strict prefix of
+    /// the key). The returned `matched` is `min(len(key), tokens.len())`, so
+    /// the policy's `covered = matched - 1` stays exact except the
+    /// request-is-one-shorter boundary (matched capped to the request
+    /// length under-reports coverage by one there — stats only; the adapter
+    /// derives its true feed point from the blob's own meta). The entry
+    /// always reports its TRUE `key`: a divergent request's tokens do not
+    /// spell it, so quarantine/eviction must key by `entry.key`. Mid-prefix
+    /// divergence is never served — KV past the LCP is not identical for the
+    /// diverging request, and truncating persistent MLX cache states is
+    /// unsafe on the quantized tier (explicitly out of scope).
     pub fn lookup(&self, tokens: &[u32]) -> Option<(IndexEntry, usize)> {
         use std::sync::atomic::Ordering::Relaxed;
         let root = self.read_lock();
@@ -135,7 +165,53 @@ impl PrefixIndex {
                 None => break,
             }
         }
+        // T22 end-anchored divergence: the walk stopped one edge short of any
+        // deeper entry. A published DIRECT child of the deepest-reached node
+        // has key length depth+1 and the request agrees with it through
+        // depth = len(key) - 1 — exactly the serve rule. Deeper descendants
+        // need LCP >= len(key)-1 > depth: never qualify. At walk end (request
+        // a strict prefix of the key) the same rule serves a request one
+        // token short. Prefer the hottest child (recency tie-break: lowest
+        // token, deterministic); its coverage (len(key)-1) always beats the
+        // walk best's, so it supersedes unconditionally.
+        if let Some(child) = Self::hottest_published_child(node) {
+            child.last_used_millis.store(now_millis(), Relaxed);
+            // The cap only bites at the walk-end boundary (matched = n+1);
+            // a break has matched = len(key) <= tokens.len() by construction.
+            let matched = child.key.len().min(tokens.len());
+            if matched >= 2 {
+                best = Some((child, matched));
+            }
+        }
         best
+    }
+
+    /// Hottest published direct child of `node` (T22 serve rule): the entry a
+    /// request that stopped here may adopt. Selection is by recency
+    /// (last_used_millis) with a lowest-token tie-break for determinism;
+    /// every candidate covers the same positions, so any of them is sound
+    /// and the pick only affects which blob stays warm.
+    fn hottest_published_child(node: &Node) -> Option<IndexEntry> {
+        let mut best: Option<(u64, u32, IndexEntry)> = None;
+        for (t, child) in &node.children {
+            let Some(entry) = &child.entry else {
+                continue;
+            };
+            if entry.state != CheckpointState::Published {
+                continue;
+            }
+            let used = entry
+                .last_used_millis
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let better = match &best {
+                None => true,
+                Some((bu, bt, _)) => used > *bu || (used == *bu && t < bt),
+            };
+            if better {
+                best = Some((used, *t, entry.clone()));
+            }
+        }
+        best.map(|(_, _, entry)| entry)
     }
 
     /// Every Published entry, as an eviction candidate: its prefix tokens (the
@@ -284,6 +360,10 @@ impl PrefixIndex {
         }
         node.entry = Some(IndexEntry {
             meta,
+            // The trie path IS the key (publish is the only constructor);
+            // lookups that serve an end-divergent request report this key,
+            // not the request's tokens (T22).
+            key: tokens.to_vec(),
             blob_path,
             generation,
             state: CheckpointState::Published,
@@ -639,11 +719,104 @@ mod tests {
     }
 
     #[test]
-    fn matched_never_exceeds_request_length() {
-        // A request that is a strict prefix of a longer published entry must
-        // NOT match the longer entry: the walk ends when request tokens run out,
-        // so no entry beyond the request tail is ever seen. This guards the
-        // invariant that `classify` can never see matched_tokens > request_tokens.
+    fn end_divergent_request_serves_entry_t22() {
+        // T22 serve rule: a request that diverges from the entry's key at the
+        // key's LAST token is served (the blob covers tokens[:-1], and the
+        // KV at every covered position depends only on the agreed prefix).
+        // Trie-wise the walk breaks one edge short and the deepest-reached
+        // node's direct child (the entry) qualifies.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2, 3], "turn1");
+        // Divergence exactly at the key's last token (the multi-turn shape:
+        // turn 2 replaced turn 1's closing bracket).
+        let (entry, matched) = index.lookup(&[1, 2, 9]).unwrap();
+        assert_eq!(entry.blob_path, "turn1");
+        assert_eq!(matched, 3, "matched = len(key) capped to the request");
+        // A longer divergent request matches the same entry.
+        let (entry, matched) = index.lookup(&[1, 2, 9, 9]).unwrap();
+        assert_eq!(entry.blob_path, "turn1");
+        assert_eq!(matched, 3);
+        // Divergence + walk-end boundary in one: request SHORTER than the
+        // key, agreeing through len(key)-1.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2, 3, 4], "long");
+        let (entry, matched) = index.lookup(&[1, 2, 3]).unwrap();
+        assert_eq!(entry.blob_path, "long");
+        assert_eq!(matched, 3, "capped to the request length at walk end");
+    }
+
+    #[test]
+    fn mid_prefix_divergence_never_serves_t22() {
+        // The serve rule is END-ANCHORED: divergence before the key's last
+        // token means KV past the LCP is NOT identical for the request —
+        // the trie geometry enforces it (the entry is not a direct child of
+        // the deepest-reached node) and these pin it.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2, 3], "turn1");
+        assert!(
+            index.lookup(&[1, 9, 3]).is_none(),
+            "divergence at position 1 must not serve a key of length 3"
+        );
+        assert!(
+            index.lookup(&[9, 2, 3]).is_none(),
+            "divergence at position 0 must not serve"
+        );
+        // A two-token entry serves a divergent second token (agreement 1 =
+        // len(key)-1) but nothing below two agreed tokens.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2], "short");
+        let (_, matched) = index.lookup(&[1, 9]).unwrap();
+        assert_eq!(matched, 2);
+        assert!(
+            index.lookup(&[9, 9]).is_none(),
+            "a request agreeing on zero tokens must not serve (root children \
+             cannot hold entries: publish refuses <2-token keys)"
+        );
+    }
+
+    #[test]
+    fn one_token_request_never_serves_t22() {
+        // A 1-token request has an empty covered prefix (matched would cap
+        // to 1 < 2): never a hit/partial, mirroring publish's 2-token floor.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2], "short");
+        assert!(index.lookup(&[1]).is_none());
+    }
+
+    #[test]
+    fn quarantine_keys_by_the_entry_key_after_divergent_serve_t22() {
+        // Under end-anchored divergence the REQUEST's tokens do not spell
+        // the entry's key. Retirement must use the entry's TRUE key (now
+        // carried on IndexEntry): the entry stays servable to divergent
+        // requests until quarantined by that key, and a divergent lookup
+        // finds nothing after quarantine.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2, 3], "turn1");
+        let (entry, _) = index.lookup(&[1, 2, 9]).unwrap();
+        assert_eq!(entry.key, vec![1, 2, 3], "the entry reports its true key");
+        assert!(index.quarantine_blob("turn1", entry.generation, &entry.key, || {}));
+        assert!(
+            index.lookup(&[1, 2, 9]).is_none(),
+            "a quarantined entry must not serve divergent requests either"
+        );
+    }
+
+    #[test]
+    fn exact_depth_match_still_dominates_t22() {
+        // Pre-T22 behavior is preserved verbatim when the request contains
+        // the key exactly, and a deeper walked entry still beats the
+        // hottest-child candidate (coverage grows with depth).
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2], "base");
+        let _ = publish_entry(&index, &[1, 2, 3], "deep");
+        let (entry, matched) = index.lookup(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(entry.blob_path, "deep");
+        assert_eq!(matched, 3);
+        // And the old shortest-request guard: a request that is a strict
+        // prefix must not match a longer entry (unchanged at 2+ depth).
+        let (entry, matched) = index.lookup(&[1, 2, 3]).unwrap();
+        assert_eq!(entry.blob_path, "deep");
+        assert_eq!(matched, 3, "walk-end boundary serves the one-short case");
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2, 3, 4, 5], "long");
         assert!(
