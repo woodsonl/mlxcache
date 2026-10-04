@@ -59,6 +59,8 @@ async fn main() -> Result<()> {
         served_models,
         sidecar,
         persistence,
+        trace: mlxcache_daemon::trace::TraceWriter::from_env()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
     });
     // R1-4: rebuild the index from persisted checkpoints so a daemon restart
     // resumes from disk instead of re-prefilling everything.

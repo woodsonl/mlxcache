@@ -6,3 +6,4 @@ pub mod observability;
 pub mod orchestrator;
 pub mod persistence;
 pub mod sidecar;
+pub mod trace;
