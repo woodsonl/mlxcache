@@ -83,10 +83,15 @@ impl AppState {
     /// record the count in /stats. Both the background reaper (main.rs) and
     /// tests go through this single path, so the counter can never drift from
     /// what the reaper actually removed.
-    pub fn evict_pass(&self, max_entries: usize, anchor_window: std::time::Duration) -> usize {
-        let evicted = self
-            .orchestrator
-            .evict_cold(&self.persistence, max_entries, anchor_window);
+    pub fn evict_pass(
+        &self,
+        max_entries: usize,
+        max_bytes: u64,
+        anchor_window: std::time::Duration,
+    ) -> usize {
+        let evicted =
+            self.orchestrator
+                .evict_cold(&self.persistence, max_entries, max_bytes, anchor_window);
         if evicted > 0 {
             self.stats.record_evictions(evicted as u64);
         }
