@@ -318,6 +318,11 @@ class SyntheticEngine:
         # checkpoint key exactly at its last token, the shape the end-
         # anchored serve rule turns into reuse.
         self._diverge_tail = os.environ.get("MLXCACHE_TOKENIZE_DIVERGE") == "1"
+        # Test knob: fail /prefill with a transient 500 on exactly the Nth
+        # call (counting from 1). Exercises the daemon's publish-failure
+        # path with an ADOPTED ancestor: a 500 must NOT quarantine the
+        # ancestor, and the next identical request must retry cleanly.
+        self._prefill_fail_at = int(os.environ.get("MLXCACHE_PREFILL_FAIL_AT", "0") or 0)
         # Phase timers (B2): last prefill's coverage, for the delta-prefill test.
         self.last_prefill_tokens = 0
         self.last_prefill_delta_tokens = 0
@@ -387,6 +392,14 @@ class SyntheticEngine:
         # but the GIL makes this increment effectively safe. Add a lock if the
         # coalescing e2e ever sees a lost count.
         self.prefill_count += 1
+        # Test knob (see __init__): a transient RuntimeError on exactly the
+        # Nth call. The handler maps it to a 500, which the daemon must
+        # classify as a NON-rejection (no quarantine) — the ancestor blob
+        # was never invalid, the publish just failed.
+        if self._prefill_fail_at and self.prefill_count == self._prefill_fail_at:
+            raise RuntimeError(
+                f"synthetic induced prefill failure (test knob, call #{self.prefill_count})"
+            )
         # Optional delay (test knob): widens the single-flight window so
         # concurrent identical requests are provably coalesced. It runs BEFORE the
         # empty-prefix return below so a one-token prompt also holds the window
@@ -880,6 +893,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+
+        # Test knob: flood the stream with N bytes and NO newline, then hold
+        # the connection open. Exercises the daemon's partial-line cap
+        # (MAX_PARTIAL_LINE): the idle budget only governs byte ARRIVALS, so
+        # a fast newline-free flood must trip the explicit "unbounded line"
+        # upstream error instead of growing the bridge buffer.
+        flood = int(os.environ.get("MLXCACHE_STREAM_FLOOD", "0") or 0)
+        if flood:
+            self.wfile.write(b"x" * flood)
+            self.wfile.flush()
+            time.sleep(30)
+            return
 
         n = 0
         try:
