@@ -2125,6 +2125,101 @@ async fn corrupt_ancestor_quarantines_and_prefills_from_scratch() {
 }
 
 #[tokio::test]
+async fn trace_records_the_settled_verdict_not_the_stale_route() {
+    // RT#7 (red-team 2026-10-04): the trace record used to be emitted right
+    // after routing — before the generate leg could still flip the outcome.
+    // A request whose blob the adapter 422s quarantines it and retries from
+    // scratch: /stats corrects the claim via correct_retire, but the trace
+    // kept the stale hit. A capture and its /stats line must agree by
+    // construction, so the record may only be emitted once the outcome has
+    // SETTLED. (Would fail pre-fix with line 2 reading "hit".)
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "trace settle")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let tracedir = tempfile::tempdir().unwrap();
+    let trace_path = tracedir.path().join("trace.jsonl");
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: Some(mlxcache_daemon::trace::TraceWriter::from_path(&trace_path).unwrap()),
+    });
+    let post = |body: String| {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "trace settle"}],
+        "stream": false,
+    })
+    .to_string();
+    let body_grown = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "trace settle and grow the prompt"}],
+        "stream": false,
+    })
+    .to_string();
+
+    // Request 1: publishes the checkpoint (a genuine miss).
+    let res = post(body).await;
+    assert_eq!(res.status(), 200);
+
+    // Corrupt the published blob in place (same shape as the quarantine
+    // tests). The synthetic engine's /generate is token arithmetic and never
+    // re-reads blob bytes, so the rejection must be driven through the
+    // delta-PREFILL leg — the grown request's matched ancestor IS the corrupt
+    // blob: the adapter 422s the prefill, the daemon quarantines and retries
+    // from scratch → 200 with a miss body.
+    let blob = state.persistence.list_blobs().unwrap().pop().unwrap();
+    std::fs::write(&blob, b"JUNK").unwrap();
+
+    // Request 2, grown: routes as a PARTIAL against the corrupt ancestor,
+    // settles as a miss after quarantine + scratch retry.
+    let res = post(body_grown).await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "miss", "{v}");
+
+    // Per-record flush means the JSONL is readable live.
+    let trace = std::fs::read_to_string(&trace_path).unwrap();
+    let lines: Vec<&str> = trace.lines().collect();
+    assert_eq!(lines.len(), 2, "one record per request: {trace}");
+    let rec2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(
+        rec2["verdict"], "miss",
+        "the SETTLED verdict (scratch retry after quarantine), not the stale routing partial: {rec2}"
+    );
+    assert_eq!(rec2["prefill_from"].as_u64(), Some(0), "{rec2}");
+    assert_eq!(rec2["matched_tokens"].as_u64(), Some(0), "{rec2}");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
 async fn stalled_stream_is_cut_by_the_idle_budget_with_an_explicit_error() {
     // Streams carry NO total timeout (a decode's wall time is unbounded by
     // design). Instead the daemon enforces an idle budget between bytes: a
