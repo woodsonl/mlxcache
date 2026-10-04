@@ -151,9 +151,7 @@ def test_adapter_delta_prefill_matches_scratch(engine):
     from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
 
     base = engine.tokenize("The quick brown fox jumps over the lazy dog.")
-    grown = engine.tokenize(
-        "The quick brown fox jumps over the lazy dog. " * 4
-    )
+    grown = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 4)
     assert len(grown) > len(base) and grown[: len(base)] == base, (
         "test premise: the grown prompt must extend the base token-for-token"
     )
