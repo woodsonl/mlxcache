@@ -1,8 +1,13 @@
 """Sidecar HTTP server: the mlx-lm compatibility adapter.
 
 Endpoints (daemon -> sidecar protocol):
-- POST /tokenize  {"prompt": str} -> {"tokens": [u32], "tokenizer_hash": str}
-- POST /prefill   {"prompt": str, "tokens": [u32]} -> KV checkpoint blob (binary)
+- POST /tokenize  {"prompt": str} -> {"tokens": [u32], "tokenizer_hash": str,
+                   "kv_dtype": str, "kv_bits": int, "kv_group_size": int}
+- POST /prefill   {"tokens": [u32], "ancestor_blob_path": str|null}
+                   -> KV checkpoint payload (binary; EMPTY body = nothing
+                   cacheable). 400 on bad input; 422 when a declared ancestor
+                   is missing or unloadable (the daemon quarantines it and
+                   retries from scratch).
 - POST /generate  {"tokens": [u32], "max_tokens": int, "blob_path": str|null,
                    "stream": bool} -> NDJSON token stream
 
@@ -16,10 +21,11 @@ Run: uv run python -m mlxcache_sidecar.server
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import sys
-import tempfile
+import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +37,36 @@ class CheckpointRejectedError(Exception):
     Mapped to HTTP 422 so the daemon retires (quarantines) the entry. Distinct
     from a decode/generation failure, which must NOT retire a healthy
     checkpoint."""
+
+
+# Phase timers (B2). Aggregates, not per-request traces: /stats exposes totals
+# + counts so the benchmark harness can decompose TTFT. The GIL makes dict
+# increments safe under ThreadingHTTPServer's thread-per-request model (same
+# reasoning as prefill_count); the lock keeps multi-field updates coherent for
+# the reader.
+_phase_lock = threading.Lock()
+_phase_totals: dict[str, float] = {}
+_phase_counts: dict[str, int] = {}
+
+
+def _phase_add(name: str, ms: float) -> None:
+    """Record one operation of phase `name` taking `ms` wall milliseconds.
+    Aggregates `{name}_total` (ms) and `{name}_count`."""
+    with _phase_lock:
+        key = f"{name}_total"
+        _phase_totals[key] = _phase_totals.get(key, 0.0) + ms
+        _phase_counts[name] = _phase_counts.get(name, 0) + 1
+
+
+def _phase_stats() -> dict[str, float]:
+    out: dict[str, float] = {}
+    with _phase_lock:
+        for name, count in _phase_counts.items():
+            total = _phase_totals.get(f"{name}_total", 0.0)
+            out[f"{name}_count"] = count
+            out[f"{name}_ms_total"] = round(total, 3)
+            out[f"{name}_ms_avg"] = round(total / (count or 1), 3)
+    return out
 
 
 _SAFETENSORS_DTYPE_BYTES = {
@@ -140,6 +176,110 @@ def _valid_safetensors(payload: bytes) -> bool:
     return all(ranges[i][0] >= ranges[i - 1][1] for i in range(1, len(ranges)))
 
 
+def read_wire_checkpoint(
+    blob_path: str, tokens: list[int] | None = None, check_safetensors: bool = True
+) -> tuple[object | None, bytes, bool]:
+    """Read and validate a daemon wire-format checkpoint off disk.
+
+    Shared trust boundary for BOTH engines (prefill-with-ancestor and generate
+    resume). Returns ``(meta, payload, usable)``:
+
+    - A corrupt/invalid checkpoint (bad header, prefix disagreement with
+      `tokens`, empty payload, invalid safetensors) raises
+      CheckpointRejectedError → HTTP 422 → the daemon quarantines the entry.
+    - A legitimately uncacheable checkpoint (prefix shorter than 2 tokens) sets
+      ``usable=False`` with meta/payload intact — the caller runs from scratch
+      WITHOUT retiring the entry.
+    - A transient OS read failure (EIO, ENFILE) propagates as OSError → HTTP
+      500 → the daemon retries without retiring a healthy entry.
+
+    When ``tokens`` is given the recorded prefix must equal ``tokens[:n]``; a
+    mismatch is a mislabeled/corrupt entry and is REJECTED, never silently
+    ignored (resuming from wrong KV would break identical-to-scratch parity).
+
+    ``check_safetensors`` validates the safetensors framing of the payload —
+    the real MLX engine requires it (a malformed inner header would otherwise
+    raise the same RuntimeError type as a transient OS failure); the synthetic
+    engine's deterministic KV bytes are not safetensors and pass False.
+    """
+    from .blob import decode  # noqa: PLC0415
+
+    # Read first. A MISSING file is a raced/retired checkpoint (the daemon
+    # only passes paths its index currently points at): reject it (422 →
+    # quarantine + scratch retry), not a 500 — a 500 makes the daemon treat
+    # it as transient, the client eats a 502, and the dead entry stays
+    # selectable. EVERY OTHER OSError (EIO, ENFILE, ...) is transient: let it
+    # propagate as a 500 — a failed stat/open must never retire a healthy
+    # entry (see os.stat pre-checks in the handlers).
+    try:
+        with open(blob_path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError as exc:
+        raise CheckpointRejectedError(f"blob missing: {blob_path}") from exc
+    try:
+        meta, payload = decode(raw)
+        # The JSON header is untrusted: a field of the wrong type (e.g.
+        # "tokens":123) must be rejected here, inside the boundary. Letting
+        # len() raise a bare TypeError outside it would 500 forever and leave
+        # the poison selectable.
+        if not isinstance(meta.tokens, list) or not all(
+            isinstance(t, int) and not isinstance(t, bool) for t in meta.tokens
+        ):
+            raise ValueError("tokens must be a list of integers")
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+        # A header that does not decode or lacks required fields is a bad
+        # checkpoint: retire it rather than 500 forever while it stays
+        # selectable. AttributeError (fingerprint: null/[]/5 → .items() on a
+        # non-dict) and RecursionError (deeply nested JSON) were both
+        # reproducible escapes — outside this handler they are a 500 with the
+        # poison left selectable (mirror _valid_safetensors, which already
+        # covers them).
+        raise CheckpointRejectedError(f"checkpoint header invalid: {exc}") from exc
+    # The checkpoint prefix must be self-describing: only meta.tokens tells
+    # us which prefix the KV actually covers. The daemon always writes
+    # meta.tokens, so a blob the index matched WITHOUT them cannot be
+    # verified against this request. Adopting it would trust it covers
+    # tokens[:token_count] by construction; silently running scratch while
+    # the daemon reports a hit would be an accounting lie. Reject it.
+    if not meta.tokens:
+        raise CheckpointRejectedError("checkpoint has no recorded token prefix")
+    prefix_len = len(meta.tokens)
+    if prefix_len < 2:
+        # A prefix shorter than 2 caches nothing. This also rejects legacy
+        # one-token checkpoints whose nonempty KV already holds that token:
+        # adopting one and feeding the whole prompt would double-feed it.
+        return meta, payload, False
+    if tokens is not None:
+        if prefix_len > len(tokens):
+            return meta, payload, False
+        # The adapter is a trust boundary: verify the blob really covers the
+        # KV it claims for THIS request. T22 (prefix-stable multi-turn): the
+        # persisted cache covers meta.tokens[:-1], and the KV at position j
+        # depends only on tokens ..=j — so a request that diverges from the
+        # recorded prefix at its LAST token still gets byte-identical KV for
+        # every covered position (a multi-turn wire prompt that grew: the
+        # previous turn's checkpoint key ends in a closing bracket the next
+        # turn replaced). Divergence anywhere else — including the final
+        # COVERED position — means the file does not match the index entry
+        # that pointed at it (mislabeled/corrupt): retire it, do not
+        # silently resume from or ignore wrong KV.
+        if meta.tokens[:-1] != tokens[: prefix_len - 1]:
+            raise CheckpointRejectedError("checkpoint prefix does not match the request")
+    # A multi-token checkpoint with no KV payload is CORRUPT (a truncated
+    # write), not uncacheable: reject so the daemon quarantines the entry.
+    if not payload:
+        raise CheckpointRejectedError("checkpoint payload is empty")
+    # Validate the safetensors framing ourselves, BEFORE handing it to MLX.
+    # MLX's native parser raises RuntimeError for a bad header length, the
+    # same type it uses for a transient OS read failure, so we cannot
+    # classify from the exception alone. A malformed inner header is
+    # deterministic corruption: reject it here so it is retired, while
+    # RuntimeError from the loader below stays transient (500).
+    if check_safetensors and not _valid_safetensors(payload):
+        raise CheckpointRejectedError("checkpoint payload is not valid safetensors")
+    return meta, payload, True
+
+
 class SyntheticEngine:
     """Hermetic engine: deterministic tokens + KV bytes, no MLX dependency."""
 
@@ -150,6 +290,41 @@ class SyntheticEngine:
         self.prefill_count = 0
         self.tokenizer_hash = "synthetic"
         self.kv_dtype = "synthetic"
+        # The synthetic engine reports the same quantization knobs so daemon
+        # e2e tests can exercise the q8 fingerprint tier without a GPU: the
+        # payload is fake bytes either way, but the fingerprint (and blob
+        # names) must respond exactly as the real engine's would.
+        self.kv_bits = max(0, int(os.environ.get("MLXCACHE_KV_BITS", "0") or 0))
+        self.kv_group_size = max(0, int(os.environ.get("MLXCACHE_KV_GROUP_SIZE", "0") or 0))
+        if self.kv_bits and not self.kv_group_size:
+            # Parity with MlxLmEngine (review 2026-10-04): a group size is
+            # mandatory with quantization and 64 is the proven one. The two
+            # engines' parses drifted here — different fingerprints/blob names
+            # for the same operator config, breaking the synthetic engine's
+            # own must-respond-exactly contract.
+            self.kv_group_size = 64
+        # Test knob: emulate a tokenizer that grows a base prompt's tokens —
+        # tokenize(base) is a strict token-prefix of tokenize(base + rest), so
+        # daemon tests can exercise partial hits and delta prefill (which the
+        # fixed 8-token hash alone can never produce).
+        self._grow_base = os.environ.get("MLXCACHE_TOKENIZE_GROW")
+        # Test knob (T22): emulate the real multi-turn wire shape. When set,
+        # one extra token is appended whose value hinges on the WHOLE
+        # serialized prompt string: turn r's stream = grow tokens + hash(
+        # turn-r-serialization). A grown conversation re-serializes with the
+        # closing bracket replaced, so the appended token differs while the
+        # grow tokens agree — the stream diverges from the previous turn's
+        # checkpoint key exactly at its last token, the shape the end-
+        # anchored serve rule turns into reuse.
+        self._diverge_tail = os.environ.get("MLXCACHE_TOKENIZE_DIVERGE") == "1"
+        # Test knob: fail /prefill with a transient 500 on exactly the Nth
+        # call (counting from 1). Exercises the daemon's publish-failure
+        # path with an ADOPTED ancestor: a 500 must NOT quarantine the
+        # ancestor, and the next identical request must retry cleanly.
+        self._prefill_fail_at = int(os.environ.get("MLXCACHE_PREFILL_FAIL_AT", "0") or 0)
+        # Phase timers (B2): last prefill's coverage, for the delta-prefill test.
+        self.last_prefill_tokens = 0
+        self.last_prefill_delta_tokens = 0
 
     def tokenize(self, prompt: str) -> list[int]:
         # Deterministic token stream derived from the prompt hash. Not a real
@@ -160,15 +335,64 @@ class SyntheticEngine:
         # Test knob: emulate a one-token prompt (nothing cacheable).
         if os.environ.get("MLXCACHE_TOKENIZE_ONE") == "1":
             return [12345]
-        digest = hashlib.sha256(prompt.encode()).digest()
+        tokens = self._tokenize_inner(prompt)
+        if self._diverge_tail:
+            # T22 knob: hinge ONE token on the WHOLE serialized prompt. A
+            # grown conversation re-serializes (closing bracket replaced),
+            # so the hinge token differs between turns while every earlier
+            # token agrees — turn r+1's stream diverges from turn r's
+            # checkpoint key exactly at its last token, the shape the
+            # end-anchored serve rule turns into reuse.
+            tokens = tokens + [self._hash1(prompt) & 0x7FFFFFFF]
+        return tokens
+
+    def _tokenize_inner(self, prompt: str) -> list[int]:
+        if self._grow_base is not None:
+            # The daemon tokenizes the JSON-serialized message list, so the
+            # user content appears VERBATIM between JSON quotes. Emulate a
+            # real tokenizer over the CONTENT: the first occurrence of the
+            # grow base starts the token stream, and the content runs to the
+            # closing JSON quote. The remainder is split on " | " separators
+            # and each segment hashed independently, so appending a new
+            # segment EXTENDS the token stream: tokenize(round r) is a strict
+            # token-prefix of tokenize(round r+1) — the property that makes a
+            # growing conversation partial-match at every round (delta
+            # prefill's OV3 showcase), the way real BPE keeps deep prefix
+            # matches on appended text.
+            idx = prompt.find(self._grow_base)
+            if idx >= 0:
+                end = prompt.find('"', idx + len(self._grow_base))
+                content = prompt[idx:end] if end >= 0 else prompt[idx:]
+                base = self._hash_tokens(self._grow_base)
+                if len(content) == len(self._grow_base):
+                    return base
+                segments = content[len(self._grow_base) :].removeprefix(" | ").split(" | ")
+                return base + [t for seg in segments for t in self._hash_tokens(seg)]
+        return self._hash_tokens(prompt)
+
+    @staticmethod
+    def _hash1(text: str) -> int:
+        return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "little")
+
+    @staticmethod
+    def _hash_tokens(text: str) -> list[int]:
+        digest = hashlib.sha256(text.encode()).digest()
         return [int.from_bytes(digest[i : i + 4], "little") % 2**31 for i in range(0, 32, 4)]
 
-    def prefill(self, tokens: list[int]) -> bytes:
+    def prefill(self, tokens: list[int], ancestor_blob_path: str | None = None) -> bytes:
         # KV payload: 1024 bytes/token, deterministic from token ids.
         # ponytail: test-only counter; ThreadingHTTPServer is thread-per-request
         # but the GIL makes this increment effectively safe. Add a lock if the
         # coalescing e2e ever sees a lost count.
         self.prefill_count += 1
+        # Test knob (see __init__): a transient RuntimeError on exactly the
+        # Nth call. The handler maps it to a 500, which the daemon must
+        # classify as a NON-rejection (no quarantine) — the ancestor blob
+        # was never invalid, the publish just failed.
+        if self._prefill_fail_at and self.prefill_count == self._prefill_fail_at:
+            raise RuntimeError(
+                f"synthetic induced prefill failure (test knob, call #{self.prefill_count})"
+            )
         # Optional delay (test knob): widens the single-flight window so
         # concurrent identical requests are provably coalesced. It runs BEFORE the
         # empty-prefix return below so a one-token prompt also holds the window
@@ -181,6 +405,25 @@ class SyntheticEngine:
         # payload.
         if len(tokens) < 2:
             return b""
+        covered = 0
+        if ancestor_blob_path is not None:
+            meta, _payload, usable = read_wire_checkpoint(
+                ancestor_blob_path, tokens, check_safetensors=False
+            )
+            if usable and meta is not None:
+                # read_wire_checkpoint verified meta.tokens == tokens[:n]
+                # against THIS request (the daemon only ever passes the matched
+                # ancestor of the same token sequence).
+                covered = len(meta.tokens) - 1
+        # Phase accounting (B2): what a real engine would recompute. The
+        # synthetic KV is a pure function of (token, position), so "prefilling
+        # the delta" reproduces the identical full payload — byte-parity with a
+        # scratch prefill by construction, while last_prefill_delta_tokens
+        # records how many model steps the delta path actually performed
+        # (scratch = len-1 steps; delta = len-covered-1 steps), so e2e tests
+        # can assert the delta path ran and how much it saved.
+        self.last_prefill_tokens = len(tokens)
+        self.last_prefill_delta_tokens = max(len(tokens) - 1 - covered, 0)
         payload = b"".join(
             ((t * 31 + i) & 0xFFFFFFFF).to_bytes(4, "little") * 256 for i, t in enumerate(tokens)
         )
@@ -208,6 +451,11 @@ class SyntheticEngine:
 
     def stream_prepared(self, prompt: list[int], cache):
         """Yield (token_id, text) from an already-prepared prompt/cache."""
+        # Test knob (daemon idle-timeout e2e): stall before the first token so
+        # the daemon's per-chunk idle budget can be exercised deterministically.
+        delay = float(os.environ.get("MLXCACHE_FIRST_TOKEN_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
         for i, t in enumerate(self.generate(prompt, 64)):
             yield t, f"tok{i} "
 
@@ -231,7 +479,37 @@ class MlxLmEngine:
         # identity. The vocab is deterministic and artifact-derived.
         self.tokenizer_hash = self._hash_vocab()
         self.kv_dtype = self._kv_dtype()
+        # T12 adoption knobs: KV quantization applied before persisting.
+        # bits=0 (default) = f16, byte-identical to the historical behavior.
+        # Only 8-bit group-64 is parity-proven (T12); anything else is the
+        # operator's explicit choice and is fingerprinted as its own tier.
+        self.kv_bits = max(0, int(os.environ.get("MLXCACHE_KV_BITS", "0") or 0))
+        self.kv_group_size = max(0, int(os.environ.get("MLXCACHE_KV_GROUP_SIZE", "0") or 0))
+        if self.kv_bits and not self.kv_group_size:
+            # A group size is mandatory with quantization; 64 is the proven one.
+            self.kv_group_size = 64
         self.prefill_count = 0
+        # Metal allocator hygiene: MLX pools freed GPU buffers by size-class
+        # indefinitely (set_cache_limit defaults high). A day of mixed-leg
+        # 20K prefills (each a new size class) then grows the pool for the
+        # life of the process. Bound the cache; freed buffers beyond it are
+        # released to the OS instead of pooled. (Read the env as MB; 0 keeps
+        # the library default for tests that never want reclaim churn.)
+        metal_cache_mb = os.environ.get("MLXCACHE_METAL_CACHE_MB", "1024")
+        try:
+            import mlx.core as mx  # noqa: PLC0415
+
+            limit = int(metal_cache_mb) * 1024 * 1024
+            try:
+                mx.set_cache_limit(limit)
+            except AttributeError:  # older MLX: knob lived under mx.metal
+                mx.metal.set_cache_limit(limit)
+        except (ImportError, AttributeError, ValueError):
+            pass  # CPU-only build or older MLX without the knob: nothing to bound
+        # EOS for THIS tokenizer artifact (identity-pinned alongside it).
+        self._eos_ids = getattr(self.tokenizer, "_eos_token_ids", None) or {
+            self.tokenizer.eos_token_id
+        }
 
     def _kv_dtype(self) -> str:
         """The KV/compute dtype this model will cache in (bf16 vs f16 changes the
@@ -280,7 +558,52 @@ class MlxLmEngine:
         mx.eval([c.state for c in cache], logits)
         return cache, logits
 
-    def prefill(self, tokens: list[int]) -> bytes:
+    def _load_cache_from_payload(self, payload: bytes):
+        """Load a prompt cache from an ALREADY-VALIDATED safetensors payload.
+
+        Delta prefill needs the same load the generate path does, but without a
+        second disk read (the caller just validated the wire checkpoint). A
+        pure-Python parse/schema failure is corruption → CheckpointRejectedError
+        (422/quarantine); OSError/RuntimeError stay transient (500)."""
+        from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
+
+        # Parse from memory: the daemon just sent this payload over the wire
+        # and validated it — a temp-file write + read doubled disk I/O per
+        # PARTIAL hit at GB scale (performance review 2026-10-04).
+        # load_prompt_cache forwards to mx.load WITHOUT a format argument, so
+        # mlx infers safetensors from the file EXTENSION and reads `.name` —
+        # a bare BytesIO raises AttributeError. Naming the buffer satisfies
+        # the inference; the data itself still never touches disk.
+        blob = io.BytesIO(payload)
+        blob.name = "checkpoint.safetensors"
+        try:
+            return load_prompt_cache(blob)
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+            raise CheckpointRejectedError(
+                f"checkpoint failed to load: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def _quantize_cache(self, cache):
+        """Apply the configured KV quantization (T12 tier). No-op at bits=0.
+
+        A cache already holding QuantizedKVCache layers (a delta prefill that
+        adopted a quantized ancestor) must NOT be re-quantized: to_quantized
+        runs mx.quantize over the packed uint32 words as if they were floats,
+        corrupting the KV (the fingerprint pins kv_bits/kv_group_size, so an
+        adoptable ancestor is always this same tier — skipping is exact).
+        """
+        if not self.kv_bits:
+            return cache
+        from mlx_lm.models.cache import QuantizedKVCache  # noqa: PLC0415
+
+        return [
+            c
+            if isinstance(c, QuantizedKVCache)
+            else c.to_quantized(group_size=self.kv_group_size, bits=self.kv_bits)
+            for c in cache
+        ]
+
+    def prefill(self, tokens: list[int], ancestor_blob_path: str | None = None) -> bytes:
         import mlx.core as mx  # noqa: PLC0415
         from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
 
@@ -296,16 +619,55 @@ class MlxLmEngine:
         # scratch.
         if len(tokens) < 2:
             return b""
-        cache, _ = self._prefill_cache(tokens[:-1])
-        # safetensors needs a real file; write to a temp, then read the bytes.
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
-            tmp = fh.name
-        try:
-            save_prompt_cache(tmp, cache)
-            with open(tmp, "rb") as fh:
-                payload = fh.read()
-        finally:
-            os.unlink(tmp)
+        cache = None
+        covered = 0
+        if ancestor_blob_path is not None:
+            # Delta prefill (OV3 — the single biggest TTFT lever on a growing
+            # conversation): adopt the ancestor's KV instead of recomputing it.
+            # read_wire_checkpoint enforces the trust boundary (prefix must
+            # agree with THIS request; bad → 422 → the daemon quarantines and
+            # retries from scratch).
+            meta, payload, usable = read_wire_checkpoint(ancestor_blob_path, tokens)
+            if usable:
+                t0 = time.perf_counter()
+                cache = self._load_cache_from_payload(payload)
+                _phase_add("cache_load", (time.perf_counter() - t0) * 1000)
+                # The persisted cache covers meta.tokens[:-1] = tokens[:covered].
+                covered = len(meta.tokens) - 1
+        if cache is None:
+            cache, _ = self._prefill_cache(tokens[:-1])
+            self.last_prefill_tokens = len(tokens)
+            self.last_prefill_delta_tokens = len(tokens) - 1
+        else:
+            # Feed ONLY the uncovered tokens, stopping BEFORE the final token so
+            # the saved cache covers tokens[:-1] — byte-identical convention to a
+            # scratch prefill. Work drops from len(tokens)-1 model steps to
+            # len(tokens)-1-covered.
+            delta = tokens[covered:-1]
+            self.last_prefill_tokens = len(tokens)
+            self.last_prefill_delta_tokens = len(delta)
+            if delta:
+                t0 = time.perf_counter()
+                inp = mx.array(delta)[None]
+                logits = self.model(inp, cache=cache)
+                mx.eval([c.state for c in cache], logits)
+                _phase_add("delta_prefill", (time.perf_counter() - t0) * 1000)
+        # Serialize to an IN-MEMORY buffer: the payload must be in RAM for the
+        # HTTP response regardless, so the old temp-file roundtrip (a full
+        # GB-scale disk write + read back at 20K tokens, before the daemon
+        # could even publish) was pure TTFT tax with zero durability benefit
+        # (performance review 2026-10-04). mx.save_safetensors — and thus
+        # save_prompt_cache — accepts file objects.
+        # Quantize BEFORE save (T12 tier): the persisted blob holds the
+        # quantized state, so bytes/token drops ~47% at 8-bit g64. The
+        # fingerprint the daemon recorded already pins (kv_bits,
+        # kv_group_size) from /tokenize, so f16 and q8 never cross-serve.
+        cache = self._quantize_cache(cache)
+        buf = io.BytesIO()
+        t0 = time.perf_counter()
+        save_prompt_cache(buf, cache)
+        _phase_add("cache_save", (time.perf_counter() - t0) * 1000)
+        payload = buf.getvalue()
         mx.clear_cache()
 
         # Return the raw safetensors payload. The daemon owns the checkpoint
@@ -343,6 +705,11 @@ class MlxLmEngine:
 
     def stream_prepared(self, prompt, cache):
         """Yield (token_id, text) after the checkpoint is already loaded."""
+        # Test knob (daemon idle-timeout e2e): stall before the first token so
+        # the daemon's per-chunk idle budget can be exercised deterministically.
+        delay = float(os.environ.get("MLXCACHE_FIRST_TOKEN_DELAY", "0"))
+        if delay:
+            time.sleep(delay)
         yield from self._stream_with_cache(prompt, cache)
 
     def _stream_with_cache(self, prompt, cache):
@@ -384,79 +751,25 @@ class MlxLmEngine:
         one-token prompt whose cache covers 0 tokens (delta = the whole prompt)."""
         from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
 
-        from .blob import decode  # noqa: PLC0415
-
-        # Read first: an OSError here (EIO, ENFILE, EMFILE, ENOMEM, a momentary
-        # disk fault) is TRANSIENT, not a bad checkpoint. Let it propagate as a
-        # 500 so the daemon retries without retiring a healthy entry.
-        with open(blob_path, "rb") as fh:
-            raw = fh.read()
-        try:
-            meta, payload = decode(raw)
-            # The JSON header is untrusted: a field of the wrong type (e.g.
-            # "tokens":123) must be rejected here, inside the boundary. Letting
-            # len() raise a bare TypeError outside it would 500 forever and leave
-            # the poison selectable.
-            if not isinstance(meta.tokens, list) or not all(
-                isinstance(t, int) and not isinstance(t, bool) for t in meta.tokens
-            ):
-                raise ValueError("tokens must be a list of integers")
-        except (ValueError, KeyError, TypeError) as exc:
-            # A header that does not decode or lacks required fields is a bad
-            # checkpoint: retire it rather than 500 forever while it stays
-            # selectable.
-            raise CheckpointRejectedError(f"checkpoint header invalid: {exc}") from exc
-        # The checkpoint prefix must be self-describing: only meta.tokens tells
-        # us which prefix the KV actually covers. The daemon always writes
-        # meta.tokens, so a blob the index matched WITHOUT them cannot be
-        # verified against this request. Adopting it would trust it covers
-        # tokens[:token_count] by construction; silently running scratch while
-        # the daemon reports a hit would be an accounting lie. Reject it.
-        if not meta.tokens:
-            raise CheckpointRejectedError("checkpoint has no recorded token prefix")
-        prefix_len = len(meta.tokens)
-        if prefix_len < 2 or prefix_len > len(tokens):
-            # A prefix shorter than 2 caches nothing. This also rejects legacy
-            # one-token checkpoints whose nonempty KV already holds that token:
-            # adopting one and feeding the whole prompt would double-feed it.
+        meta, payload, usable = read_wire_checkpoint(blob_path, tokens)
+        if not usable:
             return None, tokens
-        # The adapter is a trust boundary: verify the blob really covers this
-        # request's prefix. A disagreement means the file does not match the
-        # index entry that pointed at it (mislabeled/corrupt): retire it, do not
-        # silently resume from or ignore wrong KV.
-        prefix = meta.tokens
-        if prefix != tokens[:prefix_len]:
-            raise CheckpointRejectedError("checkpoint prefix does not match the request")
-        # A multi-token checkpoint with no KV payload is CORRUPT (a truncated
-        # write), not uncacheable: reject so the daemon quarantines the entry.
-        if not payload:
-            raise CheckpointRejectedError("checkpoint payload is empty")
-        # Validate the safetensors framing ourselves, BEFORE handing it to MLX.
-        # MLX's native parser raises RuntimeError for a bad header length, the
-        # same type it uses for a transient OS read failure, so we cannot classify
-        # from the exception alone. A malformed inner header is deterministic
-        # corruption: reject it here so it is retired, while RuntimeError from the
-        # loader below stays transient (500).
-        if not _valid_safetensors(payload):
-            raise CheckpointRejectedError("checkpoint payload is not valid safetensors")
-        covered = prefix_len - 1
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
-            tmp = fh.name
-            fh.write(payload)
+        covered = len(meta.tokens) - 1
+        # From-memory load — same rationale and same named-buffer requirement
+        # as _load_cache_from_payload (performance review 2026-10-04).
+        # A pure-Python parse/schema failure is corruption: reject so the
+        # daemon retires it. MemoryError, OSError, and RuntimeError are
+        # transient (a real OOM, a disk fault; MLX's native reader raises
+        # RuntimeError on an OS read failure): let them propagate as a 500 so
+        # a healthy checkpoint is not retired.
+        blob = io.BytesIO(payload)
+        blob.name = "checkpoint.safetensors"
         try:
-            # A pure-Python parse/schema failure is corruption: reject so the
-            # daemon retires it. MemoryError, OSError, and RuntimeError are
-            # transient (a real OOM, a disk fault; MLX's native reader raises
-            # RuntimeError on an OS read failure): let them propagate as a 500 so
-            # a healthy checkpoint is not retired.
-            try:
-                return load_prompt_cache(tmp), tokens[covered:]
-            except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
-                raise CheckpointRejectedError(
-                    f"checkpoint failed to load: {type(exc).__name__}: {exc}"
-                ) from exc
-        finally:
-            os.unlink(tmp)
+            return load_prompt_cache(blob), tokens[covered:]
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+            raise CheckpointRejectedError(
+                f"checkpoint failed to load: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def generate_from_blob(self, tokens: list[int], blob_path: str, max_tokens: int) -> list[int]:
         """Resume generation from a persisted wire-format checkpoint (a cache
@@ -481,6 +794,20 @@ def make_engine(model_id: str) -> SyntheticEngine | MlxLmEngine:
 class Handler(BaseHTTPRequestHandler):
     engine: object = None  # set by serve()
 
+    # HTTP/1.1 keep-alive (Content-Length is always set on every response,
+    # including errors — see _json/_binary). The daemon's reqwest pool REUSES
+    # connections; with the HTTP/1.0 default each response closed the socket
+    # while the pool raced the next request onto it, surfacing as spurious
+    # ConnectionReset/500s under concurrent load (the e2e coalescing tests
+    # tripped this flakily in release builds).
+    protocol_version = "HTTP/1.1"
+
+    # A pooled keep-alive socket that sits idle between bursts must not die
+    # mid-teardown when the next request lands: None disables the socket
+    # timeout (BaseHTTPRequestHandler's default), relying on the daemon's own
+    # budgets (JSON total timeout, stream open/idle) for liveness.
+    timeout = None
+
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("sidecar: %s\n" % (fmt % args))
 
@@ -497,6 +824,18 @@ class Handler(BaseHTTPRequestHandler):
         if key not in req:
             raise Handler._BadRequestError(f"missing required field '{key}'")
         return req[key]
+
+    @staticmethod
+    def _require_tokens(req: dict) -> list[int]:
+        """The daemon always sends a JSON list of ints; anything else is a
+        client error (400), not a 500 raised from inside the engine. bool is
+        excluded: isinstance(True, int) in Python."""
+        tokens = Handler._require(req, "tokens")
+        if not isinstance(tokens, list) or not all(
+            isinstance(t, int) and not isinstance(t, bool) for t in tokens
+        ):
+            raise Handler._BadRequestError("tokens must be a list of integers")
+        return tokens
 
     def _binary(self, code: int, body: bytes) -> None:
         self.send_response(code)
@@ -548,6 +887,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
+        # Test knob: flood the stream with N bytes and NO newline, then hold
+        # the connection open. Exercises the daemon's partial-line cap
+        # (MAX_PARTIAL_LINE): the idle budget only governs byte ARRIVALS, so
+        # a fast newline-free flood must trip the explicit "unbounded line"
+        # upstream error instead of growing the bridge buffer.
+        flood = int(os.environ.get("MLXCACHE_STREAM_FLOOD", "0") or 0)
+        if flood:
+            self.wfile.write(b"x" * flood)
+            self.wfile.flush()
+            time.sleep(30)
+            return
+
         n = 0
         try:
             gen = self.engine.stream_prepared(prompt, cache)
@@ -577,22 +928,53 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/tokenize":
                 req = self._read_json()
-                tokens = self.engine.tokenize(req.get("prompt", ""))
+                # Client error, not a 500: a non-string prompt would raise
+                # inside the tokenizer (AttributeError/TypeError) after the
+                # handler's trust boundary — reject it before any engine call.
+                prompt = req.get("prompt")
+                if not isinstance(prompt, str):
+                    self._json(400, {"error": "prompt must be a string"})
+                    return
+                t0 = time.perf_counter()
+                tokens = self.engine.tokenize(prompt)
+                _phase_add("tokenize", (time.perf_counter() - t0) * 1000)
                 self._json(
                     200,
                     {
                         "tokens": tokens,
                         "tokenizer_hash": getattr(self.engine, "tokenizer_hash", "synthetic"),
                         "kv_dtype": getattr(self.engine, "kv_dtype", "unknown"),
+                        "kv_bits": getattr(self.engine, "kv_bits", 0),
+                        "kv_group_size": getattr(self.engine, "kv_group_size", 0),
                     },
                 )
             elif self.path == "/prefill":
                 req = self._read_json()
-                blob = self.engine.prefill(self._require(req, "tokens"))
+                # Delta prefill (OV3): the daemon passes the matched ancestor
+                # checkpoint's absolute path when this request extends one. The
+                # engine verifies it as a trust boundary (a mismatching or
+                # corrupt ancestor → 422 → quarantine + scratch retry) and
+                # prefills only the uncovered delta.
+                ancestor = req.get("ancestor_blob_path")
+                if ancestor is not None:
+                    if not isinstance(ancestor, str) or not ancestor:
+                        self._json(400, {"error": "ancestor_blob_path must be a non-empty string"})
+                        return
+                    try:
+                        os.stat(ancestor)
+                    except FileNotFoundError:
+                        # The index pointed at a blob that is now gone: the same
+                        # treatment as a missing generate blob (422 → quarantine
+                        # → the daemon retries from scratch).
+                        self._json(422, {"error": f"ancestor blob missing: {ancestor}"})
+                        return
+                t0 = time.perf_counter()
+                blob = self.engine.prefill(self._require_tokens(req), ancestor)
+                _phase_add("prefill", (time.perf_counter() - t0) * 1000)
                 self._binary(200, blob)
             elif self.path == "/generate":
                 req = self._read_json()
-                tokens = self._require(req, "tokens")
+                tokens = self._require_tokens(req)
                 # A MISSING blob is a bad checkpoint: 422 so the daemon
                 # quarantines it and retries from scratch. Use os.stat, not
                 # os.path.exists, so a transient stat failure (EIO, ENFILE)
@@ -647,15 +1029,42 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/stats":
             # Test observability: how many prefills the engine actually ran.
             # Proves single-flight coalesced concurrent identical requests.
-            self._json(200, {"prefill_count": getattr(self.engine, "prefill_count", None)})
+            # Phase timers (B2) decompose where prefill time goes (cache load,
+            # delta prefill, save) and what the delta path actually saved.
+            engine = self.engine
+            self._json(
+                200,
+                {
+                    "prefill_count": getattr(engine, "prefill_count", None),
+                    "last_prefill_tokens": getattr(engine, "last_prefill_tokens", 0),
+                    "last_prefill_delta_tokens": getattr(engine, "last_prefill_delta_tokens", 0),
+                    "phases": _phase_stats(),
+                },
+            )
         else:
             self._json(404, {"error": f"unknown path {self.path}"})
+
+
+class BurstServer(ThreadingHTTPServer):
+    """Sidecar HTTP server with a production-shaped listen backlog.
+
+    Stock ThreadingHTTPServer has request_queue_size = 5: a connect burst
+    larger than 5 (single-flight releases a whole coalesced burst at once,
+    plus health probes) resets surplus connections on a loaded machine,
+    which the daemon classifies as adapter_unreachable → 503 — the exact
+    failure two e2e single-flight tests hit under parallel test load
+    (2026-10-04). Backlog 128 + daemon threads: accept bursts drain fast
+    because every request gets a thread immediately.
+    """
+
+    request_queue_size = 128
+    daemon_threads = True
 
 
 def serve(addr: str = "127.0.0.1", port: int = 8421) -> None:
     model_id = os.environ.get("MLXCACHE_MODEL", "synthetic-model")
     Handler.engine = make_engine(model_id)
-    server = ThreadingHTTPServer((addr, port), Handler)
+    server = BurstServer((addr, port), Handler)
     print(f"sidecar: {Handler.engine.name} engine on {addr}:{port}", flush=True)
     server.serve_forever()
 

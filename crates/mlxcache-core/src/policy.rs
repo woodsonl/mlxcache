@@ -82,6 +82,18 @@ pub fn covered_kv_tokens(verdict: CacheVerdict, matched_tokens: usize) -> usize 
     }
 }
 
+/// The canonical "this request cached nothing" decision: a miss with zero
+/// matched tokens. One definition so every force-scratch site (empty adapter
+/// payload, publish refusal, publish failure, follower of a no-publish leader)
+/// reports identical verdicts and cannot drift apart.
+pub fn scratch_decision(request_tokens: usize) -> PolicyDecision {
+    PolicyDecision {
+        verdict: CacheVerdict::Miss,
+        matched_tokens: 0,
+        request_tokens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +104,7 @@ mod tests {
             tokenizer_hash: "h".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            ..Default::default()
         }
     }
 
@@ -146,5 +159,16 @@ mod tests {
         assert_eq!(covered_kv_tokens(CacheVerdict::Miss, 8), 0);
         assert_eq!(covered_kv_tokens(CacheVerdict::Partial, 0), 0);
         assert_eq!(covered_kv_tokens(CacheVerdict::Hit, 1), 0);
+    }
+
+    #[test]
+    fn scratch_decision_is_a_zero_coverage_miss() {
+        // The single force-scratch constructor: a miss that claims no matched
+        // tokens and no covered KV, for whatever the request length was.
+        let d = scratch_decision(17);
+        assert_eq!(d.verdict, CacheVerdict::Miss);
+        assert_eq!(d.matched_tokens, 0);
+        assert_eq!(d.request_tokens, 17);
+        assert_eq!(covered_kv_tokens(d.verdict, d.matched_tokens), 0);
     }
 }

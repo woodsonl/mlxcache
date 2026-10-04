@@ -37,6 +37,11 @@ jobs:
           MLXCACHE_BENCH_REAL: "0"
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Hot-path alloc gate (SSE framer ≤ 1 alloc/frame)
+        # Single-threaded on purpose: the counting allocator is process-global,
+        # so parallel test-harness threads would leak allocations into the
+        # measurement window and flake the tight budgets.
+        run: cargo test -p mlxcache-daemon --test alloc_gate --release -- --test-threads=1
 
   python:
     runs-on: macos-14
@@ -51,6 +56,10 @@ jobs:
         run: uv run ruff format --check sidecar/
       - name: Test
         run: uv run pytest sidecar/tests/ -v
+        env:
+          # The probes are opt-in real-engine experiments, not hermetic tests;
+          # keep them out of the pytest collection on CI.
+          MLXCACHE_BENCH_REAL: "0"
 
   # The real mlx-lm round-trip is the product's core claim (resumed generation ==
   # scratch generation). It needs a ~500MB model download + load, so it runs on a
@@ -73,4 +82,10 @@ jobs:
         run: uv run pytest sidecar/tests/test_roundtrip_real.py -v
         env:
           MLXCACHE_BENCH_REAL: "1"
+      - name: Real delta-prefill parity (OV3 on the real engine)
+        # T17: the same gate at 64-token oracle width, plus the delta-prefill
+        # resume path — generation from an ancestor-derived blob must be
+        # token-identical to scratch.
+        run: uv run pytest sidecar/tests/test_roundtrip_real.py::test_adapter_delta_prefill_matches_scratch -v
+        if: runner.arch == 'arm64'
 
