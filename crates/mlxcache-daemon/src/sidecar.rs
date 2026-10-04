@@ -81,12 +81,51 @@ impl SidecarError {
     }
 }
 
+/// Error-body read budget for classifying a failed sidecar response: a total
+/// deadline of 5s. JSON calls carry a total client timeout, but the classify
+/// step reads the body AFTER the headers are in — without its own deadline, a
+/// sidecar that sends 4xx/5xx headers then stalls would wedge the request
+/// outside every other budget. 5s covers an honest slow error page on localhost.
+const ERROR_BODY_TIMEOUT_S: u64 = 5;
+/// Cap on how much error body is read before classifying. Error frames are
+/// SSE/JSON produced by our own adapter — a 422 rejection detail or an HTTP
+/// error page — small by construction, so 64KB is generous headroom; the cap
+/// exists only so a misbehaving sidecar cannot flood the daemon's memory.
+const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
+
 /// Map a non-success sidecar response to the right error. HTTP 422 is the
 /// adapter's explicit checkpoint rejection; everything else is a plain HTTP
 /// error. Shared so every endpoint classifies identically.
-async fn classify_http_error(resp: reqwest::Response) -> SidecarError {
+async fn classify_http_error(mut resp: reqwest::Response) -> SidecarError {
     let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
+    // Read chunk-by-chunk under a total deadline and a size cap, stopping at
+    // whichever bound lands first: a stalled sidecar must yield a PARTIAL
+    // classification (still the right status), not a wedge, and a flood must
+    // not grow memory unboundedly. Bodies are our own UTF-8 JSON/SSE, so a
+    // lossy decode can only mangle a truncated tail, never a real message.
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(ERROR_BODY_TIMEOUT_S);
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        // `chunk()` itself returns a Result (transport layer), which the
+        // timeout then wraps (deadline layer) — hence the two matches.
+        let chunk = match tokio::time::timeout_at(deadline, resp.chunk()).await {
+            // Deadline elapsed: stop reading, classify what arrived.
+            Err(_elapsed) => break,
+            Ok(inner) => match inner {
+                // Body complete or transport died mid-read: classify what
+                // made it across either way.
+                Ok(None) | Err(_) => break,
+                Ok(Some(chunk)) => chunk,
+            },
+        };
+        let take = chunk.len().min(ERROR_BODY_MAX_BYTES - raw.len());
+        raw.extend_from_slice(&chunk[..take]);
+        if raw.len() >= ERROR_BODY_MAX_BYTES {
+            break;
+        }
+    }
+    let body = String::from_utf8_lossy(&raw).into_owned();
     classify_status(status, body)
 }
 
@@ -128,7 +167,7 @@ impl SidecarClient {
         let idle_s: u64 = std::env::var("MLXCACHE_STREAM_IDLE_TIMEOUT_S")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(60);
+            .unwrap_or_else(default_stream_idle_s);
         Self::with_timeouts(config, timeout_s, idle_s)
     }
 

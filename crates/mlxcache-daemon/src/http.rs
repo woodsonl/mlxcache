@@ -22,6 +22,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+/// Cap on the stream line buffer between newlines. The idle timeout governs
+/// byte ARRIVALS, not their content, so a fast flood without a newline would
+/// otherwise grow `st.buf` unboundedly; past this the stream is cut with an
+/// explicit upstream error (no legitimate token frame approaches it).
+const MAX_PARTIAL_LINE: usize = 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -380,7 +386,6 @@ async fn chat_completions(
                     Ok(blob) => {
                         publish_leader_blob(
                             state.clone(),
-                            client,
                             lead,
                             &mut outcome,
                             &fingerprint,
@@ -420,7 +425,6 @@ async fn chat_completions(
                                 Ok(blob) if !blob.is_empty() && tokens.len() >= 2 => {
                                     publish_leader_blob(
                                         state.clone(),
-                                        client,
                                         lead,
                                         &mut outcome,
                                         &fingerprint,
@@ -625,14 +629,16 @@ async fn chat_completions(
 /// reporting a miss would hide real reuse from /stats and hit_rate. When no
 /// ancestor was adopted, the leader ran a fresh full prefill and reports a
 /// plain miss with zero covered KV (generation resuming from the blob just
-/// written is not reuse). On any write/refusal failure the outcome is forced
-/// to scratch and single-flight is completed with the empty-name sentinel so
-/// followers run from scratch too (OV6: a failed publish must never 502 a
-/// follower whose request was fine).
-#[allow(clippy::too_many_arguments)]
+/// written is not reuse). On a write/refusal failure the outcome degrades:
+/// a leader that adopted an ancestor keeps its Partial (the ancestor's KV is
+/// still published and reusable — the ENOSPC/refusal path completes
+/// single-flight with the ancestor's name so followers re-route onto it),
+/// and only a leader with no adopted ancestor is forced to scratch, with
+/// single-flight completed with the empty-name sentinel so followers run from
+/// scratch too (OV6: a failed publish must never 502 a follower whose request
+/// was fine).
 async fn publish_leader_blob(
     state: Arc<AppState>,
-    _client: &SidecarClient,
     lead: mlxcache_core::singleflight::Leadership,
     outcome: &mut crate::orchestrator::RouteOutcome,
     fingerprint: &ModelFingerprint,
@@ -761,14 +767,6 @@ async fn publish_leader_blob(
     Ok(())
 }
 
-/// Stable blob key for a token prefix: 128 bits from two FNV-1a passes with
-/// different seeds and different primes, so a collision in one lane does not
-/// correlate with the other. 64 bits is too thin as the store grows; a filename
-/// collision would alias two distinct KV states. (The index is exact and keyed
-/// by token ids; this only names the blob on disk.)
-///
-/// The token-only prefix hash for the request log line. Public for the B1
-/// criterion bench; the blob filename uses a DIFFERENT key (`blob_key` =
 /// Adapter-reported cache identity (R1-1/R1-2): everything the fingerprint
 /// pins that the sidecar owns. The native-tokenize path adopts it wholesale
 /// after the parity probe so fingerprints stay byte-identical to the
@@ -781,7 +779,6 @@ struct Identity {
     kv_group_size: u32,
 }
 
-/// fingerprint + tokens) — the two are not equal.
 /// T13 identity resolution: prove the native tokenizer IS the engine's, once,
 /// then reuse the verdict forever (the artifact cannot change mid-process).
 ///
@@ -861,6 +858,13 @@ async fn resolve_native_identity(
     Ok(identity)
 }
 
+/// The token-only prefix hash for the request log line: 128 bits from two
+/// FNV-1a passes with different seeds and different primes, so a collision in
+/// one lane does not correlate with the other. 64 bits is too thin as the
+/// store grows; a collision would alias two distinct KV states in the log.
+/// (The index is exact and keyed by token ids; this only names log lines.)
+/// Public for the B1 criterion bench; the blob filename uses a DIFFERENT key
+/// (`blob_key` = fingerprint + tokens) — the two are not equal.
 pub fn prefix_hash(tokens: &[u32]) -> u128 {
     fn fnv1a(seed: u64, prime: u64, tokens: &[u32]) -> u64 {
         let mut h = seed;
@@ -1090,6 +1094,10 @@ async fn stream_response(
     // a final flush handles a trailing line with no newline plus a guaranteed
     // [DONE] terminator (SSE clients wait for it; an early close must not leave
     // them hanging or silently truncate the completion).
+    //
+    // The line buffer itself is bounded (MAX_PARTIAL_LINE): a flood of bytes
+    // containing no newline never trips the idle timeout (bytes ARE arriving),
+    // so without a cap the buffer would grow unboundedly on a fast flood.
     let meta_bytes = bytes::Bytes::from(format!("data: {meta_line}\n\n"));
     let first =
         futures_util::stream::once(async move { Ok::<bytes::Bytes, std::io::Error>(meta_bytes) });
@@ -1149,6 +1157,27 @@ async fn stream_response(
                 }
                 Ok(Some(Ok(bytes))) => {
                     st.buf.extend_from_slice(&bytes);
+                    // Bound the partial-line buffer: a fast flood with no
+                    // newline never fires the idle timeout, so the buffer
+                    // needs its own cap. Frames are emitted (including the
+                    // stats frame when TTFT is known), not silently dropped,
+                    // matching the stream-abort shape above.
+                    if !st.buf.contains(&b'\n') && st.buf.len() > MAX_PARTIAL_LINE {
+                        if let Some(ttft) = st.ttft_ms {
+                            let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
+                            frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
+                        }
+                        let err = serde_json::json!({
+                            "error": {
+                                "message": "upstream protocol error: unbounded line",
+                                "type": "upstream_error",
+                            }
+                        });
+                        frames.push(Ok(bytes::Bytes::from(format!("data: {err}\n\n"))));
+                        frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
+                        st.done = true;
+                        break;
+                    }
                     while let Some(pos) = st.buf.iter().position(|b| *b == b'\n') {
                         let line = st.buf.split_to(pos + 1);
                         push_frame(&mut frames, &line);

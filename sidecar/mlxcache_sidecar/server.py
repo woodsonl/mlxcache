@@ -199,12 +199,18 @@ def read_wire_checkpoint(
     """
     from .blob import decode  # noqa: PLC0415
 
-    # Read first: an OSError here is TRANSIENT, not a bad checkpoint (see
-    # docstring). A MISSING file is also surfaced as rejection: the daemon
-    # only passes paths its index currently points at, so a miss here means
-    # the entry is already bad (retired/raced); 422 cleans it up.
-    with open(blob_path, "rb") as fh:
-        raw = fh.read()
+    # Read first. A MISSING file is a raced/retired checkpoint (the daemon
+    # only passes paths its index currently points at): reject it (422 →
+    # quarantine + scratch retry), not a 500 — a 500 makes the daemon treat
+    # it as transient, the client eats a 502, and the dead entry stays
+    # selectable. EVERY OTHER OSError (EIO, ENFILE, ...) is transient: let it
+    # propagate as a 500 — a failed stat/open must never retire a healthy
+    # entry (see os.stat pre-checks in the handlers).
+    try:
+        with open(blob_path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError as exc:
+        raise CheckpointRejectedError(f"blob missing: {blob_path}") from exc
     try:
         meta, payload = decode(raw)
         # The JSON header is untrusted: a field of the wrong type (e.g.
@@ -215,10 +221,14 @@ def read_wire_checkpoint(
             isinstance(t, int) and not isinstance(t, bool) for t in meta.tokens
         ):
             raise ValueError("tokens must be a list of integers")
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
         # A header that does not decode or lacks required fields is a bad
         # checkpoint: retire it rather than 500 forever while it stays
-        # selectable.
+        # selectable. AttributeError (fingerprint: null/[]/5 → .items() on a
+        # non-dict) and RecursionError (deeply nested JSON) were both
+        # reproducible escapes — outside this handler they are a 500 with the
+        # poison left selectable (mirror _valid_safetensors, which already
+        # covers them).
         raise CheckpointRejectedError(f"checkpoint header invalid: {exc}") from exc
     # The checkpoint prefix must be self-describing: only meta.tokens tells
     # us which prefix the KV actually covers. The daemon always writes
@@ -461,6 +471,23 @@ class MlxLmEngine:
             # A group size is mandatory with quantization; 64 is the proven one.
             self.kv_group_size = 64
         self.prefill_count = 0
+        # Metal allocator hygiene: MLX pools freed GPU buffers by size-class
+        # indefinitely (set_cache_limit defaults high). A day of mixed-leg
+        # 20K prefills (each a new size class) then grows the pool for the
+        # life of the process. Bound the cache; freed buffers beyond it are
+        # released to the OS instead of pooled. (Read the env as MB; 0 keeps
+        # the library default for tests that never want reclaim churn.)
+        metal_cache_mb = os.environ.get("MLXCACHE_METAL_CACHE_MB", "1024")
+        try:
+            import mlx.core as mx  # noqa: PLC0415
+
+            limit = int(metal_cache_mb) * 1024 * 1024
+            try:
+                mx.set_cache_limit(limit)
+            except AttributeError:  # older MLX: knob lived under mx.metal
+                mx.metal.set_cache_limit(limit)
+        except (ImportError, AttributeError, ValueError):
+            pass  # CPU-only build or older MLX without the knob: nothing to bound
         # T21 (lean decode): skip stream_generate's per-token machinery —
         # the full-vocab logsumexp (pure GPU waste when we only argmax), a
         # GenerationResponse dataclass built per token (with get_peak_memory +
@@ -543,10 +570,24 @@ class MlxLmEngine:
             os.unlink(tmp)
 
     def _quantize_cache(self, cache):
-        """Apply the configured KV quantization (T12 tier). No-op at bits=0."""
+        """Apply the configured KV quantization (T12 tier). No-op at bits=0.
+
+        A cache already holding QuantizedKVCache layers (a delta prefill that
+        adopted a quantized ancestor) must NOT be re-quantized: to_quantized
+        runs mx.quantize over the packed uint32 words as if they were floats,
+        corrupting the KV (the fingerprint pins kv_bits/kv_group_size, so an
+        adoptable ancestor is always this same tier — skipping is exact).
+        """
         if not self.kv_bits:
             return cache
-        return [c.to_quantized(group_size=self.kv_group_size, bits=self.kv_bits) for c in cache]
+        from mlx_lm.models.cache import QuantizedKVCache  # noqa: PLC0415
+
+        return [
+            c
+            if isinstance(c, QuantizedKVCache)
+            else c.to_quantized(group_size=self.kv_group_size, bits=self.kv_bits)
+            for c in cache
+        ]
 
     def prefill(self, tokens: list[int], ancestor_blob_path: str | None = None) -> bytes:
         import mlx.core as mx  # noqa: PLC0415
@@ -673,6 +714,18 @@ class MlxLmEngine:
         """
         import mlx.core as mx  # noqa: PLC0415
 
+        # A scratch request (no adopted checkpoint) arrives with cache=None.
+        # The loop's single-token steps would then run with NO context — each
+        # call sees only the one generated token, so output is garbage after
+        # the first token. Allocate a fresh prompt cache: the first
+        # full-prompt call below prefills it, and history persists across the
+        # loop exactly as in the mlx-lm path (stream_generate does the same
+        # internally when handed a None cache).
+        if cache is None:
+            from mlx_lm.models.cache import make_prompt_cache  # noqa: PLC0415
+
+            cache = make_prompt_cache(self.model)
+
         # A detokenizer is STATEFUL per stream: create one per call, never
         # cache it on the engine (ThreadingHTTPServer interleaves streams).
         detok = self.tokenizer.detokenizer
@@ -694,18 +747,25 @@ class MlxLmEngine:
 
                 token = int(y.item())
                 detok.add_token(token)
+                # Finalize BEFORE the final yield (EOS, or the cap consumed
+                # by this step): the last yielded segment must be the
+                # finalized one, or any text still buffered in the
+                # detokenizer is silently dropped — stream_generate finalizes
+                # before its last frame, and parity tests diff full text.
                 # Yield EVERY token including EOS, mirroring stream_generate
                 # (its final frame carries the EOS token; parity tests diff
                 # full token lists, so the stream shapes must match).
+                last = token in eos or n + 1 >= 256
+                if last:
+                    detok.finalize()
                 yield token, detok.last_segment
-                if token in eos:
+                if last:
                     break
 
                 y = next_y
                 n += 1
-                if n >= 256:
-                    break
-        detok.finalize()
+        # (finalize moved into the loop: after the last yield it was
+        # unreachable by the consumer and dropped its text)
 
     def stream_with_cache(self, tokens, cache):
         """Yield (token_id, text_piece) per decode step from mlx-lm.
@@ -825,6 +885,18 @@ class Handler(BaseHTTPRequestHandler):
             raise Handler._BadRequestError(f"missing required field '{key}'")
         return req[key]
 
+    @staticmethod
+    def _require_tokens(req: dict) -> list[int]:
+        """The daemon always sends a JSON list of ints; anything else is a
+        client error (400), not a 500 raised from inside the engine. bool is
+        excluded: isinstance(True, int) in Python."""
+        tokens = Handler._require(req, "tokens")
+        if not isinstance(tokens, list) or not all(
+            isinstance(t, int) and not isinstance(t, bool) for t in tokens
+        ):
+            raise Handler._BadRequestError("tokens must be a list of integers")
+        return tokens
+
     def _binary(self, code: int, body: bytes) -> None:
         self.send_response(code)
         self.send_header("Content-Type", "application/octet-stream")
@@ -904,8 +976,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/tokenize":
                 req = self._read_json()
+                # Client error, not a 500: a non-string prompt would raise
+                # inside the tokenizer (AttributeError/TypeError) after the
+                # handler's trust boundary — reject it before any engine call.
+                prompt = req.get("prompt")
+                if not isinstance(prompt, str):
+                    self._json(400, {"error": "prompt must be a string"})
+                    return
                 t0 = time.perf_counter()
-                tokens = self.engine.tokenize(req.get("prompt", ""))
+                tokens = self.engine.tokenize(prompt)
                 _phase_add("tokenize", (time.perf_counter() - t0) * 1000)
                 self._json(
                     200,
@@ -938,12 +1017,12 @@ class Handler(BaseHTTPRequestHandler):
                         self._json(422, {"error": f"ancestor blob missing: {ancestor}"})
                         return
                 t0 = time.perf_counter()
-                blob = self.engine.prefill(self._require(req, "tokens"), ancestor)
+                blob = self.engine.prefill(self._require_tokens(req), ancestor)
                 _phase_add("prefill", (time.perf_counter() - t0) * 1000)
                 self._binary(200, blob)
             elif self.path == "/generate":
                 req = self._read_json()
-                tokens = self._require(req, "tokens")
+                tokens = self._require_tokens(req)
                 # A MISSING blob is a bad checkpoint: 422 so the daemon
                 # quarantines it and retries from scratch. Use os.stat, not
                 # os.path.exists, so a transient stat failure (EIO, ENFILE)
