@@ -1,0 +1,5 @@
+{"timestamp":"2026-10-04T17:04:23.492255Z","level":"INFO","fields":{"message":"eviction reaper disabled (set MLXCACHE_EVICT_INTERVAL_S and MLXCACHE_EVICT_MAX_ENTRIES to enable; blob growth is unbounded)","interval_s":60,"max_entries":0},"target":"mlxcache_daemon"}
+{"timestamp":"2026-10-04T17:04:23.492490Z","level":"INFO","fields":{"message":"mlxcache daemon listening","addr":"127.0.0.1:18450"},"target":"mlxcache_daemon"}
+{"timestamp":"2026-10-04T17:04:25.018561Z","level":"INFO","fields":{"message":"request","model":"e2e-model","prefix_hash":"64402436749704192013546615296717093775","verdict":"miss","kv_claimed":0,"tokens_cached":0,"tokens_total":9,"ttft_ms":9},"target":"mlxcache_daemon::observability"}
+{"timestamp":"2026-10-04T17:04:25.032817Z","level":"INFO","fields":{"message":"request","model":"e2e-model","prefix_hash":"223771905322704324682545694620387227982","verdict":"hit","kv_claimed":8,"tokens_cached":8,"tokens_total":9,"ttft_ms":0},"target":"mlxcache_daemon::observability"}
+{"timestamp":"2026-10-04T17:04:38.384748Z","level":"INFO","fields":{"message":"mlxcache daemon stopped"},"target":"mlxcache_daemon"}
