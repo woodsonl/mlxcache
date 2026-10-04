@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Persistence {
     pub blob_dir: PathBuf,
 }
@@ -317,5 +318,32 @@ mod tests {
     fn contract_error_display() {
         let e = ContractError::VersionMismatch { got: 2, want: 1 };
         assert!(e.to_string().contains("incompatible"));
+    }
+
+    #[test]
+    fn foreign_format_version_blob_is_rejected_with_reason() {
+        // Wire-format skew (api-contract 2026-10-04): a blob written by a
+        // NEWER daemon/sidecar carries a higher format_version. `load` must
+        // refuse it loudly (Corrupt, reason naming the version) so a mixed
+        // rollout retires the foreign blob instead of mis-reading it — the
+        // on-disk layout beyond the header is not ours to interpret.
+        let dir = tempfile::tempdir().unwrap();
+        let p = Persistence::new(dir.path()).unwrap();
+        let mut meta = meta(6);
+        meta.format_version = 2;
+        let header = serde_json::to_vec(&meta).unwrap();
+        let mut wire = (header.len() as u32).to_le_bytes().to_vec();
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(b"payload-bytes");
+        let blob = dir.path().join("foreign.ckpt");
+        fs::write(&blob, &wire).unwrap();
+
+        let e = p.load(&blob).unwrap_err();
+        match e {
+            PersistError::Corrupt { reason } => {
+                assert!(reason.contains("format version 2"), "reason: {reason}");
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 }

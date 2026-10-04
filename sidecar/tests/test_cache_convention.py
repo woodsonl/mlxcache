@@ -10,6 +10,7 @@ output than a scratch run.
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import types
 
@@ -73,6 +74,9 @@ def _install_fake_mlx(monkeypatch, on_load=None):
     cache_mod.make_prompt_cache = lambda model: FakeCache(0)
     cache_mod.save_prompt_cache = lambda path, cache: saved.__setitem__(path, cache.len)
     cache_mod.load_prompt_cache = _load
+    # The q8 delta-prefill gate (_quantize_cache) isinstance-checks this class
+    # to skip re-quantizing an already-quantized adopted cache.
+    cache_mod.QuantizedKVCache = type("QuantizedKVCache", (), {})
 
     mlx_lm = types.ModuleType("mlx_lm")
     mlx_lm.models = types.ModuleType("mlx_lm.models")
@@ -93,6 +97,12 @@ def _engine(model=None):
     eng.model_id = "fake"
     eng.model = model if model is not None else types.SimpleNamespace()
     eng.tokenizer_hash = "h"
+    # The __new__ bypass skips __init__, so hand-set every attribute the
+    # engine's runtime paths read. Keep in sync with MlxLmEngine.__init__:
+    # kv_bits/kv_group_size (T12) default to the f16 tier here — these tests
+    # pin the f16 cache convention, not the quantization tier.
+    eng.kv_bits = 0
+    eng.kv_group_size = 0
     return eng
 
 
@@ -114,7 +124,63 @@ def _write_blob(path, tokens):
     return path
 
 
-def test_prefill_seeds_the_cache_with_tokens_minus_one(monkeypatch):
+def test_end_divergent_prefix_is_adopted_t22(monkeypatch, tmp_path):
+    # T22 serve rule at the adapter trust boundary: a blob recorded with
+    # prefix P may serve a request R that diverges from P at P's LAST token
+    # (the multi-turn wire shape: turn 2 replaced turn 1's closing bracket).
+    # The covered KV holds P[:-1] positions; the request's delta feed starts
+    # at len(P)-1 (absorbing the position that differs) — KV at every
+    # covered position is byte-identical for R, so the run stays
+    # identical-to-scratch.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    key = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "turn1.ckpt"), key)
+    # Divergence exactly at the key's last token, request longer than key.
+    _cache, prompt = eng._load_cache_delta([1, 2, 9, 9], path)
+    assert prompt == [9, 9], "adopted: delta feeds from len(key)-1 = 2"
+    # Same divergence with an exactly-key-length request: delta = [9].
+    _cache, prompt = eng._load_cache_delta([1, 2, 9], path)
+    assert prompt == [9]
+
+
+def test_end_divergent_prefix_short_request_not_adopted_t22(monkeypatch, tmp_path):
+    # The concentric boundary: a request SHORTER than len(key)-1 cannot be
+    # verified against the blob (the divergence reaches INTO the covered
+    # region) — read_wire_checkpoint must NOT adopt it (returns usable=False
+    # upstream; _load_cache_delta runs from scratch entirely), never 422.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    key = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "turn1.ckpt"), key)
+    cache, prompt = eng._load_cache_delta([1], path)
+    assert cache is None
+    assert prompt == [1]
+
+
+def test_mid_prefix_divergence_is_rejected_not_adopted_t22(monkeypatch, tmp_path):
+    # Divergence BEFORE the key's last token: the KV past the LCP differs for
+    # the diverging request (the T22 serve rule never covers this) — the
+    # trust boundary must REJECT (422 -> daemon quarantines), not adopt.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    key = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "turn1.ckpt"), key)
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta([1, 9, 3, 3], path)
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta([9, 2, 3, 3], path)
+
+
+def test_exact_equivalence_still_adopts_t22(monkeypatch, tmp_path):
+    # Pre-T22 behavior unchanged: exact prefix equality adopts (the special
+    # case of the widened rule where the last key token also matches).
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    key = [1, 2, 3]
+    path = _write_blob(str(tmp_path / "turn1.ckpt"), key)
+    _cache, prompt = eng._load_cache_delta([1, 2, 3, 4], path)
+    assert prompt == [3, 4]
     # The saved cache must cover tokens[:-1]. Caching all tokens makes the hit
     # path re-feed the last token and diverge from a scratch run.
     prefilled, model = _install_fake_mlx(monkeypatch)
@@ -637,6 +703,140 @@ def test_legacy_one_token_checkpoint_is_not_adopted(monkeypatch, tmp_path):
     cache, prompt = eng._load_cache_delta(tokens, path)
     assert cache is None, "a one-token checkpoint must never be adopted"
     assert prompt == tokens
+
+
+# ---------------------------------------------------------------------------
+# Wire-boundary regressions (review gauntlet): every malformed shape a hostile
+# or raced filesystem can hand read_wire_checkpoint must land INSIDE the trust
+# boundary — CheckpointRejectedError (422 → quarantine), never a 500 that
+# leaves the poison selectable or misses quarantine on a raced-away file.
+# ---------------------------------------------------------------------------
+
+
+def _poison_fingerprint_blob(path, fingerprint_value) -> str:
+    """A length-prefixed blob whose fingerprint is the given JSON value."""
+    header = json.dumps(
+        {
+            "fingerprint": fingerprint_value,
+            "token_count": 3,
+            "tokens": [1, 2, 3],
+            "format_version": blob.FORMAT_VERSION,
+        }
+    ).encode()
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<I", len(header)) + header + b"payload")
+    return path
+
+
+@pytest.mark.parametrize("poison", [None, [], 5, "x"])
+def test_non_dict_fingerprint_is_rejected_not_500(monkeypatch, tmp_path, poison):
+    # Regression (Codex adversarial #9): fingerprint: null/[]/5 made
+    # Fingerprint(**...) raise TypeError/AttributeError OUTSIDE the boundary
+    # tuple → 500 forever, poison selectable. Now decode() validates the
+    # shape (ValueError) and the boundary catches the rest.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    path = _poison_fingerprint_blob(str(tmp_path / "poison.ckpt"), poison)
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta([1, 2, 3], path)
+    # Defense in depth: blob.decode itself raises ValueError (not
+    # AttributeError/TypeError) for the non-dict fingerprint.
+    with pytest.raises(ValueError), open(path, "rb") as fh:
+        blob.decode(fh.read())
+
+
+def test_deeply_nested_header_field_is_rejected_not_500(monkeypatch, tmp_path):
+    # RecursionError from json.loads on ~2000 nested lists escaped the
+    # (ValueError, KeyError, TypeError) tuple as a 500. Distinct from
+    # test_deeply_nested_header_is_rejected_not_500 above: the nesting is
+    # inside a header FIELD value, not the header document itself.
+    # (Was silently shadowing that test under a duplicate name — F811.)
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    deep = "[]" * 2000
+    header = json.dumps(
+        {
+            "fingerprint": {
+                "model_id": deep,
+                "tokenizer_hash": "h",
+                "kv_dtype": "f16",
+                "kv_layout_version": 1,
+            },
+            "token_count": 3,
+            "tokens": [1, 2, 3],
+            "format_version": blob.FORMAT_VERSION,
+        }
+    ).encode()
+    path = str(tmp_path / "deep.ckpt")
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<I", len(header)) + header + b"payload")
+    with pytest.raises(server.CheckpointRejectedError):
+        eng._load_cache_delta([1, 2, 3], path)
+
+
+def test_missing_blob_file_is_rejected_not_500(monkeypatch, tmp_path):
+    # Regression (Codex adversarial #8): between the daemon's os.stat
+    # pre-check and this open, eviction can unlink the blob. The open's
+    # FileNotFoundError used to escape as a 500 (transient → client 502, no
+    # quarantine). A missing file the index pointed at is a raced/retired
+    # checkpoint: 422 so the daemon quarantines and retries scratch.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    with pytest.raises(server.CheckpointRejectedError, match="blob missing"):
+        eng._load_cache_delta([1, 2, 3], str(tmp_path / "gone.ckpt"))
+
+
+def test_transient_read_error_still_propagates(monkeypatch, tmp_path):
+    # The FileNotFoundError conversion must stay NARROW: EIO/ENFILE on a
+    # healthy blob is transient — a 500 that does NOT retire the entry.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    path = _write_blob(str(tmp_path / "healthy.ckpt"), [1, 2, 3])
+    real_open = open
+
+    def _eio_open(p, *a, **k):
+        if p == path:
+            raise OSError(5, "Input/output error")
+        return real_open(p, *a, **k)
+
+    import builtins
+
+    monkeypatch.setattr(builtins, "open", _eio_open)
+    with pytest.raises(OSError):
+        eng._load_cache_delta([1, 2, 3], path)
+
+
+def test_quantize_cache_skips_already_quantized_delta_ancestor(monkeypatch):
+    # Regression (adversarial F2): under MLXCACHE_KV_BITS=8, a delta prefill
+    # that adopted a quantized ancestor loaded a QuantizedKVCache; the old
+    # code ran to_quantized over it — mx.quantize on packed uint32 words —
+    # corrupting every published blob built on an ancestor. Already-quantized
+    # layers must pass through untouched; plain layers still quantize.
+    _install_fake_mlx(monkeypatch)
+    eng = _engine()
+    eng.kv_bits = 8
+    eng.kv_group_size = 64
+    import sys
+
+    fake_quant_cls = sys.modules["mlx_lm.models.cache"].QuantizedKVCache
+    already = fake_quant_cls()
+
+    class Plain:
+        def __init__(self):
+            self.calls = []
+
+        def to_quantized(self, group_size, bits):
+            self.calls.append((group_size, bits))
+            return "quantized"
+
+    plain = Plain()
+    out = eng._quantize_cache([already, plain])
+    assert out[0] is already, "an already-quantized layer must pass through"
+    assert out[1] == "quantized" and plain.calls == [(64, 8)]
+    # bits=0 stays a full no-op.
+    eng.kv_bits = 0
+    marker = object()
+    assert eng._quantize_cache([marker]) == [marker]
 
 
 if __name__ == "__main__":

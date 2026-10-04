@@ -22,7 +22,7 @@ async fn singleflight_race_one_winner() {
         let sf = sf.clone();
         let count = prefill_count.clone();
         handles.push(tokio::spawn(async move {
-            match sf.enter(vec![0xFFFF_0001]).await {
+            match sf.enter(&[0xFFFF_0001]).await {
                 Role::Leader(lead) => {
                     // Only the leader runs the prefill.
                     count.fetch_add(1, Ordering::SeqCst);
@@ -56,7 +56,7 @@ async fn singleflight_different_keys_run_parallel() {
         let sf = sf.clone();
         let c = completed.clone();
         handles.push(tokio::spawn(async move {
-            match sf.enter(vec![0xFFFF_0000 + i as u32]).await {
+            match sf.enter(&[0xFFFF_0000 + i as u32]).await {
                 Role::Leader(lead) => {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     c.fetch_add(1, Ordering::SeqCst);

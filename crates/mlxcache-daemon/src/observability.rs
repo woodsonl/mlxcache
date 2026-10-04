@@ -30,17 +30,26 @@ pub fn log_request(model: &str, prefix_hash: u128, decision: &PolicyDecision, tt
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use mlxcache_core::policy::PolicyDecision;
 
+    /// A decision for the trace/log tests (kept public to crate siblings).
+    pub(crate) fn decision(
+        verdict: CacheVerdict,
+        matched_tokens: usize,
+        request_tokens: usize,
+    ) -> PolicyDecision {
+        PolicyDecision {
+            verdict,
+            matched_tokens,
+            request_tokens,
+        }
+    }
+
     #[test]
     fn log_line_does_not_panic() {
-        let d = PolicyDecision {
-            verdict: CacheVerdict::Hit,
-            matched_tokens: 50,
-            request_tokens: 60,
-        };
+        let d = decision(CacheVerdict::Hit, 50, 60);
         log_request("test-model", 0xdeadbeef, &d, 12);
     }
 }
