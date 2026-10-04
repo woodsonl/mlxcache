@@ -56,6 +56,9 @@ pub struct AppState {
     pub served_models: Vec<String>,
     pub sidecar: Option<SidecarClient>,
     pub persistence: crate::persistence::Persistence,
+    /// Optional JSONL trace capture (MLXCACHE_TRACE, step 5). None when the
+    /// env knob is unset — the hot path costs one `Option::None` check.
+    pub trace: Option<crate::trace::TraceWriter>,
 }
 
 impl AppState {
@@ -486,6 +489,20 @@ async fn chat_completions(
     // after single-flight keeps stats truthful.
     state.stats.record(&outcome.decision);
     log_request(&req.model, prefix_hash, &outcome.decision, lookup_ms);
+    // Trace capture (step 5): one JSONL record per request, off the hot path
+    // (bounded channel + writer thread). model_hash folds the fingerprint so
+    // a multi-model trace stays attributable; messages embed the exact
+    // payload so replay re-sends byte-equivalent requests. The payload
+    // serialization happens ONLY when capture is on.
+    if let Some(tracer) = &state.trace {
+        let messages_value = serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null);
+        tracer.record(crate::trace::TraceRecord::from_request(
+            (blob_key(&fingerprint, &[]) >> 64) as u64,
+            &req.model,
+            &messages_value,
+            &outcome.decision,
+        ));
+    }
 
     // The adapter needs an absolute path to open the blob directly.
     let blob_abs = match &outcome.blob {
@@ -1282,6 +1299,7 @@ mod tests {
             sidecar: None,
             persistence: crate::persistence::Persistence::new(tempfile::tempdir().unwrap().keep())
                 .unwrap(),
+            trace: None,
         });
         router(state)
     }
