@@ -152,6 +152,9 @@ curl -N -X POST http://127.0.0.1:8420/v1/chat/completions \
 | `MLXCACHE_ENGINE` | `synthetic` | sidecar engine: `synthetic` or `mlx-lm` |
 | `MLXCACHE_MODEL` | `synthetic-model` | model the sidecar loads |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
+| `MLXCACHE_EVICT_INTERVAL_S` | `60` | eviction-reaper sweep cadence; `0` disables the reaper |
+| `MLXCACHE_EVICT_MAX_BYTES` | `34359738368` | published-store byte budget (32 GiB). Each sweep evicts coldest non-anchor blobs, biggest first, until the store fits; `0` disables the byte cap. Anchors are never evicted — a store held over budget by live anchors only logs a warning |
+| `MLXCACHE_EVICT_MAX_ENTRIES` | `0` | published-entry cap on top of the byte budget; `0` = no entry cap |
 
 ## Building and testing
 
