@@ -657,6 +657,15 @@ async fn chat_completions(
         None
     };
 
+    // Shared by both legs: the OpenAI envelope's per-request identity (SDK
+    // parsers require id/created/model on the non-stream body AND on every
+    // SSE chunk).
+    let completion_id = format!("chatcmpl-{:032x}", prefix_hash);
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     if req.stream {
         return stream_response(
             state.clone(),
@@ -665,6 +674,8 @@ async fn chat_completions(
                 tokens,
                 max_tokens,
                 trace_ctx,
+                model: req.model.clone(),
+                completion_id,
                 started,
             },
             outcome,
@@ -680,7 +691,10 @@ async fn chat_completions(
     // report a scratch run: no prior KV was reused. Quarantine is a separate
     // decision, taken only on an explicit adapter rejection.
     let mut blob_unused = false;
-    let generated = match client.generate(&tokens, max_tokens, blob_arg).await {
+    // `generated` = token ids, `generated_text` = the sidecar's detokenized
+    // completion (same pieces the streaming path emits, so both legs agree
+    // character-for-character).
+    let (generated, generated_text) = match client.generate(&tokens, max_tokens, blob_arg).await {
         Ok(t) => t,
         Err(e) => {
             // If this request leaned on a blob and the request failed, retry
@@ -743,7 +757,28 @@ async fn chat_completions(
     emit_trace(&state, &trace_ctx, &settled_decision);
 
     let total_ms = started.elapsed().as_millis() as u64;
+    // OpenAI ChatCompletion-required fields (id/object/created/model are
+    // mandatory in stock SDK parsers — extras like `mlxcache` are allowed,
+    // missing-required is not). The response is ADDITIVE: the raw fields
+    // (`generated_tokens`, `mlxcache`, `status`) stay for existing consumers.
     let body = serde_json::json!({
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": req.model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": generated_text,
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": tokens.len(),
+            "completion_tokens": generated.len(),
+            "total_tokens": tokens.len() + generated.len(),
+        },
         "mlxcache": {
             "verdict": if blob_unused {
                 "miss"
@@ -1108,59 +1143,215 @@ pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens:
     prefix_hash(&all)
 }
 
-/// Map one raw NDJSON line from the sidecar into zero or more SSE frames.
-/// `{"done":true}` becomes `[DONE]`; a token line becomes `data: {...}`; a
-/// non-JSON line is a protocol violation and surfaces as a stream error.
+/// Per-request constants for OpenAI-shaped SSE chunks. Stock SDK chunk
+/// parsers REQUIRE `id`/`object`/`created`/`model`/`choices` on every frame
+/// (missing-required fails validation; extra keys like `mlxcache` are
+/// allowed) — so every frame opens with this precomputed head.
 ///
-/// Hot-path shape (P2b): the line is validated with a two-field typed struct —
-/// serde skips every other field without allocating — and the frame is emitted
-/// by forwarding the engine's OWN bytes. The old path built a full
-/// `serde_json::Value` tree per token and re-serialized it; at 64+ tokens per
-/// stream that is a tree alloc + string churn per token for zero gain. Key
-/// order and spacing now come straight from the sidecar instead of serde's
-/// normalization — both are valid JSON and clients parse by key, not layout.
-fn push_frame(frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]) {
-    /// A done marker may carry any NON-NULL JSON value (`true`, `1`, …):
-    /// `Option<IgnoredAny>` maps a literal `null` to `None`, so presence of
-    /// the key with a null value would NOT terminate the stream. Our sidecar
-    /// pins `true` (server.py's done line), making the gap contractual
-    /// rather than live (red-team 2026-10-04).
-    #[derive(serde::Deserialize)]
-    struct SidecarStreamFrame {
-        #[serde(default)]
-        done: Option<serde::de::IgnoredAny>,
+/// Built once per request; token frames then splice in the sidecar's OWN
+/// already-escaped `"text"` string and `"token"` digits by byte scanning the
+/// NDJSON line — no per-frame JSON parse, no re-escaping, ONE buffer
+/// allocation per token frame (the alloc gate pins this).
+pub struct ChunkFramer {
+    /// `{"id":"…","object":"chat.completion.chunk","created":N,"model":"…",`
+    head: String,
+}
+
+impl ChunkFramer {
+    pub fn new(id: &str, created: u64, model: &str) -> Self {
+        // Escape the model once (it is client-supplied and may contain
+        // quotes); the id is daemon-generated hex and needs no escaping.
+        let model_json = serde_json::to_string(model).unwrap_or_else(|_| "\"\"".into());
+        ChunkFramer {
+            head: format!(
+                "{{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\
+                 \"created\":{created},\"model\":{model_json},"
+            ),
+        }
     }
-    let line = match std::str::from_utf8(raw) {
-        Ok(s) => s.trim(),
-        // Invalid UTF-8 from the sidecar is a protocol violation (it must be,
-        // because the SSE body is a text/event-stream). Heap-building the
-        // error is fine: this is a fatal one-time stream abort, not a
-        // per-token cost.
-        Err(_) => {
-            frames.push(Err(std::io::Error::other(
-                "sidecar emitted a non-UTF-8 stream line",
-            )));
+
+    /// The leading chunk as a standalone frame: assistant role delta + the
+    /// cache verdict as a top-level extra (SDKs ignore extras).
+    /// `mlxcache_json` is a pre-built `"mlxcache":{...}` fragment.
+    fn first_chunk(&self, mlxcache_json: &str) -> bytes::Bytes {
+        let mut frame = Vec::with_capacity(self.head.len() + mlxcache_json.len() + 128);
+        frame.extend_from_slice(b"data: ");
+        frame.extend_from_slice(self.head.as_bytes());
+        frame.extend_from_slice(
+            b"\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\
+             \"finish_reason\":null}],",
+        );
+        frame.extend_from_slice(mlxcache_json.as_bytes());
+        frame.extend_from_slice(b"}\n\n");
+        bytes::Bytes::from(frame)
+    }
+
+    /// Map one raw NDJSON line from the sidecar into zero or more SSE frames.
+    /// `{"done":true}` becomes the final `finish_reason:"stop"` chunk plus
+    /// `[DONE]`; a token line becomes an OpenAI delta chunk carrying the
+    /// sidecar's text piece (plus the raw `token` id as an extra field for
+    /// existing consumers); a non-JSON line is a protocol violation.
+    pub fn push_line(&self, frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]) {
+        /// A done marker may carry any NON-NULL JSON value (`true`, `1`, …):
+        /// `Option<IgnoredAny>` maps a literal `null` to `None`, so presence
+        /// of the key with a null value would NOT terminate the stream. Our
+        /// sidecar pins `true` (server.py's done line), making the gap
+        /// contractual rather than live (red-team 2026-10-04).
+        #[derive(serde::Deserialize)]
+        struct SidecarStreamFrame {
+            #[serde(default)]
+            done: Option<serde::de::IgnoredAny>,
+        }
+        let line = match std::str::from_utf8(raw) {
+            Ok(s) => s.trim(),
+            // Invalid UTF-8 from the sidecar is a protocol violation (it must
+            // be, because the SSE body is a text/event-stream). Heap-building
+            // the error is fine: this is a fatal one-time stream abort, not a
+            // per-token cost.
+            Err(_) => {
+                frames.push(Err(std::io::Error::other(
+                    "sidecar emitted a non-UTF-8 stream line",
+                )));
+                return;
+            }
+        };
+        if line.is_empty() {
             return;
         }
-    };
-    if line.is_empty() {
-        return;
-    }
-    match serde_json::from_str::<SidecarStreamFrame>(line) {
-        Ok(f) if f.done.is_some() => {
-            frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")))
+        match serde_json::from_str::<SidecarStreamFrame>(line) {
+            Ok(f) if f.done.is_some() => {
+                // Final chunk (empty delta + stop), then the protocol
+                // terminator. Two frames: the chunk buffer sized exactly
+                // (zero-alloc Bytes::from), and a static [DONE].
+                const SSE: &[u8] = b"data: ";
+                const DONE_CHUNK: &[u8] =
+                    b"\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+                let mut frame = Vec::with_capacity(SSE.len() + self.head.len() + DONE_CHUNK.len());
+                frame.extend_from_slice(SSE);
+                frame.extend_from_slice(self.head.as_bytes());
+                frame.extend_from_slice(DONE_CHUNK);
+                debug_assert_eq!(frame.len(), frame.capacity());
+                frames.push(Ok(bytes::Bytes::from(frame)));
+                frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
+            }
+            Ok(_) => {
+                // Token chunk. The sidecar's line is `{"token": <id>,
+                // "text": "<already-escaped>"}` — splice both values through
+                // verbatim instead of parsing/re-serializing (alloc gate:
+                // exactly one buffer allocation per token frame, and the
+                // buffer is sized EXACTLY: len == capacity puts
+                // `Bytes::from(Vec)` on its zero-alloc fast path; a rounded-up
+                // capacity silently allocates the Shared box per frame).
+                let (text_start, text_end) = match scan_json_string_value(line, "\"text\"") {
+                    Some(r) => r,
+                    None => {
+                        frames.push(Err(std::io::Error::other(
+                            "sidecar token line lacks a text string",
+                        )));
+                        return;
+                    }
+                };
+                let token = scan_json_number_value(line, "\"token\"").unwrap_or("0");
+                const SSE: &[u8] = b"data: ";
+                const OPEN: &[u8] = b"\"choices\":[{\"index\":0,\"delta\":{\"content\":";
+                const CLOSE: &[u8] = b"},\"finish_reason\":null}],\"token\":";
+                const TAIL: &[u8] = b"}\n\n";
+                let mut frame = Vec::with_capacity(
+                    SSE.len()
+                        + self.head.len()
+                        + OPEN.len()
+                        + (text_end - text_start)
+                        + CLOSE.len()
+                        + token.len()
+                        + TAIL.len(),
+                );
+                frame.extend_from_slice(SSE);
+                frame.extend_from_slice(self.head.as_bytes());
+                frame.extend_from_slice(OPEN);
+                frame.extend_from_slice(&line.as_bytes()[text_start..text_end]);
+                frame.extend_from_slice(CLOSE);
+                frame.extend_from_slice(token.as_bytes());
+                frame.extend_from_slice(TAIL);
+                debug_assert_eq!(frame.len(), frame.capacity());
+                frames.push(Ok(bytes::Bytes::from(frame)));
+            }
+            Err(_) => frames.push(Err(std::io::Error::other(
+                "sidecar emitted a non-JSON stream line",
+            ))),
         }
-        Ok(_) => {
-            let mut frame = Vec::with_capacity(line.len() + 8);
-            frame.extend_from_slice(b"data: ");
-            frame.extend_from_slice(line.as_bytes());
-            frame.extend_from_slice(b"\n\n");
-            frames.push(Ok(bytes::Bytes::from(frame)));
-        }
-        Err(_) => frames.push(Err(std::io::Error::other(
-            "sidecar emitted a non-JSON stream line",
-        ))),
     }
+
+    /// A trailing stats chunk (e.g. ttft): a VALID chunk (required fields
+    /// present, empty delta) so strict parsers stay happy, with the stats
+    /// folded in as a top-level extra.
+    fn push_stats(
+        &self,
+        frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>,
+        mlxcache_json: &str,
+    ) {
+        let mut frame = Vec::with_capacity(self.head.len() + mlxcache_json.len() + 96);
+        frame.extend_from_slice(b"data: ");
+        frame.extend_from_slice(self.head.as_bytes());
+        frame
+            .extend_from_slice(b"\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}],");
+        frame.extend_from_slice(mlxcache_json.as_bytes());
+        frame.extend_from_slice(b"}\n\n");
+        frames.push(Ok(bytes::Bytes::from(frame)));
+    }
+}
+
+/// Unix seconds, once per request (shared by the JSON and stream envelopes).
+fn created_stamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Byte-scan a JSON object line for `"key": "<string value>"`, returning the
+/// (start, end) byte range of the value INCLUDING its quotes — already
+/// escaped by the producer, so it can be spliced verbatim. `needle` is the
+/// quoted key literal (e.g. `"\"text\""`). No allocation.
+fn scan_json_string_value(line: &str, needle: &str) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let key_pos = line.find(needle)?;
+    let mut i = key_pos + needle.len();
+    // skip whitespace and the colon
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b':') {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'"' {
+        return None; // not a string value
+    }
+    let start = i;
+    i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2, // escaped char — skip its partner
+            b'"' => return Some((start, i + 1)),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Byte-scan for `"key": <number>`, returning the digits as a &str slice of
+/// the line. `needle` is the quoted key literal. No allocation.
+fn scan_json_number_value<'a>(line: &'a str, needle: &str) -> Option<&'a str> {
+    let key_pos = line.find(needle)?;
+    let mut i = key_pos + needle.len();
+    let bytes = line.as_bytes();
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b':') {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    Some(&line[start..i])
 }
 
 /// Open the sidecar's NDJSON generation stream and re-emit it as SSE.
@@ -1172,6 +1363,11 @@ struct StreamReq {
     tokens: Vec<u32>,
     max_tokens: usize,
     trace_ctx: Option<TraceCtx>,
+    /// Model id + completion id for the OpenAI chunk envelope (SDK parsers
+    /// require them on every frame; the raw `token`/`mlxcache` extras stay
+    /// for existing consumers).
+    model: String,
+    completion_id: String,
     started: std::time::Instant,
 }
 
@@ -1291,6 +1487,15 @@ async fn stream_response(
             "lookup_ms": lookup_ms,
         }
     });
+    // The verdict rides INSIDE the first OpenAI chunk as a top-level extra
+    // (SDKs allow extras) instead of a bare leading frame — a frame without
+    // id/object/created/model/choices fails strict chunk parsers.
+    let framer = ChunkFramer::new(&req.completion_id, created_stamp(), &req.model);
+    let meta_frag = {
+        let m = meta_line.to_string();
+        // strip the outer braces: {"mlxcache":{…}} → "mlxcache":{…}
+        m[1..m.len() - 1].to_string()
+    };
 
     // Split the upstream byte stream on newlines, then map each NDJSON line to
     // an SSE frame. A tiny state machine keeps partial lines across chunks, and
@@ -1301,11 +1506,13 @@ async fn stream_response(
     // The line buffer itself is bounded (MAX_PARTIAL_LINE): a flood of bytes
     // containing no newline never trips the idle timeout (bytes ARE arriving),
     // so without a cap the buffer would grow unboundedly on a fast flood.
-    let meta_bytes = bytes::Bytes::from(format!("data: {meta_line}\n\n"));
+    let meta_bytes = framer.first_chunk(&meta_frag);
     let first =
         futures_util::stream::once(async move { Ok::<bytes::Bytes, std::io::Error>(meta_bytes) });
 
     struct StreamState {
+        /// Per-request OpenAI chunk envelope (id/created/model head).
+        framer: ChunkFramer,
         upstream: std::pin::Pin<
             Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         >,
@@ -1323,6 +1530,7 @@ async fn stream_response(
         idle: std::time::Duration,
     }
     let state = StreamState {
+        framer,
         upstream: Box::pin(upstream.bytes_stream()),
         buf: bytes::BytesMut::with_capacity(8 * 1024),
         done: false,
@@ -1344,8 +1552,10 @@ async fn stream_response(
                 // upstream so the client sees a failure, not a hang.
                 Err(_elapsed) => {
                     if let Some(ttft) = st.ttft_ms {
-                        let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
-                        frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
+                        st.framer.push_stats(
+                            &mut frames,
+                            &format!("\"mlxcache\":{{\"ttft_ms\":{ttft}}}"),
+                        );
                     }
                     let err = serde_json::json!({
                         "error": {
@@ -1383,7 +1593,7 @@ async fn stream_response(
                     }
                     while let Some(pos) = st.buf.iter().position(|b| *b == b'\n') {
                         let line = st.buf.split_to(pos + 1);
-                        push_frame(&mut frames, &line);
+                        st.framer.push_line(&mut frames, &line);
                         let last_done = frames.last().is_some_and(|f| {
                             f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
                         });
@@ -1402,8 +1612,10 @@ async fn stream_response(
                             // appended [DONE]; re-emit it after the stats frame.
                             let done = frames.pop().expect("just pushed [DONE]");
                             if let Some(ttft) = st.ttft_ms {
-                                let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
-                                frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
+                                st.framer.push_stats(
+                                    &mut frames,
+                                    &format!("\"mlxcache\":{{\"ttft_ms\":{ttft}}}"),
+                                );
                             }
                             frames.push(done);
                             st.terminated = true;
@@ -1426,7 +1638,7 @@ async fn stream_response(
                     // does not read a silent truncation as a completed answer.
                     if !st.buf.is_empty() {
                         let line = std::mem::take(&mut st.buf);
-                        push_frame(&mut frames, &line);
+                        st.framer.push_line(&mut frames, &line);
                         if frames.last().is_some_and(|f| {
                             f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
                         }) {
@@ -1579,31 +1791,59 @@ mod tests {
     }
 
     #[test]
-    fn push_frame_maps_ndjson_to_sse() {
+    fn push_line_maps_ndjson_to_openai_chunks() {
+        let framer = ChunkFramer::new("chatcmpl-t", 7, "m");
         let mut frames = Vec::new();
-        push_frame(&mut frames, b"{\"token\":5,\"text\":\"hi\"}\n");
+        framer.push_line(&mut frames, b"{\"token\":5,\"text\":\"hi\"}\n");
         assert_eq!(frames.len(), 1);
         let text = std::string::String::from_utf8(frames[0].as_ref().unwrap().to_vec()).unwrap();
-        assert!(text.starts_with("data: {"));
-        assert!(text.ends_with("\n\n"));
+        assert!(text.starts_with("data: {\"id\":\"chatcmpl-t\""), "{text}");
+        assert!(
+            text.contains("\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}"),
+            "{text}"
+        );
+        assert!(text.contains("\"token\":5"), "{text}");
+        assert!(text.ends_with("}\n\n"), "{text}");
 
         frames.clear();
-        push_frame(&mut frames, b"{\"done\":true}\n");
+        framer.push_line(&mut frames, b"{\"done\":true}\n");
+        assert_eq!(frames.len(), 2, "final chunk + [DONE]");
+        assert!(
+            std::string::String::from_utf8(frames[0].as_ref().unwrap().to_vec())
+                .unwrap()
+                .contains("\"finish_reason\":\"stop\"")
+        );
         assert_eq!(
-            frames[0].as_ref().unwrap().as_ref(),
+            frames[1].as_ref().unwrap().as_ref(),
             b"data: [DONE]\n\n".as_slice()
         );
 
         // Blank lines and whitespace are ignored, not turned into frames.
         frames.clear();
-        push_frame(&mut frames, b"\n");
-        push_frame(&mut frames, b"   \n");
+        framer.push_line(&mut frames, b"\n");
+        framer.push_line(&mut frames, b"   \n");
         assert!(frames.is_empty());
 
         // A non-JSON line is a protocol violation.
         frames.clear();
-        push_frame(&mut frames, b"not json\n");
+        framer.push_line(&mut frames, b"not json\n");
         assert!(frames[0].is_err());
+    }
+
+    #[test]
+    fn chunk_scanners_handle_escaped_text_and_key_order() {
+        // The splice scanners must find values regardless of key order and
+        // must respect escapes inside the (already-escaped) text string.
+        let line = r#"{"text": "he said \"hi\" \\ done", "token": 42}"#;
+        let (s, e) = scan_json_string_value(line, "\"text\"").expect("text found");
+        assert_eq!(
+            &line[s..e],
+            "\"he said \\\"hi\\\" \\\\ done\"",
+            "the spliced value keeps its producer-side escaping verbatim"
+        );
+        assert_eq!(scan_json_number_value(line, "\"token\""), Some("42"));
+        // A non-string text value must not be spliced as one.
+        assert!(scan_json_string_value(r#"{"text": 5}"#, "\"text\"").is_none());
     }
 
     fn app() -> Router {
@@ -1904,7 +2144,18 @@ mod tests {
 /// runs in its own test binary (a counting global allocator is process-wide)
 /// and needs to exercise the REAL framer, not a copy of it.
 pub mod test_support {
-    pub fn push_frame_for_gate(frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]) {
-        super::push_frame(frames, raw);
+    pub fn framer_for_gate() -> super::ChunkFramer {
+        // Per-REQUEST cost (head construction), deliberately OUTSIDE the
+        // gate's per-frame measurement — the real caller builds one framer
+        // per stream and reuses it for every token.
+        super::ChunkFramer::new("chatcmpl-gate", 0, "gate-model")
+    }
+
+    pub fn push_line_for_gate(
+        framer: &super::ChunkFramer,
+        frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>,
+        raw: &[u8],
+    ) {
+        framer.push_line(frames, raw);
     }
 }

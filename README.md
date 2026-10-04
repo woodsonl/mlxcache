@@ -83,18 +83,29 @@ The request is OpenAI-shaped, not OpenAI-complete. Exactly four fields are
 honored: `model` (must be in `MLXCACHE_MODELS`), `messages`, `stream`, and
 `max_tokens` (default `64`, capped at `8192` — larger values get a `400`).
 Everything else (`temperature`, `top_p`, `stop`, `tools`, …) is ignored, not
-rejected. The response is NOT `choices[]`: it is `{"mlxcache": {verdict,
-tokens_cached, tokens_total, prefill_from, timings}, "generated_tokens": [...],
-"status": "ok"}` — decode the text from `generated_tokens`. Every error is the
-same envelope: `{"error": {"message", "type"}}`, including body-parse failures
-(`400`), a missing JSON content-type (`415`), and unknown models (`404`, checked
-before any cache lookup). Status codes say what to retry: `503
-adapter_unavailable` means the sidecar is down or stalled (back off and retry
-later), `502 adapter_error` means the sidecar answered but the answer was bad —
-including its explicit `422`-rejections, which the daemon already handled by
-quarantining the checkpoint and (on the next request) serving from scratch.
-`GET /healthz` is a dependency-free liveness probe (`{"status":"ok"}`); cache
-and adapter state live in `/stats`.
+rejected.
+
+Responses decode with **stock OpenAI SDKs**: the non-stream body carries
+`id`/`object`/`created`/`model`/`choices[0].message.content` (detokenized by
+the sidecar — identical text to the streaming path) plus a `usage` block, and
+every SSE frame is a valid `chat.completion.chunk` with
+`choices[0].delta.content` pieces, a role-delta first chunk, and a
+`finish_reason:"stop"` final chunk before `data: [DONE]`. Point an SDK at
+`base_url=http://127.0.0.1:8420/v1` and it works, streaming and not.
+
+Cache telemetry rides along as extra fields the SDKs ignore: `mlxcache`
+(verdict, tokens_cached, tokens_total, prefill_from, timings; on the first
+stream chunk and the final body) and `generated_tokens` (raw token ids).
+
+Every error is the same envelope: `{"error": {"message", "type"}}`, including
+body-parse failures (`400`), a missing JSON content-type (`415`), and unknown
+models (`404`, checked before any cache lookup). Status codes say what to
+retry: `503 adapter_unavailable` means the sidecar is down or stalled (back
+off and retry later), `502 adapter_error` means the sidecar answered but the
+answer was bad — including its explicit `422`-rejections, which the daemon
+already handled by quarantining the checkpoint and (on the next request)
+serving from scratch. `GET /healthz` is a dependency-free liveness probe
+(`{"status":"ok"}`); cache and adapter state live in `/stats`.
 
 ## Storage: integrity, quarantine, and eviction
 
