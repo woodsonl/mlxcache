@@ -841,3 +841,46 @@ def test_quantize_cache_skips_already_quantized_delta_ancestor(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_payload_digest_mismatch_is_rejected_not_served(tmp_path):
+    # D1 integrity: a framing-valid blob whose payload no longer matches the
+    # daemon-stamped digest is bit rot — it must be REJECTED (422 →
+    # quarantine + republish), never loaded to serve confidently-wrong KV.
+    import hashlib
+
+    from mlxcache_sidecar import blob, server
+
+    fp = blob.Fingerprint(model_id="m", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1)
+    payload = b"kv-bytes-here"
+    meta = blob.CheckpointMeta(
+        fingerprint=fp,
+        token_count=4,
+        tokens=[1, 2, 3, 4],
+        format_version=blob.FORMAT_VERSION_D1,
+        payload_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    good = tmp_path / "good.ckpt"
+    good.write_bytes(blob.encode(meta, payload))
+    _, loaded, _ = server.read_wire_checkpoint(str(good), [1, 2, 3, 4], check_safetensors=False)
+    assert loaded == payload
+
+    # Tampered twin: header + digest intact, one payload byte flipped. A
+    # different PATH, so the once-per-path verify cache must NOT wave it
+    # through on the healthy twin's digest.
+    raw = bytearray(good.read_bytes())
+    raw[-1] ^= 0xFF
+    tampered = tmp_path / "tampered.ckpt"
+    tampered.write_bytes(bytes(raw))
+    with pytest.raises(server.CheckpointRejectedError, match="digest"):
+        server.read_wire_checkpoint(str(tampered), [1, 2, 3, 4], check_safetensors=False)
+
+    # Legacy v1 (no digest) stays loadable — the boundary is strict about
+    # what v2 PROMISES, not about pre-D1 stores.
+    legacy = blob.CheckpointMeta(fingerprint=fp, token_count=4, tokens=[1, 2, 3, 4])
+    legacy_path = tmp_path / "legacy.ckpt"
+    legacy_path.write_bytes(blob.encode(legacy, payload))
+    _, loaded, _ = server.read_wire_checkpoint(
+        str(legacy_path), [1, 2, 3, 4], check_safetensors=False
+    )
+    assert loaded == payload

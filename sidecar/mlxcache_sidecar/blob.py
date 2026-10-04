@@ -11,6 +11,9 @@ import struct
 from dataclasses import asdict, dataclass, field
 
 FORMAT_VERSION = 1
+# D1 integrity: version 2 adds payload_sha256 (written by the daemon at
+# publish, verified at load). Version 1 blobs predate it and stay readable.
+FORMAT_VERSION_D1 = 2
 
 
 @dataclass
@@ -48,6 +51,9 @@ class CheckpointMeta:
     token_count: int
     tokens: list[int] = field(default_factory=list)
     format_version: int = FORMAT_VERSION
+    # D1 integrity (format_version 2, written by the daemon at publish):
+    # sha256 hex of the payload bytes. None on legacy v1 blobs — unverified.
+    payload_sha256: str | None = None
 
 
 def encode(meta: CheckpointMeta, payload: bytes) -> bytes:
@@ -73,7 +79,11 @@ def decode(blob: bytes) -> tuple[CheckpointMeta, bytes]:
         token_count=raw["token_count"],
         tokens=raw.get("tokens", []),
         format_version=raw["format_version"],
+        payload_sha256=raw.get("payload_sha256"),
     )
-    if meta.format_version != FORMAT_VERSION:
+    # Version policy mirrors the daemon's load(): 1 = legacy (no digest
+    # field), 2 = current (D1 digest contract). Anything else is a layout
+    # this reader must not interpret.
+    if meta.format_version not in (1, FORMAT_VERSION_D1):
         raise ValueError(f"format version {meta.format_version}")
     return meta, blob[4 + header_len :]

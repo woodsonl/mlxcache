@@ -795,7 +795,9 @@ async fn publish_leader_blob(
         fingerprint: fingerprint.clone(),
         token_count: tokens.len() as u64,
         tokens: tokens.to_vec(),
+        // publish_atomic stamps the current version + payload digest (D1).
         format_version: 1,
+        payload_sha256: None,
     };
     let key = blob_key(fingerprint, tokens);
     // Refuse before writing if the generation floor is unknown (a failed
@@ -828,7 +830,7 @@ async fn publish_leader_blob(
     let persistence = state.persistence.clone();
     let meta_for_write = meta.clone();
     let write_result = tokio::task::spawn_blocking(move || {
-        persistence.publish_atomic(key, generation, &meta_for_write, &blob)
+        persistence.publish_atomic(key, generation, meta_for_write, &blob)
     })
     .await
     .unwrap_or_else(|join| {
