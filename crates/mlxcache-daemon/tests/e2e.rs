@@ -659,8 +659,18 @@ async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> Option<(String, std::pr
         Err(_) => return None,
     };
     let url = format!("http://127.0.0.1:{port}");
+    // The health probe needs its own deadline: `reqwest::get` is a bare
+    // client with NO timeout, so under a loaded machine (18 parallel `uv
+    // run` starts resolving simultaneously) a half-open connect hangs the
+    // poll forever and the test wedges instead of failing. A per-attempt
+    // timeout converts that into the intended "not up yet" retry.
+    let probe = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .expect("probe client");
     for _ in 0..100 {
-        if reqwest::get(format!("{url}/health")).await.is_ok() {
+        if probe.get(format!("{url}/health")).send().await.is_ok() {
             return Some((url, child));
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1625,6 +1635,137 @@ async fn partial_hit_delta_prefills_only_the_delta() {
         state.stats.snapshot().partials,
         1,
         "exactly one partial (the delta-prefill leader) was recorded"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn multi_turn_end_divergent_serves_t22() {
+    // T22: a growing MULTI-TURN conversation whose turn-2 token stream
+    // diverges from turn-1's checkpoint key at its LAST token must reuse
+    // turn-1's KV. The wire shape: the daemon JSON-serializes the messages,
+    // so turn r's serialization replaces turn r-1's closing bracket. Under
+    // the diverge knob the turn streams share the first len(key)-1 tokens
+    // and differ at the key's final (hinge) token — the exact measured
+    // shape (Qwen2.5: turn-2 LCP 7454 vs turn-1 key 7455). Pre-T22 this
+    // classified as a full miss and re-prefilled everything; the end-
+    // anchored serve rule serves turn-1's checkpoint instead.
+    let Some((sidecar_url, mut child)) = spawn_sidecar_with_env(&[
+        ("MLXCACHE_TOKENIZE_GROW", "turn one"),
+        ("MLXCACHE_TOKENIZE_DIVERGE", "1"),
+    ])
+    .await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: None,
+    });
+
+    let post = |body: String| {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Turn 1: a full miss, publishes the 9-token checkpoint (8 grow + 1
+    // hinge token). Covered KV = 8 tokens.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "turn one"}],
+            "stream": false,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "miss", "{v}");
+
+    // Turn 2: the conversation grows (the serialization changes, the hinge
+    // token differs), so the stream diverges from turn-1's key exactly at
+    // its last token. The end-anchored rule serves turn-1's checkpoint as a
+    // HIT: matched = 9 (the full request), covered KV = 8 (matched - 1),
+    // and the adapter's feed derives from the blob meta (tokens[len-1:])
+    // so it consumes the one uncovered token and the delta — identical to
+    // a scratch run by construction.
+    let turn2 = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [
+            {"role": "user", "content": "turn one"},
+            {"role": "assistant", "content": "ans"},
+            {"role": "user", "content": "turn two"},
+        ],
+        "stream": false,
+    })
+    .to_string();
+    let res = post(turn2.clone()).await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v["mlxcache"]["verdict"], "hit",
+        "turn 2 must reuse turn 1's checkpoint through the end-anchored rule: {v}"
+    );
+    assert_eq!(
+        v["mlxcache"]["prefill_from"], 8,
+        "turn-1's 8 tokens of covered KV reused (matched 9 - 1): {v}"
+    );
+    // Turn 2 did NOT republish: it served from turn-1's blob (no new
+    // publication on the hit path).
+    assert_eq!(
+        state.persistence.list_blobs().unwrap().len(),
+        1,
+        "a hit must not publish a second checkpoint"
+    );
+
+    // Replay turn 2: the same hit, byte-identical routing.
+    let res = post(turn2).await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "hit", "{v}");
+    assert_eq!(v["mlxcache"]["prefill_from"], 8, "{v}");
+
+    // The sidecar saw exactly one prefill: turn 1. Turn 2 (and its replay)
+    // resumed from the checkpoint — no prefill calls at all on the divergent
+    // hit path (the generate path's uncovered tail is fed by the loader, not
+    // a prefill).
+    let stats: serde_json::Value = reqwest::get(format!("{sidecar_url}/stats"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["prefill_count"].as_u64(),
+        Some(1),
+        "turn 2 must not prefill: its KV came from turn-1's checkpoint: {stats}"
     );
 
     child.kill().expect("kill sidecar");

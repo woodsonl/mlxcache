@@ -287,6 +287,15 @@ class SyntheticEngine:
         # daemon tests can exercise partial hits and delta prefill (which the
         # fixed 8-token hash alone can never produce).
         self._grow_base = os.environ.get("MLXCACHE_TOKENIZE_GROW")
+        # Test knob (T22): emulate the real multi-turn wire shape. When set,
+        # one extra token is appended whose value hinges on the WHOLE
+        # serialized prompt string: turn r's stream = grow tokens + hash(
+        # turn-r-serialization). A grown conversation re-serializes with the
+        # closing bracket replaced, so the appended token differs while the
+        # grow tokens agree — the stream diverges from the previous turn's
+        # checkpoint key exactly at its last token, the shape the end-
+        # anchored serve rule turns into reuse.
+        self._diverge_tail = os.environ.get("MLXCACHE_TOKENIZE_DIVERGE") == "1"
         # Phase timers (B2): last prefill's coverage, for the delta-prefill test.
         self.last_prefill_tokens = 0
         self.last_prefill_delta_tokens = 0
@@ -300,6 +309,18 @@ class SyntheticEngine:
         # Test knob: emulate a one-token prompt (nothing cacheable).
         if os.environ.get("MLXCACHE_TOKENIZE_ONE") == "1":
             return [12345]
+        tokens = self._tokenize_inner(prompt)
+        if self._diverge_tail:
+            # T22 knob: hinge ONE token on the WHOLE serialized prompt. A
+            # grown conversation re-serializes (closing bracket replaced),
+            # so the hinge token differs between turns while every earlier
+            # token agrees — turn r+1's stream diverges from turn r's
+            # checkpoint key exactly at its last token, the shape the
+            # end-anchored serve rule turns into reuse.
+            tokens = tokens + [self._hash1(prompt) & 0x7FFFFFFF]
+        return tokens
+
+    def _tokenize_inner(self, prompt: str) -> list[int]:
         if self._grow_base is not None:
             # The daemon tokenizes the JSON-serialized message list, so the
             # user content appears VERBATIM between JSON quotes. Emulate a
@@ -328,6 +349,10 @@ class SyntheticEngine:
                     t for seg in segments for t in self._hash_tokens(seg)
                 ]
         return self._hash_tokens(prompt)
+
+    @staticmethod
+    def _hash1(text: str) -> int:
+        return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "little")
 
     @staticmethod
     def _hash_tokens(text: str) -> list[int]:
