@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
             "index rebuilt from persisted checkpoints"
         );
     }
+    spawn_reaper(state.clone());
     let app = mlxcache_daemon::http::router(state);
     let addr = std::env::var("MLXCACHE_ADDR").unwrap_or_else(|_| "127.0.0.1:8420".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -103,6 +104,57 @@ async fn main() -> Result<()> {
     serve.await?;
     tracing::info!("mlxcache daemon stopped");
     Ok(())
+}
+
+/// Background eviction reaper (T-eviction). Every `interval_s` seconds, evict
+/// cold checkpoints until at most `max_entries` published blobs remain. Scoring
+/// and anchor protection live in `Orchestrator::evict_cold` (ds4 anchor policy:
+/// recently-served checkpoints and live chain bases are never evicted).
+///
+/// Knobs:
+/// - `MLXCACHE_EVICT_INTERVAL_S` — sweep cadence; `0` disables the reaper
+///   entirely (default 60).
+/// - `MLXCACHE_EVICT_MAX_ENTRIES` — published-entry cap; `0` disables eviction
+///   (treat as unlimited, the historical behavior; default 0).
+/// - `MLXCACHE_EVICT_ANCHOR_WINDOW_S` — how long a served checkpoint stays an
+///   anchor (default 900 = 15 min).
+fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
+    let interval_s: u64 = std::env::var("MLXCACHE_EVICT_INTERVAL_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let max_entries: usize = std::env::var("MLXCACHE_EVICT_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if interval_s == 0 || max_entries == 0 {
+        tracing::info!(
+            interval_s,
+            max_entries,
+            "eviction reaper disabled (set MLXCACHE_EVICT_INTERVAL_S and \
+             MLXCACHE_EVICT_MAX_ENTRIES to enable; blob growth is unbounded)"
+        );
+        return;
+    }
+    let anchor_window_s: u64 = std::env::var("MLXCACHE_EVICT_ANCHOR_WINDOW_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_s));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // interval fires immediately; skip the no-op tick
+        loop {
+            ticker.tick().await;
+            state.evict_pass(max_entries, std::time::Duration::from_secs(anchor_window_s));
+        }
+    });
+    tracing::info!(
+        interval_s,
+        max_entries,
+        anchor_window_s,
+        "eviction reaper armed"
+    );
 }
 
 /// Receive SIGINT/SIGTERM and enforce the shutdown deadline off the async

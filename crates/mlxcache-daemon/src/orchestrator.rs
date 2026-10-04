@@ -186,6 +186,87 @@ impl Orchestrator {
         self.index.published_count()
     }
 
+    /// Evict cold checkpoints until the store holds at most `max_entries`
+    /// published blobs (T-eviction: the ds4 anchor policy, now actually wired).
+    ///
+    /// Scoring (policy::eviction_score): anchors score 0 and are never evicted;
+    /// an entry is an anchor when a longer published checkpoint extends it (a
+    /// live chain's base) OR it was served within `anchor_window` (recently
+    /// used). The remainder evict coldest-first until under the cap.
+    ///
+    /// Safety: each removal re-verifies blob path + generation at the node, so
+    /// an entry republished between the snapshot and the removal is untouched;
+    /// the blob file is unlinked only after the index removal wins, and a
+    /// failed unlink is logged (an orphan file is re-scanned and re-published
+    /// by the next startup rebuild — never resurrected mid-run, since the index
+    /// entry is already gone).
+    ///
+    /// Returns the number of entries evicted.
+    pub fn evict_cold(
+        &self,
+        persistence: &crate::persistence::Persistence,
+        max_entries: usize,
+        anchor_window: std::time::Duration,
+    ) -> usize {
+        let candidates = self.index.eviction_candidates();
+        if candidates.len() <= max_entries {
+            return 0;
+        }
+        let now = std::time::Instant::now();
+        let mut scored: Vec<(u64, mlxcache_core::index::IndexCandidate)> = candidates
+            .into_iter()
+            .map(|c| {
+                let anchored = c.is_anchor || now.duration_since(c.last_used) <= anchor_window;
+                let score = mlxcache_core::policy::eviction_score(
+                    &mlxcache_core::policy::EvictionCandidate {
+                        token_count: c.token_count as u64,
+                        last_used: c.last_used,
+                        is_anchor: anchored,
+                    },
+                );
+                (score, c)
+            })
+            .collect();
+        // Policy contract: "Higher score = evict first." Descending order puts
+        // the biggest non-anchor blobs at the front (most bytes freed per
+        // unlink); anchors score 0 and sink to the back, never reached.
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        let excess = scored.len().saturating_sub(max_entries);
+        let mut evicted = 0usize;
+        for (score, cand) in &scored {
+            if evicted >= excess {
+                break;
+            }
+            if *score == 0 {
+                continue; // anchor: never evict
+            }
+            // The candidate carries the blob NAME (relative): removal is by
+            // name under the blob dir, matching quarantine's convention.
+            if self
+                .index
+                .remove_published(&cand.tokens, &cand.blob_path, cand.generation)
+            {
+                // Index removal won the verify race: now reclaim the file.
+                if let Err(e) = persistence.remove(&cand.blob_path) {
+                    tracing::warn!(
+                        blob = %cand.blob_path,
+                        error = %e,
+                        "evicted from index but could not delete blob file (startup rescan will reconcile)"
+                    );
+                }
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            tracing::info!(
+                evicted,
+                target = max_entries,
+                "eviction: cold checkpoints reaped"
+            );
+        }
+        evicted
+    }
+
     /// Rebuild the index from persisted checkpoints at startup (R1-4: persisted
     /// checkpoints survive a restart). Each blob's header carries its own token
     /// prefix, so the radix index can be reconstructed without a request. Blobs
@@ -477,5 +558,148 @@ mod tests {
         // native path. The sidecar is never the hot-path default (R4).
         let cfg = SidecarConfig::new("http://127.0.0.1:8421".into(), "m".into());
         assert_eq!(cfg.model_id, "m");
+    }
+
+    #[test]
+    fn evict_cold_reaps_blobs_up_to_cap_and_unlinks_files() {
+        // The reaper must evict down to the cap, unlink the evicted blob files
+        // (a blob left on disk resurrects on the next restart rebuild), and
+        // leave under-cap stores untouched. Window 0 disables the recency
+        // anchor; all four prefixes are standalone, so structural anchors do
+        // not apply either. (Recency anchoring is asserted separately below.)
+        let orch = Orchestrator::new();
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = crate::persistence::Persistence::new(dir.path().join("blobs")).unwrap();
+
+        let mut names = Vec::new();
+        for i in 0..4u64 {
+            let name = format!("blob-{i}");
+            // A real file per blob, so unlinking is observable.
+            std::fs::write(persistence.blob_dir.join(&name), b"payload").unwrap();
+            publish(&orch, &[i as u32, 2, 3], meta("m", 3), &name, i + 1);
+            names.push(name);
+        }
+        assert_eq!(orch.published_count(), 4);
+
+        // Under the cap: no-op.
+        assert_eq!(
+            orch.evict_cold(&persistence, 10, std::time::Duration::ZERO),
+            0
+        );
+        assert_eq!(orch.published_count(), 4);
+
+        // Cap at 1: the reaper must remove 3. All scores tie (token_count 3),
+        // so which one survives is walk-order dependent — but index removal
+        // and file unlink must agree for every entry.
+        let evicted = orch.evict_cold(&persistence, 1, std::time::Duration::ZERO);
+        assert_eq!(evicted, 3);
+        assert_eq!(orch.published_count(), 1);
+        for (i, name) in names.iter().enumerate() {
+            let gone = !persistence.blob_dir.join(name).exists();
+            let still_published =
+                orch.route(&[i as u32, 2, 3], &fp("m")).decision.verdict == CacheVerdict::Hit;
+            assert_eq!(
+                gone, !still_published,
+                "index removal and file unlink must agree for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn evict_cold_never_reaps_chain_bases_and_highest_score_first() {
+        // ds4 lesson: the base a live chain was built on must survive, even
+        // when it is the "coldest" entry. Policy contract: higher score evicts
+        // first (score = token_count), so with window 0 the 4-token chain
+        // entry goes before the 3-token standalone, and the 2-token base
+        // (anchor) is never reached.
+        let orch = Orchestrator::new();
+        let persistence = persist();
+
+        // [1,2] anchors the chain [1,2,3,4]; [7,7,7] is standalone.
+        publish(&orch, &[1, 2], meta("m", 2), "base", 1);
+        publish(&orch, &[1, 2, 3, 4], meta("m", 4), "chain", 2);
+        publish(&orch, &[7, 7, 7], meta("m", 3), "cold", 3);
+
+        // Cap 2 (excess 1): the highest-score non-anchor is the chain entry.
+        let evicted = orch.evict_cold(&persistence, 2, std::time::Duration::ZERO);
+        assert_eq!(evicted, 1);
+        // The 4-token entry is gone: [1,2,3,4] now only PARTIALLY matches the
+        // surviving base at depth 2.
+        let out = orch.route(&[1, 2, 3, 4], &fp("m"));
+        assert_eq!(
+            out.decision.verdict,
+            CacheVerdict::Partial,
+            "the 4-token chain entry has the highest score and evicts first"
+        );
+        assert_eq!(out.decision.matched_tokens, 2);
+        assert_eq!(
+            orch.route(&[1, 2], &fp("m")).decision.verdict,
+            CacheVerdict::Hit
+        );
+        assert_eq!(
+            orch.route(&[7, 7, 7], &fp("m")).decision.verdict,
+            CacheVerdict::Hit
+        );
+
+        // Cap 1 (excess 1): the standalone goes next; the base is untouched
+        // (it is only ever reached after higher-scored non-anchors).
+        let evicted = orch.evict_cold(&persistence, 1, std::time::Duration::ZERO);
+        assert_eq!(evicted, 1);
+        assert_eq!(
+            orch.route(&[7, 7, 7], &fp("m")).decision.verdict,
+            CacheVerdict::Miss
+        );
+
+        // The base is now alone (its chain was reaped, so the structural
+        // anchor has lapsed) — but it was just SERVED: within the recency
+        // window it is an anchor and must survive even a cap of 0.
+        orch.route(&[1, 2], &fp("m")); // touch via lookup
+        let evicted = orch.evict_cold(&persistence, 0, std::time::Duration::from_secs(900));
+        assert_eq!(evicted, 0, "a recently served entry is never evicted");
+        assert_eq!(
+            orch.route(&[1, 2], &fp("m")).decision.verdict,
+            CacheVerdict::Hit
+        );
+
+        // Outside the window (0) with no published extension, the same entry
+        // is legitimately evictable: structural anchoring follows the live
+        // chain, recency follows the window. A cold, unextended checkpoint is
+        // dead weight no matter how it got there.
+        let evicted = orch.evict_cold(&persistence, 0, std::time::Duration::ZERO);
+        assert_eq!(evicted, 1);
+        assert_eq!(
+            orch.route(&[1, 2], &fp("m")).decision.verdict,
+            CacheVerdict::Miss
+        );
+    }
+
+    #[test]
+    fn evict_cold_recency_window_anchors_recently_used_entries() {
+        // Within the anchor window, everything is anchored and nothing is
+        // reaped (the live-working-set guarantee). Past the window (window 0
+        // here), the same store evicts normally.
+        let orch = Orchestrator::new();
+        let persistence = persist();
+        publish(&orch, &[7, 7, 7], meta("m", 3), "cold", 1); // standalone
+
+        let evicted = orch.evict_cold(&persistence, 0, std::time::Duration::from_secs(900));
+        assert_eq!(evicted, 0, "a just-published entry is an anchor (recency)");
+        assert_eq!(
+            orch.route(&[7, 7, 7], &fp("m")).decision.verdict,
+            CacheVerdict::Hit
+        );
+        // Window 0: not recently used, no descendants — evictable.
+        let evicted = orch.evict_cold(&persistence, 0, std::time::Duration::ZERO);
+        assert_eq!(evicted, 1);
+    }
+
+    #[test]
+    fn evict_cold_is_a_noop_when_store_is_empty() {
+        let orch = Orchestrator::new();
+        let persistence = persist();
+        assert_eq!(
+            orch.evict_cold(&persistence, 0, std::time::Duration::ZERO),
+            0
+        );
     }
 }

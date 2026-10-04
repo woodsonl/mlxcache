@@ -16,7 +16,7 @@ struct Node {
     entry: Option<IndexEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IndexEntry {
     pub meta: CheckpointMeta,
     /// Path of the published blob (post-rename, never a temp path).
@@ -27,12 +27,63 @@ pub struct IndexEntry {
     /// publication it used, never a fresh republish that landed meanwhile.
     pub generation: u64,
     pub state: CheckpointState,
+    /// Last time a lookup matched this entry — monotonic milliseconds from the
+    /// process-start instant (see [`last_used_instant`]). Drives eviction
+    /// anchoring (policy::eviction_score): a recently served checkpoint is the
+    /// base of a live chain and must not be reaped. Atomic so `lookup` can
+    /// touch it through the read lock.
+    last_used_millis: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for IndexEntry {
+    fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        Self {
+            meta: self.meta.clone(),
+            blob_path: self.blob_path.clone(),
+            generation: self.generation,
+            state: self.state,
+            last_used_millis: std::sync::atomic::AtomicU64::new(
+                self.last_used_millis.load(Relaxed),
+            ),
+        }
+    }
+}
+
+/// Process-start instant backing [`IndexEntry::last_used_instant`]. Monotonic
+/// clock (Instant), so eviction decisions are immune to wall-clock jumps.
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn now_millis() -> u64 {
+    let start = START.get_or_init(std::time::Instant::now);
+    start.elapsed().as_millis() as u64
+}
+
+fn last_used_instant(millis: u64) -> std::time::Instant {
+    let start = START.get_or_init(std::time::Instant::now);
+    *start + std::time::Duration::from_millis(millis)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
     #[error("index corrupt: {0}")]
     Corrupt(String),
+}
+
+/// One Published entry, shaped for the eviction policy (policy::eviction_score).
+#[derive(Debug, Clone)]
+pub struct IndexCandidate {
+    /// The exact token prefix the entry lives at — the removal key.
+    pub tokens: Vec<u32>,
+    pub token_count: usize,
+    pub last_used: std::time::Instant,
+    /// True when a longer published checkpoint extends this prefix (a live
+    /// chain's base). Feeds `EvictionCandidate::is_anchor`.
+    pub is_anchor: bool,
+    /// The published blob file (post-rename name) and its generation: eviction
+    /// must remove the exact publication it snapshotted, never a republish.
+    pub blob_path: String,
+    pub generation: u64,
 }
 
 #[derive(Debug, Default)]
@@ -62,6 +113,7 @@ impl PrefixIndex {
     /// Longest published prefix match for `tokens`. Returns the entry and the
     /// number of tokens matched.
     pub fn lookup(&self, tokens: &[u32]) -> Option<(IndexEntry, usize)> {
+        use std::sync::atomic::Ordering::Relaxed;
         let root = self.read_lock();
         let mut node: &Node = &root;
         let mut best: Option<(IndexEntry, usize)> = None;
@@ -71,6 +123,11 @@ impl PrefixIndex {
                     node = child;
                     if let Some(entry) = &node.entry {
                         if entry.state == CheckpointState::Published {
+                            // Anchor touch: this entry just served a request, so
+                            // it is the base of a live chain. Relaxed is fine —
+                            // the value feeds a heuristic (eviction), and a torn
+                            // read would still be *a* past time.
+                            entry.last_used_millis.store(now_millis(), Relaxed);
                             best = Some((entry.clone(), i + 1));
                         }
                     }
@@ -79,6 +136,94 @@ impl PrefixIndex {
             }
         }
         best
+    }
+
+    /// Every Published entry, as an eviction candidate: its prefix tokens (the
+    /// removal key), token count, last-use instant, and whether any *other*
+    /// published entry extends it (an ancestor of a live chain — the ds4
+    /// anchor rule: never reap the base a longer checkpoint was built on).
+    pub fn eviction_candidates(&self) -> Vec<IndexCandidate> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let root = self.read_lock();
+        let mut out = Vec::new();
+        // One DFS collects entries and marks extended prefixes: a published
+        // node is "extended" if any published node below it shares its prefix.
+        // Two passes over the same lock hold, so the snapshot is consistent.
+        struct Frame<'a> {
+            node: &'a Node,
+            tokens: Vec<u32>,
+        }
+        let mut stack = vec![Frame {
+            node: &root,
+            tokens: Vec::new(),
+        }];
+        // (token_count, path_index into a flat list) pairs to patch later.
+        let mut entries: Vec<(Vec<u32>, usize, u64, std::time::Instant, String, u64)> = Vec::new();
+        while let Some(frame) = stack.pop() {
+            if let Some(entry) = &frame.node.entry {
+                if entry.state == CheckpointState::Published {
+                    let millis = entry.last_used_millis.load(Relaxed);
+                    entries.push((
+                        frame.tokens.clone(),
+                        entry.meta.token_count as usize,
+                        millis,
+                        last_used_instant(millis),
+                        entry.blob_path.clone(),
+                        entry.generation,
+                    ));
+                }
+            }
+            for (t, child) in &frame.node.children {
+                let mut tokens = frame.tokens.clone();
+                tokens.push(*t);
+                stack.push(Frame {
+                    node: child,
+                    tokens,
+                });
+            }
+        }
+        // A candidate is an ANCHOR when its token prefix is a strict prefix of
+        // another published candidate's prefix (a longer checkpoint extends it).
+        for (tokens, count, _millis, instant, blob_path, generation) in &entries {
+            let is_anchor = entries.iter().any(|(other, _, _, _, _, _)| {
+                other.len() > tokens.len() && other.starts_with(tokens.as_slice())
+            });
+            out.push(IndexCandidate {
+                tokens: tokens.clone(),
+                token_count: *count,
+                last_used: *instant,
+                is_anchor,
+                blob_path: blob_path.clone(),
+                generation: *generation,
+            });
+        }
+        out
+    }
+
+    /// Remove the Published entry at exactly `tokens` if it is still the same
+    /// blob + generation. Returns true when removed (the blob file should then
+    /// be unlinked by the caller). Never touches quarantined entries — they are
+    /// diagnostics, not space.
+    pub fn remove_published(&self, tokens: &[u32], blob_path: &str, generation: u64) -> bool {
+        let mut root = self.write_lock();
+        let mut node: &mut Node = &mut root;
+        for t in tokens {
+            match node.children.get_mut(t) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        match &mut node.entry {
+            Some(entry)
+                if entry.blob_path == blob_path
+                    && entry.generation == generation
+                    && entry.state == CheckpointState::Published =>
+            {
+                node.entry = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Reserve the next publication generation. Callers reserve BEFORE writing
@@ -142,6 +287,10 @@ impl PrefixIndex {
             blob_path,
             generation,
             state: CheckpointState::Published,
+            // A freshly published checkpoint counts as just-used: it must not
+            // be the first thing the reaper picks the moment it goes cold,
+            // since it is by definition the newest KV in the store.
+            last_used_millis: std::sync::atomic::AtomicU64::new(now_millis()),
         });
         true
     }
@@ -502,5 +651,75 @@ mod tests {
         // Writes still work too.
         let _ = publish_entry(&index, &[4, 5], "c");
         assert_eq!(index.published_count(), 2);
+    }
+
+    #[test]
+    fn eviction_candidates_reports_anchors_and_sizes() {
+        // [1,2] is the base of the live chain ending at [1,2,3,4]: it must be
+        // reported as an anchor (is_anchor), while the standalone [9,9] is not.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2], "base");
+        let _ = publish_entry(&index, &[1, 2, 3, 4], "chain");
+        let _ = publish_entry(&index, &[9, 9], "loner");
+        let mut cands = index.eviction_candidates();
+        cands.sort_by(|a, b| a.tokens.cmp(&b.tokens));
+        assert_eq!(cands.len(), 3);
+        assert!(cands[0].is_anchor, "[1,2] extends to [1,2,3,4]");
+        assert!(!cands[1].is_anchor, "[1,2,3,4] has no published extension");
+        assert!(!cands[2].is_anchor, "[9,9] is standalone");
+        assert_eq!(cands[0].token_count, 3);
+        assert_eq!(cands[2].blob_path, "loner");
+    }
+
+    #[test]
+    fn remove_published_removes_exact_entry_only() {
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2], "base");
+        let chain_gen = publish_entry(&index, &[1, 2, 3, 4], "chain");
+        // Wrong generation / wrong blob / wrong prefix all refuse.
+        assert!(!index.remove_published(&[1, 2, 3, 4], "chain", chain_gen + 1));
+        assert!(!index.remove_published(&[1, 2, 3, 4], "other", chain_gen));
+        assert!(!index.remove_published(&[1, 2], "chain", chain_gen));
+        assert_eq!(index.published_count(), 2, "nothing removed yet");
+        // Exact match removes, and only that entry.
+        assert!(index.remove_published(&[1, 2, 3, 4], "chain", chain_gen));
+        assert_eq!(index.published_count(), 1);
+        // [1,2,3,4] now matches only the surviving base, at depth 2.
+        let (entry, matched) = index.lookup(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(matched, 2, "the removed entry must no longer match");
+        assert_eq!(entry.blob_path, "base");
+        // Removing again is a no-op (idempotent-safe).
+        assert!(!index.remove_published(&[1, 2, 3, 4], "chain", chain_gen));
+    }
+
+    #[test]
+    fn quarantined_entries_are_not_eviction_candidates() {
+        // Quarantine keeps a tombstone for diagnostics; eviction must not reap
+        // (and unlink) it a second time.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2], "base");
+        let gen = publish_entry(&index, &[7, 7, 7], "poison");
+        assert!(index.quarantine_blob("poison", gen, &[7, 7, 7], || {}));
+        let cands = index.eviction_candidates();
+        assert_eq!(cands.len(), 1, "only the published entry is a candidate");
+        assert_eq!(cands[0].tokens, vec![1, 2]);
+    }
+
+    #[test]
+    fn lookup_touches_last_used_for_recency_anchoring() {
+        // The eviction policy anchors recently-served checkpoints. The touch
+        // happens through the read lock; verify it observes a later timestamp
+        // than publish time. The millis clock truncates, so sleep past one
+        // full tick (2ms) to guarantee strict progress on any platform.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2, 3], "blob");
+        let before = index.eviction_candidates()[0].last_used;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = index.lookup(&[1, 2, 3, 9]);
+        let after = index.eviction_candidates()[0].last_used;
+        assert!(
+            after > before,
+            "lookup must advance the entry's last_used instant"
+        );
     }
 }
