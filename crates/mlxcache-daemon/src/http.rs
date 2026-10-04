@@ -20,6 +20,20 @@ use mlxcache_core::policy::{covered_kv_tokens, CacheVerdict, PolicyDecision};
 use mlxcache_core::singleflight::SingleFlight;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// Cap on the stream line buffer between newlines. The idle timeout governs
+/// byte ARRIVALS, not their content, so a fast flood without a newline would
+/// otherwise grow `st.buf` unboundedly; past this the stream is cut with an
+/// explicit upstream error (no legitimate token frame approaches it).
+const MAX_PARTIAL_LINE: usize = 1024 * 1024;
+
+/// Default generation budget when the client omits `max_tokens`; kept at the
+/// historical hardcoded value so existing clients see zero behavior change.
+const MAX_TOKENS_DEFAULT: usize = 64;
+/// Upper bound on a client-requested generation budget: a typo'd 100M must
+/// not translate into unbounded adapter work (api-contract 2026-10-04).
+const MAX_TOKENS_LIMIT: usize = 8192;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -27,6 +41,10 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
+    /// OpenAI `max_tokens`: forwarded to the adapter's /generate. Absent
+    /// keeps the historical 64. Capped by [`MAX_TOKENS_LIMIT`] (400 above).
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -55,50 +73,101 @@ pub struct AppState {
     pub served_models: Vec<String>,
     pub sidecar: Option<SidecarClient>,
     pub persistence: crate::persistence::Persistence,
+    /// Optional JSONL trace capture (MLXCACHE_TRACE, step 5). None when the
+    /// env knob is unset — the hot path costs one `Option::None` check.
+    pub trace: Option<crate::trace::TraceWriter>,
 }
 
-/// Hit-rate counters (D3). Mutex over a small struct is fine at v1 scale.
+impl AppState {
+    /// One eviction pass against this state: reap cold checkpoints, then
+    /// record the count in /stats. Both the background reaper (main.rs) and
+    /// tests go through this single path, so the counter can never drift from
+    /// what the reaper actually removed.
+    pub fn evict_pass(&self, max_entries: usize, anchor_window: std::time::Duration) -> usize {
+        let evicted = self
+            .orchestrator
+            .evict_cold(&self.persistence, max_entries, anchor_window);
+        if evicted > 0 {
+            self.stats.record_evictions(evicted as u64);
+        }
+        evicted
+    }
+}
+
+/// Hit-rate counters (D3). Per-counter atomics instead of a Mutex: `record`
+/// runs on every request, and under concurrent streaming the lock is a
+/// cross-core contention point on the hot path for no benefit — the counters
+/// are independent monotonic (or correcting) totals that never need to be
+/// read and written transactionally together.
 #[derive(Debug, Default)]
 pub struct Stats {
-    inner: std::sync::Mutex<StatsInner>,
-}
-
-#[derive(Debug, Default)]
-pub struct StatsInner {
-    pub requests: u64,
-    pub hits: u64,
-    pub misses: u64,
-    pub partials: u64,
+    requests: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+    partials: std::sync::atomic::AtomicU64,
     /// Sum of covered KV across requests. On a retire, `correct_retire` subtracts
     /// the entry's covered count, so this reflects KV actually in hand.
-    pub tokens_cached: u64,
+    tokens_cached: std::sync::atomic::AtomicU64,
     /// Sum of request lengths. `hit_rate = tokens_cached / tokens_total` is a
     /// coarse reuse diagnostic, not a true per-request fraction: a retire lowers
     /// the numerator without lowering this, so the ratio can dip below the
     /// fraction of requests that hit. Read it as a trend, not an exact rate.
+    tokens_total: std::sync::atomic::AtomicU64,
+    /// Checkpoints removed by the eviction reaper (ds4 anchor policy). Purely
+    /// cumulative observability: evictions are policy, not failures.
+    evictions: std::sync::atomic::AtomicU64,
+}
+
+/// Point-in-time read of every counter, for /stats and tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub requests: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub partials: u64,
+    pub tokens_cached: u64,
     pub tokens_total: u64,
+    pub evictions: u64,
 }
 
 impl Stats {
-    /// Recover a poisoned lock instead of panicking: counters are diagnostic,
-    /// never worth failing a request over (error-registry principle).
-    fn lock(&self) -> std::sync::MutexGuard<'_, StatsInner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    fn get(c: &std::sync::atomic::AtomicU64) -> u64 {
+        c.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Decremented-by-one, saturating at zero (a retire racing a concurrent
+    /// record can observe a transient zero; counters are diagnostic).
+    fn sub_one(c: &std::sync::atomic::AtomicU64) {
+        let _ = c.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| v.checked_sub(1),
+        );
+    }
+    fn sub(c: &std::sync::atomic::AtomicU64, n: u64) {
+        let _ = c.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| v.checked_sub(n),
+        );
     }
 
     pub fn record(&self, d: &PolicyDecision) {
-        let mut s = self.lock();
-        s.requests += 1;
+        use std::sync::atomic::Ordering::Relaxed;
+        self.requests.fetch_add(1, Relaxed);
         match d.verdict {
-            CacheVerdict::Hit => s.hits += 1,
-            CacheVerdict::Miss => s.misses += 1,
-            CacheVerdict::Partial => s.partials += 1,
-        }
+            CacheVerdict::Hit => self.hits.fetch_add(1, Relaxed),
+            CacheVerdict::Miss => self.misses.fetch_add(1, Relaxed),
+            CacheVerdict::Partial => self.partials.fetch_add(1, Relaxed),
+        };
         // tokens_cached counts KV actually in hand (covered = matched-1), the
         // same value the response reports as tokens_cached/prefill_from. Counting
         // matched_tokens here would overstate reuse by one per hit.
-        s.tokens_cached += covered_kv_tokens(d.verdict, d.matched_tokens) as u64;
-        s.tokens_total += d.request_tokens as u64;
+        self.tokens_cached.fetch_add(
+            covered_kv_tokens(d.verdict, d.matched_tokens) as u64,
+            Relaxed,
+        );
+        self.tokens_total
+            .fetch_add(d.request_tokens as u64, Relaxed);
     }
 
     /// Correct a decision whose checkpoint was retired (quarantined) after
@@ -111,19 +180,37 @@ impl Stats {
     /// its miss verdict while adopting the blob it just published, and retiring
     /// that blob must not count a second miss for the one request.
     pub fn correct_retire(&self, d: &PolicyDecision) {
+        use std::sync::atomic::Ordering::Relaxed;
         if d.verdict == CacheVerdict::Miss {
             return;
         }
-        let mut s = self.lock();
         match d.verdict {
-            CacheVerdict::Hit => s.hits = s.hits.saturating_sub(1),
-            CacheVerdict::Partial => s.partials = s.partials.saturating_sub(1),
+            CacheVerdict::Hit => Self::sub_one(&self.hits),
+            CacheVerdict::Partial => Self::sub_one(&self.partials),
             CacheVerdict::Miss => {}
         }
-        s.misses += 1;
-        s.tokens_cached = s
-            .tokens_cached
-            .saturating_sub(covered_kv_tokens(d.verdict, d.matched_tokens) as u64);
+        self.misses.fetch_add(1, Relaxed);
+        Self::sub(
+            &self.tokens_cached,
+            covered_kv_tokens(d.verdict, d.matched_tokens) as u64,
+        );
+    }
+
+    pub fn record_evictions(&self, n: u64) {
+        self.evictions
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            requests: Self::get(&self.requests),
+            hits: Self::get(&self.hits),
+            misses: Self::get(&self.misses),
+            partials: Self::get(&self.partials),
+            tokens_cached: Self::get(&self.tokens_cached),
+            tokens_total: Self::get(&self.tokens_total),
+            evictions: Self::get(&self.evictions),
+        }
     }
 }
 
@@ -131,7 +218,53 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/stats", get(stats))
+        // Liveness probe (api-contract 2026-10-04): deliberately
+        // dependency-free — it answers "is the process up", NOT "is the
+        // adapter reachable" (that is /stats' job, which reports adapter
+        // state and cache counters). A healthz that probed the sidecar would
+        // flap 503 whenever the engine restarts, evicting the daemon from
+        // load balancer pools that are perfectly healthy to 404/502.
+        .route("/healthz", get(healthz))
         .with_state(state)
+}
+
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// `Json<T>` with rejections mapped into the documented error envelope.
+/// axum's built-in Json rejections emit bare bodies (plain text for a
+/// missing content-type, its own JSON shape for syntax errors) that bypass
+/// the error registry — a client could not parse them with the same code
+/// path it uses for every other daemon error (api-contract 2026-10-04).
+struct ValidJson<T>(T);
+
+impl<S, T> axum::extract::FromRequest<S> for ValidJson<T>
+where
+    Json<T>: axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+
+    async fn from_request(
+        req: axum::http::Request<axum::body::Body>,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let rejection = match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => return Ok(ValidJson(value)),
+            Err(rejection) => rejection,
+        };
+        let (status, kind) = match &rejection {
+            axum::extract::rejection::JsonRejection::MissingJsonContentType(_) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+            }
+            _ => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        };
+        // Rejection strings embed a bounded body snippet by construction;
+        // the truncation is belt-and-braces against a future axum change.
+        let message: String = rejection.to_string().chars().take(300).collect();
+        Err(err(status, &message, kind))
+    }
 }
 
 fn err(status: StatusCode, message: &str, kind: &str) -> (StatusCode, Json<ErrorResponse>) {
@@ -146,9 +279,25 @@ fn err(status: StatusCode, message: &str, kind: &str) -> (StatusCode, Json<Error
     )
 }
 
+/// Transport-level sidecar failures (unreachable, stream-open timeout) mean
+/// the adapter is DOWN: 503 `adapter_unavailable`, consistently on every leg
+/// (tokenize, prefill, generate, stream-open). Everything else — an HTTP
+/// error the adapter returned, a protocol violation, a decode failure — is
+/// 502 `adapter_error`. Before this split the same sidecar-down condition
+/// mapped to 503 on one leg and 502 on another, so a client retry policy
+/// could not trust the code (api-contract review 2026-10-04).
+fn sidecar_http_err(e: &SidecarError) -> (StatusCode, &'static str) {
+    match e {
+        SidecarError::Unreachable { .. } | SidecarError::StreamOpenTimeout { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "adapter_unavailable")
+        }
+        _ => (StatusCode::BAD_GATEWAY, "adapter_error"),
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ChatRequest>,
+    ValidJson(req): ValidJson<ChatRequest>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     // Validation order per error registry: malformed → 400; unknown model →
     // 404 BEFORE any cache lookup (Section 3 finding).
@@ -166,6 +315,20 @@ async fn chat_completions(
             "invalid_request_error",
         ));
     }
+    // Resolve the generation budget once, for both the JSON and stream legs.
+    // Some(0) passes through (a client asking for zero tokens gets zero);
+    // only a value above the cap is refused.
+    let max_tokens = match req.max_tokens {
+        None => MAX_TOKENS_DEFAULT,
+        Some(n) if n > MAX_TOKENS_LIMIT => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("max_tokens must be <= {MAX_TOKENS_LIMIT}").as_str(),
+                "invalid_request_error",
+            ));
+        }
+        Some(n) => n,
+    };
 
     let started = std::time::Instant::now();
     let prompt = serde_json::to_string(&req.messages).map_err(|_| {
@@ -176,31 +339,65 @@ async fn chat_completions(
         )
     })?;
 
-    // Tokenize via adapter (R1-2). Sidecar unavailable → 503 naming it.
-    let (tokens, tokenizer_hash, kv_dtype) = match &state.sidecar {
-        Some(client) => match client.tokenize(&prompt).await {
-            Ok(r) => (r.tokens, r.tokenizer_hash, r.kv_dtype),
-            Err(SidecarError::Unreachable { url, .. }) => {
+    // Tokenize (R1-2). T13: when a native tokenizer is configured the daemon
+    // encodes in-process — no HTTP hop. Before the first native encode, the
+    // daemon proves the configured tokenizer.json IS the engine's tokenizer:
+    // one probe prompt is encoded both ways and the ids must match, or the
+    // daemon refuses to serve (a mismatched artifact would corrupt routing).
+    // On match it adopts the sidecar-reported tokenizer_hash + kv_dtype (+
+    // kv quantization config), so fingerprints are IDENTICAL to the
+    // pure-sidecar path — native tokenize is a pure latency optimization,
+    // invisible to the cache.
+    let (identity, tokens) = if let Some((_path, native)) = crate::native_tokenizer::from_env() {
+        match resolve_native_identity(&prompt, native, state.sidecar.as_ref()).await {
+            // A failed native encode must surface (502, matching the sidecar
+            // tokenize path's failure class), never degrade to an empty prompt.
+            Ok(identity) => match native.encode(&prompt) {
+                Some(tokens) => (identity, tokens),
+                None => {
+                    return Err(err(
+                        StatusCode::BAD_GATEWAY,
+                        "native tokenizer failed to encode the prompt",
+                        "adapter_error",
+                    ));
+                }
+            },
+            Err(e) => return Err(e),
+        }
+    } else {
+        match &state.sidecar {
+            Some(client) => match client.tokenize(&prompt).await {
+                Ok(r) => (
+                    Identity {
+                        tokenizer_hash: r.tokenizer_hash,
+                        kv_dtype: r.kv_dtype,
+                        kv_bits: r.kv_bits,
+                        kv_group_size: r.kv_group_size,
+                    },
+                    r.tokens,
+                ),
+                Err(SidecarError::Unreachable { url, .. }) => {
+                    return Err(err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("adapter (sidecar) unreachable at {url}").as_str(),
+                        "adapter_unavailable",
+                    ));
+                }
+                Err(e) => {
+                    return Err(err(
+                        StatusCode::BAD_GATEWAY,
+                        &e.to_string(),
+                        "adapter_error",
+                    ));
+                }
+            },
+            None => {
                 return Err(err(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!("adapter (sidecar) unreachable at {url}").as_str(),
+                    "no adapter configured",
                     "adapter_unavailable",
                 ));
             }
-            Err(e) => {
-                return Err(err(
-                    StatusCode::BAD_GATEWAY,
-                    &e.to_string(),
-                    "adapter_error",
-                ));
-            }
-        },
-        None => {
-            return Err(err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no adapter configured",
-                "adapter_unavailable",
-            ));
         }
     };
 
@@ -215,14 +412,17 @@ async fn chat_completions(
         ));
     }
 
-    // Route + classify (R1-1 fingerprint check inside classify). The tokenizer
-    // hash comes from the adapter (R1-2): a constant here would let checkpoints
-    // from different tokenizers share a fingerprint and be served wrongly.
+    // Route + classify (R1-1 fingerprint check inside classify). The identity
+    // comes from the adapter (R1-2): a constant here would let checkpoints
+    // from different tokenizers/dtypes/quantization share a fingerprint and
+    // be served wrongly.
     let fingerprint = ModelFingerprint {
         model_id: req.model.clone(),
-        tokenizer_hash,
-        kv_dtype,
+        tokenizer_hash: identity.tokenizer_hash,
+        kv_dtype: identity.kv_dtype,
         kv_layout_version: 1,
+        kv_bits: identity.kv_bits,
+        kv_group_size: identity.kv_group_size,
     };
     let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
     // The token-only prefix hash for the request log line. The blob filename
@@ -243,9 +443,23 @@ async fn chat_completions(
         ));
     };
     if outcome.decision.verdict != CacheVerdict::Hit {
-        match state.singleflight.enter(tokens.clone()).await {
+        match state.singleflight.enter(&tokens).await {
             mlxcache_core::singleflight::Role::Leader(lead) => {
-                match client.prefill(&tokens).await {
+                // Delta prefill (OV3): on a PARTIAL match the route already
+                // found an ancestor checkpoint covering tokens[:matched-1] of
+                // KV. Pass its absolute path so the adapter loads that KV and
+                // prefills only the uncovered delta, instead of recomputing
+                // the whole prefix (the single biggest TTFT lever on growing
+                // conversations). A full miss has no ancestor.
+                let ancestor = outcome.blob.as_ref().map(|(name, _, _)| {
+                    state
+                        .persistence
+                        .blob_dir
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                match client.prefill(&tokens, ancestor.as_deref()).await {
                     // An empty payload means the adapter cached nothing (e.g. a
                     // one-token prompt). Publishing would index a checkpoint with
                     // no KV. The leader's publish result is an `Ok(blob_name)`, and
@@ -262,97 +476,78 @@ async fn chat_completions(
                         // follower report the same verdict: nothing was cached,
                         // so no blob may be resumed from even if a shorter
                         // ancestor had been matched.
-                        outcome.decision = mlxcache_core::policy::PolicyDecision {
-                            verdict: mlxcache_core::policy::CacheVerdict::Miss,
-                            matched_tokens: 0,
-                            request_tokens: tokens.len(),
-                        };
+                        outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
                         outcome.blob = None;
                         outcome.prefill_from = 0;
                         lead.complete(Ok(String::new()));
                     }
                     Ok(blob) => {
-                        let meta = mlxcache_core::contract::CheckpointMeta {
-                            fingerprint: fingerprint.clone(),
-                            token_count: tokens.len() as u64,
-                            tokens: tokens.clone(),
-                            format_version: 1,
-                        };
-                        let key = blob_key(&fingerprint, &tokens);
-                        // Refuse before writing if the generation floor is unknown
-                        // (a failed startup scan): writing first would leak an
-                        // unindexed file on every request. Serve from scratch.
-                        if !state.orchestrator.can_publish() {
-                            // Floor unknown: don't write. Report a plain miss so
-                            // followers also serve from scratch (an empty name is
-                            // the "not cached" signal, not an error).
-                            tracing::warn!("not caching: startup recovery incomplete");
-                            outcome.decision = mlxcache_core::policy::PolicyDecision {
-                                verdict: mlxcache_core::policy::CacheVerdict::Miss,
-                                matched_tokens: 0,
-                                request_tokens: tokens.len(),
-                            };
-                            outcome.blob = None;
-                            outcome.prefill_from = 0;
-                            lead.complete(Ok(String::new()));
-                        } else {
-                            // Reserve the generation BEFORE writing so the on-disk
-                            // name is generation-specific (immutable). A republish
-                            // then never overwrites an earlier generation's file, so
-                            // a delayed retirement cannot delete a healthy
-                            // replacement.
-                            let generation = state.orchestrator.reserve_generation();
-                            let blob_name = format!("{:032x}-{:016x}.ckpt", key, generation);
-                            match state
-                                .persistence
-                                .publish_atomic(key, generation, &meta, &blob)
-                            {
-                                // ENOSPC rescue (registry): log and continue uncached.
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
-                                    lead.complete(Err(e.to_string()));
-                                }
-                                Ok(_) => {
-                                    let published = state.orchestrator.publish_checkpoint(
-                                        &state.persistence,
-                                        &tokens,
-                                        meta,
-                                        blob_name.clone(),
-                                        generation,
-                                    );
-                                    // publish_checkpoint is expected to succeed (we
-                                    // checked can_publish), but if the index rejected
-                                    // it, remove the now-unindexed file so it cannot
-                                    // leak.
-                                    if !published {
-                                        if let Err(e) = state.persistence.remove(&blob_name) {
-                                            tracing::warn!(error = %e, "could not remove unindexed blob");
-                                        }
-                                    }
-                                    // The leader ran a FRESH prefill over the whole
-                                    // prompt (the ancestor blob was not passed to the
-                                    // adapter), so no prior-request KV was reused, even
-                                    // on a partial. Report a miss with zero covered KV
-                                    // so response, /stats, and the log agree on what
-                                    // actually happened. Only generation resumes from
-                                    // the blob just written; that is not reuse.
-                                    outcome.decision = mlxcache_core::policy::PolicyDecision {
-                                        verdict: mlxcache_core::policy::CacheVerdict::Miss,
-                                        matched_tokens: 0,
-                                        request_tokens: tokens.len(),
-                                    };
-                                    outcome.prefill_from = 0;
-                                    outcome.blob =
-                                        Some((blob_name.clone(), generation, tokens.clone()));
-                                    lead.complete(Ok(blob_name));
-                                }
-                            }
-                        }
+                        publish_leader_blob(
+                            state.clone(),
+                            lead,
+                            &mut outcome,
+                            &fingerprint,
+                            &tokens,
+                            blob,
+                        )
+                        .await?;
                     }
                     Err(e) => {
-                        let msg = e.to_string();
-                        lead.complete(Err(msg.clone()));
-                        return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
+                        // A rejected ANCESTOR (the adapter 422s when the blob it
+                        // was told to resume from is bad) must not wedge the
+                        // partial path: quarantine the ancestor exactly like the
+                        // generate path does, then retry once from full scratch.
+                        // Any other error (or a failed scratch retry) is an
+                        // adapter failure: 502, no quarantine — same contract
+                        // as the generate path's open failure.
+                        if e.is_checkpoint_rejected() {
+                            if let Some((name, generation, prefix)) = outcome.blob.take() {
+                                state.orchestrator.quarantine_checkpoint(
+                                    &state.persistence,
+                                    &name,
+                                    generation,
+                                    &prefix,
+                                );
+                                tracing::warn!(
+                                    blob = %name,
+                                    error = %e,
+                                    "ancestor rejected by adapter during prefill; quarantined, retrying from scratch"
+                                );
+                            }
+                            outcome.decision =
+                                mlxcache_core::policy::scratch_decision(tokens.len());
+                            outcome.prefill_from = 0;
+                            // The retry below re-derives blob state from the
+                            // scratch prefill.
+                            match client.prefill(&tokens, None).await {
+                                Ok(blob) if !blob.is_empty() && tokens.len() >= 2 => {
+                                    publish_leader_blob(
+                                        state.clone(),
+                                        lead,
+                                        &mut outcome,
+                                        &fingerprint,
+                                        &tokens,
+                                        blob,
+                                    )
+                                    .await?;
+                                }
+                                Ok(_) => {
+                                    outcome.blob = None;
+                                    lead.complete(Ok(String::new()));
+                                }
+                                Err(e2) => {
+                                    let msg = e2.to_string();
+                                    lead.complete(Err(msg.clone()));
+                                    let (status, kind) = sidecar_http_err(&e2);
+                                    return Err(err(status, &msg, kind));
+                                }
+                            }
+                        } else {
+                            let msg = e.to_string();
+                            lead.complete(Err(msg.clone()));
+                            let (status, kind) = sidecar_http_err(&e);
+                            return Err(err(status, &msg, kind));
+                        }
                     }
                 }
             }
@@ -361,7 +556,12 @@ async fn chat_completions(
                 // publishing, so fall through to our own (uncached) path.
                 match mlxcache_core::singleflight::await_result(&mut follower).await {
                     Some(Err(msg)) => {
-                        // Leader failed too; surface the same adapter error.
+                        // Leader failed too; surface its error. The
+                        // single-flight channel carries a lossy STRING (no
+                        // typed SidecarError), so the transport-vs-adapter
+                        // split of `sidecar_http_err` cannot apply here;
+                        // 502 is the conservative classification. Rare
+                        // path: the leader must have died mid-flight.
                         return Err(err(StatusCode::BAD_GATEWAY, &msg, "adapter_error"));
                     }
                     Some(Ok(name)) if !name.is_empty() => {
@@ -370,13 +570,12 @@ async fn chat_completions(
                         outcome = state.orchestrator.route(&tokens, &fingerprint);
                     }
                     Some(Ok(_)) => {
-                        // Leader cached nothing (empty blob): run from scratch and
-                        // report the same scratch verdict as the leader.
-                        outcome.decision = mlxcache_core::policy::PolicyDecision {
-                            verdict: mlxcache_core::policy::CacheVerdict::Miss,
-                            matched_tokens: 0,
-                            request_tokens: tokens.len(),
-                        };
+                        // Leader cached nothing (empty blob: a one-token prompt,
+                        // a publish refusal, or a publish failure): run from
+                        // scratch and report the same scratch verdict as the
+                        // leader. D2: a full disk must never turn a follower's
+                        // working completion into a 502.
+                        outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
                         outcome.blob = None;
                         outcome.prefill_from = 0;
                     }
@@ -395,6 +594,20 @@ async fn chat_completions(
     // after single-flight keeps stats truthful.
     state.stats.record(&outcome.decision);
     log_request(&req.model, prefix_hash, &outcome.decision, lookup_ms);
+    // Trace capture (step 5): one JSONL record per request, off the hot path
+    // (bounded channel + writer thread). model_hash folds the fingerprint so
+    // a multi-model trace stays attributable; messages embed the exact
+    // payload so replay re-sends byte-equivalent requests. The payload
+    // serialization happens ONLY when capture is on.
+    if let Some(tracer) = &state.trace {
+        let messages_value = serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null);
+        tracer.record(crate::trace::TraceRecord::from_request(
+            (blob_key(&fingerprint, &[]) >> 64) as u64,
+            &req.model,
+            &messages_value,
+            &outcome.decision,
+        ));
+    }
 
     // The adapter needs an absolute path to open the blob directly.
     let blob_abs = match &outcome.blob {
@@ -413,7 +626,16 @@ async fn chat_completions(
     };
 
     if req.stream {
-        return stream_response(state.clone(), client, tokens, outcome, blob_arg, started).await;
+        return stream_response(
+            state.clone(),
+            client,
+            tokens,
+            outcome,
+            blob_arg,
+            max_tokens,
+            started,
+        )
+        .await;
     }
 
     // Generate: full context tokens, continuation from the request length.
@@ -423,7 +645,7 @@ async fn chat_completions(
     // report a scratch run: no prior KV was reused. Quarantine is a separate
     // decision, taken only on an explicit adapter rejection.
     let mut blob_unused = false;
-    let generated = match client.generate(&tokens, 64, blob_arg).await {
+    let generated = match client.generate(&tokens, max_tokens, blob_arg).await {
         Ok(t) => t,
         Err(e) => {
             // If this request leaned on a blob and the request failed, retry
@@ -454,7 +676,7 @@ async fn chat_completions(
                         "blob run failed with a non-rejection error; retrying from scratch without quarantine (effective prefill_from=0)"
                     );
                 }
-                match client.generate(&tokens, 64, None).await {
+                match client.generate(&tokens, max_tokens, None).await {
                     Ok(t) => {
                         // Correct the aggregate only after the scratch retry
                         // succeeds: the covered KV counted at record() was never
@@ -463,19 +685,13 @@ async fn chat_completions(
                         t
                     }
                     Err(e2) => {
-                        return Err(err(
-                            StatusCode::BAD_GATEWAY,
-                            &e2.to_string(),
-                            "adapter_error",
-                        ))
+                        let (status, kind) = sidecar_http_err(&e2);
+                        return Err(err(status, &e2.to_string(), kind));
                     }
                 }
             } else {
-                return Err(err(
-                    StatusCode::BAD_GATEWAY,
-                    &e.to_string(),
-                    "adapter_error",
-                ));
+                let (status, kind) = sidecar_http_err(&e);
+                return Err(err(status, &e.to_string(), kind));
             }
         }
     };
@@ -507,12 +723,277 @@ async fn chat_completions(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
-/// Stable blob key for a token prefix: 128 bits from two FNV-1a passes with
-/// different seeds and different primes, so a collision in one lane does not
-/// correlate with the other. 64 bits is too thin as the store grows; a filename
-/// collision would alias two distinct KV states. (The index is exact and keyed
-/// by token ids; this only names the blob on disk.)
-fn prefix_hash(tokens: &[u32]) -> u128 {
+/// Publish the leader's freshly prefilled checkpoint (shared by the plain
+/// prefill path and the rejected-ancestor scratch retry) and settle the
+/// leader's route outcome.
+///
+/// Delta-prefill-aware accounting: when the leader adopted an ancestor's KV
+/// (`adopted_from = Some(matched)`), the prefill DID reuse `matched - 1`
+/// tokens of cached KV, so the Partial verdict and its prefill_from stand —
+/// reporting a miss would hide real reuse from /stats and hit_rate. When no
+/// ancestor was adopted, the leader ran a fresh full prefill and reports a
+/// plain miss with zero covered KV (generation resuming from the blob just
+/// written is not reuse). On a write/refusal failure the outcome degrades:
+/// a leader that adopted an ancestor keeps its Partial (the ancestor's KV is
+/// still published and reusable — the ENOSPC/refusal path completes
+/// single-flight with the ancestor's name so followers re-route onto it),
+/// and only a leader with no adopted ancestor is forced to scratch, with
+/// single-flight completed with the empty-name sentinel so followers run from
+/// scratch too (OV6: a failed publish must never 502 a follower whose request
+/// was fine).
+async fn publish_leader_blob(
+    state: Arc<AppState>,
+    lead: mlxcache_core::singleflight::Leadership,
+    outcome: &mut crate::orchestrator::RouteOutcome,
+    fingerprint: &ModelFingerprint,
+    tokens: &[u32],
+    blob: Vec<u8>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let adopted_from = outcome.blob.as_ref().map(|(_, _, prefix)| prefix.len());
+    let meta = mlxcache_core::contract::CheckpointMeta {
+        fingerprint: fingerprint.clone(),
+        token_count: tokens.len() as u64,
+        tokens: tokens.to_vec(),
+        format_version: 1,
+    };
+    let key = blob_key(fingerprint, tokens);
+    // Refuse before writing if the generation floor is unknown (a failed
+    // startup scan): writing first would leak an unindexed file on every
+    // request. Serve from scratch.
+    if !state.orchestrator.can_publish() {
+        // Floor unknown: don't write. Report a plain miss so followers also
+        // serve from scratch (an empty name is the "not cached" signal, not an
+        // error). An adopted ancestor's KV was still real reuse, but the
+        // recovery-blocked daemon reports conservatively: scratch.
+        tracing::warn!("not caching: startup recovery incomplete");
+        outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
+        outcome.blob = None;
+        outcome.prefill_from = 0;
+        lead.complete(Ok(String::new()));
+        return Ok(());
+    }
+    // Reserve the generation BEFORE writing so the on-disk name is
+    // generation-specific (immutable). A republish then never overwrites an
+    // earlier generation's file, so a delayed retirement cannot delete a
+    // healthy replacement.
+    let generation = state.orchestrator.reserve_generation();
+    let blob_name = format!("{:032x}-{:016x}.ckpt", key, generation);
+    // The write + fsync + rename runs on the blocking pool, not a runtime
+    // worker: an fsync is milliseconds of disk latency, and blocking a worker
+    // here stalls every OTHER request scheduled on it, including live streams
+    // (A3). The payload MOVES into the closure (nothing needs it after
+    // publish) and meta is cloned (publish_checkpoint still consumes it
+    // below) — one memcpy vs. an ms-scale runtime stall.
+    let persistence = state.persistence.clone();
+    let meta_for_write = meta.clone();
+    let write_result = tokio::task::spawn_blocking(move || {
+        persistence.publish_atomic(key, generation, &meta_for_write, &blob)
+    })
+    .await
+    .unwrap_or_else(|join| {
+        // A panic inside publish_atomic is a daemon bug, not a request error:
+        // treat it exactly like a failed write (serve uncached) and log it at
+        // error level, loudly.
+        tracing::error!(error = %join, "checkpoint publish task panicked");
+        Err(crate::persistence::PersistError::Io(std::io::Error::other(
+            "checkpoint publish task panicked",
+        )))
+    });
+    match write_result {
+        // ENOSPC rescue (registry): log and continue uncached. The LEADER
+        // continues AND the single-flight result is the empty-name sentinel,
+        // so coalesced followers also run from scratch instead of 502ing (D2
+        // serve-uncached must hold for every request the disk failed under,
+        // not just the leader).
+        //
+        // One refinement (delta prefill): when this leader ADOPTED an
+        // ancestor's KV, that KV was loaded and verified by the adapter
+        // moments ago and the ancestor is still published — so the leader
+        // keeps generating from it (real reuse) while followers re-route onto
+        // the same ancestor. Only a leader with no adopted ancestor falls
+        // back to a plain scratch miss.
+        Err(e) => {
+            tracing::warn!(error = %e, "checkpoint write failed; continuing uncached");
+            if let Some(matched) = adopted_from {
+                // The ancestor KV was loaded and verified by the adapter
+                // moments ago and the ancestor is still published: the leader
+                // keeps generating from it (real reuse), and completing with
+                // its name lets followers RE-ROUTE onto it (a Partial hit)
+                // instead of forcing them to scratch.
+                let ancestor_name = outcome
+                    .blob
+                    .as_ref()
+                    .map(|(name, _, _)| name.clone())
+                    .unwrap_or_default();
+                outcome.decision.verdict = CacheVerdict::Partial;
+                outcome.decision.matched_tokens = matched;
+                outcome.prefill_from = covered_kv_tokens(CacheVerdict::Partial, matched);
+                lead.complete(Ok(ancestor_name));
+            } else {
+                outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
+                outcome.blob = None;
+                outcome.prefill_from = 0;
+                lead.complete(Ok(String::new()));
+            }
+        }
+        Ok(_) => {
+            let published = state.orchestrator.publish_checkpoint(
+                &state.persistence,
+                tokens,
+                meta,
+                blob_name.clone(),
+                generation,
+            );
+            // publish_checkpoint is expected to succeed (we checked
+            // can_publish), but if the index rejected it, remove the
+            // now-unindexed file so it cannot leak.
+            if !published {
+                if let Err(e) = state.persistence.remove(&blob_name) {
+                    tracing::warn!(error = %e, "could not remove unindexed blob");
+                }
+            }
+            if adopted_from.is_some() {
+                // Delta prefill reused the ancestor's KV: keep the Partial
+                // verdict + its covered count (prefill_from = matched-1) so
+                // stats/reporting reflect the reuse. Generation resumes from
+                // the NEW blob (which covers tokens[:-1]).
+                outcome.blob = Some((blob_name.clone(), generation, tokens.to_vec()));
+            } else {
+                // Fresh full prefill: report a miss with zero covered KV so
+                // response, /stats, and the log agree on what happened.
+                outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
+                outcome.prefill_from = 0;
+                outcome.blob = Some((blob_name.clone(), generation, tokens.to_vec()));
+            }
+            lead.complete(Ok(blob_name));
+        }
+    }
+    Ok(())
+}
+
+/// Adapter-reported cache identity (R1-1/R1-2): everything the fingerprint
+/// pins that the sidecar owns. The native-tokenize path adopts it wholesale
+/// after the parity probe so fingerprints stay byte-identical to the
+/// pure-sidecar path.
+#[derive(Debug, Clone)]
+struct Identity {
+    tokenizer_hash: String,
+    kv_dtype: String,
+    kv_bits: u8,
+    kv_group_size: u32,
+}
+
+/// T13 identity resolution: prove the native tokenizer IS the engine's, once,
+/// then reuse the verdict forever (the artifact cannot change mid-process).
+///
+/// The probe SET (request prompt + fixed adversarial prompts) is encoded
+/// natively and via the sidecar; every probe requires exact id equality. On
+/// success the sidecar-reported (tokenizer_hash, kv_dtype) is cached and
+/// adopted for every later request — fingerprints are byte-identical to the
+/// pure-sidecar path. On mismatch the error is 503 (fail closed): serving
+/// with the wrong tokenizer would mis-route every checkpoint.
+async fn resolve_native_identity(
+    prompt: &str,
+    native: &crate::native_tokenizer::NativeTokenizer,
+    sidecar: Option<&SidecarClient>,
+) -> Result<Identity, (StatusCode, Json<ErrorResponse>)> {
+    static VERIFIED: OnceLock<Result<Identity, String>> = OnceLock::new();
+    if let Some(Ok(identity)) = VERIFIED.get() {
+        return Ok(identity.clone());
+    }
+    if let Some(Err(reason)) = VERIFIED.get() {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            reason.as_str(),
+            "adapter_unavailable",
+        ));
+    }
+
+    let Some(client) = sidecar else {
+        // No sidecar at all: there is nothing to verify against and no engine
+        // to prefill with either, so the standard no-adapter error applies.
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no adapter configured",
+            "adapter_unavailable",
+        ));
+    };
+    // Probe SET, not one sample (red-team 2026-10-04): a pathological
+    // artifact could agree on one prompt and diverge elsewhere. The fixed
+    // probes cross pre-tokenizer boundaries (whitespace runs, unicode,
+    // CJK, emoji); the request prompt leads so the most representative
+    // case reports first on failure. The EMPTY string is deliberately
+    // excluded: specials-on-empty-input differs across engine versions,
+    // and failing closed over that cosmetic difference would brick native
+    // mode for real deployments (T13 verified parity live on non-empty).
+    const PARITY_PROBES: &[&str] = &[" ", "hello world", "héllo wörld — 你好世界 🚀 tab\tsep"];
+    let probes: Vec<String> =
+        std::iter::once(format!("mlxcache native-tokenizer parity probe: {prompt}"))
+            .chain(PARITY_PROBES.iter().map(|s| (*s).to_string()))
+            .collect();
+
+    let mut identity = None;
+    for (i, probe) in probes.iter().enumerate() {
+        let reference = match client.tokenize(probe).await {
+            Ok(r) => r,
+            Err(SidecarError::Unreachable { url, .. }) => {
+                return Err(err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("adapter (sidecar) unreachable at {url}").as_str(),
+                    "adapter_unavailable",
+                ));
+            }
+            Err(e) => {
+                return Err(err(
+                    StatusCode::BAD_GATEWAY,
+                    &e.to_string(),
+                    "adapter_error",
+                ));
+            }
+        };
+        // A failed probe encode is parity-unprovable: treat it exactly like
+        // a mismatch and fail closed (the verdict is cached either way).
+        let local = native.encode(probe);
+        if local.as_ref() != Some(&reference.tokens) {
+            let reason = format!(
+                "native tokenizer does not match the engine's tokenizer \
+                 (probe {i}/{n}: {a} native ids vs {m} sidecar ids) — refusing to serve; \
+                 fix MLXCACHE_NATIVE_TOKENIZER",
+                n = probes.len(),
+                a = local.as_ref().map_or(0, Vec::len),
+                m = reference.tokens.len()
+            );
+            let _ = VERIFIED.set(Err(reason.clone()));
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &reason,
+                "adapter_unavailable",
+            ));
+        }
+        if identity.is_none() {
+            // Identity fields are constant across probes (same engine);
+            // adopt them from the first answer.
+            identity = Some(Identity {
+                tokenizer_hash: reference.tokenizer_hash,
+                kv_dtype: reference.kv_dtype,
+                kv_bits: reference.kv_bits,
+                kv_group_size: reference.kv_group_size,
+            });
+        }
+    }
+    let identity = identity.expect("probes is non-empty by construction");
+    let _ = VERIFIED.set(Ok(identity.clone()));
+    Ok(identity)
+}
+
+/// The token-only prefix hash for the request log line: 128 bits from two
+/// FNV-1a passes with different seeds and different primes, so a collision in
+/// one lane does not correlate with the other. 64 bits is too thin as the
+/// store grows; a collision would alias two distinct KV states in the log.
+/// (The index is exact and keyed by token ids; this only names log lines.)
+/// Public for the B1 criterion bench; the blob filename uses a DIFFERENT key
+/// (`blob_key` = fingerprint + tokens) — the two are not equal.
+pub fn prefix_hash(tokens: &[u32]) -> u128 {
     fn fnv1a(seed: u64, prime: u64, tokens: &[u32]) -> u64 {
         let mut h = seed;
         for t in tokens {
@@ -536,8 +1017,12 @@ fn prefix_hash(tokens: &[u32]) -> u128 {
 /// share token ids; without the fingerprint in the name, the second model's
 /// prefill would overwrite the first model's blob in place, and the first
 /// model's still-valid index entry would load foreign KV on its next hit:
-/// silent wrong output. Prepending the fingerprint keeps the two files apart.
-fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u32]) -> u128 {
+/// silent wrong output. Prepending the fingerprint keeps the two files apart
+/// — short of a 128-bit fold collision (birthday scale ~2⁻⁶⁴, accepted
+/// residual risk in the D1 register): the lookup-time fingerprint check
+/// reads the INDEX entry, not the file, so a collision would NOT be caught
+/// downstream. Public for the B1 criterion bench.
+pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u32]) -> u128 {
     // Length-prefix each field so no field's bytes can be re-split across the
     // boundaries: joining with a separator is ambiguous when model_id itself
     // (request-controlled) contains the separator, which would alias two
@@ -552,6 +1037,12 @@ fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u
     put(&mut f, &fingerprint.tokenizer_hash);
     put(&mut f, &fingerprint.kv_dtype);
     put(&mut f, &fingerprint.kv_layout_version.to_string());
+    // KV quantization config (T12): an 8-bit checkpoint of the same model must
+    // never share a filename with the f16 one — a republish at the same name
+    // would unlink the other tier's blob (index replacement reclaims the old
+    // file), ping-ponging the two tiers on every alternating request.
+    put(&mut f, &fingerprint.kv_bits.to_string());
+    put(&mut f, &fingerprint.kv_group_size.to_string());
     // Fold the fingerprint into the token hash: hash the fingerprint bytes into
     // both lanes first, then continue with the tokens.
     let fp_bytes: Vec<u32> = f
@@ -572,15 +1063,52 @@ fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u
 /// Map one raw NDJSON line from the sidecar into zero or more SSE frames.
 /// `{"done":true}` becomes `[DONE]`; a token line becomes `data: {...}`; a
 /// non-JSON line is a protocol violation and surfaces as a stream error.
-fn push_frame(frames: &mut Vec<Result<Vec<u8>, std::io::Error>>, raw: &[u8]) {
-    let line = String::from_utf8_lossy(raw);
-    let line = line.trim();
+///
+/// Hot-path shape (P2b): the line is validated with a two-field typed struct —
+/// serde skips every other field without allocating — and the frame is emitted
+/// by forwarding the engine's OWN bytes. The old path built a full
+/// `serde_json::Value` tree per token and re-serialized it; at 64+ tokens per
+/// stream that is a tree alloc + string churn per token for zero gain. Key
+/// order and spacing now come straight from the sidecar instead of serde's
+/// normalization — both are valid JSON and clients parse by key, not layout.
+fn push_frame(frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]) {
+    /// A done marker may carry any NON-NULL JSON value (`true`, `1`, …):
+    /// `Option<IgnoredAny>` maps a literal `null` to `None`, so presence of
+    /// the key with a null value would NOT terminate the stream. Our sidecar
+    /// pins `true` (server.py's done line), making the gap contractual
+    /// rather than live (red-team 2026-10-04).
+    #[derive(serde::Deserialize)]
+    struct SidecarStreamFrame {
+        #[serde(default)]
+        done: Option<serde::de::IgnoredAny>,
+    }
+    let line = match std::str::from_utf8(raw) {
+        Ok(s) => s.trim(),
+        // Invalid UTF-8 from the sidecar is a protocol violation (it must be,
+        // because the SSE body is a text/event-stream). Heap-building the
+        // error is fine: this is a fatal one-time stream abort, not a
+        // per-token cost.
+        Err(_) => {
+            frames.push(Err(std::io::Error::other(
+                "sidecar emitted a non-UTF-8 stream line",
+            )));
+            return;
+        }
+    };
     if line.is_empty() {
         return;
     }
-    match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(v) if v.get("done").is_some() => frames.push(Ok(b"data: [DONE]\n\n".to_vec())),
-        Ok(v) => frames.push(Ok(format!("data: {v}\n\n").into_bytes())),
+    match serde_json::from_str::<SidecarStreamFrame>(line) {
+        Ok(f) if f.done.is_some() => {
+            frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")))
+        }
+        Ok(_) => {
+            let mut frame = Vec::with_capacity(line.len() + 8);
+            frame.extend_from_slice(b"data: ");
+            frame.extend_from_slice(line.as_bytes());
+            frame.extend_from_slice(b"\n\n");
+            frames.push(Ok(bytes::Bytes::from(frame)));
+        }
         Err(_) => frames.push(Err(std::io::Error::other(
             "sidecar emitted a non-JSON stream line",
         ))),
@@ -596,6 +1124,7 @@ async fn stream_response(
     tokens: Vec<u32>,
     outcome: crate::orchestrator::RouteOutcome,
     blob_arg: Option<&str>,
+    max_tokens: usize,
     started: std::time::Instant,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     use futures_util::StreamExt;
@@ -611,7 +1140,7 @@ async fn stream_response(
     // (rejection OR transient failure): the meta frame and aggregate must then
     // report a miss. Quarantine stays conditional on an explicit rejection.
     let blob_unused = std::cell::Cell::new(false);
-    let upstream = match client.generate_stream(&tokens, 64, blob_arg).await {
+    let upstream = match client.generate_stream(&tokens, max_tokens, blob_arg).await {
         Ok(u) => u,
         Err(e) if blob_for_open.is_some() => {
             // The stream could not be opened. Retry from scratch so the stream
@@ -641,20 +1170,20 @@ async fn stream_response(
             prefill_from = 0;
             blob_unused.set(true);
             let upstream = client
-                .generate_stream(&tokens, 64, None)
+                .generate_stream(&tokens, max_tokens, None)
                 .await
-                .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string(), "adapter_error"))?;
+                .map_err(|e| {
+                    let (status, kind) = sidecar_http_err(&e);
+                    err(status, &e.to_string(), kind)
+                })?;
             // Correct the aggregate only after the scratch retry succeeded: a
             // 502 must not be counted as a served miss.
             state.stats.correct_retire(&outcome.decision);
             upstream
         }
         Err(e) => {
-            return Err(err(
-                StatusCode::BAD_GATEWAY,
-                &e.to_string(),
-                "adapter_error",
-            ))
+            let (status, kind) = sidecar_http_err(&e);
+            return Err(err(status, &e.to_string(), kind));
         }
     };
 
@@ -700,40 +1229,92 @@ async fn stream_response(
     // a final flush handles a trailing line with no newline plus a guaranteed
     // [DONE] terminator (SSE clients wait for it; an early close must not leave
     // them hanging or silently truncate the completion).
-    let meta_bytes = format!("data: {meta_line}\n\n").into_bytes();
+    //
+    // The line buffer itself is bounded (MAX_PARTIAL_LINE): a flood of bytes
+    // containing no newline never trips the idle timeout (bytes ARE arriving),
+    // so without a cap the buffer would grow unboundedly on a fast flood.
+    let meta_bytes = bytes::Bytes::from(format!("data: {meta_line}\n\n"));
     let first =
-        futures_util::stream::once(async move { Ok::<Vec<u8>, std::io::Error>(meta_bytes) });
+        futures_util::stream::once(async move { Ok::<bytes::Bytes, std::io::Error>(meta_bytes) });
 
     struct StreamState {
         upstream: std::pin::Pin<
             Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         >,
-        buf: Vec<u8>,
+        /// Line buffer. BytesMut, not Vec<u8>: `split_to` hands out a line as
+        /// an O(1) view — the old `drain(..=pos).collect()` memmoved the whole
+        /// remaining buffer once per token (quadratic over a stream).
+        buf: bytes::BytesMut,
         done: bool,
         terminated: bool,
         started: std::time::Instant,
         ttft_ms: Option<u64>,
+        /// Max gap with no bytes from the sidecar before the stream is cut
+        /// with an explicit error (the sidecar stalling must not wedge a
+        /// client forever now that streams carry no total timeout).
+        idle: std::time::Duration,
     }
     let state = StreamState {
         upstream: Box::pin(upstream.bytes_stream()),
-        buf: Vec::new(),
+        buf: bytes::BytesMut::with_capacity(8 * 1024),
         done: false,
         terminated: false,
         started,
         ttft_ms: None,
+        idle: client.stream_idle_timeout(),
     };
     let body_stream = futures_util::stream::unfold(state, |mut st| async move {
         use futures_util::StreamExt;
-        let mut frames: Vec<Result<Vec<u8>, std::io::Error>> = Vec::new();
+        let mut frames: Vec<Result<bytes::Bytes, std::io::Error>> = Vec::new();
         loop {
             if st.done {
                 return None;
             }
-            match st.upstream.next().await {
-                Some(Ok(bytes)) => {
+            match tokio::time::timeout(st.idle, st.upstream.next()).await {
+                // The sidecar stopped producing tokens mid-stream: emit the
+                // same explicit-error + [DONE] treatment as a truncated
+                // upstream so the client sees a failure, not a hang.
+                Err(_elapsed) => {
+                    if let Some(ttft) = st.ttft_ms {
+                        let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
+                        frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
+                    }
+                    let err = serde_json::json!({
+                        "error": {
+                            "message": "upstream idle timeout: no tokens within the streaming budget",
+                            "type": "upstream_error",
+                        }
+                    });
+                    frames.push(Ok(bytes::Bytes::from(format!("data: {err}\n\n"))));
+                    frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
+                    st.done = true;
+                    break;
+                }
+                Ok(Some(Ok(bytes))) => {
                     st.buf.extend_from_slice(&bytes);
+                    // Bound the partial-line buffer: a fast flood with no
+                    // newline never fires the idle timeout, so the buffer
+                    // needs its own cap. Frames are emitted (including the
+                    // stats frame when TTFT is known), not silently dropped,
+                    // matching the stream-abort shape above.
+                    if !st.buf.contains(&b'\n') && st.buf.len() > MAX_PARTIAL_LINE {
+                        if let Some(ttft) = st.ttft_ms {
+                            let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
+                            frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
+                        }
+                        let err = serde_json::json!({
+                            "error": {
+                                "message": "upstream protocol error: unbounded line",
+                                "type": "upstream_error",
+                            }
+                        });
+                        frames.push(Ok(bytes::Bytes::from(format!("data: {err}\n\n"))));
+                        frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
+                        st.done = true;
+                        break;
+                    }
                     while let Some(pos) = st.buf.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = st.buf.drain(..=pos).collect();
+                        let line = st.buf.split_to(pos + 1);
                         push_frame(&mut frames, &line);
                         let last_done = frames.last().is_some_and(|f| {
                             f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
@@ -754,7 +1335,7 @@ async fn stream_response(
                             let done = frames.pop().expect("just pushed [DONE]");
                             if let Some(ttft) = st.ttft_ms {
                                 let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
-                                frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
+                                frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
                             }
                             frames.push(done);
                             st.terminated = true;
@@ -764,11 +1345,11 @@ async fn stream_response(
                         break;
                     }
                 }
-                Some(Err(e)) => {
+                Ok(Some(Err(e))) => {
                     frames.push(Err(std::io::Error::other(e.to_string())));
                     break;
                 }
-                None => {
+                Ok(None) => {
                     // Upstream ended: flush a trailing line with no newline, then
                     // terminate. A clean end is the sidecar's `{"done":true}` line
                     // (already mapped to `[DONE]` by push_frame). If EOF arrives
@@ -787,7 +1368,7 @@ async fn stream_response(
                     if !st.terminated {
                         if let Some(ttft) = st.ttft_ms {
                             let stats = serde_json::json!({"mlxcache": {"ttft_ms": ttft}});
-                            frames.push(Ok(format!("data: {stats}\n\n").into_bytes()));
+                            frames.push(Ok(bytes::Bytes::from(format!("data: {stats}\n\n"))));
                         }
                         // Truncated upstream: an explicit error, not a success.
                         let err = serde_json::json!({
@@ -796,8 +1377,8 @@ async fn stream_response(
                                 "type": "upstream_error",
                             }
                         });
-                        frames.push(Ok(format!("data: {err}\n\n").into_bytes()));
-                        frames.push(Ok(b"data: [DONE]\n\n".to_vec()));
+                        frames.push(Ok(bytes::Bytes::from(format!("data: {err}\n\n"))));
+                        frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
                     }
                     st.done = true;
                     break;
@@ -819,7 +1400,7 @@ async fn stream_response(
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let s = state.stats.lock();
+    let s = state.stats.snapshot();
     Json(serde_json::json!({
         "requests": s.requests,
         "hits": s.hits,
@@ -834,6 +1415,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         },
         "checkpoints_published": state.orchestrator.published_count(),
         "checkpoints_quarantined": state.orchestrator.quarantined_count(),
+        "evictions": s.evictions,
     }))
 }
 
@@ -844,18 +1426,151 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
 
+    /// Native-tokenizer parity is proven against a probe SET and cached:
+    /// once a mismatch fails the probe closed, later requests must reuse the
+    /// cached verdict — the stub sidecar must see exactly ONE probe batch
+    /// (testing-critical gap, 2026-10-04). This is the only test in the
+    /// binary that may call resolve_native_identity: VERIFIED is
+    /// process-global and a poisoned cache would fail-close every other
+    /// caller.
+    #[tokio::test]
+    async fn native_parity_mismatch_is_cached_fail_closed() {
+        use crate::native_tokenizer::NativeTokenizer;
+        use crate::sidecar::SidecarConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A real word-level artifact: encodes "hello world" to [0, 1].
+        const WORDLEVEL_JSON: &str = r#"{
+          "version": "1.0",
+          "truncation": null,
+          "padding": null,
+          "added_tokens": [],
+          "normalizer": null,
+          "pre_tokenizer": { "type": "Whitespace" },
+          "post_processor": null,
+          "decoder": null,
+          "model": {
+            "type": "WordLevel",
+            "vocab": { "hello": 0, "world": 1, "the": 2, "fox": 3, "[UNK]": 4 },
+            "unk_token": "[UNK]"
+          }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, WORDLEVEL_JSON).unwrap();
+        let native = NativeTokenizer::load(&path).unwrap();
+
+        // Stub sidecar: answers /tokenize with ids that CANNOT match the
+        // artifact (all 999s), and counts every request it answers.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // Drain head + body (requests are small JSON posts).
+                    loop {
+                        let end = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            Some(p) => p + 4,
+                            None => {
+                                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                                if n == 0 {
+                                    return;
+                                }
+                                buf.extend_from_slice(&chunk[..n]);
+                                continue;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let body_len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + body_len {
+                            break;
+                        }
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let body = "{\"tokens\":[999,999,999],\"tokenizer_hash\":\"h\",\
+                                \"kv_dtype\":\"f16\",\"kv_bits\":0,\"kv_group_size\":0}";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let client =
+            SidecarClient::new(SidecarConfig::new(format!("http://{addr}"), "m".into())).unwrap();
+
+        // First call: probe #0 mismatches → fail-closed 503.
+        let (status1, body1) =
+            match resolve_native_identity("probe text", &native, Some(&client)).await {
+                Err(e) => e,
+                Ok(_) => panic!("mismatched tokenizer must fail closed"),
+            };
+        assert_eq!(status1, StatusCode::SERVICE_UNAVAILABLE);
+        let msg1 = serde_json::to_string(&body1.0).unwrap();
+        assert!(
+            msg1.contains("does not match"),
+            "error should name the parity failure: {msg1}"
+        );
+
+        // Second call: the SAME error must come from the cache — the stub
+        // served one probe and must not be probed again.
+        let (status2, body2) =
+            match resolve_native_identity("probe text", &native, Some(&client)).await {
+                Err(e) => e,
+                Ok(_) => panic!("cached failure must stay failed"),
+            };
+        assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::to_string(&body2.0).unwrap(),
+            msg1,
+            "cached verdict must be byte-identical"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "exactly one probe round-trip, ever"
+        );
+    }
+
     #[test]
     fn push_frame_maps_ndjson_to_sse() {
         let mut frames = Vec::new();
         push_frame(&mut frames, b"{\"token\":5,\"text\":\"hi\"}\n");
         assert_eq!(frames.len(), 1);
-        let text = String::from_utf8(frames[0].as_ref().unwrap().clone()).unwrap();
+        let text = std::string::String::from_utf8(frames[0].as_ref().unwrap().to_vec()).unwrap();
         assert!(text.starts_with("data: {"));
         assert!(text.ends_with("\n\n"));
 
         frames.clear();
         push_frame(&mut frames, b"{\"done\":true}\n");
-        assert_eq!(frames[0].as_ref().unwrap(), b"data: [DONE]\n\n");
+        assert_eq!(
+            frames[0].as_ref().unwrap().as_ref(),
+            b"data: [DONE]\n\n".as_slice()
+        );
 
         // Blank lines and whitespace are ignored, not turned into frames.
         frames.clear();
@@ -878,6 +1593,7 @@ mod tests {
             sidecar: None,
             persistence: crate::persistence::Persistence::new(tempfile::tempdir().unwrap().keep())
                 .unwrap(),
+            trace: None,
         });
         router(state)
     }
@@ -971,12 +1687,16 @@ mod tests {
             tokenizer_hash: "tok-a".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "model-b".into(),
             tokenizer_hash: "tok-a".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         assert_ne!(blob_key(&a, &tokens), blob_key(&b, &tokens));
         // Tokenizer-only difference must also separate.
@@ -985,6 +1705,8 @@ mod tests {
             tokenizer_hash: "tok-b".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         assert_ne!(blob_key(&a, &tokens), blob_key(&c, &tokens));
         // Deterministic and distinct from the bare token hash.
@@ -1004,12 +1726,16 @@ mod tests {
             tokenizer_hash: "x".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "m".into(),
             tokenizer_hash: "tok\u{1f}x".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
         };
         assert_ne!(blob_key(&a, &tokens), blob_key(&b, &tokens));
     }
@@ -1071,12 +1797,12 @@ mod tests {
         };
         stats.record(&hit);
         {
-            let s = stats.lock();
+            let s = stats.snapshot();
             assert_eq!(s.hits, 1);
             assert_eq!(s.tokens_cached, 7);
         }
         stats.correct_retire(&hit);
-        let s = stats.lock();
+        let s = stats.snapshot();
         assert_eq!(s.hits, 0, "retired hit must not remain a hit");
         assert_eq!(s.misses, 1, "retired hit is an effective miss");
         assert_eq!(s.tokens_cached, 0, "no KV was actually reused");
@@ -1094,13 +1820,13 @@ mod tests {
         };
         stats.record(&partial);
         {
-            let s = stats.lock();
+            let s = stats.snapshot();
             assert_eq!(s.partials, 1);
             assert_eq!(s.tokens_cached, 5);
         }
         stats.correct_retire(&partial);
         {
-            let s = stats.lock();
+            let s = stats.snapshot();
             assert_eq!(s.partials, 0, "retired partial must not remain a partial");
             assert_eq!(s.misses, 1);
             assert_eq!(s.tokens_cached, 0, "no KV was actually reused");
@@ -1115,7 +1841,48 @@ mod tests {
         };
         stats.record(&miss);
         stats.correct_retire(&miss);
-        let s = stats.lock();
+        let s = stats.snapshot();
         assert_eq!(s.misses, 2, "the miss is not double-counted");
+    }
+
+    #[test]
+    fn stats_record_is_lock_free_and_concurrent() {
+        // The atomics-backed counters must survive concurrent record/retire from
+        // many tasks without deadlock, poisoning, or lost updates.
+        let stats = Stats::default();
+        let stats = std::sync::Arc::new(stats);
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let stats = stats.clone();
+            handles.push(std::thread::spawn(move || {
+                let hit = PolicyDecision {
+                    verdict: CacheVerdict::Hit,
+                    matched_tokens: 8,
+                    request_tokens: 8,
+                };
+                for _ in 0..1000 {
+                    stats.record(&hit);
+                    // No retire here: retires would legitimately move verdicts
+                    // and make totals order-dependent; record is the hot path.
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let s = stats.snapshot();
+        assert_eq!(s.requests, 16_000);
+        assert_eq!(s.hits, 16_000);
+        assert_eq!(s.tokens_cached, 112_000);
+        assert_eq!(s.tokens_total, 128_000);
+    }
+}
+
+/// Public surface for the allocation gate (`tests/alloc_gate.rs`). The gate
+/// runs in its own test binary (a counting global allocator is process-wide)
+/// and needs to exercise the REAL framer, not a copy of it.
+pub mod test_support {
+    pub fn push_frame_for_gate(frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]) {
+        super::push_frame(frames, raw);
     }
 }

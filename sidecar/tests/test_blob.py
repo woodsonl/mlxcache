@@ -59,6 +59,77 @@ def test_decode_rejects_header_longer_than_blob():
         raise AssertionError("expected ValueError")
 
 
+def test_decode_accepts_t12_daemon_blobs_with_kv_tier_fields():
+    # Regression (2026-10-03): the daemon's serde now serializes kv_bits and
+    # kv_group_size into the fingerprint. The first delta-prefill run against
+    # that daemon 422-quarantined every healthy ancestor because
+    # Fingerprint(**raw) raised TypeError on the unexpected kwargs. The reader
+    # must accept the SUPERSET (a newer daemon's header) and adopt the tier.
+    rust_style = {
+        "fingerprint": {
+            "model_id": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+            "tokenizer_hash": "1a2b3c4d5e6f7081",
+            "kv_dtype": "float16",
+            "kv_layout_version": 1,
+            "kv_bits": 8,
+            "kv_group_size": 64,
+        },
+        "token_count": 8,
+        "tokens": [10, 11, 12, 13, 14, 15, 16, 17],
+        "format_version": 1,
+    }
+    header = json.dumps(rust_style).encode()
+    blob_bytes = struct.pack("<I", len(header)) + header + b"KV"
+    meta, _payload = blob.decode(blob_bytes)
+    assert meta.fingerprint.kv_bits == 8
+    assert meta.fingerprint.kv_group_size == 64
+    assert meta.tokens == [10, 11, 12, 13, 14, 15, 16, 17]
+
+
+def test_decode_drops_unknown_fingerprint_fields():
+    # Forward compatibility: a future daemon adds a field this sidecar has
+    # never heard of. The blob must still decode (dropping the unknown key),
+    # not 422-quarantine the checkpoint.
+    rust_style = {
+        "fingerprint": {
+            "model_id": "m",
+            "tokenizer_hash": "h",
+            "kv_dtype": "f16",
+            "kv_layout_version": 1,
+            "kv_bits": 0,
+            "kv_group_size": 0,
+            "some_future_field": "x",
+        },
+        "token_count": 3,
+        "tokens": [1, 2, 3],
+        "format_version": 1,
+    }
+    header = json.dumps(rust_style).encode()
+    meta, _ = blob.decode(struct.pack("<I", len(header)) + header + b"KV")
+    assert meta.fingerprint.model_id == "m"
+    assert meta.fingerprint.kv_bits == 0
+
+
+def test_t12_blobs_still_decode_after_default_fingerprint_write():
+    # The sidecar's own encode path (asdict) round-trips the tier fields so a
+    # q8 blob written by this sidecar reads back as q8.
+    meta = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="m",
+            tokenizer_hash="h",
+            kv_dtype="f16",
+            kv_layout_version=1,
+            kv_bits=8,
+            kv_group_size=64,
+        ),
+        token_count=3,
+        tokens=[1, 2, 3],
+    )
+    meta2, _ = blob.decode(blob.encode(meta, b"payload"))
+    assert meta2.fingerprint.kv_bits == 8
+    assert meta2.fingerprint.kv_group_size == 64
+
+
 def test_decode_rejects_version_mismatch():
     meta = _meta([1])
     meta.format_version = 99

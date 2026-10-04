@@ -41,7 +41,20 @@ async fn main() -> Result<()> {
         None => None,
     };
     if served_models.is_empty() {
-        tracing::warn!("MLXCACHE_MODELS is empty: every request will 404");
+        // A daemon with no served models rejects every completion request with
+        // 404 while /stats stays 200 — a misconfigured deploy looks healthy
+        // (QA ISSUE-001). Refuse at boot unless the operator explicitly opted
+        // into a model-less run (dev/test harnesses that only exercise /stats
+        // or the synthetic stack).
+        if std::env::var("MLXCACHE_ALLOW_NO_MODELS").ok().as_deref() != Some("1") {
+            anyhow::bail!(
+                "MLXCACHE_MODELS is empty: this daemon would 404 every request \
+                 while appearing healthy. Set MLXCACHE_MODELS (comma-separated \
+                 model ids), or set MLXCACHE_ALLOW_NO_MODELS=1 to run model-less \
+                 on purpose."
+            );
+        }
+        tracing::warn!("MLXCACHE_MODELS is empty (allowed by MLXCACHE_ALLOW_NO_MODELS=1): every request will 404");
     }
     // Empty values fall back to the default rather than failing on an empty path.
     let blob_dir = std::env::var("MLXCACHE_BLOBS")
@@ -59,7 +72,15 @@ async fn main() -> Result<()> {
         served_models,
         sidecar,
         persistence,
+        trace: mlxcache_daemon::trace::TraceWriter::from_env()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
     });
+    // Warm the native-tokenizer OnceLock NOW, not on the first request: a
+    // bad MLXCACHE_NATIVE_TOKENIZER must kill the boot (the module's
+    // fail-closed contract), not panic mid-traffic inside get_or_init —
+    // there it surfaces as a dropped connection on every request until
+    // restart. When unset, this is a no-op.
+    let _ = mlxcache_daemon::native_tokenizer::from_env();
     // R1-4: rebuild the index from persisted checkpoints so a daemon restart
     // resumes from disk instead of re-prefilling everything.
     let report = state.orchestrator.rebuild_from_disk(&state.persistence);
@@ -71,7 +92,8 @@ async fn main() -> Result<()> {
             "index rebuilt from persisted checkpoints"
         );
     }
-    let app = mlxcache_daemon::http::router(state);
+    spawn_reaper(state.clone());
+    let app = mlxcache_daemon::http::router(state.clone());
     let addr = std::env::var("MLXCACHE_ADDR").unwrap_or_else(|_| "127.0.0.1:8420".into());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     // Drain in-flight requests on SIGINT/SIGTERM, bounded by
@@ -101,8 +123,84 @@ async fn main() -> Result<()> {
         let _ = signal_rx.await;
     });
     serve.await?;
+    // Graceful-shutdown trace safety net: records are queued on a bounded
+    // channel and drained by the writer thread, and every record is already
+    // flushed per-write on capture, so a queued record is at most one write
+    // away from disk. This explicit flush is therefore a near-no-op — it only
+    // matters for a record still in flight inside the writer between channel
+    // receipt and file write when the server finished draining.
+    if let Some(tracer) = &state.trace {
+        tracer.flush();
+    }
     tracing::info!("mlxcache daemon stopped");
     Ok(())
+}
+
+/// Background eviction reaper (T-eviction). Every `interval_s` seconds, evict
+/// cold checkpoints until at most `max_entries` published blobs remain. Scoring
+/// and anchor protection live in `Orchestrator::evict_cold` (ds4 anchor policy:
+/// recently-served checkpoints and live chain bases are never evicted).
+///
+/// Knobs:
+/// - `MLXCACHE_EVICT_INTERVAL_S` — sweep cadence; `0` disables the reaper
+///   entirely (default 60).
+/// - `MLXCACHE_EVICT_MAX_ENTRIES` — published-entry cap; `0` disables eviction
+///   (treat as unlimited, the historical behavior; default 0).
+/// - `MLXCACHE_EVICT_ANCHOR_WINDOW_S` — how long a served checkpoint stays an
+///   anchor (default 900 = 15 min).
+fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
+    let interval_s: u64 = std::env::var("MLXCACHE_EVICT_INTERVAL_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let max_entries: usize = std::env::var("MLXCACHE_EVICT_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if interval_s == 0 || max_entries == 0 {
+        tracing::info!(
+            interval_s,
+            max_entries,
+            "eviction reaper disabled (set MLXCACHE_EVICT_INTERVAL_S and \
+             MLXCACHE_EVICT_MAX_ENTRIES to enable; blob growth is unbounded)"
+        );
+        return;
+    }
+    let anchor_window_s: u64 = std::env::var("MLXCACHE_EVICT_ANCHOR_WINDOW_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900);
+    let anchor_window = std::time::Duration::from_secs(anchor_window_s);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_s));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // interval fires immediately; skip the no-op tick
+        loop {
+            ticker.tick().await;
+            // A3: the sweep takes the index read lock and builds a candidate
+            // snapshot over a trie that can hold ~20K entries — ms-scale
+            // blocking work that must not stall other tasks scheduled on this
+            // runtime worker, including live streams. The Arc is cloned per
+            // pass so the blocking closure can own it.
+            let state = state.clone();
+            match tokio::task::spawn_blocking(move || state.evict_pass(max_entries, anchor_window))
+                .await
+            {
+                Ok(_) => {}
+                // A silently-dead reaper repeats every interval with zero
+                // signal — log it like the publish path logs a panicked task.
+                Err(join) => {
+                    tracing::error!(error = %join, "eviction pass panicked; sweep skipped this interval")
+                }
+            }
+        }
+    });
+    tracing::info!(
+        interval_s,
+        max_entries,
+        anchor_window_s,
+        "eviction reaper armed"
+    );
 }
 
 /// Receive SIGINT/SIGTERM and enforce the shutdown deadline off the async

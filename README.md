@@ -77,6 +77,26 @@ generation then resumes from the blob it just wrote. The response also carries
 `"tokens_cached"`, the same count, and `"tokens_total"`. `/stats` reports the
 running hit rate.
 
+## API surface
+
+The request is OpenAI-shaped, not OpenAI-complete. Exactly four fields are
+honored: `model` (must be in `MLXCACHE_MODELS`), `messages`, `stream`, and
+`max_tokens` (default `64`, capped at `8192` — larger values get a `400`).
+Everything else (`temperature`, `top_p`, `stop`, `tools`, …) is ignored, not
+rejected. The response is NOT `choices[]`: it is `{"mlxcache": {verdict,
+tokens_cached, tokens_total, prefill_from, timings}, "generated_tokens": [...],
+"status": "ok"}` — decode the text from `generated_tokens`. Every error is the
+same envelope: `{"error": {"message", "type"}}`, including body-parse failures
+(`400`), a missing JSON content-type (`415`), and unknown models (`404`, checked
+before any cache lookup). Status codes say what to retry: `503
+adapter_unavailable` means the sidecar is down or stalled (back off and retry
+later), `502 adapter_error` means the sidecar answered but the answer was bad —
+including its explicit `422`-rejections, which the daemon already handled by
+quarantining the checkpoint and (on the next request) serving from scratch.
+`GET /healthz` is a dependency-free liveness probe (`{"status":"ok"}`); cache
+and adapter state live in `/stats`.
+
+
 A checkpoint the adapter cannot use is retired, not retried forever. The adapter
 answers `422` when the blob is gone, corrupt, or its recorded prefix disagrees
 with the request; the daemon quarantines that entry and serves the request from
