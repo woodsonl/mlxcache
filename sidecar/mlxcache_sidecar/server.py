@@ -269,15 +269,14 @@ def read_wire_checkpoint(
     # write), not uncacheable: reject so the daemon quarantines the entry.
     if not payload:
         raise CheckpointRejectedError("checkpoint payload is empty")
-    if check_safetensors:
-        # Validate the safetensors framing ourselves, BEFORE handing it to MLX.
-        # MLX's native parser raises RuntimeError for a bad header length, the
-        # same type it uses for a transient OS read failure, so we cannot
-        # classify from the exception alone. A malformed inner header is
-        # deterministic corruption: reject it here so it is retired, while
-        # RuntimeError from the loader below stays transient (500).
-        if not _valid_safetensors(payload):
-            raise CheckpointRejectedError("checkpoint payload is not valid safetensors")
+    # Validate the safetensors framing ourselves, BEFORE handing it to MLX.
+    # MLX's native parser raises RuntimeError for a bad header length, the
+    # same type it uses for a transient OS read failure, so we cannot
+    # classify from the exception alone. A malformed inner header is
+    # deterministic corruption: reject it here so it is retired, while
+    # RuntimeError from the loader below stays transient (500).
+    if check_safetensors and not _valid_safetensors(payload):
+        raise CheckpointRejectedError("checkpoint payload is not valid safetensors")
     return meta, payload, True
 
 
@@ -367,14 +366,8 @@ class SyntheticEngine:
                 base = self._hash_tokens(self._grow_base)
                 if len(content) == len(self._grow_base):
                     return base
-                segments = (
-                    content[len(self._grow_base) :]
-                    .removeprefix(" | ")
-                    .split(" | ")
-                )
-                return base + [
-                    t for seg in segments for t in self._hash_tokens(seg)
-                ]
+                segments = content[len(self._grow_base) :].removeprefix(" | ").split(" | ")
+                return base + [t for seg in segments for t in self._hash_tokens(seg)]
         return self._hash_tokens(prompt)
 
     @staticmethod
@@ -1044,9 +1037,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "prefill_count": getattr(engine, "prefill_count", None),
                     "last_prefill_tokens": getattr(engine, "last_prefill_tokens", 0),
-                    "last_prefill_delta_tokens": getattr(
-                        engine, "last_prefill_delta_tokens", 0
-                    ),
+                    "last_prefill_delta_tokens": getattr(engine, "last_prefill_delta_tokens", 0),
                     "phases": _phase_stats(),
                 },
             )

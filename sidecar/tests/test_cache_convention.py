@@ -741,13 +741,16 @@ def test_non_dict_fingerprint_is_rejected_not_500(monkeypatch, tmp_path, poison)
         eng._load_cache_delta([1, 2, 3], path)
     # Defense in depth: blob.decode itself raises ValueError (not
     # AttributeError/TypeError) for the non-dict fingerprint.
-    with pytest.raises(ValueError):
-        blob.decode(open(path, "rb").read())
+    with pytest.raises(ValueError), open(path, "rb") as fh:
+        blob.decode(fh.read())
 
 
-def test_deeply_nested_header_is_rejected_not_500(monkeypatch, tmp_path):
+def test_deeply_nested_header_field_is_rejected_not_500(monkeypatch, tmp_path):
     # RecursionError from json.loads on ~2000 nested lists escaped the
-    # (ValueError, KeyError, TypeError) tuple as a 500.
+    # (ValueError, KeyError, TypeError) tuple as a 500. Distinct from
+    # test_deeply_nested_header_is_rejected_not_500 above: the nesting is
+    # inside a header FIELD value, not the header document itself.
+    # (Was silently shadowing that test under a duplicate name — F811.)
     _install_fake_mlx(monkeypatch)
     eng = _engine()
     deep = "[]" * 2000
