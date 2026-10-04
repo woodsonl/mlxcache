@@ -55,14 +55,18 @@ impl Orchestrator {
     /// never re-tokenizes.
     pub fn route(&self, tokens: &[u32], request_fingerprint: &ModelFingerprint) -> RouteOutcome {
         let lookup = self.index.lookup(tokens);
-        let (matched_tokens, matched_fp, blob_path, blob_generation) = match &lookup {
+        let (matched_tokens, matched_fp, blob_path, blob_generation, key) = match &lookup {
             Some((entry, n)) => (
                 Some(*n),
                 Some(&entry.meta.fingerprint),
                 Some(entry.blob_path.clone()),
                 Some(entry.generation),
+                // T22: under end-anchored divergence the request's tokens do
+                // NOT spell the entry's key. Quarantine/eviction key by the
+                // entry's true key, never by the request prefix.
+                Some(entry.key.clone()),
             ),
-            None => (None, None, None, None),
+            None => (None, None, None, None, None),
         };
         let verdict = classify(
             matched_tokens,
@@ -71,12 +75,19 @@ impl Orchestrator {
             request_fingerprint,
         );
         // A fingerprint mismatch classifies as Miss and must not reuse the blob.
-        // The matched prefix is `tokens[..n]`, the exact key the entry lives at.
+        // T22: under end-anchored divergence the request's tokens do NOT spell
+        // the entry's key, so the quarantine/eviction key MUST come from the
+        // entry itself (`key` from the lookup), never from the request prefix.
         let blob = match verdict {
             CacheVerdict::Miss => None,
-            _ => blob_path
-                .zip(blob_generation)
-                .map(|(p, g)| (p, g, tokens[..matched_tokens.unwrap_or(0)].to_vec())),
+            _ => blob_path.zip(blob_generation).zip(key).map(|((p, g), k)| {
+                (
+                    p, g,
+                    // Exact-depth matches: the key equals the request prefix,
+                    // byte-identical to the historical behavior.
+                    k,
+                )
+            }),
         };
         // `prefill_from` is the client-facing count of tokens already covered by
         // cached KV, i.e. where prefill resumes. A checkpoint published for a

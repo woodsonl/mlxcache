@@ -237,11 +237,18 @@ def read_wire_checkpoint(
     if tokens is not None:
         if prefix_len > len(tokens):
             return meta, payload, False
-        # The adapter is a trust boundary: verify the blob really covers this
-        # request's prefix. A disagreement means the file does not match the
-        # index entry that pointed at it (mislabeled/corrupt): retire it, do
-        # not silently resume from or ignore wrong KV.
-        if meta.tokens != tokens[:prefix_len]:
+        # The adapter is a trust boundary: verify the blob really covers the
+        # KV it claims for THIS request. T22 (prefix-stable multi-turn): the
+        # persisted cache covers meta.tokens[:-1], and the KV at position j
+        # depends only on tokens ..=j — so a request that diverges from the
+        # recorded prefix at its LAST token still gets byte-identical KV for
+        # every covered position (a multi-turn wire prompt that grew: the
+        # previous turn's checkpoint key ends in a closing bracket the next
+        # turn replaced). Divergence anywhere else — including the final
+        # COVERED position — means the file does not match the index entry
+        # that pointed at it (mislabeled/corrupt): retire it, do not
+        # silently resume from or ignore wrong KV.
+        if meta.tokens[:-1] != tokens[: prefix_len - 1]:
             raise CheckpointRejectedError("checkpoint prefix does not match the request")
     # A multi-token checkpoint with no KV payload is CORRUPT (a truncated
     # write), not uncacheable: reject so the daemon quarantines the entry.
