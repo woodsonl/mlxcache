@@ -219,6 +219,7 @@ impl Orchestrator {
         &self,
         persistence: &crate::persistence::Persistence,
         max_entries: usize,
+        max_bytes: u64,
         anchor_window: std::time::Duration,
     ) -> usize {
         // Reap tombstones FIRST and unconditionally: the published-cap early
@@ -227,11 +228,26 @@ impl Orchestrator {
         // tombstone growth was possible (red-team 2026-10-04).
         let reaped = self.reap_quarantined(max_entries);
         let candidates = self.index.eviction_candidates();
-        if candidates.len() <= max_entries {
+        // File sizes for the byte budget (D-eviction): a missing file scores
+        // 0 bytes — remove_published + the unlink reconcile it regardless.
+        let size_of = |name: &str| -> u64 {
+            std::fs::metadata(persistence.blob_dir.join(name))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        };
+        let total_bytes: u64 = candidates.iter().map(|c| size_of(&c.blob_path)).sum();
+        // Entry-cap semantics at the PASS level: `max_entries` is a hard cap,
+        // 0 = allow zero published entries (evict everything evictable). The
+        // "0 disables the knob" convention lives at the env layer (main.rs
+        // translates 0 → usize::MAX = no entry cap), so pass-level 0 stays
+        // the aggressive sweep the tests rely on.
+        let under_entries = candidates.len() <= max_entries;
+        let under_bytes = max_bytes == 0 || total_bytes <= max_bytes;
+        if under_entries && under_bytes {
             return reaped;
         }
         let now = std::time::Instant::now();
-        let mut scored: Vec<(u64, mlxcache_core::index::IndexCandidate)> = candidates
+        let mut scored: Vec<(u64, u64, mlxcache_core::index::IndexCandidate)> = candidates
             .into_iter()
             .map(|c| {
                 let anchored = c.is_anchor || now.duration_since(c.last_used) <= anchor_window;
@@ -242,17 +258,20 @@ impl Orchestrator {
                         is_anchor: anchored,
                     },
                 );
-                (score, c)
+                (score, size_of(&c.blob_path), c)
             })
             .collect();
         // Policy contract: "Higher score = evict first." Descending order puts
         // the biggest non-anchor blobs at the front (most bytes freed per
         // unlink); anchors score 0 and sink to the back, never reached.
-        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-        let excess = scored.len().saturating_sub(max_entries);
+        scored.sort_by_key(|(score, _, _)| std::cmp::Reverse(*score));
+        let total_entries = scored.len();
         let mut evicted = 0usize;
-        for (score, cand) in &scored {
-            if evicted >= excess {
+        let mut remaining_bytes = total_bytes;
+        for (score, size, cand) in &scored {
+            let over_entries = total_entries - evicted > max_entries;
+            let over_bytes = max_bytes > 0 && remaining_bytes > max_bytes;
+            if !over_entries && !over_bytes {
                 break;
             }
             if *score == 0 {
@@ -273,21 +292,32 @@ impl Orchestrator {
                     );
                 }
                 evicted += 1;
+                remaining_bytes = remaining_bytes.saturating_sub(*size);
             }
+        }
+        if max_bytes > 0 && remaining_bytes > max_bytes {
+            // All that is left is anchors (or races): the budget is a
+            // best-effort cap that never breaks the anchor contract.
+            tracing::warn!(
+                remaining_bytes,
+                budget = max_bytes,
+                "eviction byte budget unreachable: published anchors hold the store above it"
+            );
         }
         if evicted > 0 {
             tracing::info!(
                 evicted,
-                target = max_entries,
+                target_entries = max_entries,
+                budget_bytes = max_bytes,
                 "eviction: cold checkpoints reaped"
             );
         }
-        if evicted < excess {
+        if total_entries - evicted > max_entries {
             // Silent-failure guard (red-team 2026-10-04): every excess
             // candidate was anchor/recency-protected (score 0) or lost its
             // removal race — the store stays above cap with no other signal.
             tracing::warn!(
-                excess,
+                excess = total_entries - evicted,
                 evicted,
                 "eviction could not reach the cap: all excess candidates are anchor- or recency-protected; the store stays above cap until anchors age out"
             );
@@ -545,7 +575,7 @@ mod tests {
         assert_eq!(orch.quarantined_count(), 3);
         // Published count (1) is far under the cap (2): the old early return
         // fired here and reaped nothing.
-        let _ = orch.evict_cold(&p, 2, std::time::Duration::from_secs(900));
+        let _ = orch.evict_cold(&p, 2, 0, std::time::Duration::from_secs(900));
         assert_eq!(
             orch.quarantined_count(),
             2,
@@ -674,7 +704,7 @@ mod tests {
 
         // Under the cap: no-op.
         assert_eq!(
-            orch.evict_cold(&persistence, 10, std::time::Duration::ZERO),
+            orch.evict_cold(&persistence, 10, 0, std::time::Duration::ZERO),
             0
         );
         assert_eq!(orch.published_count(), 4);
@@ -682,7 +712,7 @@ mod tests {
         // Cap at 1: the reaper must remove 3. All scores tie (token_count 3),
         // so which one survives is walk-order dependent — but index removal
         // and file unlink must agree for every entry.
-        let evicted = orch.evict_cold(&persistence, 1, std::time::Duration::ZERO);
+        let evicted = orch.evict_cold(&persistence, 1, 0, std::time::Duration::ZERO);
         assert_eq!(evicted, 3);
         assert_eq!(orch.published_count(), 1);
         for (i, name) in names.iter().enumerate() {
@@ -694,6 +724,75 @@ mod tests {
                 "index removal and file unlink must agree for {name}"
             );
         }
+    }
+
+    #[test]
+    fn evict_cold_enforces_the_byte_budget_biggest_first() {
+        // The launch-config decision (design doc): the store is bounded by
+        // BYTES, not entries — a long-context cache grows by GB-scale blobs
+        // per publish. Entry cap off (usize::MAX); only the byte budget
+        // drives the pass. Scores tie (3 tokens each), so the invariant
+        // asserted is the budget itself, not which name went.
+        let orch = Orchestrator::new();
+        let persistence = persist();
+        let names = ["small", "mid", "big"];
+        for ((i, name), size) in names.iter().enumerate().zip([1024, 2048, 4096]) {
+            std::fs::write(persistence.blob_dir.join(name), vec![0u8; size]).unwrap();
+            let t = (i + 1) as u32;
+            publish(&orch, &[t, t, t], meta("m", 3), name, (i + 1) as u64);
+        }
+        assert_eq!(orch.published_count(), 3);
+
+        // 7 KiB published, 4 KiB budget: at least the biggest must go.
+        let evicted = orch.evict_cold(&persistence, usize::MAX, 4096, std::time::Duration::ZERO);
+        assert!(evicted >= 1, "over-budget store must evict");
+        let remaining: u64 = names
+            .iter()
+            .map(|n| {
+                std::fs::metadata(persistence.blob_dir.join(n))
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert!(
+            remaining <= 4096,
+            "remaining {remaining} bytes must fit the 4096 budget"
+        );
+        assert_eq!(
+            orch.published_count(),
+            3 - evicted,
+            "index and disk must agree"
+        );
+    }
+
+    #[test]
+    fn evict_cold_byte_budget_never_breaks_anchors() {
+        // A budget smaller than the anchor's own size is unreachable by
+        // design: anchors are never evicted, the pass warns instead.
+        let orch = Orchestrator::new();
+        let persistence = persist();
+        std::fs::write(persistence.blob_dir.join("anchor"), vec![0u8; 8192]).unwrap();
+        publish(&orch, &[1, 2], meta("m", 2), "anchor", 1);
+        let evicted = orch.evict_cold(
+            &persistence,
+            usize::MAX,
+            1024,
+            std::time::Duration::from_secs(900),
+        );
+        assert_eq!(evicted, 0, "an anchor must never be evicted for bytes");
+        assert!(persistence.blob_dir.join("anchor").exists());
+        assert_eq!(orch.published_count(), 1);
+    }
+
+    #[test]
+    fn evict_cold_under_byte_budget_is_a_noop() {
+        let orch = Orchestrator::new();
+        let persistence = persist();
+        std::fs::write(persistence.blob_dir.join("a"), vec![0u8; 100]).unwrap();
+        publish(&orch, &[1, 2], meta("m", 2), "a", 1);
+        let evicted = orch.evict_cold(&persistence, usize::MAX, 4096, std::time::Duration::ZERO);
+        assert_eq!(evicted, 0);
+        assert_eq!(orch.published_count(), 1);
     }
 
     #[test]
@@ -712,7 +811,7 @@ mod tests {
         publish(&orch, &[7, 7, 7], meta("m", 3), "cold", 3);
 
         // Cap 2 (excess 1): the highest-score non-anchor is the chain entry.
-        let evicted = orch.evict_cold(&persistence, 2, std::time::Duration::ZERO);
+        let evicted = orch.evict_cold(&persistence, 2, 0, std::time::Duration::ZERO);
         assert_eq!(evicted, 1);
         // The 4-token entry is gone: [1,2,3,4] now only PARTIALLY matches the
         // surviving base at depth 2.
@@ -734,7 +833,7 @@ mod tests {
 
         // Cap 1 (excess 1): the standalone goes next; the base is untouched
         // (it is only ever reached after higher-scored non-anchors).
-        let evicted = orch.evict_cold(&persistence, 1, std::time::Duration::ZERO);
+        let evicted = orch.evict_cold(&persistence, 1, 0, std::time::Duration::ZERO);
         assert_eq!(evicted, 1);
         assert_eq!(
             orch.route(&[7, 7, 7], &fp("m")).decision.verdict,
@@ -745,7 +844,7 @@ mod tests {
         // anchor has lapsed) — but it was just SERVED: within the recency
         // window it is an anchor and must survive even a cap of 0.
         orch.route(&[1, 2], &fp("m")); // touch via lookup
-        let evicted = orch.evict_cold(&persistence, 0, std::time::Duration::from_secs(900));
+        let evicted = orch.evict_cold(&persistence, 0, 0, std::time::Duration::from_secs(900));
         assert_eq!(evicted, 0, "a recently served entry is never evicted");
         assert_eq!(
             orch.route(&[1, 2], &fp("m")).decision.verdict,
@@ -756,7 +855,7 @@ mod tests {
         // is legitimately evictable: structural anchoring follows the live
         // chain, recency follows the window. A cold, unextended checkpoint is
         // dead weight no matter how it got there.
-        let evicted = orch.evict_cold(&persistence, 0, std::time::Duration::ZERO);
+        let evicted = orch.evict_cold(&persistence, 0, 0, std::time::Duration::ZERO);
         assert_eq!(evicted, 1);
         assert_eq!(
             orch.route(&[1, 2], &fp("m")).decision.verdict,
@@ -773,14 +872,14 @@ mod tests {
         let persistence = persist();
         publish(&orch, &[7, 7, 7], meta("m", 3), "cold", 1); // standalone
 
-        let evicted = orch.evict_cold(&persistence, 0, std::time::Duration::from_secs(900));
+        let evicted = orch.evict_cold(&persistence, 0, 0, std::time::Duration::from_secs(900));
         assert_eq!(evicted, 0, "a just-published entry is an anchor (recency)");
         assert_eq!(
             orch.route(&[7, 7, 7], &fp("m")).decision.verdict,
             CacheVerdict::Hit
         );
         // Window 0: not recently used, no descendants — evictable.
-        let evicted = orch.evict_cold(&persistence, 0, std::time::Duration::ZERO);
+        let evicted = orch.evict_cold(&persistence, 0, 0, std::time::Duration::ZERO);
         assert_eq!(evicted, 1);
     }
 
@@ -789,7 +888,7 @@ mod tests {
         let orch = Orchestrator::new();
         let persistence = persist();
         assert_eq!(
-            orch.evict_cold(&persistence, 0, std::time::Duration::ZERO),
+            orch.evict_cold(&persistence, 0, 0, std::time::Duration::ZERO),
             0
         );
     }
