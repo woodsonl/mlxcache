@@ -1532,64 +1532,18 @@ mod tests {
         // artifact (all 999s), and counts every request it answers.
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let counter = counter.clone();
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    // Drain head + body (requests are small JSON posts).
-                    loop {
-                        let end = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            Some(p) => p + 4,
-                            None => {
-                                let n = sock.read(&mut chunk).await.unwrap_or(0);
-                                if n == 0 {
-                                    return;
-                                }
-                                buf.extend_from_slice(&chunk[..n]);
-                                continue;
-                            }
-                        };
-                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
-                        let body_len = head
-                            .lines()
-                            .find_map(|l| {
-                                let (k, v) = l.split_once(':')?;
-                                k.eq_ignore_ascii_case("content-length")
-                                    .then(|| v.trim().parse::<usize>().ok())?
-                            })
-                            .unwrap_or(0);
-                        if buf.len() >= end + body_len {
-                            break;
-                        }
-                        let n = sock.read(&mut chunk).await.unwrap_or(0);
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                    }
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    let body = "{\"tokens\":[999,999,999],\"tokenizer_hash\":\"h\",\
-                                \"kv_dtype\":\"f16\",\"kv_bits\":0,\"kv_group_size\":0}";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = sock.write_all(response.as_bytes()).await;
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
-        let client =
-            SidecarClient::new(SidecarConfig::new(format!("http://{addr}"), "m".into())).unwrap();
+        let body = r#"{"tokens":[999,999,999],"tokenizer_hash":"h","kv_dtype":"f16","kv_bits":0,"kv_group_size":0}"#.to_string();
+        let url = crate::sidecar::stub_support::http_stub(move |_path| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+        })
+        .await;
+        let client = SidecarClient::new(SidecarConfig::new(url, "m".into())).unwrap();
 
         // First call: probe #0 mismatches → fail-closed 503.
         let (status1, body1) =
