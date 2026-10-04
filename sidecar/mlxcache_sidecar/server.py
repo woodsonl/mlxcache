@@ -1075,9 +1075,19 @@ class Handler(BaseHTTPRequestHandler):
                     gen = getattr(self.engine, "generate_with_text", None)
                     if gen is not None:
                         out, text = gen(tokens, max_tokens, blob_path)
-                    elif blob_path and hasattr(self.engine, "generate_from_blob"):
-                        out = self.engine.generate_from_blob(tokens, blob_path, max_tokens)
-                        text = ""
+                    elif hasattr(self.engine, "stream"):
+                        # Contract-conforming engine without generate_with_text:
+                        # collect from its stream so non-stream clients still
+                        # get detokenized text (api-contract review: falling
+                        # through to empty choices[].content is a silent
+                        # compatibility trap for third-party adapters).
+                        out, pieces = [], []
+                        for i, (tok, piece) in enumerate(self.engine.stream(tokens, blob_path)):
+                            out.append(tok)
+                            pieces.append(piece)
+                            if i + 1 >= max_tokens:
+                                break
+                        text = "".join(pieces)
                     else:
                         out = self.engine.generate(tokens, max_tokens)
                         text = ""

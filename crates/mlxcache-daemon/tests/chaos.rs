@@ -237,7 +237,15 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         report.skipped, 3,
         "corrupt, no-prefix, and empty-payload blobs are skipped"
     );
-    assert_eq!(report.errors.len(), 1, "the corrupt blob is reported");
+    // Since the gauntlet wave (2026-10-04), a deterministically-corrupt blob
+    // is RECLAIMED at the sweep (stranding it left the file invisible to the
+    // eviction byte budget forever) instead of merely reported as an error.
+    assert_eq!(report.reclaimed_corrupt, 1, "the corrupt blob is reclaimed");
+    assert_eq!(
+        report.errors.len(),
+        0,
+        "no errors: corruption is handled, not logged",
+    );
 
     // Exact hit after rebuild.
     assert_eq!(

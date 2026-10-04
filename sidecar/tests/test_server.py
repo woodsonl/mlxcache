@@ -323,3 +323,25 @@ def test_generate_nonstream_returns_detokenized_text(sidecar_url):
     body = r.json()
     assert body["tokens"] == [3, 4, 5], body
     assert body["text"] == "tok0 tok1 tok2 ", body
+
+
+def test_engine_without_generate_with_text_collects_text_from_stream(sidecar_url, monkeypatch):
+    # api-contract review: a contract-conforming engine that implements
+    # stream() but not generate_with_text() must still produce detokenized
+    # non-stream text — an empty choices[].content is a silent trap.
+    class StreamOnly:
+        tokenizer_hash = "s"
+
+        def stream(self, tokens, blob_path):
+            for i, t in enumerate(tokens):
+                yield t + 100, f"piece{i} "
+
+    monkeypatch.setattr(server.Handler, "engine", StreamOnly())
+    try:
+        r = httpx.post(f"{sidecar_url}/generate", json={"tokens": [1, 2, 3], "max_tokens": 2})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["tokens"] == [101, 102], body
+        assert body["text"] == "piece0 piece1 ", body
+    finally:
+        server.Handler.engine = server.make_engine("test-model")
