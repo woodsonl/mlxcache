@@ -1,8 +1,13 @@
 """Sidecar HTTP server: the mlx-lm compatibility adapter.
 
 Endpoints (daemon -> sidecar protocol):
-- POST /tokenize  {"prompt": str} -> {"tokens": [u32], "tokenizer_hash": str}
-- POST /prefill   {"prompt": str, "tokens": [u32]} -> KV checkpoint blob (binary)
+- POST /tokenize  {"prompt": str} -> {"tokens": [u32], "tokenizer_hash": str,
+                   "kv_dtype": str, "kv_bits": int, "kv_group_size": int}
+- POST /prefill   {"tokens": [u32], "ancestor_blob_path": str|null}
+                   -> KV checkpoint payload (binary; EMPTY body = nothing
+                   cacheable). 400 on bad input; 422 when a declared ancestor
+                   is missing or unloadable (the daemon quarantines it and
+                   retries from scratch).
 - POST /generate  {"tokens": [u32], "max_tokens": int, "blob_path": str|null,
                    "stream": bool} -> NDJSON token stream
 
@@ -16,10 +21,10 @@ Run: uv run python -m mlxcache_sidecar.server
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 import traceback
@@ -292,6 +297,13 @@ class SyntheticEngine:
         # names) must respond exactly as the real engine's would.
         self.kv_bits = max(0, int(os.environ.get("MLXCACHE_KV_BITS", "0") or 0))
         self.kv_group_size = max(0, int(os.environ.get("MLXCACHE_KV_GROUP_SIZE", "0") or 0))
+        if self.kv_bits and not self.kv_group_size:
+            # Parity with MlxLmEngine (review 2026-10-04): a group size is
+            # mandatory with quantization and 64 is the proven one. The two
+            # engines' parses drifted here — different fingerprints/blob names
+            # for the same operator config, breaking the synthetic engine's
+            # own must-respond-exactly contract.
+            self.kv_group_size = 64
         # Test knob: emulate a tokenizer that grows a base prompt's tokens —
         # tokenize(base) is a strict token-prefix of tokenize(base + rest), so
         # daemon tests can exercise partial hits and delta prefill (which the
@@ -549,18 +561,21 @@ class MlxLmEngine:
         (422/quarantine); OSError/RuntimeError stay transient (500)."""
         from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
 
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
-            tmp = fh.name
-            fh.write(payload)
+        # Parse from memory: the daemon just sent this payload over the wire
+        # and validated it — a temp-file write + read doubled disk I/O per
+        # PARTIAL hit at GB scale (performance review 2026-10-04).
+        # load_prompt_cache forwards to mx.load WITHOUT a format argument, so
+        # mlx infers safetensors from the file EXTENSION and reads `.name` —
+        # a bare BytesIO raises AttributeError. Naming the buffer satisfies
+        # the inference; the data itself still never touches disk.
+        blob = io.BytesIO(payload)
+        blob.name = "checkpoint.safetensors"
         try:
-            try:
-                return load_prompt_cache(tmp)
-            except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
-                raise CheckpointRejectedError(
-                    f"checkpoint failed to load: {type(exc).__name__}: {exc}"
-                ) from exc
-        finally:
-            os.unlink(tmp)
+            return load_prompt_cache(blob)
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+            raise CheckpointRejectedError(
+                f"checkpoint failed to load: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def _quantize_cache(self, cache):
         """Apply the configured KV quantization (T12 tier). No-op at bits=0.
@@ -631,22 +646,22 @@ class MlxLmEngine:
                 logits = self.model(inp, cache=cache)
                 mx.eval([c.state for c in cache], logits)
                 _phase_add("delta_prefill", (time.perf_counter() - t0) * 1000)
-        # safetensors needs a real file; write to a temp, then read the bytes.
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
-            tmp = fh.name
-        try:
-            # Quantize BEFORE save (T12 tier): the persisted blob holds the
-            # quantized state, so bytes/token drops ~47% at 8-bit g64. The
-            # fingerprint the daemon recorded already pins (kv_bits,
-            # kv_group_size) from /tokenize, so f16 and q8 never cross-serve.
-            cache = self._quantize_cache(cache)
-            t0 = time.perf_counter()
-            save_prompt_cache(tmp, cache)
-            _phase_add("cache_save", (time.perf_counter() - t0) * 1000)
-            with open(tmp, "rb") as fh:
-                payload = fh.read()
-        finally:
-            os.unlink(tmp)
+        # Serialize to an IN-MEMORY buffer: the payload must be in RAM for the
+        # HTTP response regardless, so the old temp-file roundtrip (a full
+        # GB-scale disk write + read back at 20K tokens, before the daemon
+        # could even publish) was pure TTFT tax with zero durability benefit
+        # (performance review 2026-10-04). mx.save_safetensors — and thus
+        # save_prompt_cache — accepts file objects.
+        # Quantize BEFORE save (T12 tier): the persisted blob holds the
+        # quantized state, so bytes/token drops ~47% at 8-bit g64. The
+        # fingerprint the daemon recorded already pins (kv_bits,
+        # kv_group_size) from /tokenize, so f16 and q8 never cross-serve.
+        cache = self._quantize_cache(cache)
+        buf = io.BytesIO()
+        t0 = time.perf_counter()
+        save_prompt_cache(buf, cache)
+        _phase_add("cache_save", (time.perf_counter() - t0) * 1000)
+        payload = buf.getvalue()
         mx.clear_cache()
 
         # Return the raw safetensors payload. The daemon owns the checkpoint
@@ -734,23 +749,21 @@ class MlxLmEngine:
         if not usable:
             return None, tokens
         covered = len(meta.tokens) - 1
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
-            tmp = fh.name
-            fh.write(payload)
+        # From-memory load — same rationale and same named-buffer requirement
+        # as _load_cache_from_payload (performance review 2026-10-04).
+        # A pure-Python parse/schema failure is corruption: reject so the
+        # daemon retires it. MemoryError, OSError, and RuntimeError are
+        # transient (a real OOM, a disk fault; MLX's native reader raises
+        # RuntimeError on an OS read failure): let them propagate as a 500 so
+        # a healthy checkpoint is not retired.
+        blob = io.BytesIO(payload)
+        blob.name = "checkpoint.safetensors"
         try:
-            # A pure-Python parse/schema failure is corruption: reject so the
-            # daemon retires it. MemoryError, OSError, and RuntimeError are
-            # transient (a real OOM, a disk fault; MLX's native reader raises
-            # RuntimeError on an OS read failure): let them propagate as a 500 so
-            # a healthy checkpoint is not retired.
-            try:
-                return load_prompt_cache(tmp), tokens[covered:]
-            except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
-                raise CheckpointRejectedError(
-                    f"checkpoint failed to load: {type(exc).__name__}: {exc}"
-                ) from exc
-        finally:
-            os.unlink(tmp)
+            return load_prompt_cache(blob), tokens[covered:]
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+            raise CheckpointRejectedError(
+                f"checkpoint failed to load: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def generate_from_blob(self, tokens: list[int], blob_path: str, max_tokens: int) -> list[int]:
         """Resume generation from a persisted wire-format checkpoint (a cache
