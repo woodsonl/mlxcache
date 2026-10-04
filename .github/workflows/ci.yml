@@ -41,7 +41,7 @@ jobs:
         # Single-threaded on purpose: the counting allocator is process-global,
         # so parallel test-harness threads would leak allocations into the
         # measurement window and flake the tight budgets.
-        run: cargo test -p mlxcache-daemon --test alloc_gate --release -- --test-threads=1
+        run: cargo test -p mlxcache-daemon --test alloc_gate --release -- --test-threads=1 --include-ignored
 
   python:
     runs-on: macos-14
