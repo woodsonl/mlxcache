@@ -639,26 +639,34 @@ async fn end_to_end_miss_then_hit() {
 /// Spawn the sidecar with extra environment variables (test knobs), e.g. a
 /// prefill delay to widen the single-flight window, or an empty tokenizer.
 #[allow(clippy::zombie_processes)]
-async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> Option<(String, std::process::Child)> {
-    let port = portpicker::pick_unused_port().expect("free port");
-    let script = format!(
-        "import sys; sys.path.insert(0, {root:?}); \
-         from mlxcache_sidecar import server; \
-         server.Handler.engine = server.make_engine('e2e-model'); \
-         server.BurstServer(('127.0.0.1', {port}), server.Handler).serve_forever()",
-        root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
-        port = port
-    );
-    let mut cmd = std::process::Command::new("uv");
-    cmd.args(["run", "python", "-c", &script]);
-    for (k, v) in env {
-        cmd.env(k, v);
+/// RAII wrapper: the sidecar dies even when a test panics mid-flight. The
+/// tail-of-test kill+wait only runs on the happy path — failed sweeps leaked
+/// one `uv run python` engine per failed test (64 strays held real RAM after
+/// the 2026-10-04 sweeps; engines are GB-scale residents).
+struct SidecarHandle(std::process::Child);
+
+impl Drop for SidecarHandle {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let url = format!("http://127.0.0.1:{port}");
+}
+
+impl std::ops::Deref for SidecarHandle {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SidecarHandle {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> Option<(String, SidecarHandle)> {
     // The health probe needs its own deadline: `reqwest::get` is a bare
     // client with NO timeout, so under a loaded machine (18 parallel `uv
     // run` starts resolving simultaneously) a half-open connect hangs the
@@ -669,20 +677,65 @@ async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> Option<(String, std::pr
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .expect("probe client");
-    for _ in 0..100 {
-        if probe.get(format!("{url}/health")).send().await.is_ok() {
-            return Some((url, child));
+    // Retry on a FRESH port when our own sidecar dies at bind time:
+    // portpicker can hand the same port to two spawns launched milliseconds
+    // apart (two_models test), and a health answer on that port then comes
+    // from the WRONG engine — silent cross-model contamination
+    // (two_models_same_tokens flake, 2026-10-04).
+    for _ in 0..3 {
+        let port = portpicker::pick_unused_port().expect("free port");
+        let script = format!(
+            "import sys; sys.path.insert(0, {root:?}); \
+             from mlxcache_sidecar import server; \
+             server.Handler.engine = server.make_engine('e2e-model'); \
+             server.BurstServer(('127.0.0.1', {port}), server.Handler).serve_forever()",
+            root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
+            port = port
+        );
+        // Spawn the venv python DIRECTLY, not via `uv run`: uv keeps itself
+        // resident and spawns python as a CHILD, so SIGKILL to the Child we
+        // hold reaps uv and ORPHANS the server (the 64-stray leak held real
+        // RAM across sweeps, 2026-10-04) — and 18 concurrent `uv run` starts
+        // contend on uv's environment lock, the original parallel-e2e flake
+        // source. One process, one kill, no lock.
+        let python = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.venv/bin/python");
+        assert!(
+            std::path::Path::new(python).exists(),
+            "e2e needs the repo venv at {python:?} (uv sync)"
+        );
+        let mut cmd = std::process::Command::new(python);
+        cmd.arg("-c").arg(&script);
+        for (k, v) in env {
+            cmd.env(k, v);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        let url = format!("http://127.0.0.1:{port}");
+        let alive = |child: &mut std::process::Child| {
+            child.try_wait().map_or(true, |status| status.is_none())
+        };
+        for _ in 0..100 {
+            // Trust a health answer ONLY while OUR child is alive: a dead
+            // child means our bind failed and any responder on this port is
+            // someone else's server.
+            if !alive(&mut child) {
+                break; // bind race (or crash): retry on a fresh port
+            }
+            if probe.get(format!("{url}/health")).send().await.is_ok() {
+                return Some((url, SidecarHandle(child)));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    let mut child = child;
-    let _ = child.kill();
-    let _ = child.wait();
     None
 }
 
 /// One sidecar, immediately ready, no test knobs.
-async fn spawn_sidecar() -> Option<(String, std::process::Child)> {
+async fn spawn_sidecar() -> Option<(String, SidecarHandle)> {
     spawn_sidecar_with_env(&[]).await
 }
 

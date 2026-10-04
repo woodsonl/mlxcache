@@ -183,9 +183,16 @@ fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
             // runtime worker, including live streams. The Arc is cloned per
             // pass so the blocking closure can own it.
             let state = state.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || state.evict_pass(max_entries, anchor_window))
-                    .await;
+            match tokio::task::spawn_blocking(move || state.evict_pass(max_entries, anchor_window))
+                .await
+            {
+                Ok(_) => {}
+                // A silently-dead reaper repeats every interval with zero
+                // signal — log it like the publish path logs a panicked task.
+                Err(join) => {
+                    tracing::error!(error = %join, "eviction pass panicked; sweep skipped this interval")
+                }
+            }
         }
     });
     tracing::info!(
