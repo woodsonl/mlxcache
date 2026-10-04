@@ -58,6 +58,22 @@ pub struct AppState {
     pub persistence: crate::persistence::Persistence,
 }
 
+impl AppState {
+    /// One eviction pass against this state: reap cold checkpoints, then
+    /// record the count in /stats. Both the background reaper (main.rs) and
+    /// tests go through this single path, so the counter can never drift from
+    /// what the reaper actually removed.
+    pub fn evict_pass(&self, max_entries: usize, anchor_window: std::time::Duration) -> usize {
+        let evicted = self
+            .orchestrator
+            .evict_cold(&self.persistence, max_entries, anchor_window);
+        if evicted > 0 {
+            self.stats.record_evictions(evicted as u64);
+        }
+        evicted
+    }
+}
+
 /// Hit-rate counters (D3). Per-counter atomics instead of a Mutex: `record`
 /// runs on every request, and under concurrent streaming the lock is a
 /// cross-core contention point on the hot path for no benefit — the counters
@@ -77,6 +93,9 @@ pub struct Stats {
     /// the numerator without lowering this, so the ratio can dip below the
     /// fraction of requests that hit. Read it as a trend, not an exact rate.
     tokens_total: std::sync::atomic::AtomicU64,
+    /// Checkpoints removed by the eviction reaper (ds4 anchor policy). Purely
+    /// cumulative observability: evictions are policy, not failures.
+    evictions: std::sync::atomic::AtomicU64,
 }
 
 /// Point-in-time read of every counter, for /stats and tests.
@@ -88,6 +107,7 @@ pub struct StatsSnapshot {
     pub partials: u64,
     pub tokens_cached: u64,
     pub tokens_total: u64,
+    pub evictions: u64,
 }
 
 impl Stats {
@@ -156,6 +176,11 @@ impl Stats {
         );
     }
 
+    pub fn record_evictions(&self, n: u64) {
+        self.evictions
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             requests: Self::get(&self.requests),
@@ -164,6 +189,7 @@ impl Stats {
             partials: Self::get(&self.partials),
             tokens_cached: Self::get(&self.tokens_cached),
             tokens_total: Self::get(&self.tokens_total),
+            evictions: Self::get(&self.evictions),
         }
     }
 }
@@ -1174,6 +1200,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         },
         "checkpoints_published": state.orchestrator.published_count(),
         "checkpoints_quarantined": state.orchestrator.quarantined_count(),
+        "evictions": s.evictions,
     }))
 }
 

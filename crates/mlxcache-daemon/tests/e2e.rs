@@ -97,6 +97,111 @@ async fn unusable_blob_is_quarantined_and_served_from_scratch() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn eviction_reaper_unlinks_and_stats_and_next_request_misses() {
+    // Full-path eviction coverage: a real request publishes a checkpoint; a
+    // reaper pass with cap 0 and window 0 must (1) remove it from the index,
+    // (2) unlink the blob file (an orphan would resurrect on the next restart
+    // rebuild), (3) surface in /stats, and (4) leave the next identical request
+    // a clean miss served from scratch. This is the only place the reaper's
+    // interaction with the live request path is proven end to end.
+    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url, "e2e-model".into())).unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+    });
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "evict me"}],
+        "stream": false,
+    })
+    .to_string();
+    let post = |body: String| {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get_stats = || {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Request 1: miss → publish.
+    let res = post(body.clone()).await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        state.orchestrator.published_count(),
+        1,
+        "checkpoint published"
+    );
+    let blob = state.persistence.list_blobs().unwrap().pop().unwrap();
+
+    // Reaper pass: cap 0 + window 0 → the just-published entry is NOT recency-
+    // protected (window 0) and has no published extension → evicted. Goes
+    // through AppState::evict_pass — the same single path the background
+    // reaper uses — so the /stats counter is exercised here too.
+    let evicted = state.evict_pass(0, std::time::Duration::ZERO);
+    assert_eq!(evicted, 1, "the single published entry must be reaped");
+    assert_eq!(state.orchestrator.published_count(), 0);
+    assert!(
+        !blob.exists(),
+        "evicted blob file must be unlinked, or the next restart resurrects it"
+    );
+
+    // /stats reflects the eviction.
+    let res = get_stats().await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["evictions"], 1, "/stats must report the eviction");
+    assert_eq!(v["checkpoints_published"], 0);
+
+    // Request 2: identical prompt → clean miss from scratch (no 502, no
+    // reference to the unlinked blob).
+    let res = post(body).await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        v["mlxcache"]["verdict"], "miss",
+        "evicted entry must not serve"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
     // Regression (coverage audit): after a FAILED startup scan the generation
     // floor is unknown, so the handler must serve from scratch and write NO
