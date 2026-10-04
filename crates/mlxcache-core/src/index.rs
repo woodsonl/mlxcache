@@ -555,6 +555,91 @@ impl PrefixIndex {
         self.count_in_state(CheckpointState::Quarantined)
     }
 
+    /// Quarantine-candidate records, coldest first: every quarantined entry
+    /// ordered by `last_used` ascending, capped at `max_keep`. A quarantine
+    /// tombstone is diagnostic state, not a serveable asset: left unbounded, a
+    /// daemon that quarantines pathological blobs for weeks grows this map
+    /// forever (QA ISSUE-002 follow-up). The reaper calls this each pass and
+    /// retires the coldest stones beyond the cap via `remove_quarantined`.
+    /// Returns (key, blob_path, generation) triples — the key comes from the
+    /// entry itself (a serve can key-diverge from the request, T22).
+    pub fn quarantine_candidates(&self, max_keep: usize) -> Vec<(Vec<u32>, String, u64)> {
+        let root = self.read_lock();
+        let mut all: Vec<(u64, Vec<u32>, String, u64)> = Vec::new();
+        let mut stack: Vec<(Vec<u32>, &Node)> = vec![(Vec::new(), &root)];
+        while let Some((prefix, node)) = stack.pop() {
+            if let Some(entry) = &node.entry {
+                if entry.state == CheckpointState::Quarantined {
+                    all.push((
+                        entry
+                            .last_used_millis
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        prefix.clone(),
+                        entry.blob_path.clone(),
+                        entry.generation,
+                    ));
+                }
+            }
+            for (t, child) in &node.children {
+                let mut p = prefix.clone();
+                p.push(*t);
+                stack.push((p, child));
+            }
+        }
+        // Coldest first (ascending last_used). The reaper removes stones while
+        // the live count exceeds the cap, so the candidates are the EXCESS:
+        // `len - max_keep` coldest stones, front = coldest first.
+        all.sort_by_key(|(lu, _, _, _)| *lu);
+        let excess = all.len().saturating_sub(max_keep);
+        all.into_iter()
+            .take(excess)
+            .map(|(_, tokens, blob_path, generation)| (tokens, blob_path, generation))
+            .collect()
+    }
+
+    /// Remove ONE quarantined entry by exact identity (tokens + blob name +
+    /// generation), pruning the trie branch if it dies. Mirrors
+    /// `remove_published`'s verification contract: never removes a published
+    /// entry, an ancestor, or a republish that reused the name.
+    pub fn remove_quarantined(&self, tokens: &[u32], blob_path: &str, generation: u64) -> bool {
+        let mut root = self.write_lock();
+        // Same O(depth) prune shape as remove_published: track the deepest
+        // keep-node on the path, drop the childless suffix at it.
+        let mut node: &mut Node = &mut root;
+        let mut last_keep = 0usize;
+        for (j, t) in tokens.iter().enumerate() {
+            if node.entry.is_some() || node.children.len() >= 2 {
+                last_keep = j;
+            }
+            match node.children.get_mut(t) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        let removed = match &mut node.entry {
+            Some(entry)
+                if entry.blob_path == blob_path
+                    && entry.generation == generation
+                    && entry.state == CheckpointState::Quarantined =>
+            {
+                node.entry = None;
+                true
+            }
+            _ => false,
+        };
+        if removed && node.children.is_empty() {
+            let mut cur: &mut Node = &mut root;
+            for t in &tokens[..last_keep] {
+                cur = cur
+                    .children
+                    .get_mut(t)
+                    .expect("path existed during descent");
+            }
+            cur.children.remove(&tokens[last_keep]);
+        }
+        removed
+    }
+
     /// Count entries in `state`. Iterative so a very long prefix cannot overflow
     /// the thread stack.
     fn count_in_state(&self, state: CheckpointState) -> usize {
@@ -712,6 +797,57 @@ mod tests {
         let (entry, matched) = index.lookup(&[1, 2, 3, 4, 5], None).unwrap();
         assert_eq!(matched, 2);
         assert_eq!(entry.blob_path, "ancestor");
+    }
+
+    #[test]
+    fn quarantine_candidates_and_remove_quarantined_bound_tombstones() {
+        // QA ISSUE-002 follow-up: quarantine tombstones are diagnostic state
+        // and must be reapable, not an unbounded map. Candidates are coldest
+        // first and never include published entries; remove_quarantined retires
+        // the exact stone (never a published entry or a republish) and prunes
+        // the dead branch.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2, 3], "stone-a");
+        let _ = publish_entry(&index, &[4, 5, 6], "stone-b");
+        let _ = publish_entry(&index, &[7, 8, 9], "healthy");
+        for name in ["stone-a", "stone-b"] {
+            let tokens: &[u32] = if name == "stone-a" {
+                &[1, 2, 3]
+            } else {
+                &[4, 5, 6]
+            };
+            let (entry, _) = index.lookup(tokens, None).unwrap();
+            assert!(index.quarantine_blob(&entry.blob_path, entry.generation, tokens, || {}));
+        }
+        // Candidates are the EXCESS over the cap, coldest first — never a
+        // published entry. Two stones at cap 10: no excess, nothing to reap.
+        assert_eq!(index.quarantined_count(), 2, "quarantine_blob marked both");
+        assert!(
+            index.quarantine_candidates(10).is_empty(),
+            "under-cap tombstones are keepers, not candidates"
+        );
+        // Cap 1: excess 1 — the COLDEST stone is the reaper's candidate.
+        let cands = index.quarantine_candidates(1);
+        assert_eq!(cands.len(), 1);
+        assert!(cands.iter().all(|(_, name, _)| *name != "healthy"));
+        // Removing by exact identity retires the stone; a PUBLISHED identity
+        // can never be removed through this path.
+        let (tokens, name, gen) = &cands[0];
+        assert!(index.remove_quarantined(tokens, name, *gen));
+        assert!(
+            !index.remove_quarantined(tokens, name, *gen),
+            "already gone"
+        );
+        let (entry, _) = index.lookup(&[7, 8, 9], None).unwrap();
+        assert!(
+            !index.remove_quarantined(&[7, 8, 9], &entry.blob_path, entry.generation),
+            "remove_quarantined must never remove a published entry"
+        );
+        assert_eq!(index.quarantined_count(), 1);
+        assert_eq!(index.published_count(), 1);
+        // The pruned branch is gone: the removed stone's tokens no longer walk.
+        let removed_tokens = cands[0].0.clone();
+        assert!(index.lookup(&removed_tokens, None).is_none());
     }
 
     #[test]
