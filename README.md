@@ -96,15 +96,48 @@ quarantining the checkpoint and (on the next request) serving from scratch.
 `GET /healthz` is a dependency-free liveness probe (`{"status":"ok"}`); cache
 and adapter state live in `/stats`.
 
+## Storage: integrity, quarantine, and eviction
 
-A checkpoint the adapter cannot use is retired, not retried forever. The adapter
-answers `422` when the blob is gone, corrupt, or its recorded prefix disagrees
-with the request; the daemon quarantines that entry and serves the request from
-scratch. A generic decode or transport failure (`500`) does not retire a healthy
-checkpoint. Each publication is written to its own file (`{hash}-{generation}
-.ckpt`), and retirement is keyed by the publication generation the request used,
-so a late failure unlinks only that publication's file — never a fresh republish
-that replaced it.
+Every published hit writes one KV checkpoint ("blob") — a safetensors payload
+behind a JSON header — to its own `{hash}-{generation}.ckpt` file, written to
+a temp name and atomically renamed. Blobs survive restarts; the daemon
+rebuilds its index from disk at boot. Sizes are why the rest of this section
+exists: KV runs 12–262 KB **per token** depending on model size (see
+[Measured](#measured)), so a 20K-token agent context is a 1–5 GB file, and an
+unbounded store is a disk-full incident waiting to happen.
+
+**Integrity.** Each blob is stamped at publish with `format_version: 2` and a
+sha256 digest of its payload. The daemon verifies every blob during the boot
+rebuild; the sidecar re-verifies at first serve (once per file). A
+framing-valid bit-rot flip — the corruption mode no structural check can
+catch — surfaces as a `422`, the entry is quarantined, and the request re-runs
+from scratch and republishes. A checkpoint the adapter cannot use is retired,
+not retried forever: the adapter `422`s a blob that is gone, corrupt,
+digest-mismatched, or whose recorded prefix disagrees with the request, and
+retirement is keyed by publication generation, so a late failure unlinks only
+that publication's file — never a fresh republish that replaced it. A generic
+`500`/transport failure never retires a healthy checkpoint. Legacy
+version-1 blobs (written before digests existed) stay readable, unverified.
+
+**Eviction.** A background reaper bounds the store. Every
+`MLXCACHE_EVICT_INTERVAL_S` (default 60s) it measures the published blobs and,
+if the store exceeds `MLXCACHE_EVICT_MAX_BYTES` (default **32 GiB** — on by
+default), evicts until it fits: **coldest non-anchor blobs, biggest first**,
+so each unlink frees the most bytes per sweep. Two things are never evicted:
+
+- **Anchors** — a checkpoint that a longer published checkpoint extends (a
+  chain base; evicting it would collapse the whole chain's future hit rate),
+  or anything served within `MLXCACHE_EVICT_ANCHOR_WINDOW_S` (default 15 min).
+  If anchors alone hold the store over budget, the reaper logs a warning and
+  stops — it never breaks the anchor contract.
+- **Fresh replacements** — removal is verified against the exact publication
+  generation before the file is unlinked, so a sweep can never delete a newer
+  republish of the same prefix.
+
+Eviction is a throughput cost, never a correctness one: the next request that
+would have hit an evicted checkpoint takes an honest miss and republishes it.
+`/stats` carries an `evictions` counter. To run unbounded (the old behavior):
+`MLXCACHE_EVICT_MAX_BYTES=0`.
 
 ## Real inference (mlx-lm)
 
@@ -142,19 +175,32 @@ curl -N -X POST http://127.0.0.1:8420/v1/chat/completions \
 
 ## Configuration
 
+Daemon:
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `MLXCACHE_ADDR` | `127.0.0.1:8420` | daemon bind address |
-| `MLXCACHE_MODELS` | (empty) | comma-separated served models; others 404 before any cache lookup |
+| `MLXCACHE_MODELS` | (empty) | comma-separated served models; others 404 before any cache lookup; empty fails the boot unless `MLXCACHE_ALLOW_NO_MODELS=1` |
+| `MLXCACHE_ALLOW_NO_MODELS` | (unset) | escape hatch to boot model-less (every request 404s) |
 | `MLXCACHE_SIDECAR_URL` | (unset) | sidecar base URL; unset = no adapter, requests 503 |
 | `MLXCACHE_BLOBS` | `/tmp/mlxcache-blobs` | where KV checkpoints are written |
 | `MLXCACHE_SIDECAR_TIMEOUT_S` | `120` | per-request sidecar timeout; must exceed the slowest prefill |
-| `MLXCACHE_ENGINE` | `synthetic` | sidecar engine: `synthetic` or `mlx-lm` |
-| `MLXCACHE_MODEL` | `synthetic-model` | model the sidecar loads |
+| `MLXCACHE_NATIVE_TOKENIZER` | (unset) | path to the engine's `tokenizer.json`; when set, the daemon tokenizes natively (no sidecar round-trip) after PROVING parity against the engine over an adversarial probe set — any mismatch fails closed (503) rather than risk mis-routing checkpoints |
+| `MLXCACHE_TRACE` | (unset) | capture one JSONL record per settled request (exact payload, verdict, covered KV); score and replay with `scripts/replay_trace.py` |
+| `MLXCACHE_SHUTDOWN_GRACE_S` | `30` | SIGTERM drain window for in-flight streams |
+| `MLXCACHE_EVICT_INTERVAL_S` | `60` | eviction sweep cadence; `0` disables the reaper |
+| `MLXCACHE_EVICT_MAX_BYTES` | 32 GiB | store byte budget, on by default — see [Storage](#storage-integrity-quarantine-and-eviction); `0` = unbounded |
+| `MLXCACHE_EVICT_MAX_ENTRIES` | `0` | entry cap on top of the byte budget; `0` = none |
+
+Sidecar:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MLXCACHE_ENGINE` | `synthetic` | `synthetic` (deterministic, no download) or `mlx-lm` |
+| `MLXCACHE_MODEL` | `synthetic-model` | model the sidecar loads (HF repo or local path) |
+| `MLXCACHE_SIDECAR_PORT` | `8421` | sidecar bind port |
+| `MLXCACHE_KV_BITS` | `0` | KV quantization tier: `0` = f16, `8` = q8 — the tier is folded into the fingerprint, so tiers never share blobs |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
-| `MLXCACHE_EVICT_INTERVAL_S` | `60` | eviction-reaper sweep cadence; `0` disables the reaper |
-| `MLXCACHE_EVICT_MAX_BYTES` | `34359738368` | published-store byte budget (32 GiB). Each sweep evicts coldest non-anchor blobs, biggest first, until the store fits; `0` disables the byte cap. Anchors are never evicted — a store held over budget by live anchors only logs a warning |
-| `MLXCACHE_EVICT_MAX_ENTRIES` | `0` | published-entry cap on top of the byte budget; `0` = no entry cap |
 
 ## Building and testing
 
@@ -185,6 +231,12 @@ serialize 20 ms, deserialize <1 ms. Qwen2.5-7B-Instruct-4bit: 57,344 bytes/token
 serialize 526 ms, deserialize <1 ms, prefill 10.2 s. Qwen3-32B-4bit: 262,150
 bytes/token, serialize 203 ms, deserialize 1 ms, prefill 11.1 s. A hit eliminates
 that prefill, and the 2 s TTFT resume budget holds with margin at every size.
+
+Restart resume (the claim that matters for a cache): a 19,847-token agent
+context on Qwen2.5-7B-Instruct-4bit goes 34.5 s cold → 1.56 s warm → **1.59 s
+after SIGTERM-killing both processes and restarting from disk** (verified in
+both KV tiers, f16 and q8).
+
 Full numbers and caveats in the [design doc](docs/designs/mlx-kv-cache-daemon.md) (R1-5).
 
 ## Operating it
@@ -197,5 +249,7 @@ launchd service, and the mlx-lm version-pinning policy.
 Early. Working end to end (cache, persistence, single-flight, streaming, error
 rescues, chaos tests). The R1-5 gate has run on Qwen2-0.5B,
 Qwen2.5-7B-Instruct-4bit, and the named representative Qwen3-32B-4bit, all
-token-identical to scratch. The engine-agnostic contract has one adapter
-(mlx-lm). No license assigned — private build, all rights reserved.
+token-identical to scratch. The store is bounded by default (32 GiB eviction
+budget with anchor protection) and every checkpoint carries a sha256 payload
+digest verified at boot and first serve. The engine-agnostic contract has one
+adapter (mlx-lm). No license assigned — private build, all rights reserved.
