@@ -269,6 +269,12 @@ class SyntheticEngine:
         self.prefill_count = 0
         self.tokenizer_hash = "synthetic"
         self.kv_dtype = "synthetic"
+        # The synthetic engine reports the same quantization knobs so daemon
+        # e2e tests can exercise the q8 fingerprint tier without a GPU: the
+        # payload is fake bytes either way, but the fingerprint (and blob
+        # names) must respond exactly as the real engine's would.
+        self.kv_bits = max(0, int(os.environ.get("MLXCACHE_KV_BITS", "0") or 0))
+        self.kv_group_size = max(0, int(os.environ.get("MLXCACHE_KV_GROUP_SIZE", "0") or 0))
         # Test knob: emulate a tokenizer that grows a base prompt's tokens —
         # tokenize(base) is a strict token-prefix of tokenize(base + rest), so
         # daemon tests can exercise partial hits and delta prefill (which the
@@ -413,6 +419,15 @@ class MlxLmEngine:
         # identity. The vocab is deterministic and artifact-derived.
         self.tokenizer_hash = self._hash_vocab()
         self.kv_dtype = self._kv_dtype()
+        # T12 adoption knobs: KV quantization applied before persisting.
+        # bits=0 (default) = f16, byte-identical to the historical behavior.
+        # Only 8-bit group-64 is parity-proven (T12); anything else is the
+        # operator's explicit choice and is fingerprinted as its own tier.
+        self.kv_bits = max(0, int(os.environ.get("MLXCACHE_KV_BITS", "0") or 0))
+        self.kv_group_size = max(0, int(os.environ.get("MLXCACHE_KV_GROUP_SIZE", "0") or 0))
+        if self.kv_bits and not self.kv_group_size:
+            # A group size is mandatory with quantization; 64 is the proven one.
+            self.kv_group_size = 64
         self.prefill_count = 0
         # T21 (lean decode): skip stream_generate's per-token machinery —
         # the full-vocab logsumexp (pure GPU waste when we only argmax), a
@@ -495,6 +510,12 @@ class MlxLmEngine:
         finally:
             os.unlink(tmp)
 
+    def _quantize_cache(self, cache):
+        """Apply the configured KV quantization (T12 tier). No-op at bits=0."""
+        if not self.kv_bits:
+            return cache
+        return [c.to_quantized(group_size=self.kv_group_size, bits=self.kv_bits) for c in cache]
+
     def prefill(self, tokens: list[int], ancestor_blob_path: str | None = None) -> bytes:
         import mlx.core as mx  # noqa: PLC0415
         from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
@@ -548,6 +569,11 @@ class MlxLmEngine:
         with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as fh:
             tmp = fh.name
         try:
+            # Quantize BEFORE save (T12 tier): the persisted blob holds the
+            # quantized state, so bytes/token drops ~47% at 8-bit g64. The
+            # fingerprint the daemon recorded already pins (kv_bits,
+            # kv_group_size) from /tokenize, so f16 and q8 never cross-serve.
+            cache = self._quantize_cache(cache)
             t0 = time.perf_counter()
             save_prompt_cache(tmp, cache)
             _phase_add("cache_save", (time.perf_counter() - t0) * 1000)
@@ -855,6 +881,8 @@ class Handler(BaseHTTPRequestHandler):
                         "tokens": tokens,
                         "tokenizer_hash": getattr(self.engine, "tokenizer_hash", "synthetic"),
                         "kv_dtype": getattr(self.engine, "kv_dtype", "unknown"),
+                        "kv_bits": getattr(self.engine, "kv_bits", 0),
+                        "kv_group_size": getattr(self.engine, "kv_group_size", 0),
                     },
                 )
             elif self.path == "/prefill":

@@ -16,6 +16,7 @@ fn fingerprint() -> ModelFingerprint {
         tokenizer_hash: "bench".into(),
         kv_dtype: "float16".into(),
         kv_layout_version: 1,
+        ..Default::default()
     }
 }
 

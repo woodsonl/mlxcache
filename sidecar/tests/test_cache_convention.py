@@ -93,6 +93,12 @@ def _engine(model=None):
     eng.model_id = "fake"
     eng.model = model if model is not None else types.SimpleNamespace()
     eng.tokenizer_hash = "h"
+    # The __new__ bypass skips __init__, so hand-set every attribute the
+    # engine's runtime paths read. Keep in sync with MlxLmEngine.__init__:
+    # kv_bits/kv_group_size (T12) default to the f16 tier here — these tests
+    # pin the f16 cache convention, not the quantization tier.
+    eng.kv_bits = 0
+    eng.kv_group_size = 0
     return eng
 
 

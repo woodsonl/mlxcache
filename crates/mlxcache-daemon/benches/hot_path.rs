@@ -34,6 +34,8 @@ fn bench_blob_key(c: &mut Criterion) {
         tokenizer_hash: "0123456789abcdef".into(),
         kv_dtype: "float16".into(),
         kv_layout_version: 1,
+        kv_bits: 0,
+        kv_group_size: 0,
     };
     let mut group = c.benchmark_group("blob_key");
     group.warm_up_time(std::time::Duration::from_millis(300));

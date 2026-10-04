@@ -375,6 +375,7 @@ mod tests {
             tokenizer_hash: "abc123".into(),
             kv_dtype: "f16".into(),
             kv_layout_version: 1,
+            ..Default::default()
         }
     }
 
@@ -392,6 +393,35 @@ mod tests {
             tokens: vec![1, 2, 3],
             format_version: 1,
         }
+    }
+
+    #[test]
+    fn pre_quantization_blobs_deserialize_with_default_f16_tier() {
+        // Back-compat (T12 adoption): blobs written before kv_bits/kv_group_size
+        // existed have neither field in their meta JSON. They must deserialize
+        // to the 0/0 (f16) tier so restart rebuilds keep serving them, and the
+        // 0/0 tier must be distinct from any quantized tier.
+        let old_json = serde_json::json!({
+            "model_id": "test-model",
+            "tokenizer_hash": "abc123",
+            "kv_dtype": "f16",
+            "kv_layout_version": 1
+        });
+        let fp: ModelFingerprint = serde_json::from_value(old_json).unwrap();
+        assert_eq!(fp.kv_bits, 0, "absent bits must default to f16");
+        assert_eq!(fp.kv_group_size, 0);
+        assert_eq!(fp, fingerprint(), "defaults match the f16 test fingerprint");
+
+        // A quantized tier is a different fingerprint: never cross-serves.
+        let mut q8 = fingerprint();
+        q8.kv_bits = 8;
+        q8.kv_group_size = 64;
+        assert_ne!(fp, q8);
+
+        // Round-trip: a q8 fingerprint serializes and restores exactly.
+        let back: ModelFingerprint =
+            serde_json::from_slice(&serde_json::to_vec(&q8).unwrap()).unwrap();
+        assert_eq!(back, q8);
     }
 
     #[test]

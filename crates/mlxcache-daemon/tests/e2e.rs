@@ -733,6 +733,110 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
 }
 
 #[tokio::test]
+async fn q8_and_f16_blobs_never_share_a_file() {
+    // T12 adoption: the same model+prompt under two KV tiers (q8 via the
+    // sidecar's MLXCACHE_KV_BITS knob vs f16 knobless) must publish to
+    // DIFFERENT blob files and never serve each other (R1-1: the fingerprint
+    // pins the quantization config). Two sidecars over ONE blob dir — exactly
+    // an operator flipping the knob between runs against persisted state.
+    let Some((q8_url, mut q8_child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_KV_BITS", "8"), ("MLXCACHE_KV_GROUP_SIZE", "64")])
+            .await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let Some((f16_url, mut f16_child)) = spawn_sidecar_with_env(&[]).await else {
+        q8_child.kill().ok();
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "quantized tier"}],
+        "stream": false,
+    })
+    .to_string();
+    let state = |url: String| {
+        Arc::new(AppState {
+            orchestrator: Orchestrator::new(),
+            singleflight: SingleFlight::new(),
+            stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+            served_models: vec!["e2e-model".into()],
+            sidecar: Some(SidecarClient::new(SidecarConfig::new(url, "e2e-model".into())).unwrap()),
+            persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        })
+    };
+    let post = |state: Arc<AppState>, body: String| async move {
+        router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    let blob_names = || {
+        std::fs::read_dir(blobs.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".ckpt"))
+            .collect::<Vec<_>>()
+    };
+
+    let state_q8 = state(q8_url.clone());
+    // 1) q8 run: miss → publish.
+    let res = post(state_q8.clone(), body.clone()).await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(state_q8.orchestrator.published_count(), 1, "q8 published");
+    let q8_blobs = blob_names();
+    assert_eq!(q8_blobs.len(), 1);
+
+    // 2) same prompt through the f16 sidecar: the tier is a DIFFERENT
+    //    fingerprint (kv_bits 0 vs 8 in /tokenize → blob_key fold) → the q8
+    //    checkpoint must NOT serve it, and the publish must not reclaim the
+    //    q8 blob file.
+    let state_f16 = state(f16_url.clone());
+    let res = post(state_f16.clone(), body.clone()).await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(
+        state_f16.orchestrator.published_count(),
+        1,
+        "the f16 tier must publish its own checkpoint, not serve the q8 one"
+    );
+    let both = blob_names();
+    assert_eq!(
+        both.len(),
+        2,
+        "two tiers = two blob files; a shared name would overwrite the other tier: {both:?}"
+    );
+    assert!(
+        q8_blobs.iter().all(|b| both.contains(b)),
+        "the q8 blob must survive the f16 publish (no reclaim ping-pong)"
+    );
+
+    // 3) the q8 daemon still hits ITS checkpoint: the other tier's publish
+    //    changed nothing for it.
+    let res = post(state_q8.clone(), body).await;
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["mlxcache"]["verdict"], "hit", "same tier must hit");
+
+    q8_child.kill().expect("kill q8 sidecar");
+    q8_child.wait().expect("reap q8 sidecar");
+    f16_child.kill().expect("kill f16 sidecar");
+    f16_child.wait().expect("reap f16 sidecar");
+}
+
+#[tokio::test]
 async fn concurrent_identical_requests_share_one_prefill() {
     // The core R1-3 promise: N identical uncached requests must trigger ONE
     // prefill, and every follower must still be served (from the leader's
