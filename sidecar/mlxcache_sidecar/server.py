@@ -176,6 +176,30 @@ def _valid_safetensors(payload: bytes) -> bool:
     return all(ranges[i][0] >= ranges[i - 1][1] for i in range(1, len(ranges)))
 
 
+# D1: blob paths whose digest was verified this process. Keyed by PATH, not
+# digest: files are immutable per generation ({hash}-{gen}.ckpt), so a given
+# path's bytes never change — while a rot-damaged COPY under another name
+# still gets its own verification instead of riding a verified digest.
+_DIGEST_VERIFIED: set[str] = set()
+
+
+def _payload_digest_ok(blob_path: str, meta: object, payload: bytes) -> bool:
+    """True when the payload matches the daemon-stamped digest (D1).
+
+    Legacy v1 blobs carry no digest and pass unverified; the boot sweep on
+    the daemon side applies the same policy to the whole store.
+    """
+    expected = getattr(meta, "payload_sha256", None)
+    if expected is None or blob_path in _DIGEST_VERIFIED:
+        return True
+    if hashlib.sha256(payload).hexdigest() == expected.lower():
+        if len(_DIGEST_VERIFIED) > 256:
+            _DIGEST_VERIFIED.clear()
+        _DIGEST_VERIFIED.add(blob_path)
+        return True
+    return False
+
+
 def read_wire_checkpoint(
     blob_path: str, tokens: list[int] | None = None, check_safetensors: bool = True
 ) -> tuple[object | None, bytes, bool]:
@@ -277,6 +301,14 @@ def read_wire_checkpoint(
     # RuntimeError from the loader below stays transient (500).
     if check_safetensors and not _valid_safetensors(payload):
         raise CheckpointRejectedError("checkpoint payload is not valid safetensors")
+    # D1 integrity: verify the payload digest the daemon stamped at publish.
+    # This catches framing-valid corruption (bit rot, a torn rewrite with an
+    # intact header) that every structural check above misses. Verified once
+    # per digest per process — the bytes are already in hand here, but the
+    # hash is not free on GB-scale KV, and a blob that verified once does not
+    # rot differently on the next load from the same immutable file.
+    if not _payload_digest_ok(blob_path, meta, payload):
+        raise CheckpointRejectedError(f"payload digest mismatch (expected {meta.payload_sha256})")
     return meta, payload, True
 
 

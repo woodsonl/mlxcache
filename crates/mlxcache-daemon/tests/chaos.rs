@@ -111,8 +111,9 @@ fn crash_before_rename_never_serves_partial() {
         token_count: 3,
         tokens: vec![1, 2, 3],
         format_version: 1,
+        payload_sha256: None,
     };
-    let path = p.publish_atomic(0xabc, 1, &meta, b"complete-kv").unwrap();
+    let path = p.publish_atomic(0xabc, 1, meta, b"complete-kv").unwrap();
     let (m, payload) = p.load(&path).unwrap();
     assert_eq!(m.token_count, 3);
     assert_eq!(payload, b"complete-kv");
@@ -131,8 +132,9 @@ fn rebuild_skips_one_token_legacy_blob() {
         token_count: 1,
         tokens: vec![7],
         format_version: 1,
+        payload_sha256: None,
     };
-    p.publish_atomic(0x1, 1, &meta, b"nonempty-legacy-kv")
+    p.publish_atomic(0x1, 1, meta, b"nonempty-legacy-kv")
         .unwrap();
 
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
@@ -159,8 +161,9 @@ async fn restart_drops_streams_checkpoints_survive() {
         token_count: 4,
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
+        payload_sha256: None,
     };
-    let path = p.publish_atomic(0x777, 1, &meta, b"kv").unwrap();
+    let path = p.publish_atomic(0x777, 1, meta, b"kv").unwrap();
 
     // "Restart": fresh index, rebuild from disk via the real startup path.
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
@@ -199,8 +202,9 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         token_count: 4,
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
+        payload_sha256: None,
     };
-    p.publish_atomic(0x1, 1, &good, b"kv").unwrap();
+    p.publish_atomic(0x1, 1, good, b"kv").unwrap();
 
     // A corrupt blob (garbage bytes) and a blob with no recoverable prefix.
     std::fs::write(dir.path().join("deadbeef.ckpt"), b"not-a-blob").unwrap();
@@ -209,8 +213,9 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         token_count: 2,
         tokens: vec![],
         format_version: 1,
+        payload_sha256: None,
     };
-    p.publish_atomic(0x2, 1, &noprefix, b"kv").unwrap();
+    p.publish_atomic(0x2, 1, noprefix, b"kv").unwrap();
 
     // A multi-token blob with an EMPTY payload: a truncated write the adapter
     // rejects at runtime. The file can outlive its retirement (a repaired
@@ -221,8 +226,9 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         token_count: 3,
         tokens: vec![7, 7, 7],
         format_version: 1,
+        payload_sha256: None,
     };
-    p.publish_atomic(0x3, 1, &empty, b"").unwrap();
+    p.publish_atomic(0x3, 1, empty, b"").unwrap();
 
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report = orch.rebuild_from_disk(&p);
@@ -261,10 +267,11 @@ async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
         token_count: 4,
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
+        payload_sha256: None,
     };
     // Same prefix, generations 5 and 17. gen 17 is the repair; it must win.
-    p.publish_atomic(0xabc, 5, &meta, b"old").unwrap();
-    let repair = p.publish_atomic(0xabc, 17, &meta, b"new").unwrap();
+    p.publish_atomic(0xabc, 5, meta.clone(), b"old").unwrap();
+    let repair = p.publish_atomic(0xabc, 17, meta.clone(), b"new").unwrap();
 
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report = orch.rebuild_from_disk(&p);
@@ -296,7 +303,9 @@ async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
         gen > 17,
         "counter must resume above the persisted max, got {gen}"
     );
-    let newer = p.publish_atomic(0xabc, gen, &meta, b"newer").unwrap();
+    let newer = p
+        .publish_atomic(0xabc, gen, meta.clone(), b"newer")
+        .unwrap();
     let orch2 = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report2 = orch2.rebuild_from_disk(&p);
     assert_eq!(report2.rebuilt, 1);
@@ -323,8 +332,9 @@ async fn rebuild_seeds_generation_above_unloadable_files_too() {
         token_count: 4,
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
+        payload_sha256: None,
     };
-    p.publish_atomic(0x1, 3, &meta, b"kv").unwrap();
+    p.publish_atomic(0x1, 3, meta, b"kv").unwrap();
     // A higher-generation file whose body is unreadable (truncated header): it is
     // skipped by the load, but its NAME must still seed the floor above 17.
     std::fs::write(

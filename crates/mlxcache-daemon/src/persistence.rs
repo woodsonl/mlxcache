@@ -6,6 +6,7 @@
 use mlxcache_core::contract::CheckpointMeta;
 #[cfg(test)]
 use mlxcache_core::contract::ContractError;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -55,9 +56,16 @@ impl Persistence {
         &self,
         prefix_hash: u128,
         generation: u64,
-        meta: &CheckpointMeta,
+        mut meta: CheckpointMeta,
         payload: &[u8],
     ) -> Result<PathBuf, PersistError> {
+        // D1 integrity (format_version 2), stamped at the single publish
+        // choke point so every blob carries it: a framing-valid bit-rot flip
+        // is otherwise undetectable — the wire checks catch bad headers and
+        // bad framing, not wrong bytes. The version bump marks the new
+        // on-disk contract; legacy version-1 blobs stay loadable, unverified.
+        meta.format_version = 2;
+        meta.payload_sha256 = Some(format!("{:x}", Sha256::digest(payload)));
         let final_path = self
             .blob_dir
             .join(format!("{:032x}-{:016x}.ckpt", prefix_hash, generation));
@@ -75,7 +83,7 @@ impl Persistence {
         );
         let tmp_path = self.blob_dir.join(unique);
 
-        let header = serde_json::to_vec(meta).map_err(|e| PersistError::Corrupt {
+        let header = serde_json::to_vec(&meta).map_err(|e| PersistError::Corrupt {
             reason: format!("meta serialize: {e}"),
         })?;
         // The on-disk header length is a u32; reject rather than silently
@@ -139,10 +147,33 @@ impl Persistence {
                     reason: format!("meta parse: {e}"),
                 }
             })?;
-        if meta.format_version != 1 {
-            return Err(PersistError::Corrupt {
-                reason: format!("format version {}", meta.format_version),
-            });
+        // Version policy: 1 = legacy (no digest field exists — structural
+        // checks only), 2 = current (digest required and verified here).
+        // Anything else is a blob a daemon we cannot reason about wrote:
+        // refuse loudly rather than misinterpret its layout.
+        match meta.format_version {
+            1 => {}
+            2 => {
+                let expected =
+                    meta.payload_sha256
+                        .as_deref()
+                        .ok_or_else(|| PersistError::Corrupt {
+                            reason: "format version 2 requires payload_sha256".into(),
+                        })?;
+                let actual = format!("{:x}", Sha256::digest(&bytes[4 + header_len..]));
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Err(PersistError::Corrupt {
+                        reason: format!(
+                            "payload digest mismatch (expected {expected}, got {actual})"
+                        ),
+                    });
+                }
+            }
+            v => {
+                return Err(PersistError::Corrupt {
+                    reason: format!("format version {v}"),
+                })
+            }
         }
         Ok((meta, bytes[4 + header_len..].to_vec()))
     }
@@ -187,6 +218,7 @@ mod tests {
             token_count: n,
             tokens: vec![1, 2, 3],
             format_version: 1,
+            payload_sha256: None,
         }
     }
 
@@ -199,7 +231,7 @@ mod tests {
         let dir = tmpdir();
         let p = Persistence::new(dir.path()).unwrap();
         let path = p
-            .publish_atomic(0xdeadbeef, 1, &meta(10), b"kvbytes")
+            .publish_atomic(0xdeadbeef, 1, meta(10), b"kvbytes")
             .unwrap();
         assert!(path.exists());
         assert!(!path.to_string_lossy().ends_with(".tmp"));
@@ -215,7 +247,7 @@ mod tests {
         // may race another).
         let dir = tmpdir();
         let p = Persistence::new(dir.path()).unwrap();
-        let path = p.publish_atomic(0x1, 1, &meta(10), b"kv").unwrap();
+        let path = p.publish_atomic(0x1, 1, meta(10), b"kv").unwrap();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         p.remove(&name).unwrap();
         assert!(!path.exists(), "retired blob file must be gone");
@@ -232,25 +264,84 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_version_mismatch() {
+    fn publish_stamps_v2_with_verified_digest() {
+        // D1: publish is the single choke point that stamps format_version 2
+        // + the payload digest; load verifies it. Legacy v1 blobs (no digest)
+        // stay loadable, unverified.
         let dir = tmpdir();
         let p = Persistence::new(dir.path()).unwrap();
-        let m = CheckpointMeta {
-            fingerprint: fp("m"),
-            token_count: 1,
-            tokens: vec![9],
-            format_version: 99,
-        };
-        let path = p.publish_atomic(0x2, 1, &m, b"x").unwrap();
-        assert!(matches!(p.load(&path), Err(PersistError::Corrupt { .. })));
+        let path = p.publish_atomic(0x2, 1, meta(10), b"kv-payload").unwrap();
+        let (m, _payload) = p.load(&path).unwrap();
+        assert_eq!(m.format_version, 2);
+        assert_eq!(
+            m.payload_sha256.as_deref(),
+            Some(&format!("{:x}", Sha256::digest(b"kv-payload"))[..]),
+            "digest must be sha256 of exactly the payload bytes"
+        );
+    }
+
+    #[test]
+    fn tampered_payload_is_rejected_by_digest() {
+        // Framing-valid corruption (bit rot, a torn rewrite that kept the
+        // header intact) is exactly what the structural checks cannot catch.
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        let path = p.publish_atomic(0x2, 1, meta(10), b"kv-payload").unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        match p.load(&path) {
+            Err(PersistError::Corrupt { reason }) => {
+                assert!(reason.contains("digest mismatch"), "reason: {reason}");
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v2_without_digest_and_legacy_v1_are_classified_apart() {
+        // Hand-crafted wire blobs (publish always stamps v2, so the skew
+        // paths must be built by hand): a v2 header without a digest is
+        // corrupt (the field is part of the v2 contract); a legacy v1 blob
+        // loads unverified (the boot sweep must not strand pre-D1 stores).
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        let mut m2 = meta(10);
+        m2.format_version = 2;
+        let header = serde_json::to_vec(&m2).unwrap();
+        let mut wire = (header.len() as u32).to_le_bytes().to_vec();
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(b"kv");
+        let v2_path = dir.path().join("v2-nodigest.ckpt");
+        fs::write(&v2_path, &wire).unwrap();
+        match p.load(&v2_path) {
+            Err(PersistError::Corrupt { reason }) => {
+                assert!(
+                    reason.contains("requires payload_sha256"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+
+        let mut m1 = meta(10);
+        m1.format_version = 1;
+        let header = serde_json::to_vec(&m1).unwrap();
+        let mut wire = (header.len() as u32).to_le_bytes().to_vec();
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(b"kv");
+        let v1_path = dir.path().join("v1-legacy.ckpt");
+        fs::write(&v1_path, &wire).unwrap();
+        assert!(p.load(&v1_path).is_ok(), "legacy v1 must stay loadable");
     }
 
     #[test]
     fn list_blobs_finds_published_only() {
         let dir = tmpdir();
         let p = Persistence::new(dir.path()).unwrap();
-        p.publish_atomic(0x1, 1, &meta(1), b"a").unwrap();
-        p.publish_atomic(0x2, 1, &meta(2), b"b").unwrap();
+        p.publish_atomic(0x1, 1, meta(1), b"a").unwrap();
+        p.publish_atomic(0x2, 1, meta(2), b"b").unwrap();
         fs::write(dir.path().join("stray.txt"), b"nope").unwrap();
         assert_eq!(p.list_blobs().unwrap().len(), 2);
     }
@@ -266,7 +357,7 @@ mod tests {
         for i in 0..8u8 {
             let p = p.clone();
             handles.push(std::thread::spawn(move || {
-                p.publish_atomic(0x55, 1, &meta(3), &[i; 4096]).unwrap();
+                p.publish_atomic(0x55, 1, meta(3), &[i; 4096]).unwrap();
             }));
         }
         for h in handles {
@@ -301,7 +392,7 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(true);
         fs::set_permissions(dir.path(), perms).unwrap();
-        let result = p.publish_atomic(0x3, 1, &meta(1), b"x");
+        let result = p.publish_atomic(0x3, 1, meta(1), b"x");
         // Restore so tempdir cleanup works (explicit 0o755, not set_readonly(false))
         let mut perms = fs::metadata(dir.path()).unwrap().permissions();
         use std::os::unix::fs::PermissionsExt;
@@ -323,14 +414,15 @@ mod tests {
     #[test]
     fn foreign_format_version_blob_is_rejected_with_reason() {
         // Wire-format skew (api-contract 2026-10-04): a blob written by a
-        // NEWER daemon/sidecar carries a higher format_version. `load` must
-        // refuse it loudly (Corrupt, reason naming the version) so a mixed
-        // rollout retires the foreign blob instead of mis-reading it — the
-        // on-disk layout beyond the header is not ours to interpret.
+        // NEWER daemon/sidecar carries a higher format_version (2 is CURRENT:
+        // the D1 digest contract; use 3 here as a genuinely foreign one).
+        // `load` must refuse it loudly (Corrupt, reason naming the version)
+        // so a mixed rollout retires the foreign blob instead of mis-reading
+        // it — the on-disk layout beyond the header is not ours to interpret.
         let dir = tempfile::tempdir().unwrap();
         let p = Persistence::new(dir.path()).unwrap();
         let mut meta = meta(6);
-        meta.format_version = 2;
+        meta.format_version = 3;
         let header = serde_json::to_vec(&meta).unwrap();
         let mut wire = (header.len() as u32).to_le_bytes().to_vec();
         wire.extend_from_slice(&header);
@@ -341,7 +433,7 @@ mod tests {
         let e = p.load(&blob).unwrap_err();
         match e {
             PersistError::Corrupt { reason } => {
-                assert!(reason.contains("format version 2"), "reason: {reason}");
+                assert!(reason.contains("format version 3"), "reason: {reason}");
             }
             other => panic!("expected Corrupt, got {other:?}"),
         }
