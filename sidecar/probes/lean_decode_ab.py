@@ -6,7 +6,8 @@ sidecar (measured 1.01x, default-off — see the design doc T21 note), so its
 implementation lives HERE as the preserved measurement and the resurrection
 template if a native forward pass (T14) ever needs the structure again.
 
-Run: MLXCACHE_BENCH_MODEL=Qwen/Qwen2-0.5B-Instruct uv run --extra mlx python sidecar/probes/lean_decode_ab.py
+Run: MLXCACHE_BENCH_MODEL=Qwen/Qwen2-0.5B-Instruct \
+uv run --extra mlx python sidecar/probes/lean_decode_ab.py
 """
 
 from __future__ import annotations

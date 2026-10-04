@@ -41,6 +41,7 @@ def _known_fields(data: dict) -> dict:
     known = {f.name for f in dataclasses.fields(Fingerprint)}
     return {k: v for k, v in data.items() if k in known}
 
+
 @dataclass
 class CheckpointMeta:
     fingerprint: Fingerprint
