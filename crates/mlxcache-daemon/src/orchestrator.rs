@@ -505,6 +505,7 @@ mod tests {
             token_count: n,
             tokens: vec![1, 2, 3, 4, 5, 6],
             format_version: 1,
+            payload_sha256: None,
         }
     }
 
