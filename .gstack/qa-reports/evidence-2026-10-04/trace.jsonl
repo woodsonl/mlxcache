@@ -1,0 +1,2 @@
+{"ts_ms":1791133870063,"model":"e2e-model","model_hash":278425361447420438,"n_tokens":8,"verdict":"hit","matched_tokens":8,"prefill_from":7,"messages":[{"content":"coalesce probe unique alpha omega","role":"user"}]}
+{"ts_ms":1791133870063,"model":"e2e-model","model_hash":278425361447420438,"n_tokens":8,"verdict":"miss","matched_tokens":0,"prefill_from":0,"messages":[{"content":"coalesce probe unique alpha omega","role":"user"}]}
