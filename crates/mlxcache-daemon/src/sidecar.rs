@@ -34,6 +34,15 @@ pub struct TokenizeResponse {
     /// different bytes and must not be served to this request.
     #[serde(default = "default_kv_dtype")]
     pub kv_dtype: String,
+    /// KV quantization the engine applies before persisting (T12): 0 = f16.
+    /// Defaults keep older sidecars (which never reported these) compatible —
+    /// they were f16, and f16 is the 0/0 fingerprint.
+    #[serde(default)]
+    pub kv_bits: u8,
+    /// Group size for `kv_bits` (0 when unquantized). Distinct group sizes are
+    /// distinct formats for R1-1, not tunable variants.
+    #[serde(default)]
+    pub kv_group_size: u32,
 }
 
 fn default_kv_dtype() -> String {
