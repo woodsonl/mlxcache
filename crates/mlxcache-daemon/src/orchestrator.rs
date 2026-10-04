@@ -55,18 +55,17 @@ impl Orchestrator {
     /// never re-tokenizes.
     pub fn route(&self, tokens: &[u32], request_fingerprint: &ModelFingerprint) -> RouteOutcome {
         let lookup = self.index.lookup(tokens, Some(request_fingerprint));
-        let (matched_tokens, matched_fp, blob_path, blob_generation, key) = match &lookup {
-            Some((entry, n)) => (
-                Some(*n),
-                Some(&entry.meta.fingerprint),
-                Some(entry.blob_path.clone()),
-                Some(entry.generation),
-                // T22: under end-anchored divergence the request's tokens do
-                // NOT spell the entry's key. Quarantine/eviction key by the
-                // entry's true key, never by the request prefix.
-                Some(entry.key.clone()),
-            ),
-            None => (None, None, None, None, None),
+        // Borrow, don't clone: the full-prefix key (~80 KB at 20K tokens) and
+        // the blob path are needed only when the verdict survives classify —
+        // a fingerprint mismatch classifies as Miss and discards them, so
+        // cloning up front paid a second full-prefix copy per request on the
+        // hottest path (performance review 2026-10-04).
+        let matched = lookup
+            .as_ref()
+            .map(|(entry, n)| (&entry.meta.fingerprint, *n, entry));
+        let (matched_tokens, matched_fp) = match &matched {
+            Some((fp, n, _)) => (Some(*n), Some(*fp)),
+            None => (None, None),
         };
         let verdict = classify(
             matched_tokens,
@@ -80,12 +79,13 @@ impl Orchestrator {
         // entry itself (`key` from the lookup), never from the request prefix.
         let blob = match verdict {
             CacheVerdict::Miss => None,
-            _ => blob_path.zip(blob_generation).zip(key).map(|((p, g), k)| {
+            _ => matched.map(|(_, _, entry)| {
                 (
-                    p, g,
+                    entry.blob_path.clone(),
+                    entry.generation,
                     // Exact-depth matches: the key equals the request prefix,
                     // byte-identical to the historical behavior.
-                    k,
+                    entry.key.clone(),
                 )
             }),
         };
@@ -221,9 +221,14 @@ impl Orchestrator {
         max_entries: usize,
         anchor_window: std::time::Duration,
     ) -> usize {
+        // Reap tombstones FIRST and unconditionally: the published-cap early
+        // return below fires in the common under-cap steady state, and burial
+        // behind it made the tombstone cap dead code exactly where unbounded
+        // tombstone growth was possible (red-team 2026-10-04).
+        let reaped = self.reap_quarantined(max_entries);
         let candidates = self.index.eviction_candidates();
         if candidates.len() <= max_entries {
-            return 0;
+            return reaped;
         }
         let now = std::time::Instant::now();
         let mut scored: Vec<(u64, mlxcache_core::index::IndexCandidate)> = candidates
@@ -277,7 +282,17 @@ impl Orchestrator {
                 "eviction: cold checkpoints reaped"
             );
         }
-        evicted + self.reap_quarantined(max_entries)
+        if evicted < excess {
+            // Silent-failure guard (red-team 2026-10-04): every excess
+            // candidate was anchor/recency-protected (score 0) or lost its
+            // removal race — the store stays above cap with no other signal.
+            tracing::warn!(
+                excess,
+                evicted,
+                "eviction could not reach the cap: all excess candidates are anchor- or recency-protected; the store stays above cap until anchors age out"
+            );
+        }
+        evicted + reaped
     }
 
     /// Cap quarantined tombstones at `max_entries` (QA ISSUE-002 follow-up):
@@ -503,6 +518,39 @@ mod tests {
     /// Publish in a test (publishing is allowed until a scan FAILS).
     fn publish(orch: &Orchestrator, tokens: &[u32], meta: CheckpointMeta, name: &str, gen: u64) {
         orch.publish_checkpoint(&persist(), tokens, meta, name.into(), gen);
+    }
+
+    #[test]
+    fn tombstones_reap_even_when_published_are_under_cap() {
+        // Red-team 2026-10-04: the tombstone reaper used to run only AFTER
+        // evict_cold's published-cap early return, so a store under the
+        // published cap — the normal steady state — never reaped, and the
+        // ISSUE-002 tombstone cap was dead code exactly where unbounded
+        // tombstone growth was possible.
+        let orch = Orchestrator::new();
+        let p = persist();
+        publish(&orch, &[1, 2, 3, 4, 5, 6], meta("m", 6), "pub-a", 1);
+        // Distinct keys: one trie node holds ONE entry, so same-key publishes
+        // would replace each other's tombstones.
+        for (tokens, name, gen) in [
+            (&[20u32, 21, 22, 23][..], "q-a", 2),
+            (&[30u32, 31, 32, 33][..], "q-b", 3),
+            (&[40u32, 41, 42, 43][..], "q-c", 4),
+        ] {
+            publish(&orch, tokens, meta("m", 6), name, gen);
+            assert!(orch.quarantine_checkpoint(&p, name, gen, tokens));
+        }
+        assert_eq!(orch.published_count(), 1);
+        assert_eq!(orch.quarantined_count(), 3);
+        // Published count (1) is far under the cap (2): the old early return
+        // fired here and reaped nothing.
+        let _ = orch.evict_cold(&p, 2, std::time::Duration::from_secs(900));
+        assert_eq!(
+            orch.quarantined_count(),
+            2,
+            "tombstones must reap to the cap even with published entries under cap"
+        );
+        assert_eq!(orch.published_count(), 1, "reaping never touches published");
     }
 
     #[test]

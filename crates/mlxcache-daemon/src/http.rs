@@ -263,7 +263,18 @@ async fn chat_completions(
     // invisible to the cache.
     let (identity, tokens) = if let Some((_path, native)) = crate::native_tokenizer::from_env() {
         match resolve_native_identity(&prompt, native, state.sidecar.as_ref()).await {
-            Ok(identity) => (identity, native.encode(&prompt)),
+            // A failed native encode must surface (502, matching the sidecar
+            // tokenize path's failure class), never degrade to an empty prompt.
+            Ok(identity) => match native.encode(&prompt) {
+                Some(tokens) => (identity, tokens),
+                None => {
+                    return Err(err(
+                        StatusCode::BAD_GATEWAY,
+                        "native tokenizer failed to encode the prompt",
+                        "adapter_error",
+                    ));
+                }
+            },
             Err(e) => return Err(e),
         }
     } else {
@@ -783,11 +794,11 @@ struct Identity {
 /// then reuse the verdict forever (the artifact cannot change mid-process).
 ///
 /// The probe encodes a fixed prompt natively and via the sidecar and requires
-/// exact id equality plus the same prompt hashed to the same prefix hash. On
-/// success the sidecar-reported (tokenizer_hash, kv_dtype) is cached and
-/// adopted for every later request — fingerprints are byte-identical to the
-/// pure-sidecar path. On mismatch the error is 503 (fail closed): serving
-/// with the wrong tokenizer would mis-route every checkpoint.
+/// exact id equality. On success the sidecar-reported (tokenizer_hash,
+/// kv_dtype) is cached and adopted for every later request — fingerprints are
+/// byte-identical to the pure-sidecar path. On mismatch the error is 503
+/// (fail closed): serving with the wrong tokenizer would mis-route every
+/// checkpoint.
 async fn resolve_native_identity(
     prompt: &str,
     native: &crate::native_tokenizer::NativeTokenizer,
@@ -832,13 +843,15 @@ async fn resolve_native_identity(
             ));
         }
     };
+    // A failed probe encode is parity-unprovable: treat it exactly like a
+    // mismatch and fail closed (the verdict is cached either way).
     let local = native.encode(&probe);
-    if local != reference.tokens {
+    if local.as_ref() != Some(&reference.tokens) {
         let reason = format!(
             "native tokenizer does not match the engine's tokenizer \
              (probe encode: {n} native ids vs {m} sidecar ids) — refusing to serve; \
              fix MLXCACHE_NATIVE_TOKENIZER",
-            n = local.len(),
+            n = local.as_ref().map_or(0, Vec::len),
             m = reference.tokens.len()
         );
         let _ = VERIFIED.set(Err(reason.clone()));
@@ -889,8 +902,11 @@ pub fn prefix_hash(tokens: &[u32]) -> u128 {
 /// share token ids; without the fingerprint in the name, the second model's
 /// prefill would overwrite the first model's blob in place, and the first
 /// model's still-valid index entry would load foreign KV on its next hit:
-/// silent wrong output. Prepending the fingerprint keeps the two files apart.
-/// Public for the B1 criterion bench.
+/// silent wrong output. Prepending the fingerprint keeps the two files apart
+/// — short of a 128-bit fold collision (birthday scale ~2⁻⁶⁴, accepted
+/// residual risk in the D1 register): the lookup-time fingerprint check
+/// reads the INDEX entry, not the file, so a collision would NOT be caught
+/// downstream. Public for the B1 criterion bench.
 pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u32]) -> u128 {
     // Length-prefix each field so no field's bytes can be re-split across the
     // boundaries: joining with a separator is ambiguous when model_id itself
@@ -941,8 +957,11 @@ pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens:
 /// order and spacing now come straight from the sidecar instead of serde's
 /// normalization — both are valid JSON and clients parse by key, not layout.
 fn push_frame(frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]) {
-    /// A done marker may carry any JSON value (`true`, `1`, …); presence of
-    /// the key is the signal, matching the previous Value-based behavior.
+    /// A done marker may carry any NON-NULL JSON value (`true`, `1`, …):
+    /// `Option<IgnoredAny>` maps a literal `null` to `None`, so presence of
+    /// the key with a null value would NOT terminate the stream. Our sidecar
+    /// pins `true` (server.py's done line), making the gap contractual
+    /// rather than live (red-team 2026-10-04).
     #[derive(serde::Deserialize)]
     struct SidecarStreamFrame {
         #[serde(default)]

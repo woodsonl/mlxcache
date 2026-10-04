@@ -20,12 +20,13 @@ class Fingerprint:
     kv_dtype: str
     kv_layout_version: int
     # KV quantization tier (T12 adoption, mirrors the Rust ModelFingerprint's
-    # serde defaults): 0/0 = f16. Lines 1-2 below strip fields a NEWER daemon
-    # wrote that this sidecar does not know (forward compat), then the
-    # explicit kwargs adopt the two fields written by the current daemon —
-    # WITHOUT them, Fingerprint(**raw['fingerprint']) raises TypeError on
-    # every blob the T12-era daemon publishes (observed as a 422 quarantine
-    # of every healthy ancestor: delta-prefill e2e regressed to 'miss').
+    # serde defaults): 0/0 = f16. _known_fields() (this module) strips fields a
+    # NEWER daemon wrote that this sidecar does not know, at decode time
+    # (forward compat); the two defaulted dataclass fields adopt the fields the
+    # current daemon writes — WITHOUT them, Fingerprint(**_known_fields(...))
+    # raises TypeError on every blob the T12-era daemon publishes (observed as
+    # a 422 quarantine of every healthy ancestor: delta-prefill e2e regressed
+    # to 'miss').
     # Being strict about UNKNOWN fields is wrong here: the daemon serde serializes
     # the fingerprint struct it has; this reader must accept a superset and
     # preserve what it recognizes.

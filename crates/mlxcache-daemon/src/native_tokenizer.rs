@@ -57,11 +57,15 @@ impl NativeTokenizer {
     /// off would disagree by exactly that token and permanently 503 the
     /// daemon (the parity probe caches its verdict). With specials on, the
     /// two implementations agree by construction for every artifact.
-    pub fn encode(&self, prompt: &str) -> Vec<u32> {
+    /// `None` on tokenizer failure — the caller must surface it, never
+    /// substitute an empty encoding (an empty token list would silently
+    /// route as an empty prompt: the user's message vanishes; red-team
+    /// 2026-10-04).
+    pub fn encode(&self, prompt: &str) -> Option<Vec<u32>> {
         self.tokenizer
             .encode(prompt, /* add_special_tokens */ true)
             .map(|e| e.get_ids().to_vec())
-            .unwrap_or_default()
+            .ok()
     }
 }
 
@@ -140,11 +144,11 @@ mod tests {
         let path = write_tokenizer_json(dir.path(), WORDLEVEL_JSON);
         let nt = NativeTokenizer::load(&path).unwrap();
         let ids = nt.encode("hello world fox");
-        assert_eq!(ids, vec![0, 1, 3]);
+        assert_eq!(ids, Some(vec![0, 1, 3]));
         // Unknown words must not panic; WordLevel maps the whole pre-token
         // to [UNK] (the id after the 4 vocab entries).
         let ids = nt.encode("zebra");
-        assert_eq!(ids, vec![4]);
+        assert_eq!(ids, Some(vec![4]));
     }
 
     #[test]
@@ -152,7 +156,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_tokenizer_json(dir.path(), WORDLEVEL_JSON);
         let nt = NativeTokenizer::load(&path).unwrap();
-        assert!(nt.encode("").is_empty());
+        // An empty prompt encodes to an EMPTY SUCCESS (Some), not a failure:
+        // None is reserved for tokenizer errors (the caller surfaces those —
+        // an empty encoding must never be fabricated).
+        assert!(nt.encode("").is_some_and(|ids| ids.is_empty()));
     }
 
     #[test]

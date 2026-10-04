@@ -137,9 +137,20 @@ def wait_healthy(url: str, deadline_s: float = 30.0) -> None:
     raise RuntimeError(f"daemon did not become healthy at {url}")
 
 
+def _free_port() -> int:
+    """Pick an unused localhost port (hardcoding 8420/8421 collided with any
+    dev daemon/demo already running — and silently benchmarked the wrong
+    stack; review 2026-10-04)."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]:
     """Start sidecar (uv, synthetic engine) + daemon (release build)."""
-    sidecar_port = 8421
+    sidecar_port = _free_port()
     env = dict(os.environ, MLXCACHE_TOKENIZE_GROW="growing conversation seed")
     sidecar = subprocess.Popen(
         [
@@ -155,7 +166,7 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
         ],
         env=env,
     )
-    daemon_port = 8420
+    daemon_port = _free_port()
     daemon = subprocess.Popen(
         [
             "uv",

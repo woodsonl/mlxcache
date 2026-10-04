@@ -163,7 +163,12 @@ impl PrefixIndex {
         let fp_ok = |entry: &IndexEntry| fingerprint.is_none_or(|f| entry.meta.fingerprint == *f);
         let root = self.read_lock();
         let mut node: &Node = &root;
-        let mut best: Option<(IndexEntry, usize)> = None;
+        // Borrow-walk: track the best entry by REFERENCE and clone once at
+        // return. The previous shape deep-cloned a full IndexEntry (an 80 KB
+        // key at 20K tokens, plus meta strings) at EVERY published node the
+        // walk passed — once per turn, quadratic in conversation length, on
+        // the hottest function in the daemon (performance review 2026-10-04).
+        let mut best: Option<(&IndexEntry, usize)> = None;
         for (i, t) in tokens.iter().enumerate() {
             match node.children.get(t) {
                 Some(child) => {
@@ -175,7 +180,7 @@ impl PrefixIndex {
                             // the value feeds a heuristic (eviction), and a torn
                             // read would still be *a* past time.
                             entry.last_used_millis.store(now_millis(), Relaxed);
-                            best = Some((entry.clone(), i + 1));
+                            best = Some((entry, i + 1));
                         }
                     }
                 }
@@ -203,19 +208,23 @@ impl PrefixIndex {
         // (recency tie-break: lowest token, deterministic); its coverage
         // (len(key)-1) beats any walk best, which ends at depth < len(key)-1.
         if let Some(child_entry) = Self::hottest_published_child(node, fingerprint) {
-            // Touch through the reference BEFORE cloning: the clone's
-            // last_used_millis is a copy, and storing into it would leave the
-            // real trie entry cold (the reaper would then reap the base of a
-            // live multi-turn chain).
-            child_entry.last_used_millis.store(now_millis(), Relaxed);
             if tokens.len() >= child_entry.key.len() {
+                // Touch through the reference, INSIDE the eligibility guard:
+                // only an entry this lookup actually serves counts as recently
+                // served (the contract at the top of this function) — a touch
+                // before the guard let unserved walk-end traffic extend a
+                // child's anchor window (review 2026-10-04). The touch must
+                // still hit the REAL trie entry: a clone's last_used_millis is
+                // a copy, and storing into it would leave the base of a live
+                // multi-turn chain cold for the reaper.
+                child_entry.last_used_millis.store(now_millis(), Relaxed);
                 let matched = child_entry.key.len();
                 if matched >= 2 {
-                    best = Some((child_entry.clone(), matched));
+                    best = Some((child_entry, matched));
                 }
             }
         }
-        best
+        best.map(|(entry, depth)| (entry.clone(), depth))
     }
 
     /// Hottest published direct child of `node` (T22 serve rule): the entry a
@@ -566,25 +575,26 @@ impl PrefixIndex {
     pub fn quarantine_candidates(&self, max_keep: usize) -> Vec<(Vec<u32>, String, u64)> {
         let root = self.read_lock();
         let mut all: Vec<(u64, Vec<u32>, String, u64)> = Vec::new();
-        let mut stack: Vec<(Vec<u32>, &Node)> = vec![(Vec::new(), &root)];
-        while let Some((prefix, node)) = stack.pop() {
+        // No path-building DFS: an entry carries its own key (see the doc
+        // above), so rebuilding each node's prefix — cloning the full path
+        // for EVERY node, the exact O(nodes × depth) churn the eviction walk
+        // was rewritten to kill — bought nothing. Clones happen only for
+        // quarantined entries (capped, few). (Review 2026-10-04.)
+        let mut stack: Vec<&Node> = vec![&root];
+        while let Some(node) = stack.pop() {
             if let Some(entry) = &node.entry {
                 if entry.state == CheckpointState::Quarantined {
                     all.push((
                         entry
                             .last_used_millis
                             .load(std::sync::atomic::Ordering::Relaxed),
-                        prefix.clone(),
+                        entry.key.clone(),
                         entry.blob_path.clone(),
                         entry.generation,
                     ));
                 }
             }
-            for (t, child) in &node.children {
-                let mut p = prefix.clone();
-                p.push(*t);
-                stack.push((p, child));
-            }
+            stack.extend(node.children.values());
         }
         // Coldest first (ascending last_used). The reaper removes stones while
         // the live count exceeds the cap, so the candidates are the EXCESS:
