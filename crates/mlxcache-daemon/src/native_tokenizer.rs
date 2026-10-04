@@ -8,10 +8,14 @@
 //! backs HF's Python binding, so parity is by construction (and probed).
 //!
 //! Opt-in via `MLXCACHE_NATIVE_TOKENIZER=<path to tokenizer.json>`. When set,
-//! the daemon answers tokenize locally and reports the file's SHA-256 as the
-//! fingerprint's `tokenizer_hash`: the artifact identity R1-2 pins. A native
-//! tokenize and a sidecar tokenize of DIFFERENT artifacts therefore can never
-//! cross-serve — different files, different hashes.
+//! the daemon answers tokenize locally. Since T13 the fingerprint's
+//! `tokenizer_hash` is NOT the local file's hash: the daemon runs a one-time
+//! probe (native encode vs sidecar encode of the same prompt, see
+//! `resolve_native_identity` in http.rs) and, on parity, ADOPTS the
+//! sidecar-reported identity for the daemon's lifetime — fingerprints stay
+//! byte-identical to the pure-sidecar path, so checkpoints published before
+//! the native path was enabled still match. One probe per daemon lifetime:
+//! the artifact cannot change mid-process.
 //!
 //! Fail closed: if the file is missing/unparsable at startup the daemon
 //! refuses to start. A partial native rollout (some requests hashed by one
@@ -47,9 +51,15 @@ impl NativeTokenizer {
 
     /// Encode a prompt to token ids — identical to the sidecar's
     /// `tokenizer.encode(prompt)` for the same artifact (same library).
+    /// Specials MUST stay symmetric: HF's Python `encode` defaults to
+    /// `add_special_tokens=True`, so a BOS-adding artifact (Llama-style)
+    /// produces a BOS on the sidecar path; encoding natively with specials
+    /// off would disagree by exactly that token and permanently 503 the
+    /// daemon (the parity probe caches its verdict). With specials on, the
+    /// two implementations agree by construction for every artifact.
     pub fn encode(&self, prompt: &str) -> Vec<u32> {
         self.tokenizer
-            .encode(prompt, /* add_special_tokens */ false)
+            .encode(prompt, /* add_special_tokens */ true)
             .map(|e| e.get_ids().to_vec())
             .unwrap_or_default()
     }

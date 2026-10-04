@@ -209,6 +209,56 @@ def test_adapter_delta_prefill_matches_scratch(engine):
     )
 
 
+def test_adapter_divergent_resume_matches_scratch(engine):
+    """T22 parity on the REAL engine: a request that shares the first
+    len(key)-1 tokens with the published key (divergence AT the key's last
+    token) must resume from the ancestor's blob and match scratch exactly.
+    This is the divergent-serve shape the daemon routes as `partial`
+    (matched = len(key), prefill_from = len(key)-1) — the earlier real-engine
+    suite only covered exact-extension growth, where the whole key is a
+    prefix of the request. Divergent resume feeds the divergent token plus
+    the new tail; a wrong feed would corrupt the first generated token."""
+    import mlx.core as mx
+    from mlx_lm import stream_generate
+    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+
+    base = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 40)
+    assert len(base) > 64
+    # T22 shape by construction: identical to the key through len(key)-2, then
+    # the key's LAST token is replaced by three fresh tokens. LCP = len-1.
+    divergent = base[:-1] + [2, 11, 5678]
+    assert divergent[: len(base) - 1] == base[:-1] and divergent[len(base) - 1] != base[-1]
+
+    scratch = [
+        r.token
+        for r in stream_generate(
+            engine.model, engine.tokenizer, prompt=mx.array(divergent), max_tokens=64
+        )
+    ]
+
+    # Publish the ancestor (the key), then resume the divergent request from it.
+    payload = engine.prefill(base)
+    meta = CheckpointMeta(
+        fingerprint=Fingerprint(
+            model_id=engine.model_id,
+            tokenizer_hash=engine.tokenizer_hash,
+            kv_dtype=engine.kv_dtype,
+            kv_layout_version=1,
+        ),
+        token_count=len(base),
+        tokens=base,
+    )
+    with TempSafetensors() as path:
+        with open(path, "wb") as fh:
+            fh.write(encode(meta, payload))
+        resumed = engine.generate_from_blob(divergent, path, max_tokens=64)
+
+    assert resumed == scratch, (
+        "divergent (T22) resume diverged from scratch:\n"
+        f"  resumed={resumed[:8]}\n  scratch={scratch[:8]}"
+    )
+
+
 def test_adapter_one_token_prompt_matches_scratch(engine):
     """Regression: a ONE-token prompt. The cache covers tokens[:-1] = nothing, so
     the resume path must feed the whole prompt once. The earlier special case

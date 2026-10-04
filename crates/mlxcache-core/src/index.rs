@@ -3,7 +3,7 @@
 //! Longest-prefix match in O(prefix length). No SQLite on the hot path (D2-reopened).
 //! Index rows are only visible after the checkpoint blob's atomic publish (R1-3).
 
-use crate::contract::{CheckpointMeta, CheckpointState};
+use crate::contract::{CheckpointMeta, CheckpointState, ModelFingerprint};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -142,8 +142,25 @@ impl PrefixIndex {
     /// divergence is never served — KV past the LCP is not identical for the
     /// diverging request, and truncating persistent MLX cache states is
     /// unsafe on the quantized tier (explicitly out of scope).
-    pub fn lookup(&self, tokens: &[u32]) -> Option<(IndexEntry, usize)> {
+    /// Longest-prefix lookup with T22 end-anchored divergence serving.
+    ///
+    /// `fingerprint` gates BOTH the result and the recency touch: only
+    /// entries whose meta fingerprint matches are served, and only a
+    /// fingerprint-matched touch counts as "recently served". A request with
+    /// the wrong model/tokenizer/kv-tier must not refresh a cold blob's
+    /// anchor window (an unauthenticated wrong-model loop would otherwise
+    /// keep every blob eviction-proof for the anchor duration — disk
+    /// exhaustion by anchor). It also must not let a fingerprint-mismatched
+    /// child mask a fingerprint-matched exact entry at the walk-end node
+    /// (the mismatch classifies as Miss, so serving it is a lie). `None`
+    /// disables the gate (tests, benches).
+    pub fn lookup(
+        &self,
+        tokens: &[u32],
+        fingerprint: Option<&ModelFingerprint>,
+    ) -> Option<(IndexEntry, usize)> {
         use std::sync::atomic::Ordering::Relaxed;
+        let fp_ok = |entry: &IndexEntry| fingerprint.is_none_or(|f| entry.meta.fingerprint == *f);
         let root = self.read_lock();
         let mut node: &Node = &root;
         let mut best: Option<(IndexEntry, usize)> = None;
@@ -152,7 +169,7 @@ impl PrefixIndex {
                 Some(child) => {
                     node = child;
                     if let Some(entry) = &node.entry {
-                        if entry.state == CheckpointState::Published {
+                        if entry.state == CheckpointState::Published && fp_ok(entry) {
                             // Anchor touch: this entry just served a request, so
                             // it is the base of a live chain. Relaxed is fine —
                             // the value feeds a heuristic (eviction), and a torn
@@ -165,40 +182,66 @@ impl PrefixIndex {
                 None => break,
             }
         }
-        // T22 end-anchored divergence: the walk stopped one edge short of any
-        // deeper entry. A published DIRECT child of the deepest-reached node
-        // has key length depth+1 and the request agrees with it through
-        // depth = len(key) - 1 — exactly the serve rule. Deeper descendants
-        // need LCP >= len(key)-1 > depth: never qualify. At walk end (request
-        // a strict prefix of the key) the same rule serves a request one
-        // token short. Prefer the hottest child (recency tie-break: lowest
-        // token, deterministic); its coverage (len(key)-1) always beats the
-        // walk best's, so it supersedes unconditionally.
-        if let Some(child) = Self::hottest_published_child(node) {
-            child.last_used_millis.store(now_millis(), Relaxed);
-            // The cap only bites at the walk-end boundary (matched = n+1);
-            // a break has matched = len(key) <= tokens.len() by construction.
-            let matched = child.key.len().min(tokens.len());
-            if matched >= 2 {
-                best = Some((child, matched));
+        // T22 end-anchored divergence: a published DIRECT child of the
+        // deepest-reached node has key length depth+1; whether the walk
+        // broke on a request token or consumed the request exactly, the
+        // request agrees with such a child through depth = len(key) - 1 —
+        // exactly the serve rule — PROVIDED the request is long enough
+        // (checked below). Deeper descendants need LCP >= len(key)-1 >
+        // depth: never qualify.
+        //
+        // The child is adoptable ONLY when the request is at least as long as
+        // the child's key: the sidecar covers len(key)-1 positions and must
+        // still receive the key's final token as part of the delta it feeds
+        // (prefix_len > len(tokens) is rejected as unusable → scratch). A
+        // shorter request therefore can NEVER be served by the child branch —
+        // serving it would report a hit/partial while the adapter runs from
+        // scratch (an accounting lie) and would mask a usable exact entry at
+        // the walk-end node. The break shape satisfies len(key) <= len(tokens)
+        // by construction; the walk-end shape never does, so the guard simply
+        // makes the walk-end branch inert. Prefer the hottest eligible child
+        // (recency tie-break: lowest token, deterministic); its coverage
+        // (len(key)-1) beats any walk best, which ends at depth < len(key)-1.
+        if let Some(child_entry) = Self::hottest_published_child(node, fingerprint) {
+            // Touch through the reference BEFORE cloning: the clone's
+            // last_used_millis is a copy, and storing into it would leave the
+            // real trie entry cold (the reaper would then reap the base of a
+            // live multi-turn chain).
+            child_entry.last_used_millis.store(now_millis(), Relaxed);
+            if tokens.len() >= child_entry.key.len() {
+                let matched = child_entry.key.len();
+                if matched >= 2 {
+                    best = Some((child_entry.clone(), matched));
+                }
             }
         }
         best
     }
 
     /// Hottest published direct child of `node` (T22 serve rule): the entry a
-    /// request that stopped here may adopt. Selection is by recency
-    /// (last_used_millis) with a lowest-token tie-break for determinism;
-    /// every candidate covers the same positions, so any of them is sound
-    /// and the pick only affects which blob stays warm.
-    fn hottest_published_child(node: &Node) -> Option<IndexEntry> {
-        let mut best: Option<(u64, u32, IndexEntry)> = None;
+    /// request that diverges at the child key's last token may adopt.
+    /// Selection is by recency (last_used_millis) with a lowest-token
+    /// tie-break for determinism; every candidate covers the same positions,
+    /// so any of them is sound and the pick only affects which blob stays
+    /// warm. Returns the entry BORROWED from the trie so the caller can touch
+    /// recency through the real entry before cloning (a returned clone would
+    /// make the touch a no-op on the trie).
+    fn hottest_published_child<'a>(
+        node: &'a Node,
+        fingerprint: Option<&ModelFingerprint>,
+    ) -> Option<&'a IndexEntry> {
+        let mut best: Option<(u64, u32, &IndexEntry)> = None;
         for (t, child) in &node.children {
             let Some(entry) = &child.entry else {
                 continue;
             };
             if entry.state != CheckpointState::Published {
                 continue;
+            }
+            if let Some(f) = fingerprint {
+                if entry.meta.fingerprint != *f {
+                    continue;
+                }
             }
             let used = entry
                 .last_used_millis
@@ -208,7 +251,7 @@ impl PrefixIndex {
                 Some((bu, bt, _)) => used > *bu || (used == *bu && t < bt),
             };
             if better {
-                best = Some((used, *t, entry.clone()));
+                best = Some((used, *t, entry));
             }
         }
         best.map(|(_, _, entry)| entry)
@@ -222,55 +265,102 @@ impl PrefixIndex {
         use std::sync::atomic::Ordering::Relaxed;
         let root = self.read_lock();
         let mut out = Vec::new();
-        // One DFS collects entries and marks extended prefixes: a published
-        // node is "extended" if any published node below it shares its prefix.
-        // Two passes over the same lock hold, so the snapshot is consistent.
+        // One DFS collects entries, marks anchors, and materializes removal
+        // paths. The snapshot is taken under one read lock, so it is
+        // consistent with itself.
+        //
+        // Two cost invariants (the previous implementation cloned the full
+        // path for EVERY node — O(depth) each, quadratic on long chains —
+        // and marked anchors with an all-pairs prefix scan, O(entries^2)):
+        // (1) frames link to their parent by index; an entry's path is
+        // materialized ONCE, by walking up (O(depth) per ENTRY, and entries
+        // are the output itself, so no cheaper shape exists);
+        // (2) "any published entry strictly below" propagates bottom-up in
+        // the unwind instead of pairwise compares — O(nodes) total.
         struct Frame<'a> {
             node: &'a Node,
-            tokens: Vec<u32>,
+            parent: Option<usize>,
+            /// The child token linking this frame to its parent (root: 0).
+            token: u32,
+            /// A published entry at or below this node (own entry folded in
+            /// during the unwind).
+            pub_below: bool,
         }
-        let mut stack = vec![Frame {
+        let mut stack: Vec<Frame<'_>> = vec![Frame {
             node: &root,
-            tokens: Vec::new(),
+            parent: None,
+            token: 0,
+            pub_below: false,
         }];
-        // (token_count, path_index into a flat list) pairs to patch later.
-        let mut entries: Vec<(Vec<u32>, usize, u64, std::time::Instant, String, u64)> = Vec::new();
-        while let Some(frame) = stack.pop() {
-            if let Some(entry) = &frame.node.entry {
-                if entry.state == CheckpointState::Published {
-                    let millis = entry.last_used_millis.load(Relaxed);
-                    entries.push((
-                        frame.tokens.clone(),
-                        entry.meta.token_count as usize,
-                        millis,
-                        last_used_instant(millis),
-                        entry.blob_path.clone(),
-                        entry.generation,
-                    ));
-                }
-            }
-            for (t, child) in &frame.node.children {
-                let mut tokens = frame.tokens.clone();
-                tokens.push(*t);
+        // Flat frame arena, parents always at lower indices than children.
+        let mut frames: Vec<Frame<'_>> = Vec::new();
+        while let Some(f) = stack.pop() {
+            let idx = frames.len();
+            frames.push(f);
+            for (t, child) in &frames[idx].node.children {
                 stack.push(Frame {
                     node: child,
-                    tokens,
+                    parent: Some(idx),
+                    token: *t,
+                    pub_below: false,
                 });
             }
         }
-        // A candidate is an ANCHOR when its token prefix is a strict prefix of
-        // another published candidate's prefix (a longer checkpoint extends it).
-        for (tokens, count, _millis, instant, blob_path, generation) in &entries {
-            let is_anchor = entries.iter().any(|(other, _, _, _, _, _)| {
-                other.len() > tokens.len() && other.starts_with(tokens.as_slice())
-            });
+        // Unwind children-before-parents (reverse index order): each frame
+        // folds its published-entry flag into its parent, so by the time a
+        // parent is visited, pub_below already covers its whole subtree.
+        // The snapshot collects entries; paths materialize afterwards so the
+        // flags are final when the anchor bit is read.
+        struct Snapshot {
+            frame_idx: usize,
+            token_count: usize,
+            last_used: std::time::Instant,
+            blob_path: String,
+            generation: u64,
+        }
+        let mut snapshots: Vec<Snapshot> = Vec::new();
+        for i in (0..frames.len()).rev() {
+            let mut below_self = frames[i].pub_below;
+            if let Some(entry) = &frames[i].node.entry {
+                if entry.state == CheckpointState::Published {
+                    below_self = true;
+                    let millis = entry.last_used_millis.load(Relaxed);
+                    snapshots.push(Snapshot {
+                        frame_idx: i,
+                        token_count: entry.meta.token_count as usize,
+                        last_used: last_used_instant(millis),
+                        blob_path: entry.blob_path.clone(),
+                        generation: entry.generation,
+                    });
+                }
+            }
+            if let Some(p) = frames[i].parent {
+                frames[p].pub_below |= below_self;
+            }
+        }
+        for s in snapshots {
+            // Anchor rule (ds4): a published entry whose prefix a LONGER
+            // published entry extends is a live chain's base. Its own node's
+            // pub_below excludes the entry itself (the own-entry fold went to
+            // the parent), so a true flag means a strict descendant holds one.
+            let is_anchor = frames[s.frame_idx].pub_below;
+            let mut path: Vec<u32> = Vec::new();
+            let mut cur = Some(s.frame_idx);
+            while let Some(i) = cur {
+                let f = &frames[i];
+                if f.parent.is_some() {
+                    path.push(f.token);
+                }
+                cur = f.parent;
+            }
+            path.reverse();
             out.push(IndexCandidate {
-                tokens: tokens.clone(),
-                token_count: *count,
-                last_used: *instant,
+                tokens: path,
+                token_count: s.token_count,
+                last_used: s.last_used,
                 is_anchor,
-                blob_path: blob_path.clone(),
-                generation: *generation,
+                blob_path: s.blob_path,
+                generation: s.generation,
             });
         }
         out
@@ -280,16 +370,38 @@ impl PrefixIndex {
     /// blob + generation. Returns true when removed (the blob file should then
     /// be unlinked by the caller). Never touches quarantined entries — they are
     /// diagnostics, not space.
+    ///
+    /// The removal also RECLAIMS now-empty trie branches along the path
+    /// (unique-prompt churn otherwise retains every node it ever published,
+    /// forever, eviction or not). The prune is O(depth), not quadratic: the
+    /// descent tracks the deepest "keep" node on the path — a node with an
+    /// entry (any state) or two or more children — and everything strictly
+    /// below it on this path is a linear chain of childless, entryless nodes
+    /// (each holds exactly the path child). One `children.remove` at the keep
+    /// node then drops the whole chain at once (Drop cascades). Both descents
+    /// run under the same write lock, so a concurrent publish can never sneak
+    /// a live entry into the reclaimed branch.
     pub fn remove_published(&self, tokens: &[u32], blob_path: &str, generation: u64) -> bool {
+        if tokens.is_empty() {
+            return false;
+        }
         let mut root = self.write_lock();
         let mut node: &mut Node = &mut root;
-        for t in tokens {
+        // Depth of the deepest node that must survive (root counts: it can
+        // never be removed itself). A node on the path with an entry — any
+        // state, quarantined included — or with a child OFF the path anchors
+        // the kept prefix.
+        let mut last_keep = 0usize;
+        for (j, t) in tokens.iter().enumerate() {
+            if node.entry.is_some() || node.children.len() >= 2 {
+                last_keep = j;
+            }
             match node.children.get_mut(t) {
                 Some(child) => node = child,
                 None => return false,
             }
         }
-        match &mut node.entry {
+        let removed = match &mut node.entry {
             Some(entry)
                 if entry.blob_path == blob_path
                     && entry.generation == generation
@@ -299,7 +411,22 @@ impl PrefixIndex {
                 true
             }
             _ => false,
+        };
+        // Prunable suffix: the removed entry's node must be childless (a
+        // deeper chain anchored at it survives), and the suffix is non-empty
+        // by construction (last_keep <= len-1 < the removed node's depth).
+        if removed && node.children.is_empty() {
+            let mut cur: &mut Node = &mut root;
+            for t in &tokens[..last_keep] {
+                cur = cur
+                    .children
+                    .get_mut(t)
+                    .expect("path existed during descent");
+            }
+            // Drop cascades through the empty chain below this child.
+            cur.children.remove(&tokens[last_keep]);
         }
+        removed
     }
 
     /// Reserve the next publication generation. Callers reserve BEFORE writing
@@ -459,6 +586,13 @@ mod tests {
         }
     }
 
+    fn fingerprint_other() -> ModelFingerprint {
+        ModelFingerprint {
+            model_id: "other-model".into(),
+            ..fingerprint()
+        }
+    }
+
     /// Reserve a generation and publish (the real call order), returning it.
     fn publish_entry(index: &PrefixIndex, tokens: &[u32], name: &str) -> u64 {
         let generation = index.reserve_generation();
@@ -508,18 +642,18 @@ mod tests {
     fn longest_prefix_match() {
         let index = PrefixIndex::new();
         let tokens = [1, 2, 3];
-        assert!(index.lookup(&tokens).is_none());
+        assert!(index.lookup(&tokens, None).is_none());
         let _ = publish_entry(&index, &tokens, "blob-123");
         // Exact match
-        let (entry, matched) = index.lookup(&tokens).unwrap();
+        let (entry, matched) = index.lookup(&tokens, None).unwrap();
         assert_eq!(matched, 3);
         assert_eq!(entry.blob_path, "blob-123");
         // Extension matches the same entry
-        let (entry, matched) = index.lookup(&[1, 2, 3, 4, 5]).unwrap();
+        let (entry, matched) = index.lookup(&[1, 2, 3, 4, 5], None).unwrap();
         assert_eq!(matched, 3);
         assert_eq!(entry.blob_path, "blob-123");
         // Non-matching prefix
-        assert!(index.lookup(&[9, 9]).is_none());
+        assert!(index.lookup(&[9, 9], None).is_none());
     }
 
     #[test]
@@ -527,9 +661,9 @@ mod tests {
         let index = PrefixIndex::new();
         let tokens = [1, 2, 3];
         let _ = publish_entry(&index, &tokens, "blob-123");
-        let gen = index.lookup(&tokens).unwrap().0.generation;
+        let gen = index.lookup(&tokens, None).unwrap().0.generation;
         assert!(index.quarantine_blob("blob-123", gen, &tokens, || {}));
-        assert!(index.lookup(&tokens).is_none());
+        assert!(index.lookup(&tokens, None).is_none());
         assert_eq!(index.published_count(), 0);
     }
 
@@ -543,7 +677,7 @@ mod tests {
         let _ = publish_entry(&index, &[1, 2], "short");
         // Request extends the published prefix; lookup matches at depth 2.
         let request = [1, 2, 3, 4];
-        let (entry, matched) = index.lookup(&request).unwrap();
+        let (entry, matched) = index.lookup(&request, None).unwrap();
         assert_eq!(matched, 2);
         assert!(
             index.quarantine_blob(
@@ -555,7 +689,7 @@ mod tests {
             "quarantine must mark the matched entry on a partial request"
         );
         assert!(
-            index.lookup(&request).is_none(),
+            index.lookup(&request, None).is_none(),
             "the poison entry must no longer be served"
         );
         assert_eq!(index.published_count(), 0);
@@ -568,14 +702,14 @@ mod tests {
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2], "ancestor");
         let _ = publish_entry(&index, &[1, 2, 3, 4], "deep");
-        let deep = index.lookup(&[1, 2, 3, 4, 5]).unwrap().0;
+        let deep = index.lookup(&[1, 2, 3, 4, 5], None).unwrap().0;
         assert_eq!(deep.blob_path, "deep");
         assert!(index.quarantine_blob(&deep.blob_path, deep.generation, &[1, 2, 3, 4], || {}));
         assert!(
-            index.lookup(&[1, 2, 3, 4, 5]).is_some(),
+            index.lookup(&[1, 2, 3, 4, 5], None).is_some(),
             "the shallower ancestor is still published"
         );
-        let (entry, matched) = index.lookup(&[1, 2, 3, 4, 5]).unwrap();
+        let (entry, matched) = index.lookup(&[1, 2, 3, 4, 5], None).unwrap();
         assert_eq!(matched, 2);
         assert_eq!(entry.blob_path, "ancestor");
     }
@@ -588,16 +722,16 @@ mod tests {
         // and retiring gen 2 must quarantine.
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2, 3], "same-name");
-        let gen1 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
+        let gen1 = index.lookup(&[1, 2, 3], None).unwrap().0.generation;
         let _ = publish_entry(&index, &[1, 2, 3], "same-name");
-        let gen2 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
+        let gen2 = index.lookup(&[1, 2, 3], None).unwrap().0.generation;
         assert_ne!(gen1, gen2, "each publish bumps the generation");
         assert!(
             !index.quarantine_blob("same-name", gen1, &[1, 2, 3], || {}),
             "retiring a superseded generation must not touch the live entry"
         );
         assert!(
-            index.lookup(&[1, 2, 3]).is_some(),
+            index.lookup(&[1, 2, 3], None).is_some(),
             "the fresh republish is still served"
         );
         assert!(
@@ -605,7 +739,7 @@ mod tests {
             "retiring the live generation quarantines it"
         );
         assert!(
-            index.lookup(&[1, 2, 3]).is_none(),
+            index.lookup(&[1, 2, 3], None).is_none(),
             "the retired entry is no longer served"
         );
     }
@@ -623,7 +757,7 @@ mod tests {
             index.quarantine_blob("leader-blob", generation, &[1, 2, 3], || {}),
             "the generation publish returned must retire the entry"
         );
-        assert!(index.lookup(&[1, 2, 3]).is_none());
+        assert!(index.lookup(&[1, 2, 3], None).is_none());
     }
 
     #[test]
@@ -633,14 +767,14 @@ mod tests {
         // matched prefix; it also makes retirement O(prefix), not a full scan.
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2, 3], "b");
-        let gen = index.lookup(&[1, 2, 3]).unwrap().0.generation;
+        let gen = index.lookup(&[1, 2, 3], None).unwrap().0.generation;
         assert!(
             !index.quarantine_blob("b", gen, &[1, 2, 9], || {}),
             "a wrong prefix must not match the entry"
         );
-        assert!(index.lookup(&[1, 2, 3]).is_some());
+        assert!(index.lookup(&[1, 2, 3], None).is_some());
         assert!(index.quarantine_blob("b", gen, &[1, 2, 3], || {}));
-        assert!(index.lookup(&[1, 2, 3]).is_none());
+        assert!(index.lookup(&[1, 2, 3], None).is_none());
     }
 
     #[test]
@@ -650,7 +784,7 @@ mod tests {
         // entry's file.
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2, 3], "b");
-        let gen1 = index.lookup(&[1, 2, 3]).unwrap().0.generation;
+        let gen1 = index.lookup(&[1, 2, 3], None).unwrap().0.generation;
         let _ = publish_entry(&index, &[1, 2, 3], "b"); // republish -> gen2
         let called = std::cell::Cell::new(false);
         assert!(!index.quarantine_blob("b", gen1, &[1, 2, 3], || called.set(true)));
@@ -713,7 +847,7 @@ mod tests {
             "a 1-token prefix must not index"
         );
         assert!(
-            index.lookup(&[42]).is_none(),
+            index.lookup(&[42], None).is_none(),
             "a 1-token prefix must never match"
         );
     }
@@ -729,20 +863,54 @@ mod tests {
         let _ = publish_entry(&index, &[1, 2, 3], "turn1");
         // Divergence exactly at the key's last token (the multi-turn shape:
         // turn 2 replaced turn 1's closing bracket).
-        let (entry, matched) = index.lookup(&[1, 2, 9]).unwrap();
+        let (entry, matched) = index.lookup(&[1, 2, 9], None).unwrap();
         assert_eq!(entry.blob_path, "turn1");
         assert_eq!(matched, 3, "matched = len(key) capped to the request");
         // A longer divergent request matches the same entry.
-        let (entry, matched) = index.lookup(&[1, 2, 9, 9]).unwrap();
+        let (entry, matched) = index.lookup(&[1, 2, 9, 9], None).unwrap();
         assert_eq!(entry.blob_path, "turn1");
         assert_eq!(matched, 3);
-        // Divergence + walk-end boundary in one: request SHORTER than the
-        // key, agreeing through len(key)-1.
+        // Walk-end one-short: a request SHORTER than the key is never served
+        // by the child branch (the sidecar would reject it: prefix longer
+        // than the request → scratch) — an honest miss, not a false hit.
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2, 3, 4], "long");
-        let (entry, matched) = index.lookup(&[1, 2, 3]).unwrap();
-        assert_eq!(entry.blob_path, "long");
-        assert_eq!(matched, 3, "capped to the request length at walk end");
+        assert!(
+            index.lookup(&[1, 2, 3], None).is_none(),
+            "one-short walk-end request must miss: the child blob is unusable \
+             for a request shorter than the key"
+        );
+    }
+
+    #[test]
+    fn exact_entry_not_masked_by_longer_sibling_t22() {
+        // Published [1,2,3] AND [1,2,3,4]; request [1,2,3]. The longer child
+        // is inadmissible (request shorter than its key), so the exact
+        // walk-best entry must serve — the child must not mask it.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2, 3], "exact");
+        let _ = publish_entry(&index, &[1, 2, 3, 4], "long");
+        let (entry, matched) = index.lookup(&[1, 2, 3], None).unwrap();
+        assert_eq!(entry.blob_path, "exact", "the usable exact entry serves");
+        assert_eq!(matched, 3);
+    }
+
+    #[test]
+    fn divergent_serve_touches_real_entry_recency_t22() {
+        // The divergent-serve path must refresh the TRIE entry's recency
+        // (the reaper reads eviction_candidates), not a clone's. Regression
+        // for the clone-touch bug: storing into the clone left hot chain
+        // bases cold and evictable.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2, 3], "turn1");
+        let before = index.eviction_candidates()[0].last_used;
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let _ = index.lookup(&[1, 2, 9, 9], None);
+        let after = index.eviction_candidates()[0].last_used;
+        assert!(
+            after > before,
+            "a divergent serve must advance the real entry's last_used"
+        );
     }
 
     #[test]
@@ -754,21 +922,21 @@ mod tests {
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2, 3], "turn1");
         assert!(
-            index.lookup(&[1, 9, 3]).is_none(),
+            index.lookup(&[1, 9, 3], None).is_none(),
             "divergence at position 1 must not serve a key of length 3"
         );
         assert!(
-            index.lookup(&[9, 2, 3]).is_none(),
+            index.lookup(&[9, 2, 3], None).is_none(),
             "divergence at position 0 must not serve"
         );
         // A two-token entry serves a divergent second token (agreement 1 =
         // len(key)-1) but nothing below two agreed tokens.
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2], "short");
-        let (_, matched) = index.lookup(&[1, 9]).unwrap();
+        let (_, matched) = index.lookup(&[1, 9], None).unwrap();
         assert_eq!(matched, 2);
         assert!(
-            index.lookup(&[9, 9]).is_none(),
+            index.lookup(&[9, 9], None).is_none(),
             "a request agreeing on zero tokens must not serve (root children \
              cannot hold entries: publish refuses <2-token keys)"
         );
@@ -780,7 +948,7 @@ mod tests {
         // to 1 < 2): never a hit/partial, mirroring publish's 2-token floor.
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2], "short");
-        assert!(index.lookup(&[1]).is_none());
+        assert!(index.lookup(&[1], None).is_none());
     }
 
     #[test]
@@ -792,12 +960,166 @@ mod tests {
         // finds nothing after quarantine.
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2, 3], "turn1");
-        let (entry, _) = index.lookup(&[1, 2, 9]).unwrap();
+        let (entry, _) = index.lookup(&[1, 2, 9], None).unwrap();
         assert_eq!(entry.key, vec![1, 2, 3], "the entry reports its true key");
         assert!(index.quarantine_blob("turn1", entry.generation, &entry.key, || {}));
         assert!(
-            index.lookup(&[1, 2, 9]).is_none(),
+            index.lookup(&[1, 2, 9], None).is_none(),
             "a quarantined entry must not serve divergent requests either"
+        );
+    }
+
+    #[test]
+    fn remove_published_prunes_empty_branches() {
+        // Eviction removes the entry but must also reclaim the trie nodes:
+        // unique-prompt churn otherwise retains every node forever. After a
+        // removal, the removed key is gone for lookups AND a re-publish of
+        // the same key rebuilds its branch cleanly.
+        let index = PrefixIndex::new();
+        let gen = publish_entry(&index, &[7, 7, 7], "solo");
+        assert!(index.remove_published(&[7, 7, 7], "solo", gen));
+        assert!(
+            index.lookup(&[7, 7, 7], None).is_none(),
+            "removed entry must not serve"
+        );
+        assert!(
+            index.eviction_candidates().is_empty(),
+            "pruned branch must not linger as a candidate"
+        );
+        // Re-publish rebuilds the branch.
+        let _ = publish_entry(&index, &[7, 7, 7], "solo2");
+        assert!(index.lookup(&[7, 7, 7], None).is_some());
+    }
+
+    #[test]
+    fn remove_published_keeps_shared_and_anchored_branches() {
+        // The prune must never eat a branch anything still uses: a shared
+        // fork (sibling child), a walked-off prefix entry (any state), and a
+        // deeper chain anchored at the removed node all survive.
+        let index = PrefixIndex::new();
+        // Shared fork: [1,2,3] and [1,2,9]; removing [1,2,3] keeps [1,2].
+        let _ = publish_entry(&index, &[1, 2, 3], "a");
+        let _ = publish_entry(&index, &[1, 2, 9], "b");
+        let (e, _) = index.lookup(&[1, 2, 3], None).unwrap();
+        let gen_a = e.generation;
+        assert!(index.remove_published(&[1, 2, 3], "a", gen_a));
+        assert!(
+            index.lookup(&[1, 2, 9], None).is_some(),
+            "fork sibling must survive"
+        );
+        // The removed entry is gone — but its sibling [1,2,9] legitimately
+        // serves request [1,2,3]: they agree through len(key)-1 = 2 and
+        // diverge exactly at the key's last token (the T22 serve rule).
+        let (entry, _) = index.lookup(&[1, 2, 3], None).unwrap();
+        assert_eq!(entry.blob_path, "b", "sibling serves the divergent request");
+        // Chain base: [3,3] published, [3,3,4,4] published on top; removing
+        // the DEEP one keeps the base; removing the base then must keep the
+        // deep chain's nodes (it has children — not prunable).
+        let index2 = PrefixIndex::new();
+        let _ = publish_entry(&index2, &[3, 3], "base");
+        let _ = publish_entry(&index2, &[3, 3, 4, 4], "deep");
+        let (e, _) = index2.lookup(&[3, 3, 4, 4], None).unwrap();
+        let gen_deep = e.generation;
+        assert!(index2.remove_published(&[3, 3, 4, 4], "deep", gen_deep));
+        assert!(
+            index2.lookup(&[3, 3], None).is_some(),
+            "chain base must survive"
+        );
+        // Base removal with no deeper chain: branch fully reclaimed.
+        let (e, _) = index2.lookup(&[3, 3], None).unwrap();
+        let gen_base = e.generation;
+        assert!(index2.remove_published(&[3, 3], "base", gen_base));
+        assert!(
+            index2.eviction_candidates().is_empty(),
+            "whole chain reclaimed"
+        );
+        // Quarantined entry on the path anchors its branch (diagnostics).
+        let index3 = PrefixIndex::new();
+        let _ = publish_entry(&index3, &[5, 5], "live");
+        let _ = publish_entry(&index3, &[5, 5, 6, 6], "dead");
+        let (e, _) = index3.lookup(&[5, 5, 6, 6], None).unwrap();
+        let dead = e;
+        assert!(index3.quarantine_blob("dead", dead.generation, &dead.key, || {}));
+        let (e, _) = index3.lookup(&[5, 5], None).unwrap();
+        let live = e;
+        assert!(index3.remove_published(&[5, 5], "live", live.generation));
+        assert!(
+            index3.quarantined_count() == 1,
+            "the path through a quarantined entry must survive (any-state entry anchors)"
+        );
+    }
+
+    #[test]
+    fn fingerprint_gates_serving_and_recency_t22() {
+        // Adversarial F4: a wrong-model request must not serve a blob (the
+        // daemon classifies the mismatch as Miss anyway) and must not
+        // refresh the entry's anchor recency — otherwise a wrong-model loop
+        // keeps every cold blob eviction-proof for the anchor window.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2, 3], "turn1");
+        // Wrong fingerprint: no serve at any shape.
+        assert!(index
+            .lookup(&[1, 2, 3], Some(&fingerprint_other()))
+            .is_none());
+        assert!(index
+            .lookup(&[1, 2, 9], Some(&fingerprint_other()))
+            .is_none());
+        // And no recency refresh from the mismatched traffic.
+        let before = index.eviction_candidates()[0].last_used;
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let _ = index.lookup(&[1, 2, 9], Some(&fingerprint_other()));
+        assert_eq!(
+            index.eviction_candidates()[0].last_used,
+            before,
+            "fingerprint-mismatched lookups must not refresh recency"
+        );
+        // Matching fingerprint serves the exact and the divergent shape.
+        let (entry, matched) = index.lookup(&[1, 2, 9], Some(&fingerprint())).unwrap();
+        assert_eq!(entry.blob_path, "turn1");
+        assert_eq!(matched, 3);
+        // A fingerprint-mismatched child must not mask a fingerprint-matched
+        // exact entry at the walk-end node.
+        let index2 = PrefixIndex::new();
+        let _ = publish_entry(&index2, &[1, 2, 3], "mine");
+        let generation = index2.reserve_generation();
+        assert!(index2.publish(
+            &[1, 2, 3, 4],
+            CheckpointMeta {
+                fingerprint: fingerprint_other(),
+                token_count: 4,
+                tokens: vec![1, 2, 3, 4],
+                format_version: 1,
+            },
+            "theirs".into(),
+            generation,
+            |_| {}
+        ));
+        let (entry, _) = index2.lookup(&[1, 2, 3], Some(&fingerprint())).unwrap();
+        assert_eq!(
+            entry.blob_path, "mine",
+            "fp-matched exact entry must not be masked by an fp-mismatched child"
+        );
+    }
+
+    #[test]
+    fn anchor_marking_matches_prefix_scan() {
+        // The bottom-up descendant-marking must agree with the definition:
+        // an entry is an anchor iff a LONGER published entry extends its
+        // prefix. Pins the eviction_candidates rewrite.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2], "base");
+        let _ = publish_entry(&index, &[1, 2, 3, 4], "deep");
+        let _ = publish_entry(&index, &[8, 8], "lonely");
+        let cands = index.eviction_candidates();
+        let by_path: std::collections::HashMap<&str, &crate::index::IndexCandidate> =
+            cands.iter().map(|c| (c.blob_path.as_str(), c)).collect();
+        assert!(by_path["base"].is_anchor, "extended base is an anchor");
+        assert!(!by_path["deep"].is_anchor, "leaf chain tip is not");
+        assert!(!by_path["lonely"].is_anchor, "unrelated singleton is not");
+        assert_eq!(
+            by_path["deep"].tokens,
+            vec![1, 2, 3, 4],
+            "materialized path"
         );
     }
 
@@ -809,24 +1131,30 @@ mod tests {
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2], "base");
         let _ = publish_entry(&index, &[1, 2, 3], "deep");
-        let (entry, matched) = index.lookup(&[1, 2, 3, 4]).unwrap();
+        let (entry, matched) = index.lookup(&[1, 2, 3, 4], None).unwrap();
         assert_eq!(entry.blob_path, "deep");
         assert_eq!(matched, 3);
         // And the old shortest-request guard: a request that is a strict
-        // prefix must not match a longer entry (unchanged at 2+ depth).
-        let (entry, matched) = index.lookup(&[1, 2, 3]).unwrap();
-        assert_eq!(entry.blob_path, "deep");
-        assert_eq!(matched, 3, "walk-end boundary serves the one-short case");
+        // prefix must not match a longer entry (the child branch cannot
+        // serve it — see the one-short walk-end rule in
+        // end_divergent_request_serves_entry_t22). A walk-end EXACT match
+        // (request == key) still serves through the walk itself.
+        let index = PrefixIndex::new();
+        let _ = publish_entry(&index, &[1, 2], "base");
+        let _ = publish_entry(&index, &[1, 2, 3], "deep");
+        let (entry, matched) = index.lookup(&[1, 2, 3], None).unwrap();
+        assert_eq!(entry.blob_path, "deep", "exact walk-end match serves");
+        assert_eq!(matched, 3);
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2, 3, 4, 5], "long");
         assert!(
-            index.lookup(&[1, 2]).is_none(),
+            index.lookup(&[1, 2], None).is_none(),
             "short request must not match a longer entry"
         );
         // And the overlapping case: published [1,2], request [1,2,3] matches at 2.
         let index = PrefixIndex::new();
         let _ = publish_entry(&index, &[1, 2], "short");
-        let (_, matched) = index.lookup(&[1, 2, 3]).unwrap();
+        let (_, matched) = index.lookup(&[1, 2, 3], None).unwrap();
         assert_eq!(matched, 2);
         assert!(matched <= 3);
     }
@@ -848,7 +1176,7 @@ mod tests {
 
         assert!(index.root.is_poisoned(), "lock should be poisoned");
         // Must not panic, and the pre-existing entry is still readable.
-        let (entry, matched) = index.lookup(&[1, 2, 3]).expect("recovered lookup");
+        let (entry, matched) = index.lookup(&[1, 2, 3], None).expect("recovered lookup");
         assert_eq!(matched, 3);
         assert_eq!(entry.blob_path, "b");
         // Writes still work too.
@@ -888,7 +1216,7 @@ mod tests {
         assert!(index.remove_published(&[1, 2, 3, 4], "chain", chain_gen));
         assert_eq!(index.published_count(), 1);
         // [1,2,3,4] now matches only the surviving base, at depth 2.
-        let (entry, matched) = index.lookup(&[1, 2, 3, 4]).unwrap();
+        let (entry, matched) = index.lookup(&[1, 2, 3, 4], None).unwrap();
         assert_eq!(matched, 2, "the removed entry must no longer match");
         assert_eq!(entry.blob_path, "base");
         // Removing again is a no-op (idempotent-safe).
@@ -918,7 +1246,7 @@ mod tests {
         let _ = publish_entry(&index, &[1, 2, 3], "blob");
         let before = index.eviction_candidates()[0].last_used;
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let _ = index.lookup(&[1, 2, 3, 9]);
+        let _ = index.lookup(&[1, 2, 3, 9], None);
         let after = index.eviction_candidates()[0].last_used;
         assert!(
             after > before,
