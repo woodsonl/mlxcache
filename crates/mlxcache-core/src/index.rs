@@ -701,6 +701,7 @@ mod tests {
             token_count: 3,
             tokens: vec![1, 2, 3],
             format_version: 1,
+            payload_sha256: None,
         }
     }
 
@@ -1235,6 +1236,7 @@ mod tests {
                 token_count: 4,
                 tokens: vec![1, 2, 3, 4],
                 format_version: 1,
+                payload_sha256: None,
             },
             "theirs".into(),
             generation,
