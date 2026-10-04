@@ -347,54 +347,7 @@ impl SidecarClient {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn config_shapes() {
-        let c = SidecarConfig::new("http://127.0.0.1:8421".into(), "m".into());
-        assert_eq!(c.base_url, "http://127.0.0.1:8421");
-    }
-
-    #[test]
-    fn status_classification_is_422_only() {
-        // Only 422 retires a checkpoint; every other failure must not, or a
-        // transient 500 would quarantine a healthy entry.
-        let rejected = classify_status(422, "bad header".into());
-        assert!(rejected.is_checkpoint_rejected());
-        assert!(matches!(rejected, SidecarError::CheckpointRejected { .. }));
-
-        for status in [500u16, 503, 502, 400, 404, 200] {
-            let e = classify_status(status, "x".into());
-            assert!(
-                !e.is_checkpoint_rejected(),
-                "status {status} must not retire a checkpoint"
-            );
-            assert!(matches!(e, SidecarError::Http { status: s, .. } if s == status));
-        }
-    }
-
-    #[tokio::test]
-    async fn client_times_out_against_a_black_hole() {
-        // A hung/unroutable sidecar must return an error rather than wedging the
-        // daemon (regression: the builder previously had no timeout at all).
-        // 203.0.113.0/24 (TEST-NET-3) is non-routable, so a connect never
-        // completes; the client must give up within its configured timeout.
-        // Uses with_timeout (not global env) so parallel tests are not raced.
-        let c = SidecarClient::with_timeout(
-            SidecarConfig::new("http://203.0.113.1:9".into(), "m".into()),
-            1,
-        )
-        .expect("client builds");
-        let start = std::time::Instant::now();
-        let res = c.tokenize("x").await;
-        assert!(res.is_err(), "black-hole sidecar must error, not hang");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(10),
-            "must respect the configured timeout, took {:?}",
-            start.elapsed()
-        );
-    }
+pub(crate) mod stub_support {
 
     /// Find the end of the HTTP request head (past the blank line).
     fn header_end(buf: &[u8]) -> Option<usize> {
@@ -419,7 +372,9 @@ mod tests {
     /// forever, fully drains each request (head + Content-Length body), then
     /// answers via the responder (request path → raw response bytes). Returns
     /// the stub's base URL.
-    async fn http_stub(respond: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> String {
+    pub(crate) async fn http_stub(
+        respond: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("stub binds");
@@ -466,6 +421,58 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stub_support::http_stub;
+    use super::*;
+
+    #[test]
+    fn config_shapes() {
+        let c = SidecarConfig::new("http://127.0.0.1:8421".into(), "m".into());
+        assert_eq!(c.base_url, "http://127.0.0.1:8421");
+    }
+
+    #[test]
+    fn status_classification_is_422_only() {
+        // Only 422 retires a checkpoint; every other failure must not, or a
+        // transient 500 would quarantine a healthy entry.
+        let rejected = classify_status(422, "bad header".into());
+        assert!(rejected.is_checkpoint_rejected());
+        assert!(matches!(rejected, SidecarError::CheckpointRejected { .. }));
+
+        for status in [500u16, 503, 502, 400, 404, 200] {
+            let e = classify_status(status, "x".into());
+            assert!(
+                !e.is_checkpoint_rejected(),
+                "status {status} must not retire a checkpoint"
+            );
+            assert!(matches!(e, SidecarError::Http { status: s, .. } if s == status));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_times_out_against_a_black_hole() {
+        // A hung/unroutable sidecar must return an error rather than wedging the
+        // daemon (regression: the builder previously had no timeout at all).
+        // 203.0.113.0/24 (TEST-NET-3) is non-routable, so a connect never
+        // completes; the client must give up within its configured timeout.
+        // Uses with_timeout (not global env) so parallel tests are not raced.
+        let c = SidecarClient::with_timeout(
+            SidecarConfig::new("http://203.0.113.1:9".into(), "m".into()),
+            1,
+        )
+        .expect("client builds");
+        let start = std::time::Instant::now();
+        let res = c.tokenize("x").await;
+        assert!(res.is_err(), "black-hole sidecar must error, not hang");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "must respect the configured timeout, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

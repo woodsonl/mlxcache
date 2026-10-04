@@ -83,10 +83,15 @@ impl AppState {
     /// record the count in /stats. Both the background reaper (main.rs) and
     /// tests go through this single path, so the counter can never drift from
     /// what the reaper actually removed.
-    pub fn evict_pass(&self, max_entries: usize, anchor_window: std::time::Duration) -> usize {
-        let evicted = self
-            .orchestrator
-            .evict_cold(&self.persistence, max_entries, anchor_window);
+    pub fn evict_pass(
+        &self,
+        max_entries: usize,
+        max_bytes: u64,
+        anchor_window: std::time::Duration,
+    ) -> usize {
+        let evicted =
+            self.orchestrator
+                .evict_cold(&self.persistence, max_entries, max_bytes, anchor_window);
         if evicted > 0 {
             self.stats.record_evictions(evicted as u64);
         }
@@ -292,6 +297,36 @@ fn sidecar_http_err(e: &SidecarError) -> (StatusCode, &'static str) {
             (StatusCode::SERVICE_UNAVAILABLE, "adapter_unavailable")
         }
         _ => (StatusCode::BAD_GATEWAY, "adapter_error"),
+    }
+}
+
+/// Trace-capture context (RT#7, red-team 2026-10-04): built once per request,
+/// recorded only after the request's cache outcome SETTLES. Emitting at the
+/// old pre-leg site recorded hit/partial for requests whose blob the adapter
+/// then rejected (quarantine + scratch retry correct /stats via
+/// correct_retire), leaving capture and /stats disagreeing — breaking the
+/// "a capture and its /stats line must agree by construction" invariant.
+struct TraceCtx {
+    model_hash: u64,
+    model: String,
+    messages: serde_json::Value,
+}
+
+/// Emit the settled record. `settled` must already reflect any post-route
+/// flip: a blob that was rejected (or failed transiently) and retried from
+/// scratch is a miss, matching the corrected aggregate and the response body.
+fn emit_trace(
+    state: &AppState,
+    ctx: &Option<TraceCtx>,
+    settled: &mlxcache_core::policy::PolicyDecision,
+) {
+    if let (Some(tracer), Some(ctx)) = (&state.trace, ctx) {
+        tracer.record(crate::trace::TraceRecord::from_request(
+            ctx.model_hash,
+            &ctx.model,
+            &ctx.messages,
+            settled,
+        ));
     }
 }
 
@@ -594,20 +629,17 @@ async fn chat_completions(
     // after single-flight keeps stats truthful.
     state.stats.record(&outcome.decision);
     log_request(&req.model, prefix_hash, &outcome.decision, lookup_ms);
-    // Trace capture (step 5): one JSONL record per request, off the hot path
-    // (bounded channel + writer thread). model_hash folds the fingerprint so
-    // a multi-model trace stays attributable; messages embed the exact
-    // payload so replay re-sends byte-equivalent requests. The payload
-    // serialization happens ONLY when capture is on.
-    if let Some(tracer) = &state.trace {
-        let messages_value = serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null);
-        tracer.record(crate::trace::TraceRecord::from_request(
-            (blob_key(&fingerprint, &[]) >> 64) as u64,
-            &req.model,
-            &messages_value,
-            &outcome.decision,
-        ));
-    }
+    // Trace capture (step 5) context, built once per request (RT#7): the
+    // record itself is emitted only after the request's cache outcome
+    // SETTLES — see emit_trace. model_hash folds the fingerprint so a
+    // multi-model trace stays attributable; messages embed the exact payload
+    // so replay re-sends byte-equivalent requests. Serialization happens ONLY
+    // when capture is on.
+    let trace_ctx = state.trace.is_some().then(|| TraceCtx {
+        model_hash: (blob_key(&fingerprint, &[]) >> 64) as u64,
+        model: req.model.clone(),
+        messages: serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null),
+    });
 
     // The adapter needs an absolute path to open the blob directly.
     let blob_abs = match &outcome.blob {
@@ -629,11 +661,14 @@ async fn chat_completions(
         return stream_response(
             state.clone(),
             client,
-            tokens,
+            StreamReq {
+                tokens,
+                max_tokens,
+                trace_ctx,
+                started,
+            },
             outcome,
             blob_arg,
-            max_tokens,
-            started,
         )
         .await;
     }
@@ -696,6 +731,17 @@ async fn chat_completions(
         }
     };
 
+    // RT#7: emit after the generate leg settles. A blob that was rejected
+    // (or failed transiently) and scratch-retried is a miss in /stats (the
+    // record() claim was corrected by correct_retire) — the trace must say
+    // miss too, not the stale routing verdict.
+    let settled_decision = if blob_unused {
+        mlxcache_core::policy::scratch_decision(tokens.len())
+    } else {
+        outcome.decision.clone()
+    };
+    emit_trace(&state, &trace_ctx, &settled_decision);
+
     let total_ms = started.elapsed().as_millis() as u64;
     let body = serde_json::json!({
         "mlxcache": {
@@ -754,7 +800,9 @@ async fn publish_leader_blob(
         fingerprint: fingerprint.clone(),
         token_count: tokens.len() as u64,
         tokens: tokens.to_vec(),
+        // publish_atomic stamps the current version + payload digest (D1).
         format_version: 1,
+        payload_sha256: None,
     };
     let key = blob_key(fingerprint, tokens);
     // Refuse before writing if the generation floor is unknown (a failed
@@ -787,7 +835,7 @@ async fn publish_leader_blob(
     let persistence = state.persistence.clone();
     let meta_for_write = meta.clone();
     let write_result = tokio::task::spawn_blocking(move || {
-        persistence.publish_atomic(key, generation, &meta_for_write, &blob)
+        persistence.publish_atomic(key, generation, meta_for_write, &blob)
     })
     .await
     .unwrap_or_else(|join| {
@@ -1118,21 +1166,28 @@ fn push_frame(frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]
 /// Open the sidecar's NDJSON generation stream and re-emit it as SSE.
 /// Each sidecar line `{"token":..,"text":..}` becomes an OpenAI-style
 /// `data: {...}` chunk; the terminal `{"done":true}` closes with `[DONE]`.
+/// Request-scoped values the stream leg needs (bundles what would otherwise
+/// push `stream_response` past clippy's argument budget).
+struct StreamReq {
+    tokens: Vec<u32>,
+    max_tokens: usize,
+    trace_ctx: Option<TraceCtx>,
+    started: std::time::Instant,
+}
+
 async fn stream_response(
     state: Arc<AppState>,
     client: &SidecarClient,
-    tokens: Vec<u32>,
+    req: StreamReq,
     outcome: crate::orchestrator::RouteOutcome,
     blob_arg: Option<&str>,
-    max_tokens: usize,
-    started: std::time::Instant,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     use futures_util::StreamExt;
 
     // Time from request start to the cache decision, known before the first
     // token exists. The true TTFT (first generated token) is only known once the
     // sidecar emits it, so it is reported in the terminal frame, not here.
-    let lookup_ms = started.elapsed().as_millis() as u64;
+    let lookup_ms = req.started.elapsed().as_millis() as u64;
 
     let mut blob_for_open = outcome.blob.clone();
     let mut prefill_from = outcome.prefill_from;
@@ -1140,7 +1195,10 @@ async fn stream_response(
     // (rejection OR transient failure): the meta frame and aggregate must then
     // report a miss. Quarantine stays conditional on an explicit rejection.
     let blob_unused = std::cell::Cell::new(false);
-    let upstream = match client.generate_stream(&tokens, max_tokens, blob_arg).await {
+    let upstream = match client
+        .generate_stream(&req.tokens, req.max_tokens, blob_arg)
+        .await
+    {
         Ok(u) => u,
         Err(e) if blob_for_open.is_some() => {
             // The stream could not be opened. Retry from scratch so the stream
@@ -1170,7 +1228,7 @@ async fn stream_response(
             prefill_from = 0;
             blob_unused.set(true);
             let upstream = client
-                .generate_stream(&tokens, max_tokens, None)
+                .generate_stream(&req.tokens, req.max_tokens, None)
                 .await
                 .map_err(|e| {
                     let (status, kind) = sidecar_http_err(&e);
@@ -1214,6 +1272,16 @@ async fn stream_response(
             CacheVerdict::Miss => "miss",
         }
     };
+    // RT#7: same settle rule as the JSON leg — a blob rejected at stream
+    // open (quarantined + scratch stream retry) must trace as the miss it
+    // became. Mid-stream aborts do NOT change the verdict: the checkpoint
+    // loaded and its KV was served (see the /stats truncation note above).
+    let settled_decision = if blob_unused.get() {
+        mlxcache_core::policy::scratch_decision(req.tokens.len())
+    } else {
+        outcome.decision.clone()
+    };
+    emit_trace(&state, &req.trace_ctx, &settled_decision);
     let meta_line = serde_json::json!({
         "mlxcache": {
             "verdict": verdict,
@@ -1259,7 +1327,7 @@ async fn stream_response(
         buf: bytes::BytesMut::with_capacity(8 * 1024),
         done: false,
         terminated: false,
-        started,
+        started: req.started,
         ttft_ms: None,
         idle: client.stream_idle_timeout(),
     };
@@ -1464,64 +1532,18 @@ mod tests {
         // artifact (all 999s), and counts every request it answers.
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = hits.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let counter = counter.clone();
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    // Drain head + body (requests are small JSON posts).
-                    loop {
-                        let end = match buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            Some(p) => p + 4,
-                            None => {
-                                let n = sock.read(&mut chunk).await.unwrap_or(0);
-                                if n == 0 {
-                                    return;
-                                }
-                                buf.extend_from_slice(&chunk[..n]);
-                                continue;
-                            }
-                        };
-                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
-                        let body_len = head
-                            .lines()
-                            .find_map(|l| {
-                                let (k, v) = l.split_once(':')?;
-                                k.eq_ignore_ascii_case("content-length")
-                                    .then(|| v.trim().parse::<usize>().ok())?
-                            })
-                            .unwrap_or(0);
-                        if buf.len() >= end + body_len {
-                            break;
-                        }
-                        let n = sock.read(&mut chunk).await.unwrap_or(0);
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                    }
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    let body = "{\"tokens\":[999,999,999],\"tokenizer_hash\":\"h\",\
-                                \"kv_dtype\":\"f16\",\"kv_bits\":0,\"kv_group_size\":0}";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = sock.write_all(response.as_bytes()).await;
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
-        let client =
-            SidecarClient::new(SidecarConfig::new(format!("http://{addr}"), "m".into())).unwrap();
+        let body = r#"{"tokens":[999,999,999],"tokenizer_hash":"h","kv_dtype":"f16","kv_bits":0,"kv_group_size":0}"#.to_string();
+        let url = crate::sidecar::stub_support::http_stub(move |_path| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+        })
+        .await;
+        let client = SidecarClient::new(SidecarConfig::new(url, "m".into())).unwrap();
 
         // First call: probe #0 mismatches → fail-closed 503.
         let (status1, body1) =

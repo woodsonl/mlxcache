@@ -49,6 +49,13 @@ pub struct CheckpointMeta {
     pub tokens: Vec<u32>,
     /// Format version of the checkpoint blob itself.
     pub format_version: u32,
+    /// sha256 (hex) of the payload bytes — D1 integrity (format_version 2).
+    /// Stamped by the daemon at the single publish choke point, verified on
+    /// the daemon's boot sweep (full read) and by the sidecar at first serve
+    /// (once per blob per process). None on legacy version-1 blobs, which
+    /// stay loadable but unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
 }
 
 /// The checkpoint lifecycle: absent -> in-flight -> published -> quarantined.
