@@ -41,10 +41,7 @@ async fn unusable_blob_is_quarantined_and_served_from_scratch() {
     // A published checkpoint whose blob vanished (deleted, disk fault) must not
     // 502 forever. The daemon quarantines the entry and retries from scratch;
     // the following identical request then misses cleanly (no 502).
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
@@ -117,10 +114,7 @@ async fn eviction_reaper_unlinks_and_stats_and_next_request_misses() {
     // rebuild), (3) surface in /stats, and (4) leave the next identical request
     // a clean miss served from scratch. This is the only place the reaper's
     // interaction with the live request path is proven end to end.
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
@@ -211,10 +205,7 @@ async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
     // floor is unknown, so the handler must serve from scratch and write NO
     // checkpoint (writing first would leak an unindexed file on every request).
     use std::os::unix::fs::PermissionsExt;
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let persistence = mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap();
     // Make the dir unreadable so list_blobs fails, then run the real startup
@@ -285,12 +276,7 @@ async fn one_token_prompt_serves_and_publishes_no_blob() {
     // A one-token prompt caches nothing (empty adapter payload). The daemon must
     // serve it from scratch, publish no checkpoint, and never report a phantom
     // hit on the repeat request.
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_ONE", "1")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_ONE", "1")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
@@ -341,15 +327,11 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
     // only after /stats confirms the leader is prefilling. A plain barrier on
     // entry is not enough: a task can be scheduled past the leader's completion
     // and legitimately become a second leader (observed prefill_count 2 on CI).
-    let Some((sidecar_url, mut child)) = spawn_sidecar_with_env(&[
+    let (sidecar_url, mut child) = spawn_sidecar_with_env(&[
         ("MLXCACHE_TOKENIZE_ONE", "1"),
         ("MLXCACHE_PREFILL_DELAY", "1.5"),
     ])
-    .await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    .await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
@@ -443,12 +425,8 @@ async fn stream_leg_traces_the_settled_verdict() {
     // Testing review 2026-10-04: the RT#7 settle test covered only the JSON
     // leg. A stream whose blob is 422'd at open (corrupt ancestor) must
     // also trace the miss it became after quarantine + scratch retry.
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "grow me")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "grow me")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let tracedir = tempfile::tempdir().unwrap();
     let trace_path = tracedir.path().join("trace.jsonl");
@@ -528,10 +506,7 @@ async fn zero_max_tokens_yields_empty_completion_in_sdk_shape() {
     // zero); pin the choices[] shape for it: empty content, zero-token
     // usage, finish_reason "stop" (the max_tokens>0 length rule does not
     // apply to a client-requested zero).
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let res = router(state)
@@ -569,10 +544,7 @@ async fn nonstream_response_decodes_with_stock_openai_sdk_shape() {
     // validation; extras like `mlxcache` are allowed). A client doing
     // `response.choices[0].message.content` must get the sidecar's
     // detokenized text — identical to what the streaming path emits.
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let res = router(state)
@@ -628,10 +600,7 @@ async fn stream_chunks_decode_with_stock_openai_sdk_shape() {
     // which follow OpenAI's own error-stream shape. Deltas accumulate into
     // the same text the non-stream body returns; the verdict rides as a
     // top-level extra on the first chunk.
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let res = router(state)
@@ -715,12 +684,7 @@ async fn stream_chunks_decode_with_stock_openai_sdk_shape() {
 async fn one_token_streaming_serves_and_publishes_no_blob() {
     // The streaming path for the no-publish case: a one-token prompt must stream
     // a 200 SSE with a miss verdict and publish nothing.
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_ONE", "1")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_ONE", "1")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
@@ -761,10 +725,7 @@ async fn one_token_streaming_serves_and_publishes_no_blob() {
 
 #[tokio::test]
 async fn end_to_end_miss_then_hit() {
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
 
     let state = app_state(&sidecar_url, &blobs);
@@ -877,12 +838,21 @@ async fn end_to_end_miss_then_hit() {
 /// tail-of-test kill+wait only runs on the happy path — failed sweeps leaked
 /// one `uv run python` engine per failed test (64 strays held real RAM after
 /// the 2026-10-04 sweeps; engines are GB-scale residents).
-struct SidecarHandle(std::process::Child);
+struct SidecarHandle {
+    child: std::process::Child,
+    // The child's stdout after the PORT line was consumed: held open and
+    // drained so the child never blocks on a full pipe mid-test, and closed
+    // by the Drop kill (EOF ends the drain).
+    _stdout_drain: Option<std::thread::JoinHandle<()>>,
+}
 
 impl Drop for SidecarHandle {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(handle) = self._stdout_drain.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -890,86 +860,143 @@ impl std::ops::Deref for SidecarHandle {
     type Target = std::process::Child;
 
     fn deref(&self) -> &std::process::Child {
-        &self.0
+        &self.child
     }
 }
 
 impl std::ops::DerefMut for SidecarHandle {
     fn deref_mut(&mut self) -> &mut std::process::Child {
-        &mut self.0
+        &mut self.child
     }
 }
 
-async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> Option<(String, SidecarHandle)> {
+async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> (String, SidecarHandle) {
     // The health probe needs its own deadline: `reqwest::get` is a bare
-    // client with NO timeout, so under a loaded machine (18 parallel `uv
-    // run` starts resolving simultaneously) a half-open connect hangs the
-    // poll forever and the test wedges instead of failing. A per-attempt
-    // timeout converts that into the intended "not up yet" retry.
+    // client with NO timeout, so under a loaded machine (parallel e2e
+    // spawns) a half-open connect hangs the poll forever and the test
+    // wedges instead of failing. A per-attempt timeout converts that into
+    // the intended "not up yet" retry.
     let probe = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .expect("probe client");
-    // Retry on a FRESH port when our own sidecar dies at bind time:
-    // portpicker can hand the same port to two spawns launched milliseconds
-    // apart (two_models test), and a health answer on that port then comes
-    // from the WRONG engine — silent cross-model contamination
-    // (two_models_same_tokens flake, 2026-10-04).
-    for _ in 0..3 {
-        let port = portpicker::pick_unused_port().expect("free port");
-        let script = format!(
-            "import sys; sys.path.insert(0, {root:?}); \
-             from mlxcache_sidecar import server; \
-             server.Handler.engine = server.make_engine('e2e-model'); \
-             server.BurstServer(('127.0.0.1', {port}), server.Handler).serve_forever()",
-            root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
-            port = port
-        );
-        // Spawn the venv python DIRECTLY, not via `uv run`: uv keeps itself
-        // resident and spawns python as a CHILD, so SIGKILL to the Child we
-        // hold reaps uv and ORPHANS the server (the 64-stray leak held real
-        // RAM across sweeps, 2026-10-04) — and 18 concurrent `uv run` starts
-        // contend on uv's environment lock, the original parallel-e2e flake
-        // source. One process, one kill, no lock.
-        let python = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.venv/bin/python");
-        assert!(
-            std::path::Path::new(python).exists(),
-            "e2e needs the repo venv at {python:?} (uv sync)"
-        );
-        let mut cmd = std::process::Command::new(python);
-        cmd.arg("-c").arg(&script);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(_) => return None,
-        };
-        let url = format!("http://127.0.0.1:{port}");
-        let alive = |child: &mut std::process::Child| {
-            child.try_wait().map_or(true, |status| status.is_none())
-        };
-        for _ in 0..100 {
-            // Trust a health answer ONLY while OUR child is alive: a dead
-            // child means our bind failed and any responder on this port is
-            // someone else's server.
-            if !alive(&mut child) {
-                break; // bind race (or crash): retry on a fresh port
-            }
-            if probe.get(format!("{url}/health")).send().await.is_ok() {
-                return Some((url, SidecarHandle(child)));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+    // The child binds port 0 (kernel-assigned) and prints its actual port —
+    // the URL is derived from OUR child's own bind, so a health answer on it
+    // cannot come from another test's sidecar. The previous portpicker scheme
+    // raced: two spawns milliseconds apart could take the same "unused" port,
+    // and a foreign server answering health in the alive-check window made
+    // the daemon 503 the moment that server's own test killed it
+    // (issue #31).
+    let script = format!(
+        "import sys; sys.path.insert(0, {root:?}); \
+         from mlxcache_sidecar import server; \
+         server.Handler.engine = server.make_engine('e2e-model'); \
+         srv = server.BurstServer(('127.0.0.1', 0), server.Handler); \
+         print('PORT=%d' % srv.server_address[1], flush=True); \
+         srv.serve_forever()",
+        root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
+    );
+    // Spawn the venv python DIRECTLY, not via `uv run`: uv keeps itself
+    // resident and spawns python as a CHILD, so SIGKILL to the Child we
+    // hold reaps uv and ORPHANS the server (the 64-stray leak held real
+    // RAM across sweeps) — and 18 concurrent `uv run` starts
+    // contend on uv's environment lock, the original parallel-e2e flake
+    // source. One process, one kill, no lock.
+    let python = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.venv/bin/python");
+    assert!(
+        std::path::Path::new(python).exists(),
+        "e2e needs the repo venv at {python:?} (uv sync)"
+    );
+    let mut cmd = std::process::Command::new(python);
+    cmd.arg("-c").arg(&script);
+    cmd.stdout(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
     }
-    None
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => panic!("sidecar spawn failed: {e}"),
+    };
+    // Read the PORT line with a deadline: the kernel-assigned port is the
+    // only one that can truthfully answer for this child. The thread hands
+    // the stdout back either way — the drain below needs the pipe open.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let port = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let port = line.strip_prefix("PORT=").map(|p| p.trim().to_string());
+            let _ = tx.send((port, reader.into_inner()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok((port_opt, stdout)) => {
+                let port = port_opt.unwrap_or_else(|| "<no PORT= line on stdout>".into());
+                match port.parse::<u16>() {
+                    Ok(p) => (p, stdout),
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("sidecar printed an unparsable port: {port:?}");
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("sidecar never printed its port within 30s");
+            }
+        }
+    };
+    let (port, stdout) = port;
+    // Drain the rest of stdout in the background: nothing this child may
+    // print to stdout may block it on a full pipe mid-test.
+    let drain = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdout = stdout;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+    let url = format!("http://127.0.0.1:{port}");
+    let alive =
+        |child: &mut std::process::Child| child.try_wait().map_or(true, |status| status.is_none());
+    for attempt in 0..100 {
+        // Trust a health answer ONLY while OUR child is alive, and re-check
+        // alive AFTER the answer: a crash in between frees the port for an
+        // instant rebinding, and accepting a foreign answer would poison the
+        // whole test.
+        if !alive(&mut child) {
+            panic!("sidecar exited during startup (attempt {attempt})");
+        }
+        if probe.get(format!("{url}/health")).send().await.is_ok() {
+            if !alive(&mut child) {
+                panic!("sidecar exited between health answer and accept");
+            }
+            let handle = SidecarHandle {
+                child,
+                _stdout_drain: Some(drain),
+            };
+            return (url, handle);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // The child is typically STILL ALIVE here (slow or wedged startup) and
+    // Child does not kill on drop — without this, the panic leaks a live
+    // engine (port + RAM) and the drain thread blocks forever on the pipe.
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("sidecar never became healthy after 100 probes at {url}");
 }
 
 /// One sidecar, immediately ready, no test knobs.
-async fn spawn_sidecar() -> Option<(String, SidecarHandle)> {
+async fn spawn_sidecar() -> (String, SidecarHandle) {
     spawn_sidecar_with_env(&[]).await
 }
 
@@ -979,10 +1006,7 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
     // the prompt only, so both produce identical token ids). Their checkpoints
     // MUST land in separate blob files: sharing one file would let the second
     // model overwrite the first, whose index entry would then load foreign KV.
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let state = Arc::new(AppState {
         orchestrator: Orchestrator::new(),
@@ -1045,10 +1069,7 @@ async fn trace_capture_writes_one_jsonl_record_per_request() {
     // Proven end to end over the synthetic engine: miss -> hit -> another
     // miss = exactly 3 records, verdicts in serve order, prefill_from = the
     // single covered-KV definition.
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let dir = tempfile::tempdir().unwrap();
     let trace_path = dir.path().join("trace.jsonl");
     let blobs = tempfile::tempdir().unwrap();
@@ -1156,18 +1177,10 @@ async fn q8_and_f16_blobs_never_share_a_file() {
     // DIFFERENT blob files and never serve each other (R1-1: the fingerprint
     // pins the quantization config). Two sidecars over ONE blob dir — exactly
     // an operator flipping the knob between runs against persisted state.
-    let Some((q8_url, mut q8_child)) =
+    let (q8_url, mut q8_child) =
         spawn_sidecar_with_env(&[("MLXCACHE_KV_BITS", "8"), ("MLXCACHE_KV_GROUP_SIZE", "64")])
-            .await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
-    let Some((f16_url, mut f16_child)) = spawn_sidecar_with_env(&[]).await else {
-        q8_child.kill().ok();
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+            .await;
+    let (f16_url, mut f16_child) = spawn_sidecar_with_env(&[]).await;
     let blobs = tempfile::tempdir().unwrap();
 
     let body = serde_json::json!({
@@ -1265,12 +1278,8 @@ async fn concurrent_identical_requests_share_one_prefill() {
     // only after /stats confirms it is prefilling; spawning all N at once lets a
     // task be scheduled past the leader's completion and legitimately become a
     // second leader (observed as extra "miss" verdicts on CI).
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "2.0")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "2.0")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
 
@@ -1407,12 +1416,8 @@ async fn publish_failure_serves_leader_and_followers_from_scratch() {
     // Before the fix the leader signalled Err into single-flight and every
     // follower 502ed even though nothing was wrong with their request.
     use std::os::unix::fs::PermissionsExt;
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "2.0")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_PREFILL_DELAY", "2.0")]).await;
     let blobs = tempfile::tempdir().unwrap();
     // Read-only BEFORE any request: prefill succeeds (sidecar-side), the
     // daemon-side publish fails on temp-file creation.
@@ -1545,10 +1550,7 @@ async fn end_to_end_restart_resumes_from_disk() {
     // R1-4 across the REAL HTTP path: request 1 publishes a checkpoint; a fresh
     // daemon (new AppState + rebuild_from_disk on the same blob dir) must
     // serve request 2 as a hit without re-prefilling.
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let make_state = || {
         let state = app_state(&sidecar_url, &blobs);
@@ -1611,12 +1613,8 @@ async fn end_to_end_restart_resumes_from_disk() {
 async fn empty_tokenization_is_rejected() {
     // A tokenizer that returns no tokens must yield a 400, not a prefill of an
     // empty cache or a shared zero-token blob.
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_EMPTY", "1")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_EMPTY", "1")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let body = serde_json::json!({
@@ -1648,10 +1646,7 @@ async fn empty_tokenization_is_rejected() {
 
 #[tokio::test]
 async fn end_to_end_streaming_sse() {
-    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let make_app = || router(state.clone());
@@ -1749,12 +1744,8 @@ async fn partial_hit_delta_prefills_only_the_delta() {
     // delta. Proven through the sidecar's phase accounting: the second prefill
     // processes 8 model steps (16 tokens, 7 covered by the ancestor, minus the
     // final token) instead of the 15 a scratch prefill would.
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "grow me")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "grow me")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
 
@@ -1872,15 +1863,11 @@ async fn transient_prefill_failure_keeps_ancestor_and_recovers() {
     // Contract: a 500 is NOT a checkpoint rejection — no quarantine, the
     // ancestor stays published — the client gets 502 adapter_error, and the
     // next identical request retries the delta prefill and succeeds.
-    let Some((sidecar_url, mut child)) = spawn_sidecar_with_env(&[
+    let (sidecar_url, mut child) = spawn_sidecar_with_env(&[
         ("MLXCACHE_TOKENIZE_GROW", "grow me"),
         ("MLXCACHE_PREFILL_FAIL_AT", "2"),
     ])
-    .await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    .await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
 
@@ -1988,12 +1975,8 @@ async fn newline_free_flood_is_cut_by_the_partial_line_cap() {
     // without bound (api-contract/red-team 2026-10-04). The sidecar floods
     // 2 MiB of newline-free bytes; the stream must end with the explicit
     // "unbounded line" upstream error frame + [DONE], not unbounded memory.
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_STREAM_FLOOD", "2097152")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_STREAM_FLOOD", "2097152")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
 
@@ -2046,15 +2029,11 @@ async fn multi_turn_end_divergent_serves_t22() {
     // shape (Qwen2.5: turn-2 LCP 7454 vs turn-1 key 7455). Pre-T22 this
     // classified as a full miss and re-prefilled everything; the end-
     // anchored serve rule serves turn-1's checkpoint instead.
-    let Some((sidecar_url, mut child)) = spawn_sidecar_with_env(&[
+    let (sidecar_url, mut child) = spawn_sidecar_with_env(&[
         ("MLXCACHE_TOKENIZE_GROW", "turn one"),
         ("MLXCACHE_TOKENIZE_DIVERGE", "1"),
     ])
-    .await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    .await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
 
@@ -2161,12 +2140,8 @@ async fn corrupt_ancestor_quarantines_and_prefills_from_scratch() {
     // A partial hit whose ANCESTOR blob is corrupt must not wedge the request:
     // the adapter 422s the delta prefill, the daemon quarantines the ancestor
     // and retries the prefill from full scratch → 200 with a miss verdict.
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "grow me")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "grow me")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
     let post = |body: String| {
@@ -2272,12 +2247,7 @@ async fn failed_request_gets_one_trace_record_and_stats_agree() {
     // (the RT#7 invariant, reopened). Contract now: every routed request
     // gets exactly one record; a blob that was leaned on but never served
     // corrects its claim (correct_retire) and traces as the miss it was.
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_GENERATE_FAIL", "1")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_GENERATE_FAIL", "1")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let tracedir = tempfile::tempdir().unwrap();
     let trace_path = tracedir.path().join("trace.jsonl");
@@ -2371,12 +2341,8 @@ async fn trace_records_the_settled_verdict_not_the_stale_route() {
     // kept the stale hit. A capture and its /stats line must agree by
     // construction, so the record may only be emitted once the outcome has
     // SETTLED. (Would fail pre-fix with line 2 reading "hit".)
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "trace settle")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "trace settle")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let tracedir = tempfile::tempdir().unwrap();
     let trace_path = tracedir.path().join("trace.jsonl");
@@ -2462,12 +2428,8 @@ async fn stalled_stream_is_cut_by_the_idle_budget_with_an_explicit_error() {
     // design). Instead the daemon enforces an idle budget between bytes: a
     // sidecar that stalls before the first token is cut with an explicit
     // upstream_error frame + [DONE], never a silent hang.
-    let Some((sidecar_url, mut child)) =
-        spawn_sidecar_with_env(&[("MLXCACHE_FIRST_TOKEN_DELAY", "5")]).await
-    else {
-        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
-        return;
-    };
+    let (sidecar_url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_FIRST_TOKEN_DELAY", "5")]).await;
     let blobs = tempfile::tempdir().unwrap();
     // stream_idle = 1s, far below the sidecar's 5s first-token stall.
     let sidecar_client =
