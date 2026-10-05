@@ -662,7 +662,7 @@ async fn chat_completions(
     // so replay re-sends byte-equivalent requests. Serialization happens ONLY
     // when capture is on.
     let trace_ctx = state.trace.is_some().then(|| TraceCtx {
-        model_hash: (blob_key(&fingerprint, &[]) >> 64) as u64,
+        model_hash: (blob_key(&fingerprint, None, &[]) >> 64) as u64,
         model: req.model.clone(),
         messages: serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null),
     });
@@ -870,8 +870,10 @@ async fn publish_leader_blob(
         // publish_atomic stamps the current version + payload digest (D1).
         format_version: 1,
         payload_sha256: None,
+        engine_id: None,
+        granularity: None,
     };
-    let key = blob_key(fingerprint, tokens);
+    let key = blob_key(fingerprint, None, tokens);
     // Refuse before writing if the generation floor is unknown (a failed
     // startup scan): writing first would leak an unindexed file on every
     // request. Serve from scratch.
@@ -1137,7 +1139,11 @@ pub fn prefix_hash(tokens: &[u32]) -> u128 {
 /// residual risk in the D1 register): the lookup-time fingerprint check
 /// reads the INDEX entry, not the file, so a collision would NOT be caught
 /// downstream. Public for the B1 criterion bench.
-pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens: &[u32]) -> u128 {
+pub fn blob_key(
+    fingerprint: &mlxcache_core::contract::ModelFingerprint,
+    engine_id: Option<&str>,
+    tokens: &[u32],
+) -> u128 {
     // Length-prefix each field so no field's bytes can be re-split across the
     // boundaries: joining with a separator is ambiguous when model_id itself
     // (request-controlled) contains the separator, which would alias two
@@ -1169,7 +1175,30 @@ pub fn blob_key(fingerprint: &mlxcache_core::contract::ModelFingerprint, tokens:
             u32::from_le_bytes(b)
         })
         .collect();
-    let mut all = fp_bytes;
+    // Engine domain (connector protocol §4, [B0.2]): a NON-DEFAULT engine
+    // folds its length-prefixed id FIRST, closed by its own domain
+    // separator, before any fingerprint bytes — cross-engine keys can
+    // never alias. The default engine ("mlx-lm", and absent-by-legacy
+    // blobs) contributes ZERO bytes, so pre-spec keys are byte-identical.
+    let mut all: Vec<u32> = Vec::new();
+    if let Some(engine) = engine_id {
+        if engine != "mlx-lm" {
+            // Same length-prefixed scheme as the fingerprint fields (put):
+            // `len:field` — the length prefix is what prevents zero-padding
+            // aliases ("a" vs "a\0" would otherwise chunk identically).
+            let mut e = String::new();
+            e.push_str(&engine.len().to_string());
+            e.push(':');
+            e.push_str(engine);
+            all.extend(e.as_bytes().chunks(4).map(|c| {
+                let mut b = [0u8; 4];
+                b[..c.len()].copy_from_slice(c);
+                u32::from_le_bytes(b)
+            }));
+            all.push(0xFFFF_FFFF);
+        }
+    }
+    all.extend_from_slice(&fp_bytes);
     all.push(0xFFFF_FFFF); // domain separator so fp||tokens can't alias tokens
     all.extend_from_slice(tokens);
     prefix_hash(&all)
@@ -2202,7 +2231,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
         };
-        assert_ne!(blob_key(&a, &tokens), blob_key(&b, &tokens));
+        assert_ne!(blob_key(&a, None, &tokens), blob_key(&b, None, &tokens));
         // Tokenizer-only difference must also separate.
         let c = mlxcache_core::contract::ModelFingerprint {
             model_id: "model-a".into(),
@@ -2212,10 +2241,61 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
         };
-        assert_ne!(blob_key(&a, &tokens), blob_key(&c, &tokens));
+        assert_ne!(blob_key(&a, None, &tokens), blob_key(&c, None, &tokens));
         // Deterministic and distinct from the bare token hash.
-        assert_eq!(blob_key(&a, &tokens), blob_key(&a, &[10, 20, 30]));
-        assert_ne!(blob_key(&a, &tokens), prefix_hash(&tokens));
+        assert_eq!(
+            blob_key(&a, None, &tokens),
+            blob_key(&a, None, &[10, 20, 30])
+        );
+        assert_ne!(blob_key(&a, None, &tokens), prefix_hash(&tokens));
+    }
+
+    #[test]
+    fn blob_key_engine_namespacing_and_legacy_stability() {
+        // Connector protocol §4 [B0.2]. GOLDEN values below were captured
+        // from the PRE-extension fold: the default engine (and legacy
+        // absent) must keep keys byte-identical — "the default engine
+        // contributes zero bytes" — so every existing store keeps working.
+        // A regression here silently re-keys every deployed store.
+        let fp = mlxcache_core::contract::ModelFingerprint {
+            model_id: "golden-model".into(),
+            tokenizer_hash: "golden-tok".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
+        };
+        let tokens: Vec<u32> = (1..=8).collect();
+        assert_eq!(
+            format!("{:032x}", blob_key(&fp, None, &tokens)),
+            "2786690f2948dec17c5498a6267fc101",
+            "legacy fold must be unchanged"
+        );
+        assert_eq!(
+            format!("{:032x}", blob_key(&fp, Some("mlx-lm"), &tokens)),
+            "2786690f2948dec17c5498a6267fc101",
+            "explicit default engine == legacy (zero fold bytes)"
+        );
+        assert_eq!(
+            format!("{:032x}", blob_key(&fp, None, &[])),
+            "ca1873d2c14a2fe1f6be3cc0354ea7e9"
+        );
+        // Non-default engines get their own deterministic key domain.
+        let llama = blob_key(&fp, Some("llama-cpp"), &tokens);
+        assert_ne!(llama, blob_key(&fp, None, &tokens), "engine namespacing");
+        assert_eq!(
+            llama,
+            blob_key(&fp, Some("llama-cpp"), &tokens),
+            "deterministic"
+        );
+        // Two non-default engines never alias each other either.
+        assert_ne!(llama, blob_key(&fp, Some("other-engine"), &tokens));
+        // Golden pin for the NORMATIVE non-default fold (len-prefixed engine
+        // field, spec §4) — the conformance suite (B0.3) reuses this value.
+        assert_eq!(
+            format!("{:032x}", llama),
+            "0f8b99131596e10dfed791048839d6e5"
+        );
     }
 
     #[test]
@@ -2241,7 +2321,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
         };
-        assert_ne!(blob_key(&a, &tokens), blob_key(&b, &tokens));
+        assert_ne!(blob_key(&a, None, &tokens), blob_key(&b, None, &tokens));
     }
 
     #[test]

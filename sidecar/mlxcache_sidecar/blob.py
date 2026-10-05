@@ -54,10 +54,19 @@ class CheckpointMeta:
     # D1 integrity (format_version 2, written by the daemon at publish):
     # sha256 hex of the payload bytes. None on legacy v1 blobs — unverified.
     payload_sha256: str | None = None
+    # Connector protocol §2/§4 [B0.2]: engine identity for namespaced keys
+    # (None = the default engine "mlx-lm", which contributes zero fold
+    # bytes) and resume-granularity declaration (None = 0 = ANY_PREFIX).
+    engine_id: str | None = None
+    granularity: int | None = None
 
 
 def encode(meta: CheckpointMeta, payload: bytes) -> bytes:
-    header = json.dumps(asdict(meta), separators=(",", ":")).encode()
+    # None-valued fields are OMITTED, matching the Rust writer's
+    # skip_serializing_if (byte-exactness across bindings, protocol §2:
+    # absent means default). asdict alone would emit `"engine_id": null`.
+    raw = {k: v for k, v in asdict(meta).items() if v is not None}
+    header = json.dumps(raw, separators=(",", ":")).encode()
     return struct.pack("<I", len(header)) + header + payload
 
 
@@ -80,6 +89,8 @@ def decode(blob: bytes) -> tuple[CheckpointMeta, bytes]:
         tokens=raw.get("tokens", []),
         format_version=raw["format_version"],
         payload_sha256=raw.get("payload_sha256"),
+        engine_id=raw.get("engine_id"),
+        granularity=raw.get("granularity"),
     )
     # Version policy mirrors the daemon's load(): 1 = legacy (no digest
     # field), 2 = current (D1 digest contract). Anything else is a layout

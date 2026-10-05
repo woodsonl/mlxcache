@@ -112,6 +112,8 @@ fn crash_before_rename_never_serves_partial() {
         tokens: vec![1, 2, 3],
         format_version: 1,
         payload_sha256: None,
+        engine_id: None,
+        granularity: None,
     };
     let path = p.publish_atomic(0xabc, 1, meta, b"complete-kv").unwrap();
     let (m, payload) = p.load(&path).unwrap();
@@ -133,6 +135,8 @@ fn rebuild_skips_one_token_legacy_blob() {
         tokens: vec![7],
         format_version: 1,
         payload_sha256: None,
+        engine_id: None,
+        granularity: None,
     };
     p.publish_atomic(0x1, 1, meta, b"nonempty-legacy-kv")
         .unwrap();
@@ -162,6 +166,8 @@ async fn restart_drops_streams_checkpoints_survive() {
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
         payload_sha256: None,
+        engine_id: None,
+        granularity: None,
     };
     let path = p.publish_atomic(0x777, 1, meta, b"kv").unwrap();
 
@@ -203,6 +209,8 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
         payload_sha256: None,
+        engine_id: None,
+        granularity: None,
     };
     p.publish_atomic(0x1, 1, good, b"kv").unwrap();
 
@@ -214,6 +222,8 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         tokens: vec![],
         format_version: 1,
         payload_sha256: None,
+        engine_id: None,
+        granularity: None,
     };
     p.publish_atomic(0x2, 1, noprefix, b"kv").unwrap();
 
@@ -227,6 +237,8 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
         tokens: vec![7, 7, 7],
         format_version: 1,
         payload_sha256: None,
+        engine_id: None,
+        granularity: None,
     };
     p.publish_atomic(0x3, 1, empty, b"").unwrap();
 
@@ -276,6 +288,8 @@ async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
         payload_sha256: None,
+        engine_id: None,
+        granularity: None,
     };
     // Same prefix, generations 5 and 17. gen 17 is the repair; it must win.
     p.publish_atomic(0xabc, 5, meta.clone(), b"old").unwrap();
@@ -341,6 +355,8 @@ async fn rebuild_seeds_generation_above_unloadable_files_too() {
         tokens: vec![1, 2, 3, 4],
         format_version: 1,
         payload_sha256: None,
+        engine_id: None,
+        granularity: None,
     };
     p.publish_atomic(0x1, 3, meta, b"kv").unwrap();
     // A higher-generation file whose body is unreadable (truncated header): it is
