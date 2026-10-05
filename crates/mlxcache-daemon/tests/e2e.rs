@@ -900,7 +900,7 @@ async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> (String, SidecarHandle)
     // Spawn the venv python DIRECTLY, not via `uv run`: uv keeps itself
     // resident and spawns python as a CHILD, so SIGKILL to the Child we
     // hold reaps uv and ORPHANS the server (the 64-stray leak held real
-    // RAM across sweeps, 2026-10-04) — and 18 concurrent `uv run` starts
+    // RAM across sweeps) — and 18 concurrent `uv run` starts
     // contend on uv's environment lock, the original parallel-e2e flake
     // source. One process, one kill, no lock.
     let python = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.venv/bin/python");

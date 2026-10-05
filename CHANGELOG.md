@@ -13,7 +13,7 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   twice: the 2026-10-04 two_models contamination and this week's 1-in-8
   503). The child now binds a kernel-assigned port and prints it, so the
   URL derives from our own child's bind — no foreign server can know it.
-- **Every spawn failure is loud**: the four failure paths panic with cause
+- **Every spawn failure is loud**: every spawn-failure path panics with cause
   (spawn error, missing/garbled PORT line, 30s deadline, health exhaustion,
   sidecar exit) instead of silently skipping all 27 e2e tests. The child is
   killed and reaped before every panic, and a stdout drain thread prevents
