@@ -14,7 +14,7 @@
     <string>mlxcache-daemon</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/lance/Repos/mlxcache</string>
+  <string>__REPO_ROOT__</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>MLXCACHE_ADDR</key>
@@ -29,7 +29,7 @@
     <string>http://127.0.0.1:8421</string>
     <!-- Durable checkpoint dir; the default /tmp/mlxcache-blobs is wiped on reboot. -->
     <key>MLXCACHE_BLOBS</key>
-    <string>/Users/lance/Library/Application Support/mlxcache/blobs</string>
+    <string>__HOME__/Library/Application Support/mlxcache/blobs</string>
     <!-- Shutdown grace must be UNDER ExitTimeOut below, or launchd SIGKILLs
          before the daemon finishes draining. -->
     <key>MLXCACHE_SHUTDOWN_GRACE_S</key>
