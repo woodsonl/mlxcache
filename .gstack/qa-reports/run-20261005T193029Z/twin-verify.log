@@ -1,0 +1,11 @@
+=== GREEN: new twin comparator, 3 reps (exact CI test) ===
+rep1: 1 passed in 3.34s
+rep2: 1 passed in 2.52s
+rep3: 1 passed in 2.61s
+=== RED: feed-convention mutation (covered+1) must break twin equality ===
+
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]
+Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 3214.03it/s]
+honest: resumed == twin: True
+mutated: resumed == twin: False (must be False -> comparator catches the bug)
+MUTATION CAUGHT — comparator has teeth
