@@ -88,10 +88,15 @@ rejected.
 Responses decode with **stock OpenAI SDKs**: the non-stream body carries
 `id`/`object`/`created`/`model`/`choices[0].message.content` (detokenized by
 the sidecar — identical text to the streaming path) plus a `usage` block, and
-every SSE frame is a valid `chat.completion.chunk` with
+every non-error SSE frame is a valid `chat.completion.chunk` with
 `choices[0].delta.content` pieces, a role-delta first chunk, and a
-`finish_reason:"stop"` final chunk before `data: [DONE]`. Point an SDK at
-`base_url=http://127.0.0.1:8420/v1` and it works, streaming and not.
+`finish_reason` final chunk (`"length"` when generation hit your `max_tokens`
+cap, `"stop"` otherwise) before `data: [DONE]`. Mid-stream engine failures
+emit a bare `data: {"error":{...}}` frame (OpenAI's own error-stream shape)
+before `[DONE]`. Point an SDK at `base_url=http://127.0.0.1:8420/v1` and it
+works, streaming and not. One gap: `stream_options.include_usage` is not
+honored — stream chunks carry no `usage` block (the non-stream response and
+`/stats` have the numbers).
 
 Cache telemetry rides along as extra fields the SDKs ignore: `mlxcache`
 (verdict, tokens_cached, tokens_total, prefill_from, timings; on the first
