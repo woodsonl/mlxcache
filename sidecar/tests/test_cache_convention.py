@@ -884,3 +884,36 @@ def test_payload_digest_mismatch_is_rejected_not_served(tmp_path):
         str(legacy_path), [1, 2, 3, 4], check_safetensors=False
     )
     assert loaded == payload
+
+
+def test_v2_blob_without_digest_is_rejected_at_serve(tmp_path):
+    # Red-team 2026-10-04: the sidecar used to serve a v2 header carrying
+    # payload_sha256: null UNVERIFIED while the daemon refuses the same blob
+    # at boot. The policies now match: the field is part of the v2 contract.
+    from mlxcache_sidecar import blob, server
+
+    fp = blob.Fingerprint(model_id="m", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1)
+    meta = blob.CheckpointMeta(
+        fingerprint=fp,
+        token_count=4,
+        tokens=[1, 2, 3, 4],
+        format_version=blob.FORMAT_VERSION_D1,  # digest omitted → None
+    )
+    path = tmp_path / "v2-nodigest.ckpt"
+    path.write_bytes(blob.encode(meta, b"kv"))
+    with pytest.raises(server.CheckpointRejectedError, match="digest"):
+        server.read_wire_checkpoint(str(path), [1, 2, 3, 4], check_safetensors=False)
+
+
+def test_generate_fail_knob_fails_nonstream_generate(monkeypatch):
+    # MLXCACHE_GENERATE_FAIL (synthetic test knob): every non-stream
+    # /generate raises a transient 500 — drives the daemon e2e that pins
+    # failed-request trace/stats agreement.
+    monkeypatch.setenv("MLXCACHE_GENERATE_FAIL", "1")
+    server.Handler.engine = server.SyntheticEngine("test-model")
+    try:
+        with pytest.raises(RuntimeError, match="synthetic induced generate failure"):
+            server.Handler.engine.generate([1, 2], 4)
+    finally:
+        monkeypatch.delenv("MLXCACHE_GENERATE_FAIL", raising=False)
+        server.Handler.engine = server.make_engine("test-model")

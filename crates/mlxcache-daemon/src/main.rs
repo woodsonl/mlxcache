@@ -141,61 +141,27 @@ async fn main() -> Result<()> {
 /// and anchor protection live in `Orchestrator::evict_cold` (ds4 anchor policy:
 /// recently-served checkpoints and live chain bases are never evicted).
 ///
-/// Knobs:
-/// - `MLXCACHE_EVICT_INTERVAL_S` — sweep cadence; `0` disables the reaper
-///   entirely (default 60).
-/// - `MLXCACHE_EVICT_MAX_ENTRIES` — published-entry cap; `0` disables the
-///   ENTRY cap (the byte budget below still applies).
-/// - `MLXCACHE_EVICT_MAX_BYTES` — published-store byte budget (default
-///   32 GiB; the launch-config decision the design doc deferred). `0`
-///   disables the byte cap. Eviction stays best-effort: anchors are never
-///   evicted, so a store held above budget by live anchors only warns.
-/// - `MLXCACHE_EVICT_ANCHOR_WINDOW_S` — how long a served checkpoint stays an
-///   anchor (default 900 = 15 min).
+/// The reaper reads its knobs through [`EvictConfig::from_env`] (see
+/// orchestrator.rs for the knob semantics and their tests).
 fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
-    let interval_s: u64 = std::env::var("MLXCACHE_EVICT_INTERVAL_S")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
-    let max_entries: usize = std::env::var("MLXCACHE_EVICT_MAX_ENTRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    // Default 32 GiB: the launch decision. A cache for long contexts grows
-    // by GB-scale blobs per publish; unbounded disk growth was the one
-    // footgun left on by default. 0 opts back out.
-    let max_bytes: u64 = std::env::var("MLXCACHE_EVICT_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32 * 1024 * 1024 * 1024);
-    if interval_s == 0 || (max_entries == 0 && max_bytes == 0) {
+    let cfg = mlxcache_daemon::orchestrator::EvictConfig::from_env();
+    if !cfg.enabled() {
         tracing::info!(
-            interval_s,
-            max_entries,
-            max_bytes,
+            interval_s = cfg.interval_s,
+            entry_cap = ?cfg.entry_cap,
+            max_bytes = cfg.max_bytes,
             "eviction reaper disabled (set MLXCACHE_EVICT_INTERVAL_S and a cap to enable; blob growth is unbounded)"
         );
         return;
     }
-    // Env-knob translation: a 0 ENTRY cap means "no entry cap" at the knob
-    // layer, but pass-level 0 is the aggressive zero-entries sweep — never
-    // pass a knob-0 through.
-    let entry_cap = if max_entries == 0 {
-        usize::MAX
-    } else {
-        max_entries
-    };
     tracing::info!(
-        interval_s,
-        max_entries,
-        max_bytes,
+        interval_s = cfg.interval_s,
+        entry_cap = ?cfg.entry_cap,
+        max_bytes = cfg.max_bytes,
         "eviction reaper armed (byte budget default 32 GiB; MLXCACHE_EVICT_MAX_BYTES=0 to disable)"
     );
-    let anchor_window_s: u64 = std::env::var("MLXCACHE_EVICT_ANCHOR_WINDOW_S")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(900);
-    let anchor_window = std::time::Duration::from_secs(anchor_window_s);
+    let anchor_window = std::time::Duration::from_secs(cfg.anchor_window_s);
+    let (interval_s, entry_cap, max_bytes) = (cfg.interval_s, cfg.entry_cap, cfg.max_bytes);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_s));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -222,13 +188,9 @@ fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
             }
         }
     });
-    tracing::info!(
-        interval_s,
-        max_entries,
-        anchor_window_s,
-        "eviction reaper armed"
-    );
 }
+// (The armed log lives at the top of spawn_reaper; this trailing block was a
+// duplicate from the knob refactor.)
 
 /// Receive SIGINT/SIGTERM and enforce the shutdown deadline off the async
 /// runtime. On the first signal, notify the async drain via `signal_tx`, then

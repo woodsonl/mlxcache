@@ -176,28 +176,26 @@ def _valid_safetensors(payload: bytes) -> bool:
     return all(ranges[i][0] >= ranges[i - 1][1] for i in range(1, len(ranges)))
 
 
-# D1: blob paths whose digest was verified this process. Keyed by PATH, not
-# digest: files are immutable per generation ({hash}-{gen}.ckpt), so a given
-# path's bytes never change — while a rot-damaged COPY under another name
-# still gets its own verification instead of riding a verified digest.
-_DIGEST_VERIFIED: set[str] = set()
-
-
-def _payload_digest_ok(blob_path: str, meta: object, payload: bytes) -> bool:
+def _payload_digest_ok(meta: object, payload: bytes) -> bool:
     """True when the payload matches the daemon-stamped digest (D1).
 
-    Legacy v1 blobs carry no digest and pass unverified; the boot sweep on
-    the daemon side applies the same policy to the whole store.
+    Verified on EVERY load, no per-path caching: the bytes are already in
+    hand here (one hash pass over memory the process already paid to read),
+    and a once-per-process cache would make the check vacuous for exactly the
+    hottest blobs — a blob verified once could rot in place and keep serving
+    corrupt KV with a `hit` verdict until the next daemon restart (red-team
+    2026-10-04). Legacy v1 blobs carry no digest and pass unverified; the
+    daemon's boot sweep applies the same policy to the whole store. A v2+
+    header WITHOUT a digest is corrupt (the field is part of the v2
+    contract, and the daemon refuses the same blob at boot) — reject rather
+    than serve unverified.
     """
+    if getattr(meta, "format_version", 1) >= 2 and getattr(meta, "payload_sha256", None) is None:
+        return False
     expected = getattr(meta, "payload_sha256", None)
-    if expected is None or blob_path in _DIGEST_VERIFIED:
+    if expected is None:
         return True
-    if hashlib.sha256(payload).hexdigest() == expected.lower():
-        if len(_DIGEST_VERIFIED) > 256:
-            _DIGEST_VERIFIED.clear()
-        _DIGEST_VERIFIED.add(blob_path)
-        return True
-    return False
+    return hashlib.sha256(payload).hexdigest() == expected.lower()
 
 
 def read_wire_checkpoint(
@@ -307,7 +305,7 @@ def read_wire_checkpoint(
     # per digest per process — the bytes are already in hand here, but the
     # hash is not free on GB-scale KV, and a blob that verified once does not
     # rot differently on the next load from the same immutable file.
-    if not _payload_digest_ok(blob_path, meta, payload):
+    if not _payload_digest_ok(meta, payload):
         raise CheckpointRejectedError(f"payload digest mismatch (expected {meta.payload_sha256})")
     return meta, payload, True
 
@@ -354,6 +352,11 @@ class SyntheticEngine:
         # path with an ADOPTED ancestor: a 500 must NOT quarantine the
         # ancestor, and the next identical request must retry cleanly.
         self._prefill_fail_at = int(os.environ.get("MLXCACHE_PREFILL_FAIL_AT", "0") or 0)
+        # Test knob: fail every non-stream /generate with a transient 500 from
+        # the first call onward. Exercises the daemon's failed-request path:
+        # 502 to the client, exactly one trace record, and the stats claim
+        # corrected so capture and /stats keep agreeing.
+        self._generate_fail = os.environ.get("MLXCACHE_GENERATE_FAIL") == "1"
         # Phase timers (B2): last prefill's coverage, for the delta-prefill test.
         self.last_prefill_tokens = 0
         self.last_prefill_delta_tokens = 0
@@ -464,12 +467,20 @@ class SyntheticEngine:
 
     def generate(self, tokens: list[int], max_tokens: int) -> list[int]:
         # Deterministic continuation: token ids derived from context length.
+        if self._generate_fail:
+            raise RuntimeError("synthetic induced generate failure (test knob)")
         base = len(tokens)
         return [(base + i) % 2**31 for i in range(max_tokens)]
 
     def generate_with_text(self, tokens: list[int], max_tokens: int, blob_path: str | None = None):
         """(token_ids, text) — mirrors the stream path's pieces exactly, so
         streaming and non-streaming clients see the same detokenization."""
+        if blob_path:
+            # The synthetic engine has no KV to resume, but a resumed blob
+            # must still VALIDATE like the real adapter would (wire decodes,
+            # digest matches) — otherwise corrupt checkpoints serve "fine"
+            # here and 422 in production (QA probe 2026-10-04).
+            read_wire_checkpoint(blob_path, None, check_safetensors=False)
         out = self.generate(tokens, max_tokens)
         return out, "".join(f"tok{i} " for i in range(len(out)))
 
@@ -483,8 +494,12 @@ class SyntheticEngine:
 
         Split from generation so the handler can surface a rejected checkpoint as
         a clean 422 (which the daemon quarantines) rather than a mid-stream
-        failure. The synthetic engine has no cache; returns the prompt as-is.
+        failure. The synthetic engine has no cache, but a resumed blob must
+        still VALIDATE (wire + digest) exactly like the real adapter — the
+        generation is arithmetic, the trust boundary is not optional.
         """
+        if blob_path:
+            read_wire_checkpoint(blob_path, None, check_safetensors=False)
         return tokens, None
 
     def stream_prepared(self, prompt: list[int], cache):
@@ -1070,9 +1085,19 @@ class Handler(BaseHTTPRequestHandler):
                     gen = getattr(self.engine, "generate_with_text", None)
                     if gen is not None:
                         out, text = gen(tokens, max_tokens, blob_path)
-                    elif blob_path and hasattr(self.engine, "generate_from_blob"):
-                        out = self.engine.generate_from_blob(tokens, blob_path, max_tokens)
-                        text = ""
+                    elif hasattr(self.engine, "stream"):
+                        # Contract-conforming engine without generate_with_text:
+                        # collect from its stream so non-stream clients still
+                        # get detokenized text (api-contract review: falling
+                        # through to empty choices[].content is a silent
+                        # compatibility trap for third-party adapters).
+                        out, pieces = [], []
+                        for i, (tok, piece) in enumerate(self.engine.stream(tokens, blob_path)):
+                            out.append(tok)
+                            pieces.append(piece)
+                            if i + 1 >= max_tokens:
+                                break
+                        text = "".join(pieces)
                     else:
                         out = self.engine.generate(tokens, max_tokens)
                         text = ""
