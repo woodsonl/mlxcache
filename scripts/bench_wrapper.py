@@ -162,6 +162,8 @@ class Server:
         self.base = f"http://127.0.0.1:{port}"
 
     def _log_tail(self) -> str:
+        # Best effort: the child holds its own fd, so only what it has
+        # flushed to the OS is visible here.
         with contextlib.suppress(Exception):
             self.log_fh.flush()
             return self.log_path.read_text()[-2000:]
@@ -229,7 +231,10 @@ class Server:
                 self.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
-                self.proc.wait(timeout=10)
+                # A reaped child is not guaranteed after SIGKILL; a raise
+                # here would skip the close/unlink below and re-leak the log.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self.proc.wait(timeout=10)
         with contextlib.suppress(Exception):
             self.log_fh.close()
         with contextlib.suppress(Exception):

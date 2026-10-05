@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Date / branch / revision | 2026-10-05 / b2.3/retro-gauntlet / e82ea62 (working tree clean) |
+| Date / branch / revision | 2026-10-05 / b2.3/retro-gauntlet / 7f7e4c3 + review-fix working tree (readiness + version-agreement tests, stop() guard, report corrections) |
 | Caller / authority / depth | /gstack-qa (full gauntlet); permitted writes: repo source + report dir; bound: this branch |
 | Surfaces / scope | HTTP API of `mlxcache_serve` (mlx_lm.server wrapper): /v1/chat/completions (stream + non-stream), /v1/completions, /health, error shape, disk+memory KV tiers; the two harness scripts under test (`scripts/qa_wrapper.py`, `scripts/bench_wrapper.py`) |
 | Runtime / native tools | Python 3.14 (.venv), mlx-lm 0.31.x, real model `mlx-community/Qwen2.5-7B-Instruct-4bit` (local snapshot c26a38f6…), Apple Silicon. Commands: `.venv/bin/python scripts/qa_wrapper.py`, `.venv/bin/python scripts/bench_wrapper.py --max-tokens 16` |
@@ -23,12 +23,13 @@
 | §D6 Q5 disk-resume identity (second fresh process) | Q5: third fresh process, same grown convo | answer == Q4 answer → PASS | pass |
 | §D6 Q7 store hygiene | Q7: fetch every `*.ckpt` (digest-verified) | ≥1 checkpoint, all digest-valid → PASS | pass |
 | §D5 bench gate: disk legs token-identical to MEMORY reference | `scripts/bench_wrapper.py` restart-turn2 / second-turn2 vs memory-turn2 | all legs `token-identical` → PASS | pass |
-| §D5 bench gate: ≥90% prefill skip | store coverage of the 282-token turn-2 stream | 262/282 = 93% → PASS | pass |
-| Changelog: warmup status is load-bearing (e82ea62) | mock: persistent HTTP 500 warmup | retries, raises naming the 500 (was: read as ready) → PASS | pass |
-| Changelog: warmup bounded by deadline (e82ea62) | mock: warmup that never returns | bounded timeout, retry, raise ≤ deadline (was: 600s block) → PASS | pass |
-| Changelog: transient warmup retries (e82ea62) | mock: fail once then 200 | returns after 2 calls → PASS | pass |
-| Changelog: temp log unlinked (e82ea62) | mock: `stop()` | log file removed → PASS | pass |
-| Fingerprint resolves per-process cwd (e649f87, the gate-breaker) | `_resolve_model(hfid)` and `_resolve_model(abs)` | both → same absolute snapshot path → PASS | pass |
+| §D5 bench gate: ≥90% prefill skip | store coverage of the turn-2 stream (281 computable positions) | 262/281 = 93% (disk_covered=262 of request_tokens=282) → PASS | pass |
+| Changelog: warmup status is load-bearing (e82ea62) | `sidecar/tests/test_harness_readiness.py::test_qa_warmup_non_200_is_not_ready` | retries, raises naming the 500 (was: read as ready) → PASS | pass |
+| Changelog: warmup bounded by deadline (e82ea62) | `test_bench_warmup_failure_is_bounded_and_reported` | bounded timeout ≤ 30s, retry, raise ≤ deadline (was: 600s block) → PASS | pass |
+| Changelog: transient warmup retries (e82ea62) | `test_bench_warmup_retries_then_succeeds` | returns after 2 calls → PASS | pass |
+| Changelog: temp log unlinked (e82ea62) | `test_stop_unlinks_temp_log[qa_wrapper|bench_wrapper]` | log file removed → PASS | pass |
+| Fingerprint resolves per-process cwd (e649f87, the gate-breaker) | `test_resolve_model_abs_and_hfid_agree` / `test_resolve_model_rejects_uncached_id` | hfid and abs both → same absolute snapshot path → PASS | pass |
+| Version sources agree (VERSION / Cargo / pyproject) | `sidecar/tests/test_version_agreement.py` (new in this batch) | all three == 0.1.0 → PASS | pass |
 
 ## Findings
 
@@ -38,7 +39,7 @@
 - Intended contract and source: a readiness gate must mean "the model is loaded and serving", not "the port is bound" (`/health` binds before the lazy model load).
 - Reproduction: mock `Server.post` returning `(500, {...})`; call `wait_ready(timeout_s=2)`.
 - Observed (before): returned "ready" immediately. Observed (after): retries until deadline, raises `wrapper never became healthy (last warmup error: warmup HTTP 500: ...)`.
-- Evidence: `scripts/qa_wrapper.py` `wait_ready`; mock transcript on branch.
+- Evidence: `scripts/qa_wrapper.py` `wait_ready`; `sidecar/tests/test_harness_readiness.py::test_qa_warmup_non_200_is_not_ready`.
 - Diagnosis / next action: fixed in e82ea62 — the warmup status is checked and non-200 means not-ready.
 
 ### ISSUE-002: readiness warmup was unbounded (RESOLVED)
@@ -72,7 +73,7 @@
 |---|---|---|---|---|
 | The §D5 gate could not pass with a default (non-absolute) model: parent and child realpath the model differently → fingerprint mismatch → 0% skip | `_resolve_model` unit probe (hfid vs abs both → same path) | adversarial live repro `EQUAL: False` | both resolve to c26a38f6…; bench GATE PASS | authorized change (e649f87) |
 | The turn-2 "memory reference" was disk-vs-disk (fresh server over same store) | bench memory-turn2 in the SAME process as turn 1 | reference took the disk path | memory-turn2 leg now in-process; disk legs match it | authorized change (e649f87) |
-| Readiness warmup must check status and honour the deadline | mock behavioral tests (T1–T4) | qa 500 read as ready; unbounded warmup (600s) | T1–T4 all PASS | authorized change (e82ea62) |
+| Readiness warmup must check status and honour the deadline | `sidecar/tests/test_harness_readiness.py` (new in this batch) | qa 500 read as ready; unbounded warmup (600s) | all readiness tests PASS | authorized change (e82ea62) |
 | KV-parity reference must share the producer lineage | prior learning `kv-parity-reference-shares-producer-lineage` | n/a (applied) | memory-twin reference now governs the gate | applied, confidence 10/10 |
 
 ## Coverage limits and cleanup
