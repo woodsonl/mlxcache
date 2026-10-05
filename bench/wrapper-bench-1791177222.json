@@ -1,0 +1,33 @@
+{
+  "model": "/Users/lance/models/models--mlx-community--Qwen2.5-7B-Instruct-4bit/snapshots/c26a38f6a37d0a51b4e9a1eb3026530fa35d9fed",
+  "results": [
+    {
+      "leg": "cold",
+      "wall_ms": 620.1,
+      "gen_n": null,
+      "verdict": "token-identical",
+      "reused": {}
+    },
+    {
+      "leg": "warm",
+      "wall_ms": 312.9,
+      "gen_n": null,
+      "verdict": "token-identical",
+      "reused": {}
+    },
+    {
+      "leg": "restart",
+      "wall_ms": 639.9,
+      "gen_n": null,
+      "verdict": "token-identical",
+      "reused": {}
+    },
+    {
+      "leg": "second",
+      "wall_ms": 923.2,
+      "gen_n": null,
+      "verdict": "token-identical",
+      "reused": {}
+    }
+  ]
+}
