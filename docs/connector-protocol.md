@@ -1,9 +1,6 @@
 # mlxcache Connector Protocol
 
-Status: **Normative** for the mlxcache store. Version 1.1 of this spec
-(v1.0 failed its own review gauntlet: matched_len, CacheRef, the key fold,
-coverage, and the unknown-field policy were under-specified; v1.1 fixes
-all ten findings).
+Status: **Normative** for the mlxcache store. Version 1.0 of this spec.
 
 Every clause is tagged with when it is enforceable: `[CURRENT]` is
 verifiable against the code on `main` today; `[B0.2]` is introduced by the
