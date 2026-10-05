@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wrapper benchmark (plan §D5): persistent KV reuse through mlxcache_serve.
+"""Wrapper benchmark: persistent KV reuse through mlxcache_serve.
 
 Drives the REAL mlx_lm.server (wrapped by mlxcache_serve) over five legs
 against a local mlx-lm model:
@@ -290,7 +290,7 @@ def _fp_for(model: str):
 
 
 def _gate_ok(results, skip_pct, observed_hits) -> tuple[bool, list[str]]:
-    """The §D5 acceptance predicate. Returns (ok, reasons). A reusable blob
+    """The acceptance predicate. Returns (ok, reasons). A reusable blob
     is not reuse: the disk legs must have OBSERVED a disk hit, so a store
     that is populated but never read cannot pass."""
     reasons = []
@@ -360,7 +360,7 @@ def main() -> int:
         results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2, second_stats))
 
     # ---- acceptance ------------------------------------------------------
-    # §D5 prefill-skip, measured as WORK not wall: the restart/second legs'
+    # Prefill-skip, measured as WORK not wall: the restart/second legs'
     # requests are full two-turn streams; a disk hit covers (matched-1)
     # positions of the turn-1 prefix, so the prefill actually computed is
     # the remainder. Coverage (how MUCH a blob holds) is read from the

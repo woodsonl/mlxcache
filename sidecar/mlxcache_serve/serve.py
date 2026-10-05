@@ -1,6 +1,6 @@
 """The mlxcache_serve CLI: mlx-lm's server with a persistent prompt cache.
 
-Mechanism (plan §D4, mechanism A): swap the ``LRUPromptCache`` symbol in
+Mechanism: swap the ``LRUPromptCache`` symbol in
 ``mlx_lm.server`` for a factory that wires our ``PersistentPromptCache``
 around one shared ``Store``, then hand control to mlx-lm's own ``main``.
 No mlx-lm source is modified; the swap is two module attributes (and

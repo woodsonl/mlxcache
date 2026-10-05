@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wrapper QA battery (plan §D6): chat/completions + completions + streaming,
+"""Wrapper QA battery: chat/completions + completions + streaming,
 with a restart mid-suite, against a real mlxcache_serve pair.
 
 Probes (each records pass/fail + evidence):

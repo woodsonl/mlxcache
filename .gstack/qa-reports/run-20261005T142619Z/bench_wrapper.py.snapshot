@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wrapper benchmark (plan §D5): persistent KV reuse through mlxcache_serve.
+"""Wrapper benchmark: persistent KV reuse through mlxcache_serve.
 
 Drives the REAL mlx_lm.server (wrapped by mlxcache_serve) over five legs
 against a local mlx-lm model:
@@ -83,18 +83,14 @@ def _resolve_model(raw: str) -> str:
     # (default main), so a cache holding several revisions selects the same
     # snapshot the server child will load. A bare glob of the snapshot dirs
     # would sort by commit hash — unrelated to the revision fetched.
-    with contextlib.suppress(ImportError, Exception):
+    try:
         from huggingface_hub import snapshot_download
 
         snap = snapshot_download(raw, local_files_only=True)
         if (Path(snap) / "config.json").is_file():
             return snap
-    base = (
-        Path.home() / ".cache/huggingface/hub" / f"models--{raw.replace('/', '--')}" / "snapshots"
-    )
-    snaps = sorted(base.glob("*")) if base.is_dir() else []
-    if snaps and (snaps[-1] / "config.json").is_file():
-        return str(snaps[-1])
+    except Exception:  # noqa: BLE001 — falls through to the clean SystemExit
+        pass
     raise SystemExit(
         f"model {raw!r} is neither a local dir nor a cached HF snapshot; "
         "pass an absolute snapshot path or set MLXCACHE_BENCH_MODEL"
@@ -294,7 +290,7 @@ def _fp_for(model: str):
 
 
 def _gate_ok(results, skip_pct, observed_hits) -> tuple[bool, list[str]]:
-    """The §D5 acceptance predicate. Returns (ok, reasons). A reusable blob
+    """The acceptance predicate. Returns (ok, reasons). A reusable blob
     is not reuse: the disk legs must have OBSERVED a disk hit, so a store
     that is populated but never read cannot pass."""
     reasons = []
@@ -364,7 +360,7 @@ def main() -> int:
         results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2, second_stats))
 
     # ---- acceptance ------------------------------------------------------
-    # §D5 prefill-skip, measured as WORK not wall: the restart/second legs'
+    # Prefill-skip, measured as WORK not wall: the restart/second legs'
     # requests are full two-turn streams; a disk hit covers (matched-1)
     # positions of the turn-1 prefix, so the prefill actually computed is
     # the remainder. Coverage (how MUCH a blob holds) is read from the

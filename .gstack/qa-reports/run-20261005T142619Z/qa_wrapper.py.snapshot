@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wrapper QA battery (plan §D6): chat/completions + completions + streaming,
+"""Wrapper QA battery: chat/completions + completions + streaming,
 with a restart mid-suite, against a real mlxcache_serve pair.
 
 Probes (each records pass/fail + evidence):
@@ -52,18 +52,14 @@ def _resolve_model(raw: str) -> str:
     # Resolve exactly as mlx_lm would: snapshot_download honours refs/<rev>
     # (default main), so a cache holding several revisions selects the same
     # snapshot the server child will load.
-    with contextlib.suppress(ImportError, Exception):
+    try:
         from huggingface_hub import snapshot_download
 
         snap = snapshot_download(raw, local_files_only=True)
         if (Path(snap) / "config.json").is_file():
             return snap
-    base = (
-        Path.home() / ".cache/huggingface/hub" / f"models--{raw.replace('/', '--')}" / "snapshots"
-    )
-    snaps = sorted(base.glob("*")) if base.is_dir() else []
-    if snaps and (snaps[-1] / "config.json").is_file():
-        return str(snaps[-1])
+    except Exception:  # noqa: BLE001 — falls through to the clean SystemExit
+        pass
     raise SystemExit(
         f"model {raw!r} is neither a local dir nor a cached HF snapshot; "
         "pass an absolute snapshot path or set MLXCACHE_BENCH_MODEL"
