@@ -1,0 +1,12 @@
+model: <HOME>/models/models--mlx-community--Qwen2.5-7B-Instruct-4bit/snapshots/c26a38f6a37d0a51b4e9a1eb3026530fa35d9fed
+
+| leg | wall_ms | verdict | notes |
+|-----|---------|---------|-------|
+| cold-turn1 | 570.8 | token-identical |  |
+| warm-turn1 | 306.1 | token-identical |  |
+| memory-turn2 | 354.6 | token-identical |  |
+| restart-turn2 | 357.3 | token-identical | {"prefill_skip_pct": 93, "request_tokens": 282, "disk_covered": 262} |
+| second-turn2 | 362.1 | token-identical | {"prefill_skip_pct": 93, "request_tokens": 282, "disk_covered": 262} |
+
+artifact: <REPO>/bench/wrapper-bench-1791210294.json
+GATE: PASS
