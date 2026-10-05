@@ -1,0 +1,14 @@
+=== GREEN suite, 2 verbose reps ===
+rep1: 6 passed in 24.08s
+rep2: 6 passed in 26.19s
+=== MUTATIONS (corrected: double-feed) ===
+raw honest: resumed == twin: True
+raw mutated: resumed == twin: False (must be False)
+RAW MUTATION CAUGHT
+prefill honest: resumed == twin: True
+prefill mutated: resumed == twin: True (must be False)
+Traceback (most recent call last):
+  File "/private/var/folders/mg/8hpb2rl557g8k0k2cgsk54hc0000gn/T/opencode/twin-mutations.py", line 112, in <module>
+    assert r1 == t1 and r2 != t1
+           ^^^^^^^^^^^^^^^^^^^^^
+AssertionError
