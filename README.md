@@ -184,6 +184,25 @@ MLXCACHE_SIDECAR_URL=http://127.0.0.1:8421 \
 The model id is whatever `mlx_lm.load()` accepts (an HF repo or a local path).
 First run downloads the weights.
 
+## Wrapper server (mlx-lm, no daemon)
+
+Any mlx-lm server gains persistent prefix reuse in one command — no daemon, no
+mlx-lm patches:
+
+```bash
+uv run python -m mlxcache_serve \
+  --store-dir ~/.mlxcache/store \
+  --model mlx-community/Qwen2.5-7B-Instruct-4bit --port 8080
+```
+
+Unknown flags pass through to `mlx_lm.server`. Two extra endpoints ride along:
+
+- `GET /mlxcache/stats` — the live cache's reuse counters:
+  `{"disk_hits": .., "persisted": .., "reuse_errors": .., "persist_errors": ..}`.
+  At temperature 0 a disk resume and a full prefill are token-identical, so
+  response equality cannot prove the disk tier served a request; the counter
+  can.
+
 ## Streaming
 
 Set `"stream": true` and the daemon returns OpenAI-style SSE: a leading

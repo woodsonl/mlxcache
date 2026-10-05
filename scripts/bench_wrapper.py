@@ -83,18 +83,14 @@ def _resolve_model(raw: str) -> str:
     # (default main), so a cache holding several revisions selects the same
     # snapshot the server child will load. A bare glob of the snapshot dirs
     # would sort by commit hash — unrelated to the revision fetched.
-    with contextlib.suppress(ImportError, Exception):
+    try:
         from huggingface_hub import snapshot_download
 
         snap = snapshot_download(raw, local_files_only=True)
         if (Path(snap) / "config.json").is_file():
             return snap
-    base = (
-        Path.home() / ".cache/huggingface/hub" / f"models--{raw.replace('/', '--')}" / "snapshots"
-    )
-    snaps = sorted(base.glob("*")) if base.is_dir() else []
-    if snaps and (snaps[-1] / "config.json").is_file():
-        return str(snaps[-1])
+    except Exception:  # noqa: BLE001 — falls through to the clean SystemExit
+        pass
     raise SystemExit(
         f"model {raw!r} is neither a local dir nor a cached HF snapshot; "
         "pass an absolute snapshot path or set MLXCACHE_BENCH_MODEL"
