@@ -2,9 +2,9 @@
 
 | Field | Value |
 |---|---|
-| Date / branch / revision | 2026-10-05 / b2.3/retro-gauntlet / 7f7e4c3 + review-fix working tree (readiness + version-agreement tests, stop() guard, report corrections) |
+| Date / branch / revision | 2026-10-05 / b2.3/retro-gauntlet / 7f7e4c3 + review-fix working tree (readiness + version-agreement + stats-route tests, stop() guard, report corrections); live-validated at ab45be2 |
 | Caller / authority / depth | /gstack-qa (full gauntlet); permitted writes: repo source + report dir; bound: this branch |
-| Surfaces / scope | HTTP API of `mlxcache_serve` (mlx_lm.server wrapper): /v1/chat/completions (stream + non-stream), /v1/completions, /health, error shape, disk+memory KV tiers; the two harness scripts under test (`scripts/qa_wrapper.py`, `scripts/bench_wrapper.py`) |
+| Surfaces / scope | HTTP API of `mlxcache_serve` (mlx_lm.server wrapper): /v1/chat/completions (stream + non-stream), /v1/completions, /health, /mlxcache/stats (reuse counters), error shape, disk+memory KV tiers; the two harness scripts under test (`scripts/qa_wrapper.py`, `scripts/bench_wrapper.py`) |
 | Runtime / native tools | Python 3.14 (.venv), mlx-lm 0.31.x, real model `mlx-community/Qwen2.5-7B-Instruct-4bit` (local snapshot c26a38f6…), Apple Silicon. Commands: `.venv/bin/python scripts/qa_wrapper.py`, `.venv/bin/python scripts/bench_wrapper.py --max-tokens 16` |
 | Fixture ownership / destinations | Isolated `tempfile.mkdtemp` store per run; no shared state; single GPU-resident model, announced to the peer session per plan §7b |
 | Probe budget / guarded command time / stop reason | 7 QA probes + 5 bench legs, two independent runs (pre- and post-hardening). Warmup 1-token gate; request timeout 600s; probe budget not exhausted — complete |
@@ -19,11 +19,13 @@
 | §D6 Q2 chat streaming == non-stream (temp 0) | Q2: SSE chunk parse, `object=chat.completion.chunk` | concatenated stream == non-stream content → PASS | pass |
 | §D6 Q3 completions non-stream | Q3 | 200 + non-empty text → PASS | pass |
 | §D6 Q6 error shape | Q6: `{"messages": "not-a-list"}` | 4xx + JSON error object → PASS | pass |
-| §D6 Q4 restart mid-suite, grown conversation | Q4: SIGTERM, fresh process, same store, grown convo | 200 → PASS | pass |
-| §D6 Q5 disk-resume identity (second fresh process) | Q5: third fresh process, same grown convo | answer == Q4 answer → PASS | pass |
+| §D6 Q4 restart mid-suite, grown conversation | Q4: SIGTERM, fresh process, same store, grown convo | 200 + observed disk hit on the fresh process → PASS | pass |
+| §D6 Q5 disk-resume identity (second fresh process) | Q5: third fresh process, same grown convo | answer == Q4 answer AND observed disk hit → PASS | pass |
 | §D6 Q7 store hygiene | Q7: fetch every `*.ckpt` (digest-verified) | ≥1 checkpoint, all digest-valid → PASS | pass |
 | §D5 bench gate: disk legs token-identical to MEMORY reference | `scripts/bench_wrapper.py` restart-turn2 / second-turn2 vs memory-turn2 | all legs `token-identical` → PASS | pass |
 | §D5 bench gate: ≥90% prefill skip | store coverage of the turn-2 stream (281 computable positions) | 262/281 = 93% (disk_covered=262 of request_tokens=282) → PASS | pass |
+| §D5 bench gate: disk tier OBSERVED serving | `/mlxcache/stats` on each disk leg (live 7B run) | `disk_hits=1`, `persisted=1` on both restart/second → PASS | pass |
+| `/mlxcache/stats` route (new) | unit: `test_serve_stats.py`, `test_serve_route_swap.py`; live: touched by both harnesses above | 200 JSON counters; non-stats paths delegated; swap restored → PASS | pass |
 | Changelog: warmup status is load-bearing (e82ea62) | `sidecar/tests/test_harness_readiness.py::test_qa_warmup_non_200_is_not_ready` | retries, raises naming the 500 (was: read as ready) → PASS | pass |
 | Changelog: warmup bounded by deadline (e82ea62) | `test_bench_warmup_failure_is_bounded_and_reported` | bounded timeout ≤ 30s, retry, raise ≤ deadline (was: 600s block) → PASS | pass |
 | Changelog: transient warmup retries (e82ea62) | `test_bench_warmup_retries_then_succeeds` | returns after 2 calls → PASS | pass |
@@ -67,6 +69,15 @@
 - Evidence: `Server.stop` / `Server.__init__` in both scripts.
 - Diagnosis / next action: fixed in e82ea62.
 
+### ISSUE-005: the gate and Q4/Q5 could pass with the disk tier never exercised (RESOLVED)
+
+- Classification / severity: PRODUCT DEFECT / high — the harness's central claim (persistent reuse works) was unfalsifiable. At temperature 0 a full prefill and a disk resume are token-identical, and both the §D5 gate and QA Q4/Q5 only checked response text (plus a store-side coverage read). A server with disk reuse disabled, or falling back to memory, would still print "93% prefill skip" and pass every probe.
+- Intended contract and source: plan §D5/§D6 — the gate must demonstrate that persisted KV was actually REUSED, not that a reusable blob exists.
+- Reproduction (before): read `bench_wrapper` acceptance — `ok` = legacy token verdicts + store-derived `skip_pct`; no serving counter. `PersistentPromptCache.disk_hits` existed but was in-process only and exposed over no route (mlx-lm's only GET routes are /health and /v1/models).
+- Observed (after): `mlxcache_serve` serves `GET /mlxcache/stats` (installed/restored by the same module-attribute swap as `LRUPromptCache`, no mlx-lm source change); the bench requires `disk_hits > 0` on each disk leg and QA Q4/Q5 assert an observed hit. Live 7B run: `disk_hits=1`, `persisted=1` on both disk legs; GATE PASS; QA 7/7.
+- Evidence: `sidecar/mlxcache_serve/serve.py` (`_stats_payload`/`_write_stats`); `sidecar/tests/test_serve_stats.py`, `test_serve_route_swap.py`, `test_harness_readiness.py::test_gate_requires_observed_disk_hits`; live logs `stats-bench.log`, `stats-qa.log`.
+- Diagnosis / next action: fixed in ab45be2.
+
 ## Discoveries and permanent tests
 
 | Hypothesis / discovery | Native test or proposed case | Red evidence before repair | Green + original + adjacent evidence | Parent disposition |
@@ -74,6 +85,7 @@
 | The §D5 gate could not pass with a default (non-absolute) model: parent and child realpath the model differently → fingerprint mismatch → 0% skip | `_resolve_model` unit probe (hfid vs abs both → same path) | adversarial live repro `EQUAL: False` | both resolve to c26a38f6…; bench GATE PASS | authorized change (e649f87) |
 | The turn-2 "memory reference" was disk-vs-disk (fresh server over same store) | bench memory-turn2 in the SAME process as turn 1 | reference took the disk path | memory-turn2 leg now in-process; disk legs match it | authorized change (e649f87) |
 | Readiness warmup must check status and honour the deadline | `sidecar/tests/test_harness_readiness.py` (new in this batch) | qa 500 read as ready; unbounded warmup (600s) | all readiness tests PASS | authorized change (e82ea62) |
+| A populated store is not reuse: token identity cannot show the disk tier served | `test_gate_requires_observed_disk_hits` + live `/mlxcache/stats` | gate passed with `disk_hits` unobserved | disk legs report `disk_hits=1`; gate now fails on an unread store | authorized change (ab45be2) |
 | KV-parity reference must share the producer lineage | prior learning `kv-parity-reference-shares-producer-lineage` | n/a (applied) | memory-twin reference now governs the gate | applied, confidence 10/10 |
 
 ## Coverage limits and cleanup

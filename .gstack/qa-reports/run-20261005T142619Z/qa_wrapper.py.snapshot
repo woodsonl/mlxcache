@@ -219,6 +219,13 @@ class Server:
                     events.append(json.loads(payload))
         return events
 
+    def stats(self) -> dict:
+        """GET /mlxcache/stats: the live cache's reuse counters. Response
+        equality at temperature 0 cannot distinguish a disk resume from a
+        full prefill; the counter can."""
+        with urllib.request.urlopen(f"{self.base}/mlxcache/stats", timeout=10) as r:
+            return json.loads(r.read())
+
     def stop(self):
         if self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
@@ -344,6 +351,11 @@ def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, 
             code, body = srv2.post("/v1/chat/completions", _grown_body(chat_body, chat1))
             expect(code == 200, f"status {code}")
             state["grown"] = body["choices"][0]["message"]["content"]
+            # The fresh process must have REUSED the persisted turn-1 stream,
+            # not merely re-prefilled it: the counter proves it took the disk
+            # path (at temp 0 the two are token-identical).
+            hits = srv2.stats().get("disk_hits") or 0
+            expect(hits > 0, f"restart served without a disk hit (disk_hits={hits})")
 
     @probe("Q5 disk-resume identity (second fresh process)")
     def _():
@@ -359,6 +371,8 @@ def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, 
                 f"second disk-resumed answer diverged:\n"
                 f" A={grown_state[:80]!r}\n B={body['choices'][0]['message']['content'][:80]!r}",
             )
+            hits = srv3.stats().get("disk_hits") or 0
+            expect(hits > 0, f"second process served without a disk hit (disk_hits={hits})")
 
     @probe("Q7 store hygiene")
     def _():

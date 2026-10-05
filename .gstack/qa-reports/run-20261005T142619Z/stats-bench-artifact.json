@@ -1,0 +1,56 @@
+{
+  "model": "<HOME>/models/models--mlx-community--Qwen2.5-7B-Instruct-4bit/snapshots/c26a38f6a37d0a51b4e9a1eb3026530fa35d9fed",
+  "results": [
+    {
+      "leg": "cold-turn1",
+      "wall_ms": 619.0,
+      "text": "The theory of persistent key-value (KV) cache reuse is a strategy used in",
+      "verdict": "token-identical",
+      "reused": {}
+    },
+    {
+      "leg": "warm-turn1",
+      "wall_ms": 331.4,
+      "text": "The theory of persistent key-value (KV) cache reuse is a strategy used in",
+      "verdict": "token-identical",
+      "reused": {}
+    },
+    {
+      "leg": "memory-turn2",
+      "wall_ms": 386.2,
+      "text": "The theory of persistent key-value (KV) cache reuse involves maintaining a cache of",
+      "verdict": "token-identical",
+      "reused": {}
+    },
+    {
+      "leg": "restart-turn2",
+      "wall_ms": 394.2,
+      "text": "The theory of persistent key-value (KV) cache reuse involves maintaining a cache of",
+      "verdict": "token-identical",
+      "reused": {
+        "disk_hits": 1,
+        "persisted": 1,
+        "reuse_errors": 0,
+        "persist_errors": 0,
+        "prefill_skip_pct": 93,
+        "request_tokens": 282,
+        "disk_covered": 262
+      }
+    },
+    {
+      "leg": "second-turn2",
+      "wall_ms": 504.0,
+      "text": "The theory of persistent key-value (KV) cache reuse involves maintaining a cache of",
+      "verdict": "token-identical",
+      "reused": {
+        "disk_hits": 1,
+        "persisted": 1,
+        "reuse_errors": 0,
+        "persist_errors": 0,
+        "prefill_skip_pct": 93,
+        "request_tokens": 282,
+        "disk_covered": 262
+      }
+    }
+  ]
+}
