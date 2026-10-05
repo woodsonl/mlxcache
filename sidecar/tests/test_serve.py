@@ -185,8 +185,8 @@ def test_cli_swaps_the_cache_factory_and_restores(monkeypatch, tmp_path):
 
 
 def test_cli_no_separator_passthrough(monkeypatch, tmp_path):
-    """--model must reach mlx-lm, never abbreviate into --model-id-override
-    (argparse allow_abbrev ate it — a review-wave CRITICAL)."""
+    """--model must reach mlx-lm verbatim: allow_abbrev would fold it into
+    --model-id-override and silently repartition the store."""
     import mlx_lm.server as mlx_server
 
     captured = {}
