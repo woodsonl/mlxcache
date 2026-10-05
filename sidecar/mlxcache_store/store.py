@@ -249,10 +249,10 @@ class Store:
             bump += 1
             name = f"{key:032x}-{generation + bump:016x}{CKPT_SUFFIX}"
         final = self.dir / name
-        # Collision-proof tmp suffix: id(self) is RECYCLED after GC, so
-        # pid+id+thread-ident can repeat across instances (observed as an
-        # O_EXCL FileExistsError under the test suite); a uuid4 cannot.
-        # O_EXCL also refuses a pre-planted symlink at the tmp path.
+        # Collision-proof tmp suffix: id(self) is recycled after GC, so
+        # pid+id+thread-ident can repeat across instances and O_EXCL would
+        # spuriously refuse the write. O_EXCL also refuses a pre-planted
+        # symlink at the tmp path.
         tmp = self.dir / f"{name}.tmp{uuid.uuid4().hex}"
         data = blob.encode(meta, payload)
         try:
