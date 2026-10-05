@@ -99,11 +99,13 @@
 ## Addendum: final fix-wave after the live run
 
 The live 7B evidence above was produced on the ab45be2 bytes. The final
-merge head additionally carries e32b12d and 168471d: the sorted(glob)
-snapshot fallback cut from both resolvers (real errors now fall to the
-clean SystemExit), CORS headers on /mlxcache/stats, importorskip guards
-for dev-only CI, dangling plan-§D tokens removed from docstrings, and
-the README wrapper section + CHANGELOG. None of these touch the reuse
+merge head additionally carries a790884 (evidence refresh), 6ad9752 (CORS
+on /mlxcache/stats), 5b6a8be (importorskip guards for dev-only CI),
+e32b12d (the sorted(glob) snapshot fallback cut from both resolvers —
+real errors now fall to the clean SystemExit — plus the README wrapper
+section and CHANGELOG), 168471d (README endpoint count), and f04ddda
+(dangling plan-§D tokens removed from docstrings; this snapshot
+refresh). None of these touch the reuse
 path under test; each is pinned by the committed unit tests on the exact
 merge head (test_harness_readiness.py, test_serve_stats.py,
 test_serve_route_swap.py). The *.snapshot files in this directory are the
