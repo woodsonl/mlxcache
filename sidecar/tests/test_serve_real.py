@@ -1,10 +1,11 @@
 """Real-engine thesis guard for the WRAPPER (B1.2).
 
-The wrapper's own gate: a disk-resumed generation through
-PersistentPromptCache must be token-identical to scratch. The fake-codec
-unit tests cannot see KV positions; THIS test can: a payload stored
-covering all of T instead of T[:-1] shifts the resumed context and
-diverges within a few tokens.
+The wrapper's own gate: the resumed CONTINUATION (context T = the stored
+stream minus its last token) must be token-identical to the memory
+lineage's continuation from the same context T. The fake-codec unit
+tests cannot see KV positions; THIS test can: a payload stored covering
+all of T instead of T[:-1] shifts the disk side to T+[dup] and diverges
+within the window — the assert below pins the §3.2 convention.
 
 Run: MLXCACHE_BENCH_REAL=1 uv run pytest sidecar/tests/test_serve_real.py -v
 Requires a downloaded model (Qwen2-0.5B-Instruct, ~500MB) and Apple Silicon.
@@ -40,15 +41,13 @@ def _sample(logits):
     return int(mx.argmax(logits[:, -1, :], axis=-1).item())
 
 
-def _generate_with_cache(engine, model, prompt_ids, cache, n):
+def _generate_with_cache(model, prompt_ids, cache, n):
     """Feed prompt_ids into `cache`, then generate n tokens step-by-step
     through generate_step (each yielded token was fed into the cache
     before being produced — the exact producer shape the server's finish
     sites see). Returns the generated token ids."""
     import mlx.core as mx
     from mlx_lm.generate import generate_step
-
-    from mlxcache_sidecar.server import MlxLmEngine  # noqa: F401 — parity with other suites
 
     out = []
     for generated, _logits in generate_step(
@@ -63,7 +62,7 @@ def _generate_with_cache(engine, model, prompt_ids, cache, n):
 def test_disk_resumed_generation_matches_scratch(engine, tmp_path):
     """insert_cache (finish site, post-generation state covering ALL of T)
     → fetch on a fresh cache instance (simulated restart) → the wrapper's
-    feed math must reproduce scratch EXACTLY."""
+    feed math must reproduce the memory lineage's continuation EXACTLY."""
     import mlx.core as mx
     from mlx_lm.models.cache import make_prompt_cache
     from mlxcache_serve import PersistentPromptCache, default_fingerprint_for
@@ -75,7 +74,7 @@ def test_disk_resumed_generation_matches_scratch(engine, tmp_path):
 
     # 1. Scratch: fresh cache over the full prompt, then step.
     scratch_cache = make_prompt_cache(engine.model)
-    scratch = _generate_with_cache(engine, engine.model, prompt, scratch_cache, MAX_TOKENS)
+    scratch = _generate_with_cache(engine.model, prompt, scratch_cache, MAX_TOKENS)
     assert len(scratch) == MAX_TOKENS
 
     # 2. The finish-site state: the SAME generation's cache now covers
@@ -107,7 +106,9 @@ def test_disk_resumed_generation_matches_scratch(engine, tmp_path):
     resumed = [
         int(g.item()) if hasattr(g, "item") else int(g)
         for g, _lg in generate_step(
-            mx.array(rest), engine.model, prompt_cache=disk_cache,
+            mx.array(rest),
+            engine.model,
+            prompt_cache=disk_cache,
             max_tokens=MAX_TOKENS,
         )
     ][:MAX_TOKENS]
@@ -115,9 +116,18 @@ def test_disk_resumed_generation_matches_scratch(engine, tmp_path):
     # MAX_TOKENS-1 tokens are the continuation the scratch lineage would
     # produce next. Produce that reference from the scratch side: keep
     # generating beyond scratch with the SAME memory lineage.
-    scratch_continuation = _generate_with_cache(
-        engine, engine.model, rest, scratch_cache, MAX_TOKENS - 1
-    )
+    # Reference: the memory TWIN of the disk path — the same trim-by-one
+    # the writer applies, then the same single-token feed. Both sides then
+    # sample from context T (the stored stream minus its last token); an
+    # untrimmed payload would push the disk side to T+[dup] and diverge,
+    # so this comparison is what pins the §3.2 convention.
+    import copy as _copy
+
+    from mlx_lm.models.cache import trim_prompt_cache
+
+    ref_cache = _copy.deepcopy(scratch_cache)
+    assert trim_prompt_cache(ref_cache, 1) == 1
+    scratch_continuation = _generate_with_cache(engine.model, rest, ref_cache, MAX_TOKENS - 1)
     assert len(resumed) >= MAX_TOKENS - 1, f"short resume: {len(resumed)}"
     assert resumed[: len(scratch_continuation)] == scratch_continuation, (
         "disk-resumed generation diverged from the memory lineage — the §3.2 "
