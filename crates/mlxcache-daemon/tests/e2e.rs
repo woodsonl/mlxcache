@@ -877,12 +877,21 @@ async fn end_to_end_miss_then_hit() {
 /// tail-of-test kill+wait only runs on the happy path — failed sweeps leaked
 /// one `uv run python` engine per failed test (64 strays held real RAM after
 /// the 2026-10-04 sweeps; engines are GB-scale residents).
-struct SidecarHandle(std::process::Child);
+struct SidecarHandle {
+    child: std::process::Child,
+    // The child's stdout after the PORT line was consumed: held open and
+    // drained so the child never blocks on a full pipe mid-test, and closed
+    // by the Drop kill (EOF ends the drain).
+    _stdout_drain: Option<std::thread::JoinHandle<()>>,
+}
 
 impl Drop for SidecarHandle {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(handle) = self._stdout_drain.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -890,81 +899,132 @@ impl std::ops::Deref for SidecarHandle {
     type Target = std::process::Child;
 
     fn deref(&self) -> &std::process::Child {
-        &self.0
+        &self.child
     }
 }
 
 impl std::ops::DerefMut for SidecarHandle {
     fn deref_mut(&mut self) -> &mut std::process::Child {
-        &mut self.0
+        &mut self.child
     }
 }
 
 async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> Option<(String, SidecarHandle)> {
     // The health probe needs its own deadline: `reqwest::get` is a bare
-    // client with NO timeout, so under a loaded machine (18 parallel `uv
-    // run` starts resolving simultaneously) a half-open connect hangs the
-    // poll forever and the test wedges instead of failing. A per-attempt
-    // timeout converts that into the intended "not up yet" retry.
+    // client with NO timeout, so under a loaded machine (parallel e2e
+    // spawns) a half-open connect hangs the poll forever and the test
+    // wedges instead of failing. A per-attempt timeout converts that into
+    // the intended "not up yet" retry.
     let probe = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .expect("probe client");
-    // Retry on a FRESH port when our own sidecar dies at bind time:
-    // portpicker can hand the same port to two spawns launched milliseconds
-    // apart (two_models test), and a health answer on that port then comes
-    // from the WRONG engine — silent cross-model contamination
-    // (two_models_same_tokens flake, 2026-10-04).
-    for _ in 0..3 {
-        let port = portpicker::pick_unused_port().expect("free port");
-        let script = format!(
-            "import sys; sys.path.insert(0, {root:?}); \
-             from mlxcache_sidecar import server; \
-             server.Handler.engine = server.make_engine('e2e-model'); \
-             server.BurstServer(('127.0.0.1', {port}), server.Handler).serve_forever()",
-            root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
-            port = port
-        );
-        // Spawn the venv python DIRECTLY, not via `uv run`: uv keeps itself
-        // resident and spawns python as a CHILD, so SIGKILL to the Child we
-        // hold reaps uv and ORPHANS the server (the 64-stray leak held real
-        // RAM across sweeps, 2026-10-04) — and 18 concurrent `uv run` starts
-        // contend on uv's environment lock, the original parallel-e2e flake
-        // source. One process, one kill, no lock.
-        let python = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.venv/bin/python");
-        assert!(
-            std::path::Path::new(python).exists(),
-            "e2e needs the repo venv at {python:?} (uv sync)"
-        );
-        let mut cmd = std::process::Command::new(python);
-        cmd.arg("-c").arg(&script);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(_) => return None,
-        };
-        let url = format!("http://127.0.0.1:{port}");
-        let alive = |child: &mut std::process::Child| {
-            child.try_wait().map_or(true, |status| status.is_none())
-        };
-        for _ in 0..100 {
-            // Trust a health answer ONLY while OUR child is alive: a dead
-            // child means our bind failed and any responder on this port is
-            // someone else's server.
-            if !alive(&mut child) {
-                break; // bind race (or crash): retry on a fresh port
-            }
-            if probe.get(format!("{url}/health")).send().await.is_ok() {
-                return Some((url, SidecarHandle(child)));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+    // The child binds port 0 (kernel-assigned) and prints its actual port —
+    // the URL is derived from OUR child's own bind, so a health answer on it
+    // cannot come from another test's sidecar. The previous portpicker scheme
+    // raced: two spawns milliseconds apart could take the same "unused" port,
+    // and a foreign server answering health in the alive-check window made
+    // the daemon 503 the moment that server's own test killed it
+    // (two_models_same_tokens flake 2026-10-04, again 2026-10-05).
+    let script = format!(
+        "import sys; sys.path.insert(0, {root:?}); \
+         from mlxcache_sidecar import server; \
+         server.Handler.engine = server.make_engine('e2e-model'); \
+         srv = server.BurstServer(('127.0.0.1', 0), server.Handler); \
+         print('PORT=%d' % srv.server_address[1], flush=True); \
+         srv.serve_forever()",
+        root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
+    );
+    // Spawn the venv python DIRECTLY, not via `uv run`: uv keeps itself
+    // resident and spawns python as a CHILD, so SIGKILL to the Child we
+    // hold reaps uv and ORPHANS the server (the 64-stray leak held real
+    // RAM across sweeps, 2026-10-04) — and 18 concurrent `uv run` starts
+    // contend on uv's environment lock, the original parallel-e2e flake
+    // source. One process, one kill, no lock.
+    let python = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.venv/bin/python");
+    assert!(
+        std::path::Path::new(python).exists(),
+        "e2e needs the repo venv at {python:?} (uv sync)"
+    );
+    let mut cmd = std::process::Command::new(python);
+    cmd.arg("-c").arg(&script);
+    cmd.stdout(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
     }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    // Read the PORT line with a deadline: the kernel-assigned port is the
+    // only one that can truthfully answer for this child. The thread hands
+    // the stdout back either way — the drain below needs the pipe open.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let port = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let port = line.strip_prefix("PORT=").map(|p| p.trim().to_string());
+            let _ = tx.send((port, reader.into_inner()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok((Some(port), stdout)) => match port.parse::<u16>() {
+                Ok(p) => {
+                    // Re-arm stdout for the drain below.
+                    (p, stdout)
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            },
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let (port, stdout) = port;
+    // Drain the rest of stdout in the background: the synthetic sidecar is
+    // quiet, but a traceback must never fill the pipe and wedge the child.
+    let drain = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdout = stdout;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+    let url = format!("http://127.0.0.1:{port}");
+    let alive = |child: &mut std::process::Child| {
+        child.try_wait().map_or(true, |status| status.is_none())
+    };
+    for _ in 0..100 {
+        // Trust a health answer ONLY while OUR child is alive: a dead
+        // child means our serve loop crashed and any responder on this
+        // port is not ours.
+        if !alive(&mut child) {
+            break;
+        }
+        if probe.get(format!("{url}/health")).send().await.is_ok() {
+            let handle = SidecarHandle {
+                child,
+                _stdout_drain: Some(drain),
+            };
+            return Some((url, handle));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
     None
 }
 
