@@ -43,7 +43,7 @@ fn bench_blob_key(c: &mut Criterion) {
     for n in [128usize, 2048, 32_768] {
         let tokens: Vec<u32> = (0..n as u32).collect();
         group.bench_function(format!("key_{n}_tokens"), |b| {
-            b.iter(|| black_box(blob_key(black_box(&fingerprint), black_box(&tokens))))
+            b.iter(|| black_box(blob_key(black_box(&fingerprint), None, black_box(&tokens))))
         });
     }
     group.finish();

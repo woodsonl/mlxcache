@@ -34,6 +34,8 @@ fn build_index(count: usize, chain_len: usize) -> PrefixIndex {
             tokens: tokens.clone(),
             format_version: 1,
             payload_sha256: None,
+            engine_id: None,
+            granularity: None,
         };
         index.publish(
             &tokens,
@@ -54,6 +56,8 @@ fn build_index(count: usize, chain_len: usize) -> PrefixIndex {
             tokens: tokens.clone(),
             format_version: 1,
             payload_sha256: None,
+            engine_id: None,
+            granularity: None,
         };
         index.publish(
             &tokens,
@@ -118,6 +122,8 @@ fn bench_publish(c: &mut Criterion) {
                     tokens: tokens.clone(),
                     format_version: 1,
                     payload_sha256: None,
+                    engine_id: None,
+                    granularity: None,
                 };
                 assert!(index.publish(&tokens, meta, "b".into(), 1, |_| {}));
                 assert_eq!(
