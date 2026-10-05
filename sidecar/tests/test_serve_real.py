@@ -111,6 +111,15 @@ def test_disk_resumed_generation_matches_scratch(engine, tmp_path):
             max_tokens=MAX_TOKENS,
         )
     ][:MAX_TOKENS]
-    assert resumed == scratch, (
-        "disk-resumed generation diverged from scratch — the §3.2 coverage convention is broken"
+    # The resumed stream continues AFTER the stored generation: its first
+    # MAX_TOKENS-1 tokens are the continuation the scratch lineage would
+    # produce next. Produce that reference from the scratch side: keep
+    # generating beyond scratch with the SAME memory lineage.
+    scratch_continuation = _generate_with_cache(
+        engine, engine.model, rest, scratch_cache, MAX_TOKENS - 1
+    )
+    assert len(resumed) >= MAX_TOKENS - 1, f"short resume: {len(resumed)}"
+    assert resumed[: len(scratch_continuation)] == scratch_continuation, (
+        "disk-resumed generation diverged from the memory lineage — the §3.2 "
+        "coverage convention is broken"
     )
