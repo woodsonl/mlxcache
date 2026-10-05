@@ -53,8 +53,150 @@ class TempSafetensors:
             os.unlink(self.path)
 
 
+# The measured kernel-path noise between a batch prefill and a delta feed
+# over bitwise-equal KV: ±0.3 per side. A sampled-token flip is
+# noise-explainable only under the two-sided band.
+NEAR_TIE_BAND = 0.6
+
+
+class _RecordDecode:
+    """Transparent model proxy capturing per-step decode logits. Generated
+    token k comes from the k-th [1,1] call: stream_generate batch-prefills
+    prompt[:-1] in one call, then decodes one token per call."""
+
+    def __init__(self, model):
+        self.model = model
+        self.decode_logits = []
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
+
+    def __call__(self, *args, **kwargs):
+        out = self.model(*args, **kwargs)
+        shape = args[0].shape
+        if len(shape) == 2 and shape[1] == 1:
+            self.decode_logits.append(out.reshape(-1))
+        return out
+
+
+def _witness_scratch(resumed, scratch, twin_logits, scratch_logits=None):
+    """The scratch canary shared by the resume-parity tests. Sampled-token
+    divergence from a fresh batch prefill is permitted ONLY at a near-tie
+    step. The flip is licensed by the top-2 margin at the first divergence,
+    taken as the MIN of the margins available on each lineage (twin always;
+    scratch too when recorded) — corruption on either lineage cannot
+    manufacture its own near-tie license by narrowing its own gap."""
+    if resumed == scratch:
+        return
+    k = next(
+        (i for i, (a, b) in enumerate(zip(resumed, scratch, strict=False)) if a != b),
+        None,
+    )
+    if k is None:
+        pytest.fail(
+            "one run is a strict prefix of the other (terminal-token "
+            f"divergence at an EOS/continuation near-tie); "
+            f"len(resumed)={len(resumed)} vs len(scratch)={len(scratch)}"
+        )
+
+    def _gap(logits):
+        assert k < len(logits), "decode logits missing at the divergence step"
+        top2 = sorted(logits[k].tolist(), reverse=True)[:2]
+        return top2[0] - top2[1]
+
+    gap = _gap(twin_logits)
+    if scratch_logits is not None:
+        gap = min(gap, _gap(scratch_logits))
+    assert gap < NEAR_TIE_BAND, (
+        f"resume diverged from scratch at step {k} with margin {gap:.4g} "
+        f"above the {NEAR_TIE_BAND} noise band — not a near-tie flip; "
+        "investigate the resume path"
+    )
+
+
+def _state_max_diff(cache_a, cache_b):
+    """Max absolute elementwise difference between two prompt caches' states.
+    Bitwise-equal producer states differ by the kernel-path noise (~0.3);
+    wrong KV, an off-by-one feed, or a corrupted round-trip produces
+    differences orders of magnitude larger."""
+    import mlx.core as mx
+
+    worst = 0.0
+    for ca, cb in zip(cache_a, cache_b, strict=True):
+        for sa, sb in zip(ca.state, cb.state, strict=True):
+            diff = mx.abs(sa - sb).max().item()
+            worst = max(worst, float(diff))
+    return worst
+
+
+class _ResumeSpy:
+    """Wraps engine._load_cache_delta to prove the resume actually adopted a
+    loaded cache instead of silently falling back to a scratch prefill — the
+    direct read_wire_checkpoint assert cannot see a fallback that happens
+    inside the engine's own resume call."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.adopted = None
+
+    def __enter__(self):
+        engine = self.engine
+        spy = self
+
+        def _spied(tokens, blob_path):
+            cache, delta = engine._load_cache_delta.__wrapped__(tokens, blob_path)
+            spy.adopted = cache is not None
+            return cache, delta
+
+        _spied.__wrapped__ = engine._load_cache_delta
+        engine._load_cache_delta = _spied
+        return self
+
+    def __exit__(self, *exc):
+        del self.engine._load_cache_delta
+        return False
+
+
+def _blob_bytes(engine, tokens, payload):
+    """The daemon wire format for a published checkpoint (header + payload)."""
+    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+
+    meta = CheckpointMeta(
+        fingerprint=Fingerprint(
+            model_id=engine.model_id,
+            tokenizer_hash=engine.tokenizer_hash,
+            kv_dtype=engine.kv_dtype,
+            kv_layout_version=1,
+        ),
+        token_count=len(tokens),
+        tokens=tokens,
+    )
+    return encode(meta, payload)
+
+
+def _twin_generate(engine, delta, twin_cache, max_tokens=64):
+    """Generation from a memory-resident producer state, with per-step decode
+    logits captured. Returns (tokens, decode_logits)."""
+    recorder = _RecordDecode(engine.model)
+    engine.model = recorder
+    try:
+        tokens = engine._generate_with_cache(delta, max_tokens, twin_cache)
+    finally:
+        engine.model = recorder.model
+    return tokens, recorder.decode_logits
+
+
 def test_roundtrip_logits_identical(engine):
-    """The thesis guard: resumed generation == scratch generation."""
+    """The raw thesis guard: a saved-then-loaded prompt cache is faithful to
+    the producer state that wrote it.
+
+    The equality target is the producer twin — the identical prefill state
+    held in memory — not a fresh batch prefill of the full prompt. Batch
+    prefill and the final-token feed run different kernel shapes, and their
+    ~0.3 logit disagreement decides zero-margin argmax steps per-device
+    (issue #27); the twin isolates the variable under test, the save/load
+    round-trip. The scratch run remains a margin-guarded canary (see
+    _witness_scratch)."""
     import mlx.core as mx
     from mlx_lm import stream_generate
     from mlx_lm.models.cache import load_prompt_cache, make_prompt_cache, save_prompt_cache
@@ -63,12 +205,20 @@ def test_roundtrip_logits_identical(engine):
     # identical prefixes diverge later; 64 tokens of equality is parity.
     tokens = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 4)
 
-    scratch = [
-        r.token
-        for r in stream_generate(
-            engine.model, engine.tokenizer, prompt=mx.array(tokens), max_tokens=64
-        )
-    ]
+    scratch_recorder = _RecordDecode(engine.model)
+    engine.model = scratch_recorder
+    try:
+        scratch = [
+            r.token
+            for r in stream_generate(
+                scratch_recorder,
+                engine.tokenizer,
+                prompt=mx.array(tokens),
+                max_tokens=64,
+            )
+        ]
+    finally:
+        engine.model = scratch_recorder.model
 
     # Cache path: prefill tokens[:-1], save, load, feed the final token as delta.
     cache = make_prompt_cache(engine.model)
@@ -88,10 +238,17 @@ def test_roundtrip_logits_identical(engine):
             )
         ]
 
-    assert resumed == scratch, (
-        "resumed generation diverged from scratch:\n"
-        f"  resumed={resumed[:8]}\n  scratch={scratch[:8]}"
+    # The twin: the identical producer state, memory-resident.
+    twin_cache = make_prompt_cache(engine.model)
+    engine.model(mx.array(tokens[:-1])[None], cache=twin_cache)
+    mx.eval([c.state for c in twin_cache])
+    twin, logits = _twin_generate(engine, tokens[-1:], twin_cache)
+
+    assert resumed == twin, (
+        "round-trip is not faithful to the producer state:\n"
+        f"  resumed={resumed[:8]}\n  twin={twin[:8]}"
     )
+    _witness_scratch(resumed, scratch, logits, scratch_recorder.decode_logits)
 
 
 def test_adapter_prefill_resume_matches_scratch(engine):
@@ -99,56 +256,83 @@ def test_adapter_prefill_resume_matches_scratch(engine):
     not raw mlx-lm. This is what the daemon actually calls on a miss then a hit:
     the earlier convention bug (seeding the cache with all N tokens while the
     resume path fed tokens[cached-1:]) made every real hit double-feed the last
-    token and diverge from scratch. This test would have caught it."""
+    token and diverge. This test would have caught it.
+
+    The equality target is the producer twin (the identical
+    _prefill_cache(tokens[:-1]) state, memory-resident), not a fresh batch
+    prefill: the two kernel shapes disagree at zero-margin argmax steps
+    per-device (issue #27). Scratch remains a margin-guarded canary."""
     import mlx.core as mx
     from mlx_lm import stream_generate
-    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+    from mlxcache_sidecar.server import read_wire_checkpoint
+
+    # The twin premise (blob == producer state) holds only unquantized; a
+    # quantized run of this module is a supported config that these twin
+    # comparators do not cover.
+    if engine.kv_bits != 0:
+        pytest.skip("twin parity is defined for f16; real-model quantized parity is uncovered")
 
     tokens = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 4)
 
     # 64 generated tokens: see the oracle-width note in the raw test above.
-    scratch = [
-        r.token
-        for r in stream_generate(
-            engine.model, engine.tokenizer, prompt=mx.array(tokens), max_tokens=64
-        )
-    ]
+    scratch_recorder = _RecordDecode(engine.model)
+    engine.model = scratch_recorder
+    try:
+        scratch = [
+            r.token
+            for r in stream_generate(
+                scratch_recorder,
+                engine.tokenizer,
+                prompt=mx.array(tokens),
+                max_tokens=64,
+            )
+        ]
+    finally:
+        engine.model = scratch_recorder.model
 
     # Miss path: the adapter produces the raw KV payload the daemon persists.
     payload = engine.prefill(tokens)
-    meta = CheckpointMeta(
-        fingerprint=Fingerprint(
-            model_id=engine.model_id,
-            tokenizer_hash=engine.tokenizer_hash,
-            kv_dtype=engine.kv_dtype,
-            kv_layout_version=1,
-        ),
-        token_count=len(tokens),
-        tokens=tokens,
-    )
-    blob = encode(meta, payload)
+    blob = _blob_bytes(engine, tokens, payload)
 
     with TempSafetensors() as path:
         with open(path, "wb") as fh:
             fh.write(blob)
-        # Hit path: resume from the persisted blob exactly as the daemon does.
-        resumed = engine.generate_from_blob(tokens, path, max_tokens=64)
+        # The gate is vacuous if the resume silently fell back to a scratch
+        # prefill: prove the checkpoint is consumable for this request.
+        _, _, usable = read_wire_checkpoint(path, tokens)
+        assert usable, "checkpoint unexpectedly unusable; the resume would fall back to scratch"
+        # Hit path: resume from the persisted blob exactly as the daemon does,
+        # with the spy proving the loaded cache was actually adopted.
+        with _ResumeSpy(engine) as resume_spy:
+            resumed = engine.generate_from_blob(tokens, path, max_tokens=64)
+        assert resume_spy.adopted, "resume fell back to a scratch prefill"
 
-    assert resumed == scratch, (
-        "adapter resume diverged from scratch (cache convention bug):\n"
-        f"  resumed={resumed[:8]}\n  scratch={scratch[:8]}"
+    # The twin: the identical producer prefill, memory-resident. The payload
+    # at T covers T[:-1], so the resume convention feeds tokens[len-1:].
+    twin_cache, _ = engine._prefill_cache(tokens[:-1])
+    twin, logits = _twin_generate(engine, tokens[len(tokens) - 1 :], twin_cache)
+
+    assert resumed == twin, (
+        "adapter resume diverged from its producer twin "
+        "(round-trip or feed-convention defect):\n"
+        f"  resumed={resumed[:8]}\n  twin={twin[:8]}"
     )
+    _witness_scratch(resumed, scratch, logits, scratch_recorder.decode_logits)
 
 
 def test_adapter_delta_prefill_matches_scratch(engine):
     """OV3 parity on the REAL engine: generation resumed from a blob whose KV
     was built by DELTA prefill (ancestor KV + only the uncovered tokens) must
-    be token-identical to scratch. This is the shipped fast path for a growing
-    conversation — if adopting ancestor KV diverges, every partial hit after
-    this change is silently wrong, so it is pinned here at oracle width."""
+    match its producer twin — the delta-prefilled state held in memory,
+    before the second round-trip. This is the shipped fast path for a growing
+    conversation; if adopting ancestor KV corrupted state, every partial hit
+    would be silently wrong. Scratch remains a margin-guarded canary."""
     import mlx.core as mx
     from mlx_lm import stream_generate
-    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+    from mlxcache_sidecar.server import read_wire_checkpoint
+
+    if engine.kv_bits != 0:
+        pytest.skip("twin parity is defined for f16; real-model quantized parity is uncovered")
 
     base = engine.tokenize("The quick brown fox jumps over the lazy dog.")
     grown = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 4)
@@ -156,28 +340,26 @@ def test_adapter_delta_prefill_matches_scratch(engine):
         "test premise: the grown prompt must extend the base token-for-token"
     )
 
-    scratch = [
-        r.token
-        for r in stream_generate(
-            engine.model, engine.tokenizer, prompt=mx.array(grown), max_tokens=64
-        )
-    ]
+    scratch_recorder = _RecordDecode(engine.model)
+    engine.model = scratch_recorder
+    try:
+        scratch = [
+            r.token
+            for r in stream_generate(
+                scratch_recorder,
+                engine.tokenizer,
+                prompt=mx.array(grown),
+                max_tokens=64,
+            )
+        ]
+    finally:
+        engine.model = scratch_recorder.model
 
     # Step 1: publish the ancestor (full prefill of the short prompt).
     ancestor_payload = engine.prefill(base)
     with TempSafetensors() as ancestor_path:
-        meta = CheckpointMeta(
-            fingerprint=Fingerprint(
-                model_id=engine.model_id,
-                tokenizer_hash=engine.tokenizer_hash,
-                kv_dtype=engine.kv_dtype,
-                kv_layout_version=1,
-            ),
-            token_count=len(base),
-            tokens=base,
-        )
         with open(ancestor_path, "wb") as fh:
-            fh.write(encode(meta, ancestor_payload))
+            fh.write(_blob_bytes(engine, base, ancestor_payload))
 
         # Step 2: delta prefill of the grown prompt from the ancestor.
         delta_payload = engine.prefill(grown, ancestor_blob_path=ancestor_path)
@@ -185,26 +367,57 @@ def test_adapter_delta_prefill_matches_scratch(engine):
             "delta prefill recomputed the whole prompt "
             f"({engine.last_prefill_delta_tokens} of {len(grown) - 1} steps)"
         )
-        meta = CheckpointMeta(
-            fingerprint=Fingerprint(
-                model_id=engine.model_id,
-                tokenizer_hash=engine.tokenizer_hash,
-                kv_dtype=engine.kv_dtype,
-                kv_layout_version=1,
-            ),
-            token_count=len(grown),
-            tokens=grown,
-        )
         with TempSafetensors() as delta_path:
             with open(delta_path, "wb") as fh:
-                fh.write(encode(meta, delta_payload))
-            # Step 3: resume generation from the delta-prefilled blob.
-            resumed = engine.generate_from_blob(grown, delta_path, max_tokens=64)
+                fh.write(_blob_bytes(engine, grown, delta_payload))
+            # The gate is vacuous if the resume silently fell back to scratch.
+            _, _, usable = read_wire_checkpoint(delta_path, grown)
+            assert usable, "delta checkpoint unexpectedly unusable"
+            # Step 3: resume generation from the delta-prefilled blob, with
+            # the spy proving the loaded cache was actually adopted.
+            with _ResumeSpy(engine) as resume_spy:
+                resumed = engine.generate_from_blob(grown, delta_path, max_tokens=64)
+            assert resume_spy.adopted, "resume fell back to a scratch prefill"
 
-    assert resumed == scratch, (
-        "delta-prefill resume diverged from scratch:\n"
-        f"  resumed={resumed[:8]}\n  scratch={scratch[:8]}"
+        # The twin: the delta-prefilled producer state, memory-resident. Adopt
+        # the ancestor payload and feed the uncovered tail exactly as prefill()
+        # does, minus the second round-trip. Runs INSIDE the ancestor's
+        # temp-file context: the ancestor bytes back both the delta prefill
+        # and the twin.
+        ancestor_meta, ancestor_payload2, ancestor_usable = read_wire_checkpoint(
+            ancestor_path, grown
+        )
+        assert ancestor_usable, "ancestor checkpoint unexpectedly unusable for the twin"
+        twin_cache = engine._load_cache_from_payload(ancestor_payload2)
+        covered = len(ancestor_meta.tokens) - 1
+        engine.model(mx.array(grown[covered:-1])[None], cache=twin_cache)
+        mx.eval([c.state for c in twin_cache])
+
+    # The composition gate: twin and resumed share the ancestor round-trip,
+    # so twin equality alone cannot see an ancestor-adopt defect. The
+    # delta-adopted state must also sit within kernel-path noise of a fresh
+    # full prefill of the same prompt: measured composition noise on this
+    # lineage is 0.5 max-abs, so a composition defect (wrong KV, wrong feed
+    # position) lands well above the 1.0 bound. Computed BEFORE the twin
+    # generates — generation extends the cache and would break the shape
+    # pairing.
+    fresh_cache, _ = engine._prefill_cache(grown[:-1])
+    state_diff = _state_max_diff(twin_cache, fresh_cache)
+    assert state_diff < 1.0, (
+        "delta-adopted KV diverged from a fresh full prefill by "
+        f"{state_diff:.4g} — the OV3 composition is corrupt"
     )
+
+    # Generation extends twin_cache past the compared prefix, so the twin
+    # runs after the state gate.
+    twin, logits = _twin_generate(engine, grown[len(grown) - 1 :], twin_cache)
+
+    assert resumed == twin, (
+        "delta-prefill resume diverged from its producer twin "
+        "(round-trip or feed-convention defect):\n"
+        f"  resumed={resumed[:8]}\n  twin={twin[:8]}"
+    )
+    _witness_scratch(resumed, scratch, logits, scratch_recorder.decode_logits)
 
 
 def test_adapter_divergent_resume_matches_scratch(engine):
@@ -234,16 +447,14 @@ def test_adapter_divergent_resume_matches_scratch(engine):
     """
     import mlx.core as mx
     from mlx_lm import stream_generate
-    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+    from mlxcache_sidecar.server import read_wire_checkpoint
 
     # The twin premise (blob == producer state) holds only at f16: with KV
     # quantization on, the blob holds a QuantizedKVCache while the twin stays
     # f16, and the comparison stops isolating the round-trip (the T12 q8
     # tier has its own parity tests).
-    assert engine.kv_bits == 0, (
-        "T22 twin parity is defined for f16 (kv_bits=0); run the T12 tier "
-        "tests for quantized parity"
-    )
+    if engine.kv_bits != 0:
+        pytest.skip("twin parity is defined for f16; real-model quantized parity is uncovered")
 
     base = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 40)
     assert len(base) > 64
@@ -252,97 +463,46 @@ def test_adapter_divergent_resume_matches_scratch(engine):
     divergent = base[:-1] + [2, 11, 5678]
     assert divergent[: len(base) - 1] == base[:-1] and divergent[len(base) - 1] != base[-1]
 
-    scratch = [
-        r.token
-        for r in stream_generate(
-            engine.model, engine.tokenizer, prompt=mx.array(divergent), max_tokens=64
-        )
-    ]
+    scratch_recorder = _RecordDecode(engine.model)
+    engine.model = scratch_recorder
+    try:
+        scratch = [
+            r.token
+            for r in stream_generate(
+                scratch_recorder,
+                engine.tokenizer,
+                prompt=mx.array(divergent),
+                max_tokens=64,
+            )
+        ]
+    finally:
+        engine.model = scratch_recorder.model
 
     # Publish the ancestor (the key), then resume the divergent request from it.
     payload = engine.prefill(base)
-    meta = CheckpointMeta(
-        fingerprint=Fingerprint(
-            model_id=engine.model_id,
-            tokenizer_hash=engine.tokenizer_hash,
-            kv_dtype=engine.kv_dtype,
-            kv_layout_version=1,
-        ),
-        token_count=len(base),
-        tokens=base,
-    )
     with TempSafetensors() as path:
         with open(path, "wb") as fh:
-            fh.write(encode(meta, payload))
+            fh.write(_blob_bytes(engine, base, payload))
         # The gate is meaningless if the resume silently fell back to a
         # scratch prefill (the daemon contract is about the RESUMED path):
         # prove the checkpoint is consumable for this request before using it.
-        from mlxcache_sidecar.server import read_wire_checkpoint
-
         _, _, usable = read_wire_checkpoint(path, divergent)
         assert usable, "checkpoint unexpectedly unusable; the resume would fall back to scratch"
-        resumed = engine.generate_from_blob(divergent, path, max_tokens=64)
+        with _ResumeSpy(engine) as resume_spy:
+            resumed = engine.generate_from_blob(divergent, path, max_tokens=64)
+        assert resume_spy.adopted, "resume fell back to a scratch prefill"
 
     # The twin: the same producer prefill that wrote the blob, memory-resident.
     # Covered positions match the resume convention exactly (payload at T
     # covers T[:-1]; the delta is tokens[covered:]).
     twin_cache, _ = engine._prefill_cache(base[:-1])
-    delta = divergent[len(base) - 1 :]
-
-    # Capture the twin's per-step decode logits so the scratch witness can
-    # tell a permitted near-tie flip from an unexplained divergence.
-    class _RecordDecode:
-        def __init__(self, model):
-            self.model = model
-            self.decode_logits = []
-
-        def __getattr__(self, name):
-            return getattr(self.model, name)
-
-        def __call__(self, *args, **kwargs):
-            out = self.model(*args, **kwargs)
-            shape = args[0].shape
-            if len(shape) == 2 and shape[1] == 1:
-                self.decode_logits.append(out.reshape(-1))
-            return out
-
-    recorder = _RecordDecode(engine.model)
-    engine.model = recorder
-    try:
-        twin = engine._generate_with_cache(delta, 64, twin_cache)
-    finally:
-        engine.model = recorder.model
+    twin, logits = _twin_generate(engine, divergent[len(base) - 1 :], twin_cache)
 
     assert resumed == twin, (
         "divergent (T22) resume diverged from its producer twin:\n"
         f"  resumed={resumed[:8]}\n  twin={twin[:8]}"
     )
-
-    if resumed == scratch:
-        return
-    # First divergence only; a strict-prefix difference (the resume hit EOS
-    # where scratch continued) is its own failure mode, not an index to scan.
-    k = next(
-        (i for i, (a, b) in enumerate(zip(resumed, scratch, strict=False)) if a != b),
-        None,
-    )
-    if k is None:
-        pytest.fail(
-            "one run is a strict prefix of the other (terminal-token "
-            f"divergence at an EOS/continuation near-tie); "
-            f"len(resumed)={len(resumed)} vs len(scratch)={len(scratch)}"
-        )
-    assert k < len(recorder.decode_logits), "twin logits missing at the divergence step"
-    top2 = sorted(recorder.decode_logits[k].tolist(), reverse=True)[:2]
-    gap = top2[0] - top2[1]
-    # Kernel-path noise measured up to ±0.3 per side over bitwise-equal KV;
-    # a flip is noise-explainable only up to ~0.6 (two-sided). Beyond that
-    # the resume produced something scratch's distribution does not support.
-    # The witness is a canary — the twin equality above is the defect detector.
-    assert gap < 0.6, (
-        f"resume diverged from scratch at step {k} with margin {gap:.4g} "
-        f"above the 0.6 noise band — not a near-tie flip; investigate the resume path"
-    )
+    _witness_scratch(resumed, scratch, logits, scratch_recorder.decode_logits)
 
 
 def test_adapter_one_token_prompt_matches_scratch(engine):

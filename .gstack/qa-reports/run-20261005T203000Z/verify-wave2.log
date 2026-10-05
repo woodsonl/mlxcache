@@ -1,0 +1,16 @@
+=== GREEN suite, 2 reps ===
+rep1: 1 failed, 5 passed in 20.36s
+rep2: 1 failed, 5 passed in 20.02s
+=== MUTATIONS (feed corruption) ===
+raw honest: resumed == twin: True
+raw mutated: resumed == twin: False (must be False)
+RAW MUTATION CAUGHT
+prefill honest: resumed == twin: True
+prefill mutated: resumed == twin: False (must be False)
+PREFILL MUTATION CAUGHT
+delta honest: resumed == twin: True
+delta mutated: resumed == twin: False (must be False)
+DELTA MUTATION CAUGHT
+=== STATE CEILING + VACUOUS-RESUME SPY ===
+delta composition state ceiling: 0.5 (bound 1.0)
+TypeError: MlxLmEngine._load_cache_delta() missing 1 required positional argument: 'blob_path'

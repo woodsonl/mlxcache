@@ -2,6 +2,38 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.1.2 — 2026-10-05
+
+### Fixed
+
+- **The three remaining real-engine parity comparators are flip-capable no
+  more** (issue #28). `test_roundtrip_logits_identical`,
+  `test_adapter_prefill_resume_matches_scratch`, and
+  `test_adapter_delta_prefill_matches_scratch` asserted raw sampled-token
+  equality between a resumed generation and a fresh batch prefill — the
+  comparator shape that fails per-device at zero-margin argmax steps
+  (the mechanism behind the 0.1.1 T22 fix). Each now asserts against its
+  producer twin (the identical producer prefill, memory-resident) and keeps
+  scratch as a margin-guarded canary.
+
+### Added
+
+- **Composition state gate** for the delta-prefill test: the adopted state
+  must sit within 1.0 max-abs of a fresh full prefill (measured composition
+  noise 0.5), closing the ancestor-round-trip blind spot that twin equality
+  alone cannot see.
+- **Resume spy** on the three twin-converted adapter parity tests: a
+  silent scratch fallback inside the engine's resume path now fails the
+  test instead of passing vacuously. The one-token test keeps the raw
+  comparator on purpose — its resume legitimately falls back to the
+  empty-cache scratch path.
+- **Dual-margin scratch witness**: a sampled-token flip is licensed by the
+  minimum of both lineages' top-2 margins, so corruption on either lineage
+  cannot manufacture its own near-tie license.
+- Mutation evidence per test: feed-content corruption and wrong-blob
+  round-trips are caught; the double-feed mutation is documented as a
+  phase-aligned no-op on a periodic prompt.
+
 ## 0.1.1 — 2026-10-05
 
 ### Fixed
