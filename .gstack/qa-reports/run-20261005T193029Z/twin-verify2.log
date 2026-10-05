@@ -1,0 +1,7 @@
+rep1: 1 passed in 3.44s
+rep2: 1 passed in 2.68s
+=== mutation still caught (covered+1) ===
+
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]
+Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 4188.32it/s]
+MUTATION CAUGHT — teeth intact after review fixes
