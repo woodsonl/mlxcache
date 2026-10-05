@@ -151,3 +151,33 @@ def test_resolve_model_rejects_uncached_id():
     for mod in (bench, qa):
         with pytest.raises(SystemExit):
             mod._resolve_model("definitely/not-a-cached-model-xyz")
+
+
+def _leg(verdict):
+    return {"leg": f"l-{verdict}", "wall_ms": 1.0, "text": "x", "verdict": verdict, "reused": {}}
+
+
+def test_gate_requires_observed_disk_hits():
+    """A populated store is not reuse: without an observed disk hit the gate
+    must FAIL even when every leg is token-identical and coverage is high."""
+    results = [
+        _leg("token-identical"),
+        _leg("token-identical"),
+        _leg("token-identical"),
+        _leg("token-identical"),
+        _leg("token-identical"),
+    ]
+    ok, reasons = bench._gate_ok(results, 93, {"restart-turn2": 0, "second-turn2": 0})
+    assert not ok and any("not observed serving" in r for r in reasons)
+
+    ok, _ = bench._gate_ok(results, 93, {"restart-turn2": 1, "second-turn2": 2})
+    assert ok
+
+
+def test_gate_fails_on_divergence_or_low_skip():
+    diverged = [_leg("token-identical"), _leg("DIVERGED")]
+    ok, reasons = bench._gate_ok(diverged, 93, {"restart-turn2": 1})
+    assert not ok and any("divergence" in r for r in reasons)
+
+    ok, reasons = bench._gate_ok([_leg("token-identical")], 50, {"restart-turn2": 1})
+    assert not ok and any("50% < 90%" in r for r in reasons)

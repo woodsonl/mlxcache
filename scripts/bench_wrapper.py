@@ -17,8 +17,13 @@ memory-turn2 reference. A coverage off-by-one on the write path shifts only
 the disk legs, so this comparison catches it; comparing against a fresh
 batch prefill instead would flake on near-tied argmax at temp 0.
 
+Reuse gate: token identity alone cannot prove the disk tier served the
+request (a full prefill is token-identical at temp 0). Each disk leg also
+reads /mlxcache/stats and must report disk_hits > 0, so a gate cannot pass
+while the store is merely populated and never read.
+
 Metrics per leg: wall_ms, text, verdict (token-identical | DIVERGED),
-reused (coverage + verdict notes).
+reused (coverage + observed disk_hits + verdict notes).
 
 Output: JSON artifact (bench/wrapper-bench-<ts>.json) + a markdown table on
 stdout. The model must be a local absolute snapshot path or a cached HF id,
@@ -169,6 +174,14 @@ class Server:
             return self.log_path.read_text()[-2000:]
         return "(log unreadable)"
 
+    def stats(self) -> dict:
+        """GET /mlxcache/stats: the live cache's reuse counters. This is the
+        only signal that the disk tier SERVED a request — response equality
+        at temperature 0 cannot distinguish a disk resume from a full
+        prefill."""
+        with urllib.request.urlopen(f"{self.base}/mlxcache/stats", timeout=10) as r:
+            return json.loads(r.read())
+
     def wait_ready(self, timeout_s: float = 180.0) -> None:
         deadline = time.time() + timeout_s
         last_err: str | None = None
@@ -280,6 +293,22 @@ def _fp_for(model: str):
     return default_fingerprint_for((model, None, None))
 
 
+def _gate_ok(results, skip_pct, observed_hits) -> tuple[bool, list[str]]:
+    """The §D5 acceptance predicate. Returns (ok, reasons). A reusable blob
+    is not reuse: the disk legs must have OBSERVED a disk hit, so a store
+    that is populated but never read cannot pass."""
+    reasons = []
+    bad = [r["leg"] for r in results if r["verdict"] != "token-identical"]
+    if bad:
+        reasons.append(f"token divergence in {bad}")
+    if skip_pct < 90:
+        reasons.append(f"prefill skip {skip_pct}% < 90%")
+    reused = all(v is not None and v > 0 for v in observed_hits.values())
+    if not reused:
+        reasons.append(f"disk tier not observed serving (disk_hits={observed_hits})")
+    return (not reasons), reasons
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=DEFAULT_MODEL)
@@ -324,20 +353,23 @@ def main() -> int:
     with Server(store_dir, model, args.port) as srv2:
         srv2.wait_ready()
         wall_re, text_re = srv2.chat(body2)
-        results.append(_leg_result("restart-turn2", wall_re, text_re, baseline2))
+        restart_stats = srv2.stats()
+        results.append(_leg_result("restart-turn2", wall_re, text_re, baseline2, restart_stats))
 
     # ---- second process (another pair, SAME store): determinism ----------
     with Server(store_dir, model, args.port) as srv3:
         srv3.wait_ready()
         wall_2nd, text_2nd = srv3.chat(body2)
-        results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2))
+        second_stats = srv3.stats()
+        results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2, second_stats))
 
     # ---- acceptance ------------------------------------------------------
     # §D5 prefill-skip, measured as WORK not wall: the restart/second legs'
     # requests are full two-turn streams; a disk hit covers (matched-1)
     # positions of the turn-1 prefix, so the prefill actually computed is
-    # the remainder. The wrapper exposes no counter over HTTP, so measure
-    # the disk tier's coverage directly from the store it shares.
+    # the remainder. Coverage (how MUCH a blob holds) is read from the
+    # shared store; the disk_hits counter from /mlxcache/stats proves the
+    # server actually TOOK that blob rather than the memory twin.
     from mlxcache_store import Store as _Store
 
     st = _Store(store_dir, byte_budget=0)
@@ -345,24 +377,33 @@ def main() -> int:
     fp = _fp_for(model)
     matched, _ref = st.lookup("mlx-lm", fp, tok)
     n_blobs = len(list(Path(store_dir).glob("*.ckpt")))
-    if matched == 0 and n_blobs > 0:
+    if n_blobs == 0:
         raise SystemExit(
-            "fingerprint mismatch: store has "
-            f"{n_blobs} entries but the lookup missed — the gate would "
-            "report 0% skip on a working system (model/path resolution "
-            "differs between the bench and the server)"
+            "no cache entries persisted: the writer stored nothing "
+            "(can_trim_prompt_cache false, non-trimmable cache, or a "
+            "failed publish) — the gate cannot measure reuse"
+        )
+    if matched == 0:
+        raise SystemExit(
+            f"fingerprint mismatch: store has {n_blobs} entries but the "
+            "lookup missed — the gate would report 0% skip on a working "
+            "system (model/path resolution differs between bench and server)"
         )
     covered = max(matched - 1, 0)
     skip_pct = round(100 * covered / max(len(tok) - 1, 1))
+    observed_hits = {
+        "restart-turn2": (restart_stats or {}).get("disk_hits"),
+        "second-turn2": (second_stats or {}).get("disk_hits"),
+    }
     for r in results:
         if r["leg"] in ("restart-turn2", "second-turn2"):
             r["reused"]["prefill_skip_pct"] = skip_pct
             r["reused"]["request_tokens"] = len(tok)
             r["reused"]["disk_covered"] = covered
-    ok = (
-        all(r["verdict"] == "token-identical" for r in results)
-        and skip_pct >= 90  # §D5: restart leg >= 90% prefill skip
-    )
+    # A blob existing is not reuse. At temperature 0 a full prefill and a
+    # disk resume are token-identical, so the token verdict cannot prove the
+    # disk tier served anything; the counter can. Require an observed hit.
+    ok, reasons = _gate_ok(results, skip_pct, observed_hits)
 
     out_path = args.out or str(REPO / "bench" / f"wrapper-bench-{int(time.time())}.json")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -377,12 +418,6 @@ def main() -> int:
     if ok:
         print("GATE: PASS")
     else:
-        bad = [r["leg"] for r in results if r["verdict"] != "token-identical"]
-        reasons = []
-        if bad:
-            reasons.append(f"token divergence in {bad}")
-        if skip_pct < 90:
-            reasons.append(f"prefill skip {skip_pct}% < 90%")
         print("GATE: FAIL —", "; ".join(reasons))
     return 0 if ok else 1
 
