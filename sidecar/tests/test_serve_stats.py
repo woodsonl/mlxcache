@@ -12,7 +12,13 @@ import io
 import json
 import types
 
-from mlxcache_serve.serve import _stats_payload, _write_stats
+import pytest
+
+# mlxcache_serve imports mlx_lm at module scope; CI's dev-only sync has no mlx
+# (a macOS-only extra), so these unit tests skip there rather than error.
+pytest.importorskip("mlx_lm")
+
+from mlxcache_serve.serve import _stats_payload, _write_stats  # noqa: E402
 
 
 def test_stats_payload_reads_cache_counters():

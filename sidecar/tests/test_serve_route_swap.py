@@ -14,7 +14,12 @@ import sys
 import types
 
 import pytest
-from mlxcache_serve import main as serve_main
+
+# mlxcache_serve imports mlx_lm at module scope; CI's dev-only sync has no mlx
+# (a macOS-only extra), so this unit test skips there rather than error.
+pytest.importorskip("mlx_lm")
+
+from mlxcache_serve import main as serve_main  # noqa: E402
 
 
 class _FakeHandler:
