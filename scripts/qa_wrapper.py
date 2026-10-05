@@ -36,8 +36,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = os.environ.get(
     "MLXCACHE_BENCH_MODEL",
-    "/Users/lance/models/models--mlx-community--Qwen2.5-7B-Instruct-4bit/snapshots/"
-    "c26a38f6a37d0a51b4e9a1eb3026530fa35d9fed",
+    "mlx-community/Qwen2.5-7B-Instruct-4bit",  # resolved via the HF cache
 )
 RESULTS: list[tuple[str, str, str]] = []
 
