@@ -917,3 +917,28 @@ def test_generate_fail_knob_fails_nonstream_generate(monkeypatch):
     finally:
         monkeypatch.delenv("MLXCACHE_GENERATE_FAIL", raising=False)
         server.Handler.engine = server.make_engine("test-model")
+
+
+def test_engine_id_and_granularity_round_trip():
+    # Connector protocol §2/§4 [B0.2]: the new header fields survive a
+    # wire round-trip, and absent fields (legacy blobs) read as None —
+    # the default engine and ANY_PREFIX granularity.
+    from mlxcache_sidecar import blob
+
+    fp = blob.Fingerprint(model_id="m", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1)
+    meta = blob.CheckpointMeta(
+        fingerprint=fp,
+        token_count=3,
+        tokens=[1, 2, 3],
+        engine_id="llama-cpp",
+        granularity=1,
+    )
+    m2, payload = blob.decode(blob.encode(meta, b"kv"))
+    assert payload == b"kv"
+    assert m2.engine_id == "llama-cpp", "engine identity survives the wire"
+    assert m2.granularity == 1, "granularity declaration survives the wire"
+
+    legacy = blob.CheckpointMeta(fingerprint=fp, token_count=3, tokens=[1, 2, 3])
+    m3, _ = blob.decode(blob.encode(legacy, b"kv"))
+    assert m3.engine_id is None, "absent engine_id reads as the default"
+    assert m3.granularity is None, "absent granularity reads as ANY_PREFIX"
