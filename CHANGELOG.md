@@ -2,6 +2,23 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.1.3 — 2026-10-05
+
+### Fixed
+
+- **The e2e sidecar spawn race is closed** (issue #31). The harness picked
+  sidecar ports with portpicker and trusted a health answer while the child
+  was alive; a foreign server answering health inside that window died with
+  its own test and the daemon 503'd a sidecar that was never ours (observed
+  twice: the 2026-10-04 two_models contamination and this week's 1-in-8
+  503). The child now binds a kernel-assigned port and prints it, so the
+  URL derives from our own child's bind — no foreign server can know it.
+- **Every spawn failure is loud**: every spawn-failure path panics with cause
+  (spawn error, missing/garbled PORT line, 30s deadline, health exhaustion,
+  sidecar exit) instead of silently skipping all 27 e2e tests. The child is
+  killed and reaped before every panic, and a stdout drain thread prevents
+  a mid-test pipe wedge.
+
 ## 0.1.2 — 2026-10-05
 
 ### Fixed
