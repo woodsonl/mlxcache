@@ -10,7 +10,13 @@ import copy
 import sys
 
 import pytest
-from mlx_lm.models.cache import LRUPromptCache
+
+# The wrapper subclasses mlx-lm's cache — importable only where mlx-lm is
+# (Apple Silicon). CI (ubuntu) skips this module; the gated real-engine
+# suite covers the live behavior.
+pytest.importorskip("mlx_lm")
+
+from mlx_lm.models.cache import LRUPromptCache  # noqa: E402
 from mlxcache_serve import ENGINE_ID, PersistentPromptCache, fingerprint_for_model_dir, main
 from mlxcache_store import Fingerprint, Store
 
