@@ -30,6 +30,11 @@ client ──HTTP──▶ mlxcache daemon ──▶ sidecar (mlx-lm) ──▶ 
   prefix KV reuse over one directory ([`docs/connector-protocol.md`](docs/connector-protocol.md) §3). Same blob
   format, same key fold as the Rust daemon — a directory the daemon wrote is
   readable by the embedded client and vice versa.
+- The **wrapper** (`sidecar/mlxcache_serve/`) turns that on for any mlx-lm
+  server in one command — no daemon, no mlx-lm patches:
+  `python -m mlxcache_serve --store-dir ~/.mlxcache/store --model <model>`.
+  Finished conversations persist across restarts; restarts resume from disk
+  instead of re-prefilling.
 
 The contract is engine-agnostic ([`docs/contract-spec.md`](docs/contract-spec.md));
 mlx-lm is the first adapter, not the only possible one.
