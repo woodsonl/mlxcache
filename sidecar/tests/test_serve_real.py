@@ -2,10 +2,9 @@
 
 The wrapper's own gate: a disk-resumed generation through
 PersistentPromptCache must be token-identical to scratch. The fake-codec
-unit tests cannot see KV positions; THIS test can (it catches the §3.2
-coverage off-by-one that the first review wave found: a payload stored
+unit tests cannot see KV positions; THIS test can: a payload stored
 covering all of T instead of T[:-1] shifts the resumed context and
-diverges within a few tokens).
+diverges within a few tokens.
 
 Run: MLXCACHE_BENCH_REAL=1 uv run pytest sidecar/tests/test_serve_real.py -v
 Requires a downloaded model (Qwen2-0.5B-Instruct, ~500MB) and Apple Silicon.
