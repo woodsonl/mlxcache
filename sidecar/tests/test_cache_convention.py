@@ -872,7 +872,7 @@ def test_payload_digest_mismatch_is_rejected_not_served(tmp_path):
     raw[-1] ^= 0xFF
     tampered = tmp_path / "tampered.ckpt"
     tampered.write_bytes(bytes(raw))
-    with pytest.raises(server.CheckpointRejectedError, match="digest"):
+    with pytest.raises(server.CheckpointRejectedError, match="digest mismatch"):
         server.read_wire_checkpoint(str(tampered), [1, 2, 3, 4], check_safetensors=False)
 
     # Legacy v1 (no digest) stays loadable — the boundary is strict about
@@ -901,7 +901,7 @@ def test_v2_blob_without_digest_is_rejected_at_serve(tmp_path):
     )
     path = tmp_path / "v2-nodigest.ckpt"
     path.write_bytes(blob.encode(meta, b"kv"))
-    with pytest.raises(server.CheckpointRejectedError, match="digest"):
+    with pytest.raises(server.CheckpointRejectedError, match="payload_sha256"):
         server.read_wire_checkpoint(str(path), [1, 2, 3, 4], check_safetensors=False)
 
 
