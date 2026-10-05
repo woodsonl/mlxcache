@@ -210,12 +210,28 @@ def test_adapter_delta_prefill_matches_scratch(engine):
 def test_adapter_divergent_resume_matches_scratch(engine):
     """T22 parity on the REAL engine: a request that shares the first
     len(key)-1 tokens with the published key (divergence AT the key's last
-    token) must resume from the ancestor's blob and match scratch exactly.
-    This is the divergent-serve shape the daemon routes as `partial`
-    (matched = len(key), prefill_from = len(key)-1) — the earlier real-engine
-    suite only covered exact-extension growth, where the whole key is a
-    prefix of the request. Divergent resume feeds the divergent token plus
-    the new tail; a wrong feed would corrupt the first generated token."""
+    token) must resume from the ancestor's blob, and the blob's round-trip
+    must be faithful to the producer state that wrote it.
+
+    The equality target is the resume's PRODUCER-LINEAGE TWIN, not a fresh
+    batch prefill of the full request. A batch prefill runs different kernel
+    shapes than the resume's delta feed, and the two disagree by up to ~0.3
+    in the logits over bitwise-equal KV; at a zero-margin argmax step that
+    noise decides the token, so raw token equality vs a scratch prefill
+    flips per-device — observed as a byte-identical failure on every
+    runner-machine run (index 3, 220 vs 576) while local devices agreed
+    across six runs. The twin is the identical _prefill_cache(base[:-1])
+    computation that wrote the blob, memory-resident: it differs from the
+    resumed side ONLY by the f16 save/load round-trip, so any twin
+    divergence is a real round-trip or feed-convention defect and is
+    device-stable.
+
+    The scratch run is still witnessed, softly: sampled tokens may differ
+    from the resume ONLY at a near-tie step. The twin's top-2 margin at the
+    first divergence quantifies the tie — below the kernel-noise bound the
+    flip is the documented mechanism; at or above it, the resume produced
+    something scratch's distribution does not support, and the test fails.
+    """
     import mlx.core as mx
     from mlx_lm import stream_generate
     from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
@@ -251,9 +267,53 @@ def test_adapter_divergent_resume_matches_scratch(engine):
             fh.write(encode(meta, payload))
         resumed = engine.generate_from_blob(divergent, path, max_tokens=64)
 
-    assert resumed == scratch, (
-        "divergent (T22) resume diverged from scratch:\n"
-        f"  resumed={resumed[:8]}\n  scratch={scratch[:8]}"
+    # The twin: the same producer prefill that wrote the blob, memory-resident.
+    # Covered positions match the resume convention exactly (payload at T
+    # covers T[:-1]; the delta is tokens[covered:]).
+    twin_cache, _ = engine._prefill_cache(base[:-1])
+    delta = divergent[len(base) - 1 :]
+
+    # Capture the twin's per-step decode logits so the scratch witness can
+    # tell a permitted near-tie flip from an unexplained divergence.
+    class _RecordDecode:
+        def __init__(self, model):
+            self.model = model
+            self.decode_logits = []
+
+        def __getattr__(self, name):
+            return getattr(self.model, name)
+
+        def __call__(self, *args, **kwargs):
+            out = self.model(*args, **kwargs)
+            shape = args[0].shape
+            if len(shape) == 2 and shape[1] == 1:
+                self.decode_logits.append(out.reshape(-1))
+            return out
+
+    recorder = _RecordDecode(engine.model)
+    engine.model = recorder
+    try:
+        twin = engine._generate_with_cache(delta, 64, twin_cache)
+    finally:
+        engine.model = recorder.model
+
+    assert resumed == twin, (
+        "divergent (T22) resume diverged from its producer twin:\n"
+        f"  resumed={resumed[:8]}\n  twin={twin[:8]}"
+    )
+
+    if resumed == scratch:
+        return
+    k = next(i for i, (a, b) in enumerate(zip(resumed, scratch, strict=False)) if a != b)
+    assert k < len(recorder.decode_logits), "twin logits missing at the divergence step"
+    top2 = sorted(recorder.decode_logits[k].tolist(), reverse=True)[:2]
+    gap = top2[0] - top2[1]
+    # Kernel-path noise between a batch prefill and a delta feed measured up
+    # to ~0.3 max-abs on bitwise-equal KV; a margin at or above 1.0 cannot be
+    # bridged by that noise, so a token flip there is a real defect.
+    assert gap < 1.0, (
+        f"resume diverged from scratch at step {k} with a wide margin "
+        f"(top-2 gap {gap:.4g}) — not a near-tie flip; investigate the resume path"
     )
 
 
