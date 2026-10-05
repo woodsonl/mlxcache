@@ -74,6 +74,16 @@ def _resolve_model(raw: str) -> str:
     m = os.path.abspath(os.path.expanduser(raw))
     if (Path(m) / "config.json").is_file():
         return m
+    # Resolve exactly as mlx_lm would: snapshot_download honours refs/<rev>
+    # (default main), so a cache holding several revisions selects the same
+    # snapshot the server child will load. A bare glob of the snapshot dirs
+    # would sort by commit hash — unrelated to the revision fetched.
+    with contextlib.suppress(ImportError, Exception):
+        from huggingface_hub import snapshot_download
+
+        snap = snapshot_download(raw, local_files_only=True)
+        if (Path(snap) / "config.json").is_file():
+            return snap
     base = (
         Path.home() / ".cache/huggingface/hub" / f"models--{raw.replace('/', '--')}" / "snapshots"
     )
@@ -121,25 +131,33 @@ class Server:
         fd, log_path = tempfile.mkstemp(prefix="mlxcache-bench-srv-", suffix=".log")
         self.log_path = Path(log_path)
         self.log_fh = os.fdopen(fd, "w")
-        self.proc = subprocess.Popen(
-            [
-                str(REPO / ".venv/bin/python"),
-                "-m",
-                "mlxcache_serve",
-                "--store-dir",
-                store_dir,
-                "--model",
-                model,
-                "--port",
-                str(port),
-                "--log-level",
-                "ERROR",
-            ],
-            cwd=str(REPO / "sidecar"),
-            stdout=self.log_fh,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                [
+                    str(REPO / ".venv/bin/python"),
+                    "-m",
+                    "mlxcache_serve",
+                    "--store-dir",
+                    store_dir,
+                    "--model",
+                    model,
+                    "--port",
+                    str(port),
+                    "--log-level",
+                    "ERROR",
+                ],
+                cwd=str(REPO / "sidecar"),
+                stdout=self.log_fh,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception:
+            # A failed spawn would otherwise leak the fd and the temp file.
+            with contextlib.suppress(Exception):
+                self.log_fh.close()
+            with contextlib.suppress(Exception):
+                self.log_path.unlink()
+            raise
         self.port = port
         self.base = f"http://127.0.0.1:{port}"
 
@@ -151,30 +169,47 @@ class Server:
 
     def wait_ready(self, timeout_s: float = 180.0) -> None:
         deadline = time.time() + timeout_s
+        last_err: str | None = None
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"wrapper exited early:\n{self._log_tail()}")
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
             try:
                 with urllib.request.urlopen(f"{self.base}/health", timeout=2) as r:
-                    if r.status == 200:
-                        # The port binds before the lazy model load, so
-                        # /health alone proves nothing. A 1-token warmup
-                        # forces the load: timed legs then measure serving,
-                        # and a bad model id fails here with the log tail.
-                        self.chat(
-                            {
-                                "messages": [{"role": "user", "content": "hi"}],
-                                "max_tokens": 1,
-                                "temperature": 0.0,
-                            }
-                        )
-                        return
+                    if r.status != 200:
+                        time.sleep(1.0)
+                        continue
             except Exception:
                 time.sleep(1.0)
-        raise RuntimeError(f"wrapper never became healthy:\n{self._log_tail()}")
+                continue
+            # The port binds before the lazy model load, so /health alone
+            # proves nothing. A 1-token warmup forces the load; the timeout
+            # is bounded by the readiness deadline so a hung request cannot
+            # outlive it. A warmup that fails (connection reset mid-load, or
+            # a 5xx) means NOT ready yet: retry until the deadline rather
+            # than crashing or reading a broken server as ready.
+            try:
+                self.chat(
+                    {
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 1,
+                        "temperature": 0.0,
+                    },
+                    timeout=max(1.0, min(remaining, 30.0)),
+                )
+                return
+            except Exception as exc:
+                last_err = repr(exc)
+                time.sleep(1.0)
+        raise RuntimeError(
+            f"wrapper never became healthy (last warmup error: {last_err}):\n{self._log_tail()}"
+        )
 
-    def chat(self, body: dict) -> tuple[float, str]:
-        """POST /v1/chat/completions (non-stream). Returns (wall_ms, text)."""
+    def chat(self, body: dict, timeout: float = 600) -> tuple[float, str]:
+        """POST /v1/chat/completions (non-stream). Returns (wall_ms, text).
+        Raises on non-2xx so callers cannot mistake an error for a result."""
         data = json.dumps(body).encode()
         req = urllib.request.Request(
             f"{self.base}/v1/chat/completions",
@@ -182,7 +217,7 @@ class Server:
             headers={"Content-Type": "application/json"},
         )
         t0 = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=600) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             payload = json.loads(r.read())
         wall = (time.perf_counter() - t0) * 1000
         return wall, payload["choices"][0]["message"]["content"]
@@ -197,6 +232,8 @@ class Server:
                 self.proc.wait(timeout=10)
         with contextlib.suppress(Exception):
             self.log_fh.close()
+        with contextlib.suppress(Exception):
+            self.log_path.unlink()
 
     def __enter__(self):
         return self

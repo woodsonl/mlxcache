@@ -49,6 +49,15 @@ def _resolve_model(raw: str) -> str:
     m = os.path.abspath(os.path.expanduser(raw))
     if (Path(m) / "config.json").is_file():
         return m
+    # Resolve exactly as mlx_lm would: snapshot_download honours refs/<rev>
+    # (default main), so a cache holding several revisions selects the same
+    # snapshot the server child will load.
+    with contextlib.suppress(ImportError, Exception):
+        from huggingface_hub import snapshot_download
+
+        snap = snapshot_download(raw, local_files_only=True)
+        if (Path(snap) / "config.json").is_file():
+            return snap
     base = (
         Path.home() / ".cache/huggingface/hub" / f"models--{raw.replace('/', '--')}" / "snapshots"
     )
@@ -87,25 +96,33 @@ class Server:
         fd, log_path = tempfile.mkstemp(prefix="mlxcache-qa-srv-", suffix=".log")
         self.log_path = Path(log_path)
         self.log_fh = os.fdopen(fd, "w")
-        self.proc = subprocess.Popen(
-            [
-                str(REPO / ".venv/bin/python"),
-                "-m",
-                "mlxcache_serve",
-                "--store-dir",
-                store_dir,
-                "--model",
-                model,
-                "--port",
-                str(port),
-                "--log-level",
-                "ERROR",
-            ],
-            cwd=str(REPO / "sidecar"),
-            stdout=self.log_fh,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                [
+                    str(REPO / ".venv/bin/python"),
+                    "-m",
+                    "mlxcache_serve",
+                    "--store-dir",
+                    store_dir,
+                    "--model",
+                    model,
+                    "--port",
+                    str(port),
+                    "--log-level",
+                    "ERROR",
+                ],
+                cwd=str(REPO / "sidecar"),
+                stdout=self.log_fh,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception:
+            # A failed spawn would otherwise leak the fd and the temp file.
+            with contextlib.suppress(Exception):
+                self.log_fh.close()
+            with contextlib.suppress(Exception):
+                self.log_path.unlink()
+            raise
         self.port = port
         self.base = f"http://127.0.0.1:{port}"
 
@@ -117,26 +134,49 @@ class Server:
 
     def wait_ready(self, timeout_s: float = 180.0):
         deadline = time.time() + timeout_s
+        last_err: str | None = None
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"wrapper exited early:\n{self._log_tail()}")
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
             try:
                 with urllib.request.urlopen(f"{self.base}/health", timeout=2) as r:
-                    if r.status == 200:
-                        # The port binds before the lazy model load; a tiny
-                        # warmup forces it so probes measure serving.
-                        self.post(
-                            "/v1/chat/completions",
-                            {
-                                "messages": [{"role": "user", "content": "hi"}],
-                                "max_tokens": 1,
-                                "temperature": 0.0,
-                            },
-                        )
-                        return
+                    if r.status != 200:
+                        time.sleep(1.0)
+                        continue
             except Exception:
                 time.sleep(1.0)
-        raise RuntimeError(f"wrapper never became healthy:\n{self._log_tail()}")
+                continue
+            # The port binds before the lazy model load, so /health alone
+            # proves nothing. A 1-token warmup forces the load; the timeout
+            # is bounded by the readiness deadline so a hung request cannot
+            # outlive it. post() returns errors as (code, body) rather than
+            # raising, so the status is checked explicitly, and any failure
+            # (5xx, or a reset mid-load) means NOT ready yet: retry.
+            try:
+                code, body = self.post(
+                    "/v1/chat/completions",
+                    {
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 1,
+                        "temperature": 0.0,
+                    },
+                    timeout=max(1.0, min(remaining, 30.0)),
+                )
+            except Exception as exc:
+                last_err = repr(exc)
+                time.sleep(1.0)
+                continue
+            if code != 200:
+                last_err = f"warmup HTTP {code}: {str(body)[:120]}"
+                time.sleep(1.0)
+                continue
+            return
+        raise RuntimeError(
+            f"wrapper never became healthy (last warmup error: {last_err}):\n{self._log_tail()}"
+        )
 
     def post(self, path: str, body: dict, timeout: float = 600) -> tuple[int, dict | bytes]:
         data = json.dumps(body).encode()
@@ -189,6 +229,8 @@ class Server:
                 self.proc.wait(timeout=10)
         with contextlib.suppress(Exception):
             self.log_fh.close()
+        with contextlib.suppress(Exception):
+            self.log_path.unlink()
 
     def __enter__(self):
         return self
