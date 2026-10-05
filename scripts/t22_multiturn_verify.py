@@ -14,8 +14,10 @@ Modes:
           multi-turn path).
 
 Usage:
-  MLXCACHE_BASE=http://127.0.0.1:18520 uv run python scripts/t22_multiturn_verify.py warm  /tmp/t22warm.jsonl
-  MLXCACHE_BASE=http://127.0.0.1:18522 uv run python scripts/t22_multiturn_verify.py cold  /tmp/t22cold.jsonl /tmp/t22warm.replies.json
+  MLXCACHE_BASE=http://127.0.0.1:18520 uv run python scripts/t22_multiturn_verify.py warm \
+      /tmp/t22warm.jsonl
+  MLXCACHE_BASE=http://127.0.0.1:18522 uv run python scripts/t22_multiturn_verify.py cold \
+      /tmp/t22cold.jsonl /tmp/t22warm.replies.json
 
 The prompt corpus is a PINNED snapshot (scripts/fixtures/t22), not the live
 repo: the requests embed file contents, and live files drift when fixes land
@@ -31,14 +33,12 @@ import time
 import urllib.request
 
 BASE = os.environ.get("MLXCACHE_BASE", "http://127.0.0.1:18520")
-MODEL = os.environ.get(
-    "MLXCACHE_DEMO_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit"
-)
+MODEL = os.environ.get("MLXCACHE_DEMO_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit")
 REPO = os.environ.get("MLXCACHE_DEMO_REPO", os.getcwd())
 
 
 def _read(rel: str, max_bytes: int) -> str:
-    with open(os.path.join(REPO, rel), "r", encoding="utf-8", errors="replace") as fh:
+    with open(os.path.join(REPO, rel), encoding="utf-8", errors="replace") as fh:
         return fh.read(max_bytes)
 
 
@@ -57,7 +57,7 @@ FIXTURES = os.environ.get("MLXCACHE_T22_FIXTURES", "scripts/fixtures/t22")
 
 
 def _fixture(name: str) -> str:
-    with open(os.path.join(REPO, FIXTURES, name), "r", encoding="utf-8") as fh:
+    with open(os.path.join(REPO, FIXTURES, name), encoding="utf-8") as fh:
         return fh.read()
 
 
@@ -127,7 +127,9 @@ def run(mode: str, out_path: str, replies_path: str | None) -> int:
             replies = json.load(rf)
         assert len(replies) == 3, f"expected 3 warm replies, got {len(replies)}"
 
-    fh = open(out_path, "a")
+    # The handle lives for the whole function (emit() closes over it) and is
+    # closed at the end — a context manager would fight the closure.
+    fh = open(out_path, "a")  # noqa: SIM115
 
     def emit(rec: dict):
         fh.write(json.dumps(rec) + "\n")
@@ -140,7 +142,7 @@ def run(mode: str, out_path: str, replies_path: str | None) -> int:
     # Build EVERY turn's full request (the scratch oracle must see the whole
     # conversation prefix), then post only the selected turn when
     # T22_SINGLE_TURN is set (0 = all).
-    for i, q in enumerate((Q1, Q2, Q3)):
+    for _, q in enumerate((Q1, Q2, Q3)):
         convo = convo + [{"role": "user", "content": q}]
         # The daemon's non-stream response carries generated token ids and no
         # message content, so the assistant turn appended here is OUR choice:
@@ -153,7 +155,10 @@ def run(mode: str, out_path: str, replies_path: str | None) -> int:
         if single and i + 1 != single:
             continue
         r = post(turn)
-        emit({k: v for k, v in r.items() if k != "generated"} | {"turn": i + 1, "n_messages": len(turn)})
+        emit(
+            {k: v for k, v in r.items() if k != "generated"}
+            | {"turn": i + 1, "n_messages": len(turn)}
+        )
         emit({"turn": i + 1, "generated": r["generated"], "stats": stats()})
     fh.close()
     if mode == "warm":

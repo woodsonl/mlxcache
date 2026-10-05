@@ -35,17 +35,13 @@ import time
 import urllib.request
 
 BASE = os.environ.get("MLXCACHE_BASE", "http://127.0.0.1:8420")
-MODEL = os.environ.get(
-    "MLXCACHE_DEMO_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit"
-)
+MODEL = os.environ.get("MLXCACHE_DEMO_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit")
 REPO = os.environ.get("MLXCACHE_DEMO_REPO", os.getcwd())
-CONVO_PATH = os.environ.get(
-    "MLXCACHE_DEMO_CONVO", "/tmp/mlxcache-demo/session.jsonl.convo.json"
-)
+CONVO_PATH = os.environ.get("MLXCACHE_DEMO_CONVO", "/tmp/mlxcache-demo/session.jsonl.convo.json")
 
 
 def _read(rel: str, max_bytes: int) -> str:
-    with open(os.path.join(REPO, rel), "r", encoding="utf-8", errors="replace") as fh:
+    with open(os.path.join(REPO, rel), encoding="utf-8", errors="replace") as fh:
         return fh.read(max_bytes)
 
 
@@ -53,8 +49,8 @@ def _read(rel: str, max_bytes: int) -> str:
 # ~76KB total => ~21K tokens for Qwen2.5 BPE: a real long-context request
 # whose cold prefill at 7B-4bit costs tens of seconds (the prefill a restart
 # skips), while staying far inside the 32768-token window.
-FILE_A = _read("docs/designs/mlx-kv-cache-daemon.md", 28_000)   # design doc
-FILE_B = _read("crates/mlxcache-core/src/index.rs", 30_000)     # prefix index
+FILE_A = _read("docs/designs/mlx-kv-cache-daemon.md", 28_000)  # design doc
+FILE_B = _read("crates/mlxcache-core/src/index.rs", 30_000)  # prefix index
 FILE_C = _read("crates/mlxcache-daemon/src/orchestrator.rs", 18_000)
 
 SYSTEM = "You are a coding agent working in a Rust repository. Be concise."
@@ -99,7 +95,9 @@ def post(messages: list, max_tokens: int = 64) -> dict:
 def run(leg: str, out_path: str) -> int:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     new_file = not os.path.exists(out_path)
-    fh = open(out_path, "a")
+    # The handle lives for the whole function (emit() closes over it) and is
+    # closed at the end — a context manager would fight the closure.
+    fh = open(out_path, "a")  # noqa: SIM115
 
     def emit(rec: dict):
         fh.write(json.dumps(rec) + "\n")
