@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- Template: before launchctl load, substitute the placeholders:
+     sed -e "s|__REPO_ROOT__|$(git rev-parse --show-toplevel)|" \
+         -e "s|__HOME__|$HOME|g" docs/com.mlxcache.daemon.plist > /tmp/com.mlxcache.daemon.plist
+     A literal __REPO_ROOT__ working directory will fail silently. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>

@@ -1,31 +1,31 @@
 {
-  "model": "/Users/lance/models/models--mlx-community--Qwen2.5-7B-Instruct-4bit/snapshots/c26a38f6a37d0a51b4e9a1eb3026530fa35d9fed",
+  "model": "<HOME>/models/models--mlx-community--Qwen2.5-7B-Instruct-4bit/snapshots/c26a38f6a37d0a51b4e9a1eb3026530fa35d9fed",
   "results": [
     {
       "leg": "cold-turn1",
-      "wall_ms": 622.1,
+      "wall_ms": 570.8,
       "text": "The theory of persistent key-value (KV) cache reuse is a strategy used in",
       "verdict": "token-identical",
       "reused": {}
     },
     {
       "leg": "warm-turn1",
-      "wall_ms": 299.1,
+      "wall_ms": 306.1,
       "text": "The theory of persistent key-value (KV) cache reuse is a strategy used in",
       "verdict": "token-identical",
       "reused": {}
     },
     {
       "leg": "memory-turn2",
-      "wall_ms": 501.1,
-      "text": "The theory of persistent key-value (KV) cache reuse involves maintaining a cache of frequently accessed data across sessions to improve performance",
+      "wall_ms": 354.6,
+      "text": "The theory of persistent key-value (KV) cache reuse involves maintaining a cache of",
       "verdict": "token-identical",
       "reused": {}
     },
     {
       "leg": "restart-turn2",
-      "wall_ms": 481.2,
-      "text": "The theory of persistent key-value (KV) cache reuse involves maintaining a cache of frequently accessed data across sessions to improve performance",
+      "wall_ms": 357.3,
+      "text": "The theory of persistent key-value (KV) cache reuse involves maintaining a cache of",
       "verdict": "token-identical",
       "reused": {
         "prefill_skip_pct": 93,
@@ -35,8 +35,8 @@
     },
     {
       "leg": "second-turn2",
-      "wall_ms": 889.0,
-      "text": "The theory of persistent key-value (KV) cache reuse involves maintaining a cache of frequently accessed data across sessions to improve performance",
+      "wall_ms": 362.1,
+      "text": "The theory of persistent key-value (KV) cache reuse involves maintaining a cache of",
       "verdict": "token-identical",
       "reused": {
         "prefill_skip_pct": 93,
