@@ -2,6 +2,23 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.1.1 — 2026-10-05
+
+### Fixed
+
+- **T22 divergent-resume gate no longer flips per-device** (issue #27). The
+  weekly realmodel job failed byte-identically on every runner run while
+  local machines passed: the old comparator asserted raw sampled-token
+  equality between the blob-resumed generation and a fresh batch prefill,
+  and at a zero-margin argmax step the kernel-path noise between those two
+  shapes (≤0.3 max-abs over bitwise-equal KV) decided the token. The
+  equality target is now the resume's producer twin, the identical prefill
+  that wrote the blob held in memory, so any divergence is a real
+  round-trip or feed-convention defect and is device-stable. The scratch
+  run remains as a margin-guarded canary (flips permitted only under the
+  0.6 two-sided noise band). Mutation-checked: a feed-convention
+  off-by-one is caught; five green reps on correct bytes.
+
 ## 0.1.0 — 2026-10-05
 
 First versioned release: the mlx-lm connector (Phases 0–2) — any mlx-lm server
