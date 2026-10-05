@@ -1,0 +1,9 @@
+PASS Q1 chat non-stream
+PASS Q2 chat streaming
+PASS Q3 completions non-stream
+PASS Q6 error shape
+PASS Q4 restart mid-suite (grown conversation)
+PASS Q5 disk-resume identity (second fresh process)
+PASS Q7 store hygiene
+
+7/7 pass
