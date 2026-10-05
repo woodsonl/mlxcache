@@ -11,10 +11,12 @@ sidecar/tests/test_conformance.py.
 
 from .errors import CorruptCache, Refused, Unavailable
 from .fingerprint import Fingerprint, blob_key
-from .store import Granularity, Store
+from .store import DEFAULT_ANCHOR_WINDOW_S, DEFAULT_BUDGET, Granularity, Store
 
 __all__ = [
     "CorruptCache",
+    "DEFAULT_ANCHOR_WINDOW_S",
+    "DEFAULT_BUDGET",
     "Refused",
     "Unavailable",
     "Fingerprint",
