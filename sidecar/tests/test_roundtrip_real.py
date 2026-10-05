@@ -328,8 +328,9 @@ def test_adapter_divergent_resume_matches_scratch(engine):
     )
     if k is None:
         pytest.fail(
-            "resume is a strict prefix of scratch (terminal-token divergence "
-            "at a near-tie between EOS and a continuation token)"
+            "one run is a strict prefix of the other (terminal-token "
+            f"divergence at an EOS/continuation near-tie); "
+            f"len(resumed)={len(resumed)} vs len(scratch)={len(scratch)}"
         )
     assert k < len(recorder.decode_logits), "twin logits missing at the divergence step"
     top2 = sorted(recorder.decode_logits[k].tolist(), reverse=True)[:2]
