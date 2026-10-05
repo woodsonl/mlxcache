@@ -56,6 +56,18 @@ pub struct CheckpointMeta {
     /// stay loadable but unverified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_sha256: Option<String>,
+    /// Engine identity for namespaced keys (connector protocol §4): the
+    /// engine family that produced and must consume this payload. Absent
+    /// means the default engine `"mlx-lm"` — which contributes ZERO bytes
+    /// to the key fold, so legacy stores keep their keys byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_id: Option<String>,
+    /// Resume granularity (connector protocol §3.3): 0/absent = ANY_PREFIX
+    /// (radix, partial hits), 1 = WHOLE_CONTEXT (exact full-prompt match
+    /// only). Matching semantics are enforced by the store's index, not the
+    /// format; this field is the declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granularity: Option<u8>,
 }
 
 /// The checkpoint lifecycle: absent -> in-flight -> published -> quarantined.

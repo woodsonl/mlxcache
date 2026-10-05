@@ -141,11 +141,13 @@ The fold is **normative by reference and by construction**:
   fingerprint fields → u32-LE chunks → `0xFFFFFFFF` domain separator →
   token stream → dual-lane FNV-1a (lane seeds `0xcbf29ce484222325` /
   `0x9e3779b97f4a7c15`, primes `0x100000001b3` / `0x880355f21e6d1965`).
-- **B0.2 extension**: non-default `engine_id` is length-prefixed and
-  folded BEFORE all fingerprint fields, preceded by its own `0xFFFFFFFF`
-  domain separator. The DEFAULT engine (`"mlx-lm"`) contributes ZERO
-  bytes — keys of engine-less and default-engine entries are
-  byte-identical to the current fold, so existing stores keep their keys.
+- **B0.2 extension**: a non-default `engine_id` is length-prefixed (same
+  `:field` scheme as fingerprint fields) and folded BEFORE all fingerprint
+  fields, **closed by its own `0xFFFFFFFF` domain separator**. Full order:
+  `engine_chunks? ‖ SEP ‖ fingerprint_chunks ‖ SEP ‖ tokens`. The DEFAULT
+  engine (`"mlx-lm"`) contributes ZERO bytes (no chunks, no separator) —
+  keys of engine-less and default-engine entries are byte-identical to the
+  current fold, so existing stores keep their keys.
 
 Cross-engine `lookup` returns `matched_len = 0` by construction (the
 fingerprint check in §3.3 additionally re-verifies identity).
