@@ -48,6 +48,9 @@ class _FakeHandler:
     def send_header(self, k, v):
         self.sent.append((k, v))
 
+    def _set_cors_headers(self):
+        self.sent.append(("Access-Control-Allow-Origin", "*"))
+
     def end_headers(self):
         pass
 
@@ -56,5 +59,34 @@ def test_write_stats_emits_200_json_body():
     h = _FakeHandler()
     _write_stats(h)
     assert ("status", 200) in h.sent
+    # CORS headers must be present, like every other route on this server.
+    assert ("Access-Control-Allow-Origin", "*") in h.sent
     body = json.loads(h.wfile.getvalue())
     assert body["disk_hits"] == 5
+
+
+def test_write_stats_tolerates_handler_without_cors():
+    # A handler lacking _set_cors_headers must not crash the route.
+    class _NoCors:
+        def __init__(self):
+            self.response_generator = types.SimpleNamespace(
+                prompt_cache=types.SimpleNamespace(
+                    disk_hits=1, persisted=0, reuse_errors=0, persist_errors=0
+                )
+            )
+            self.wfile = io.BytesIO()
+            self.sent = []
+
+        def send_response(self, code):
+            self.sent.append(("status", code))
+
+        def send_header(self, k, v):
+            self.sent.append((k, v))
+
+        def end_headers(self):
+            pass
+
+    h = _NoCors()
+    assert not hasattr(h, "_set_cors_headers")
+    _write_stats(h)
+    assert ("status", 200) in h.sent

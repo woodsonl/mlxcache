@@ -80,9 +80,16 @@ def _stats_payload(response_generator) -> dict:
 
 def _write_stats(handler) -> None:
     body = json.dumps(_stats_payload(handler.response_generator)).encode()
+    # Match every other route on this server: without the CORS headers the
+    # route is unreachable from a browser while /health and /v1/models are
+    # not, and a caller debugging from a web console would see a silent CORS
+    # failure rather than the counters.
+    cors = getattr(handler, "_set_cors_headers", None)
     handler.send_response(200)
     handler.send_header("Content-type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
+    if cors is not None:
+        cors()
     handler.end_headers()
     handler.wfile.write(body)
     handler.wfile.flush()

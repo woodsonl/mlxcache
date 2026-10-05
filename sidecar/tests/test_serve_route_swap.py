@@ -67,15 +67,15 @@ def fake_mlx_server(monkeypatch):
     mod.main = fake_main
     monkeypatch.setitem(sys.modules, "mlx_lm.server", mod)
     monkeypatch.setitem(sys.modules, "mlx_lm", types.ModuleType("mlx_lm"))
-    return mod, APIHandler, delegated, mod.LRUPromptCache
+    return mod, APIHandler, delegated, APIHandler.do_GET, mod.LRUPromptCache
 
 
 def test_stats_route_served_and_other_paths_delegated(fake_mlx_server):
-    mod, handler_cls, delegated, original = fake_mlx_server
+    mod, handler_cls, delegated, original, original_cache = fake_mlx_server
     with pytest.raises(SystemExit):
         serve_main(["--store-dir", "/tmp/does-not-matter-mlxcache"])
     # The original handler saw the non-stats path, not the stats one.
     assert "/health" in delegated and "/mlxcache/stats" not in delegated
-    # Both module attributes restored after main() exits.
-    assert handler_cls.do_GET.__name__ == "do_GET"
-    assert mod.LRUPromptCache is original
+    # Both module attributes restored (by identity) after main() exits.
+    assert handler_cls.do_GET is original
+    assert mod.LRUPromptCache is original_cache
