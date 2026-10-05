@@ -13,10 +13,10 @@
 
 | Contract and source | Exact probe / evidence | Expected → observed | Outcome |
 |---|---|---|---|
-| All four parity tests green on honest bytes | suite reps: 6/6 ×4 (two waves × two reps) | 6/6 PASS each | pass |
+| All four parity tests green on honest bytes | `verify-wave1.log` (6/6 ×2) and `verify-final.log` (6/6 ×2) on the final bytes; `verify-wave2.log` records the intermediate 1-failed state that caught the state-gate ordering bug (shape mismatch), superseded by d33d219 | 6/6 PASS on the final bytes, twice | pass |
 | Each comparator catches feed-convention corruption | `twin-mutations.py` (feed-content corruption): raw / prefill / delta | resumed ≠ twin on mutated bytes, all three → MUTATION CAUGHT | pass |
-| The comparator catches wrong-blob round-trips (raw layer) | wrong prompt's cache saved into the blob path | resumed ≠ twin → RAW MUTATION CAUGHT | pass |
-| The resume actually adopts the loaded cache | `_ResumeSpy` + fallback mutation (`return None, tokens`) | honest adopted=True; fallback mutation adopted=False → CAUGHT | pass |
+| The comparator catches wrong-blob round-trips (raw layer) | `mutations.log` (script `twin-mutations.py`, raw section): wrong prompt's cache saved into the blob path | resumed ≠ twin → RAW MUTATION CAUGHT | pass |
+| The resume actually adopts the loaded cache | `mutations3-spy-ceiling.log` (script committed as `mutations3-spy-ceiling.py`): honest adopted=True; class-level fallback mutation adopted=False | fallback detected → VACUOUS-RESUME MUTATION CAUGHT | pass |
 | The OV3 composition is state-faithful | composition state ceiling measured 0.5 max-abs on honest bytes (bound 1.0) | gate green with 2× headroom | pass |
 | Hermetic gates unaffected | cargo ✓ (9 suites), hermetic pytest 149/7 ✓, fmt ✓, clippy -D warnings ✓, ruff ✓ | all green | pass |
 

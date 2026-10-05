@@ -22,9 +22,11 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   must sit within 1.0 max-abs of a fresh full prefill (measured composition
   noise 0.5), closing the ancestor-round-trip blind spot that twin equality
   alone cannot see.
-- **Resume spy** on all adapter parity tests: a silent scratch fallback
-  inside the engine's resume path now fails the test instead of passing
-  vacuously.
+- **Resume spy** on the three twin-converted adapter parity tests: a
+  silent scratch fallback inside the engine's resume path now fails the
+  test instead of passing vacuously. The one-token test keeps the raw
+  comparator on purpose — its resume legitimately falls back to the
+  empty-cache scratch path.
 - **Dual-margin scratch witness**: a sampled-token flip is licensed by the
   minimum of both lineages' top-2 margins, so corruption on either lineage
   cannot manufacture its own near-tie license.
