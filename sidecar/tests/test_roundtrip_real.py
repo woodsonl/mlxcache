@@ -218,23 +218,32 @@ def test_adapter_divergent_resume_matches_scratch(engine):
     shapes than the resume's delta feed, and the two disagree by up to ~0.3
     in the logits over bitwise-equal KV; at a zero-margin argmax step that
     noise decides the token, so raw token equality vs a scratch prefill
-    flips per-device — observed as a byte-identical failure on every
-    runner-machine run (index 3, 220 vs 576) while local devices agreed
-    across six runs. The twin is the identical _prefill_cache(base[:-1])
+    flips per-device. The twin is the identical _prefill_cache(base[:-1])
     computation that wrote the blob, memory-resident: it differs from the
     resumed side ONLY by the f16 save/load round-trip, so any twin
     divergence is a real round-trip or feed-convention defect and is
     device-stable.
 
-    The scratch run is still witnessed, softly: sampled tokens may differ
-    from the resume ONLY at a near-tie step. The twin's top-2 margin at the
-    first divergence quantifies the tie — below the kernel-noise bound the
-    flip is the documented mechanism; at or above it, the resume produced
-    something scratch's distribution does not support, and the test fails.
+    The scratch run is still witnessed, softly — it is a canary, not the
+    defect detector: sampled tokens may differ from the resume ONLY at a
+    near-tie step. The twin's top-2 margin at the first divergence
+    quantifies the tie; the acceptance band derives from the measured
+    kernel-noise ceiling (±0.3 per side, so flips are noise-explainable up
+    to ~0.6). At or above that band the resume produced something scratch's
+    distribution does not support, and the test fails.
     """
     import mlx.core as mx
     from mlx_lm import stream_generate
     from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+
+    # The twin premise (blob == producer state) holds only at f16: with KV
+    # quantization on, the blob holds a QuantizedKVCache while the twin stays
+    # f16, and the comparison stops isolating the round-trip (the T12 q8
+    # tier has its own parity tests).
+    assert engine.kv_bits == 0, (
+        "T22 twin parity is defined for f16 (kv_bits=0); run the T12 tier "
+        "tests for quantized parity"
+    )
 
     base = engine.tokenize("The quick brown fox jumps over the lazy dog. " * 40)
     assert len(base) > 64
@@ -265,6 +274,13 @@ def test_adapter_divergent_resume_matches_scratch(engine):
     with TempSafetensors() as path:
         with open(path, "wb") as fh:
             fh.write(encode(meta, payload))
+        # The gate is meaningless if the resume silently fell back to a
+        # scratch prefill (the daemon contract is about the RESUMED path):
+        # prove the checkpoint is consumable for this request before using it.
+        from mlxcache_sidecar.server import read_wire_checkpoint
+
+        _, _, usable = read_wire_checkpoint(path, divergent)
+        assert usable, "checkpoint unexpectedly unusable; the resume would fall back to scratch"
         resumed = engine.generate_from_blob(divergent, path, max_tokens=64)
 
     # The twin: the same producer prefill that wrote the blob, memory-resident.
@@ -304,16 +320,27 @@ def test_adapter_divergent_resume_matches_scratch(engine):
 
     if resumed == scratch:
         return
-    k = next(i for i, (a, b) in enumerate(zip(resumed, scratch, strict=False)) if a != b)
+    # First divergence only; a strict-prefix difference (the resume hit EOS
+    # where scratch continued) is its own failure mode, not an index to scan.
+    k = next(
+        (i for i, (a, b) in enumerate(zip(resumed, scratch, strict=False)) if a != b),
+        None,
+    )
+    if k is None:
+        pytest.fail(
+            "resume is a strict prefix of scratch (terminal-token divergence "
+            "at a near-tie between EOS and a continuation token)"
+        )
     assert k < len(recorder.decode_logits), "twin logits missing at the divergence step"
     top2 = sorted(recorder.decode_logits[k].tolist(), reverse=True)[:2]
     gap = top2[0] - top2[1]
-    # Kernel-path noise between a batch prefill and a delta feed measured up
-    # to ~0.3 max-abs on bitwise-equal KV; a margin at or above 1.0 cannot be
-    # bridged by that noise, so a token flip there is a real defect.
-    assert gap < 1.0, (
-        f"resume diverged from scratch at step {k} with a wide margin "
-        f"(top-2 gap {gap:.4g}) — not a near-tie flip; investigate the resume path"
+    # Kernel-path noise measured up to ±0.3 per side over bitwise-equal KV;
+    # a flip is noise-explainable only up to ~0.6 (two-sided). Beyond that
+    # the resume produced something scratch's distribution does not support.
+    # The witness is a canary — the twin equality above is the defect detector.
+    assert gap < 0.6, (
+        f"resume diverged from scratch at step {k} with margin {gap:.4g} "
+        f"above the 0.6 noise band — not a near-tie flip; investigate the resume path"
     )
 
 
