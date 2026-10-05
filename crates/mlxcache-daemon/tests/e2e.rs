@@ -987,6 +987,11 @@ async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> (String, SidecarHandle)
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    // The child is typically STILL ALIVE here (slow or wedged startup) and
+    // Child does not kill on drop — without this, the panic leaks a live
+    // engine (port + RAM) and the drain thread blocks forever on the pipe.
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("sidecar never became healthy after 100 probes at {url}");
 }
 
