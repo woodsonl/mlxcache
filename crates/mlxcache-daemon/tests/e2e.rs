@@ -439,6 +439,130 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
 }
 
 #[tokio::test]
+async fn stream_leg_traces_the_settled_verdict() {
+    // Testing review 2026-10-04: the RT#7 settle test covered only the JSON
+    // leg. A stream whose blob is 422'd at open (corrupt ancestor) must
+    // also trace the miss it became after quarantine + scratch retry.
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_GROW", "grow me")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let tracedir = tempfile::tempdir().unwrap();
+    let trace_path = tracedir.path().join("trace.jsonl");
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: Some(mlxcache_daemon::trace::TraceWriter::from_path(&trace_path).unwrap()),
+    });
+    let post = |body: String| {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me"}],
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+
+    let blob = state.persistence.list_blobs().unwrap().pop().unwrap();
+    std::fs::write(&blob, b"JUNK").unwrap();
+
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "grow me streamed"}],
+            "stream": true,
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        200,
+        "corrupt ancestor must not fail the stream"
+    );
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    let trace = wait_for_trace_lines(&trace_path, 2).await;
+    let rec2: serde_json::Value =
+        serde_json::from_str(trace.lines().nth(1).unwrap_or_default()).unwrap_or_default();
+    assert_eq!(
+        rec2["verdict"], "miss",
+        "the stream leg must trace the settled miss: {rec2}"
+    );
+    assert_eq!(rec2["prefill_from"].as_u64(), Some(0), "{rec2}");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn zero_max_tokens_yields_empty_completion_in_sdk_shape() {
+    // Some(0) is explicitly honored (a client asking for zero tokens gets
+    // zero); pin the choices[] shape for it: empty content, zero-token
+    // usage, finish_reason "stop" (the max_tokens>0 length rule does not
+    // apply to a client-requested zero).
+    let Some((sidecar_url, mut child)) = spawn_sidecar().await else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&sidecar_url, &blobs);
+    let res = router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "e2e-model",
+                        "messages": [{"role": "user", "content": "nothing to add"}],
+                        "max_tokens": 0,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let v: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "", "{v}");
+    assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+    assert_eq!(v["usage"]["completion_tokens"], 0, "{v}");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+#[tokio::test]
 async fn nonstream_response_decodes_with_stock_openai_sdk_shape() {
     // The choices[] compatibility layer: id/object/created/model/choices/usage
     // are REQUIRED by stock SDK response models (missing-required fails
@@ -479,7 +603,9 @@ async fn nonstream_response_decodes_with_stock_openai_sdk_shape() {
     );
     assert!(v["created"].as_u64().is_some(), "{v}");
     assert_eq!(v["model"], "e2e-model", "{v}");
-    assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+    // The synthetic engine generates exactly max_tokens (4): OpenAI
+    // semantics say a cap-truncated completion ends "length", not "stop".
+    assert_eq!(v["choices"][0]["finish_reason"], "length", "{v}");
     assert_eq!(v["choices"][0]["message"]["role"], "assistant", "{v}");
     assert_eq!(
         v["choices"][0]["message"]["content"], "tok0 tok1 tok2 tok3 ",
@@ -541,7 +667,7 @@ async fn stream_chunks_decode_with_stock_openai_sdk_shape() {
             continue;
         };
         if payload.trim() == "[DONE]" {
-            assert!(saw_stop, "finish_reason=stop must precede [DONE]: {text}");
+            assert!(saw_stop, "finish_reason=length must precede [DONE]: {text}");
             last_was_done = true;
             continue;
         }
@@ -570,7 +696,8 @@ async fn stream_chunks_decode_with_stock_openai_sdk_shape() {
         if let Some(piece) = choice["delta"]["content"].as_str() {
             deltas.push_str(piece);
         }
-        if choice["finish_reason"] == "stop" {
+        if choice["finish_reason"] == "length" {
+            // max_tokens=3 and 3 tokens generated: truncated by cap.
             saw_stop = true;
         }
     }
@@ -2123,6 +2250,118 @@ async fn corrupt_ancestor_quarantines_and_prefills_from_scratch() {
     child.wait().expect("reap sidecar");
 }
 
+/// Wait for the async trace writer to land `want` records (bounded channel +
+/// writer thread; a bare read races the last record's flush).
+async fn wait_for_trace_lines(path: &std::path::Path, want: usize) -> String {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.lines().count() >= want {
+                return text;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn failed_request_gets_one_trace_record_and_stats_agree() {
+    // Testing review 2026-10-04: a request that fails PAST routing used to
+    // emit NO trace record while stats.record had already counted its
+    // verdict — capture and /stats disagreed on exactly the failed requests
+    // (the RT#7 invariant, reopened). Contract now: every routed request
+    // gets exactly one record; a blob that was leaned on but never served
+    // corrects its claim (correct_retire) and traces as the miss it was.
+    let Some((sidecar_url, mut child)) =
+        spawn_sidecar_with_env(&[("MLXCACHE_GENERATE_FAIL", "1")]).await
+    else {
+        eprintln!("skipping: sidecar unavailable (install uv + sync deps)");
+        return;
+    };
+    let blobs = tempfile::tempdir().unwrap();
+    let tracedir = tempfile::tempdir().unwrap();
+    let trace_path = tracedir.path().join("trace.jsonl");
+    let state = Arc::new(AppState {
+        orchestrator: Orchestrator::new(),
+        singleflight: SingleFlight::new(),
+        stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+        served_models: vec!["e2e-model".into()],
+        sidecar: Some(
+            SidecarClient::new(SidecarConfig::new(sidecar_url.clone(), "e2e-model".into()))
+                .unwrap(),
+        ),
+        persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+        trace: Some(mlxcache_daemon::trace::TraceWriter::from_path(&trace_path).unwrap()),
+    });
+    let post = |body: String| {
+        let app = router(state.clone());
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Request 1 (miss whose generate fails): one record, a miss — stats and
+    // trace agree with nothing to correct.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "fail me once"}],
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        502,
+        "the knob 500s generate; no blob leaned on"
+    );
+
+    // Request 2, identical: routes as a HIT (the checkpoint published by
+    // request 1's prefill), generate 500s, the scratch retry 500s → 502.
+    // The hit claim must be corrected and the record must say miss.
+    let res = post(
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": "fail me once"}],
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), 502);
+
+    let trace = wait_for_trace_lines(&trace_path, 2).await;
+    let lines: Vec<&str> = trace.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one record per request, failed or not: {trace}"
+    );
+    let rec1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let rec2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(rec1["verdict"], "miss", "{rec1}");
+    assert_eq!(
+        rec2["verdict"], "miss",
+        "the failed hit must trace as the scratch run it became: {rec2}"
+    );
+    assert_eq!(rec2["prefill_from"].as_u64(), Some(0), "{rec2}");
+    // And /stats agrees: the hit claim was corrected away.
+    let s = state.stats.snapshot();
+    assert_eq!(s.requests, 2, "{s:?}");
+    assert_eq!(s.hits, 0, "the failed hit's claim must be corrected: {s:?}");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
 #[tokio::test]
 async fn trace_records_the_settled_verdict_not_the_stale_route() {
     // RT#7 (red-team 2026-10-04): the trace record used to be emitted right
@@ -2202,8 +2441,7 @@ async fn trace_records_the_settled_verdict_not_the_stale_route() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["mlxcache"]["verdict"], "miss", "{v}");
 
-    // Per-record flush means the JSONL is readable live.
-    let trace = std::fs::read_to_string(&trace_path).unwrap();
+    let trace = wait_for_trace_lines(&trace_path, 2).await;
     let lines: Vec<&str> = trace.lines().collect();
     assert_eq!(lines.len(), 2, "one record per request: {trace}");
     let rec2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
