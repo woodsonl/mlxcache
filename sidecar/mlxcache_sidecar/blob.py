@@ -70,31 +70,94 @@ def encode(meta: CheckpointMeta, payload: bytes) -> bytes:
     return struct.pack("<I", len(header)) + header + payload
 
 
+MAX_HEADER_BYTES = 1 << 20  # headers are tiny JSON; larger = malformed (§6)
+
+
+class HeaderRejected(ValueError):  # noqa: N818 — protocol §3.4 taxonomy kind carrier
+    """A deterministically invalid header, with its taxonomy kind (§3.4):
+    "version" (version policy) or "header" (shape/schema). Message text is
+    stable for callers that match on it."""
+
+    def __init__(self, kind: str, message: str):
+        self.kind = kind
+        super().__init__(message)
+
+
+def decode_header(header: bytes) -> CheckpointMeta:
+    """Parse + validate a header slice. EVERY malformed shape raises
+    HeaderRejected (a ValueError): the header is untrusted on-disk bytes
+    and a KeyError/TypeError/RecursionError escape would poison-brick
+    every reader (§6). Validated: container types, tokens as a u32 list
+    (bools are not ints), granularity in {0,1}, string engine_id /
+    payload_sha256, int token_count (advisory) and format_version."""
+    try:
+        raw = json.loads(header)
+    except RecursionError as exc:
+        raise HeaderRejected("header", "header too deeply nested") from exc
+    if not isinstance(raw, dict):
+        raise HeaderRejected("header", "header must be a JSON object")
+    if not isinstance(raw.get("fingerprint"), dict):
+        raise HeaderRejected("header", "fingerprint must be an object")
+    try:
+        meta = CheckpointMeta(
+            fingerprint=Fingerprint(**_known_fields(raw["fingerprint"])),
+            token_count=raw["token_count"],
+            tokens=raw.get("tokens", []),
+            format_version=raw["format_version"],
+            payload_sha256=raw.get("payload_sha256"),
+            engine_id=raw.get("engine_id"),
+            granularity=raw.get("granularity"),
+        )
+    except (KeyError, TypeError) as exc:
+        raise HeaderRejected("header", f"missing or invalid header field: {exc}") from exc
+    fp = meta.fingerprint
+    if (
+        not isinstance(fp.model_id, str)
+        or not isinstance(fp.tokenizer_hash, str)
+        or not isinstance(fp.kv_dtype, str)
+        or type(fp.kv_layout_version) is not int
+        or type(fp.kv_bits) is not int
+        or type(fp.kv_group_size) is not int
+    ):
+        # The dataclass does not enforce types; a non-str field would
+        # explode later in the fold (.encode()) outside every guarded
+        # region — the nested poison-pill path.
+        raise HeaderRejected("header", "fingerprint field types are invalid")
+    if not isinstance(meta.tokens, list) or not all(
+        type(t) is int and 0 <= t <= 0xFFFFFFFF for t in meta.tokens
+    ):
+        # tokens is the AUTHORitative prefix (token_count is advisory —
+        # the sidecar's recorded-prefix-wins rule); it must be a u32 list.
+        raise HeaderRejected("header", "tokens must be a list of u32")
+    if type(meta.token_count) is not int:
+        raise HeaderRejected("header", "token_count must be an integer")
+    if type(meta.format_version) is not int:
+        raise HeaderRejected("header", "format_version must be an integer")
+    if meta.granularity is not None and (
+        type(meta.granularity) is not int or meta.granularity not in (0, 1)
+    ):
+        raise HeaderRejected("header", "granularity must be 0 or 1")
+    if meta.engine_id is not None and not isinstance(meta.engine_id, str):
+        raise HeaderRejected("header", "engine_id must be a string")
+    if meta.payload_sha256 is not None and not isinstance(meta.payload_sha256, str):
+        raise HeaderRejected("header", "payload_sha256 must be a string")
+    # Version policy mirrors the daemon's load(): 1 = legacy (no digest
+    # field), 2 = current (D1 digest contract; the digest is REQUIRED —
+    # serving a v2 header without one would be unverified). Anything else
+    # is a layout this reader must not interpret.
+    if meta.format_version not in (1, FORMAT_VERSION_D1):
+        raise HeaderRejected("version", f"format version {meta.format_version}")
+    if meta.format_version == FORMAT_VERSION_D1 and meta.payload_sha256 is None:
+        raise HeaderRejected("version", "format version 2 requires payload_sha256")
+    return meta
+
+
 def decode(blob: bytes) -> tuple[CheckpointMeta, bytes]:
     if len(blob) < 4:
         raise ValueError("truncated header length")
     (header_len,) = struct.unpack("<I", blob[:4])
+    if header_len > MAX_HEADER_BYTES:
+        raise HeaderRejected("header", f"header length {header_len} exceeds cap")
     if 4 + header_len > len(blob):
         raise ValueError("header length exceeds blob")
-    raw = json.loads(blob[4 : 4 + header_len])
-    # The header is untrusted: a fingerprint of the wrong JSON type (null, a
-    # list, a number) would raise AttributeError from .items() inside
-    # _known_fields — a 500-forever poison instead of a clean rejection.
-    # Validate the shape HERE so every malformed header is a ValueError.
-    if not isinstance(raw["fingerprint"], dict):
-        raise ValueError("fingerprint must be an object")
-    meta = CheckpointMeta(
-        fingerprint=Fingerprint(**_known_fields(raw["fingerprint"])),
-        token_count=raw["token_count"],
-        tokens=raw.get("tokens", []),
-        format_version=raw["format_version"],
-        payload_sha256=raw.get("payload_sha256"),
-        engine_id=raw.get("engine_id"),
-        granularity=raw.get("granularity"),
-    )
-    # Version policy mirrors the daemon's load(): 1 = legacy (no digest
-    # field), 2 = current (D1 digest contract). Anything else is a layout
-    # this reader must not interpret.
-    if meta.format_version not in (1, FORMAT_VERSION_D1):
-        raise ValueError(f"format version {meta.format_version}")
-    return meta, blob[4 + header_len :]
+    return decode_header(blob[4 : 4 + header_len]), blob[4 + header_len :]
