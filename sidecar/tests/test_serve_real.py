@@ -42,24 +42,20 @@ def _sample(logits):
 
 def _generate_with_cache(engine, model, prompt_ids, cache, n):
     """Feed prompt_ids into `cache`, then generate n tokens step-by-step
-    (generate_step feeds each token before yielding it — the exact
-    producer shape the server's finish sites see). Returns (tokens,
-    steps): the generated tokens and a done-flag."""
+    through generate_step (each yielded token was fed into the cache
+    before being produced — the exact producer shape the server's finish
+    sites see). Returns the generated token ids."""
     import mlx.core as mx
     from mlx_lm.generate import generate_step
 
-    logits = model(mx.array(prompt_ids)[None], cache=cache)
-    mx.eval(logits)
+    from mlxcache_sidecar.server import MlxLmEngine  # noqa: F401 — parity with other suites
+
     out = []
-    token = _sample(logits)
-    for _ in range(n):
-        out.append(token)
-        steps = generate_step(mx.array([token]), model, cache=cache)
-        token = None
-        for _, lg in steps:
-            token = _sample(lg[None] if lg.ndim == 1 else lg)
-            break
-        if token is None:
+    for generated, _logits in generate_step(
+        mx.array(prompt_ids), model, prompt_cache=cache, max_tokens=n
+    ):
+        out.append(int(generated.item()) if hasattr(generated, "item") else int(generated))
+        if len(out) >= n:
             break
     return out
 
@@ -103,20 +99,18 @@ def test_disk_resumed_generation_matches_scratch(engine, tmp_path):
     )
 
     # 5. Continue generation from the resumed cache and compare to scratch.
+    #    The loaded cache covers len(full_stream)-1 positions; feeding rest
+    #    (the final token) completes the stream — generate_step resumes
+    #    from prompt_cache and yields the continuation tokens.
     from mlx_lm.generate import generate_step
 
-    logits = engine.model(mx.array([rest[0]])[None], cache=disk_cache)
-    mx.eval(logits)
-    resumed = []
-    token = _sample(logits)
-    for _ in range(MAX_TOKENS - 1):
-        resumed.append(token)
-        token = None
-        for _, lg in generate_step(mx.array([resumed[-1]]), engine.model, cache=disk_cache):
-            token = _sample(lg[None] if lg.ndim == 1 else lg)
-            break
-        if token is None:
-            break
+    resumed = [
+        int(g.item()) if hasattr(g, "item") else int(g)
+        for g, _lg in generate_step(
+            mx.array(rest), engine.model, prompt_cache=disk_cache,
+            max_tokens=MAX_TOKENS,
+        )
+    ][:MAX_TOKENS]
     assert resumed == scratch, (
         "disk-resumed generation diverged from scratch — the §3.2 coverage convention is broken"
     )
