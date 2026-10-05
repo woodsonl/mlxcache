@@ -195,7 +195,8 @@ uv run python -m mlxcache_serve \
   --model mlx-community/Qwen2.5-7B-Instruct-4bit --port 8080
 ```
 
-Unknown flags pass through to `mlx_lm.server`. Two extra endpoints ride along:
+Unknown flags pass through to `mlx_lm.server`. One extra endpoint rides
+along:
 
 - `GET /mlxcache/stats` — the live cache's reuse counters:
   `{"disk_hits": .., "persisted": .., "reuse_errors": .., "persist_errors": ..}`.
