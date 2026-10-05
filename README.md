@@ -25,6 +25,11 @@ client ──HTTP──▶ mlxcache daemon ──▶ sidecar (mlx-lm) ──▶ 
   talks to it over local HTTP.
 - A **hit** skips the prefill entirely and resumes generation from the stored
   cache. Verified token-for-token identical to a cold run (see below).
+- The **L1 store client** (`sidecar/mlxcache_store/`) embeds the same cache
+  without the daemon: any Python engine gets persistent, bounded, digest-checked
+  prefix KV reuse over one directory ([`docs/connector-protocol.md`](docs/connector-protocol.md) §3). Same blob
+  format, same key fold as the Rust daemon — a directory the daemon wrote is
+  readable by the embedded client and vice versa.
 
 The contract is engine-agnostic ([`docs/contract-spec.md`](docs/contract-spec.md));
 mlx-lm is the first adapter, not the only possible one.
