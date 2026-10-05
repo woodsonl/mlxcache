@@ -702,6 +702,8 @@ mod tests {
             tokens: vec![1, 2, 3],
             format_version: 1,
             payload_sha256: None,
+            engine_id: None,
+            granularity: None,
         }
     }
 
@@ -1237,6 +1239,8 @@ mod tests {
                 tokens: vec![1, 2, 3, 4],
                 format_version: 1,
                 payload_sha256: None,
+                engine_id: None,
+                granularity: None,
             },
             "theirs".into(),
             generation,
