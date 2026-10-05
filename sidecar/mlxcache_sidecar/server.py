@@ -475,6 +475,12 @@ class SyntheticEngine:
     def generate_with_text(self, tokens: list[int], max_tokens: int, blob_path: str | None = None):
         """(token_ids, text) — mirrors the stream path's pieces exactly, so
         streaming and non-streaming clients see the same detokenization."""
+        if blob_path:
+            # The synthetic engine has no KV to resume, but a resumed blob
+            # must still VALIDATE like the real adapter would (wire decodes,
+            # digest matches) — otherwise corrupt checkpoints serve "fine"
+            # here and 422 in production (QA probe 2026-10-04).
+            read_wire_checkpoint(blob_path, None, check_safetensors=False)
         out = self.generate(tokens, max_tokens)
         return out, "".join(f"tok{i} " for i in range(len(out)))
 
@@ -488,8 +494,12 @@ class SyntheticEngine:
 
         Split from generation so the handler can surface a rejected checkpoint as
         a clean 422 (which the daemon quarantines) rather than a mid-stream
-        failure. The synthetic engine has no cache; returns the prompt as-is.
+        failure. The synthetic engine has no cache, but a resumed blob must
+        still VALIDATE (wire + digest) exactly like the real adapter — the
+        generation is arithmetic, the trust boundary is not optional.
         """
+        if blob_path:
+            read_wire_checkpoint(blob_path, None, check_safetensors=False)
         return tokens, None
 
     def stream_prepared(self, prompt: list[int], cache):
