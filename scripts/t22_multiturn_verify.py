@@ -19,6 +19,9 @@ Usage:
   MLXCACHE_BASE=http://127.0.0.1:18522 uv run python scripts/t22_multiturn_verify.py cold \
       /tmp/t22cold.jsonl /tmp/t22warm.replies.json
 
+MLXCACHE_DEMO_MODEL must name a model the daemon SERVES (it 404s unknown
+models); the daemon quickstart serves "demo-model".
+
 The prompt corpus is a PINNED snapshot (scripts/fixtures/t22), not the live
 repo: the requests embed file contents, and live files drift when fixes land
 between passes — which once faked a KV-parity failure (see FIXTURES below).
@@ -155,6 +158,9 @@ def run(mode: str, out_path: str, replies_path: str | None) -> int:
         if single and i + 1 != single:
             continue
         r = post(turn)
+        # The cold leg replays against these replies (it asserts there are
+        # three), so warm mode must actually collect them.
+        replies.append(r["generated"])
         emit(
             {k: v for k, v in r.items() if k != "generated"}
             | {"turn": i + 1, "n_messages": len(turn)}
