@@ -1,0 +1,40 @@
+=== clone: 9a4c0c6 t22 harness: collect the replies warm mode exists to produce ===
+=== environment (honest framing) ===
+CARGO_TARGET_DIR=<unset> RUSTC_WRAPPER=<unset> sccache=none
+note: ~/.cargo registry cache is warm; a first-ever cargo user would add crate downloads
+=== uv sync --group dev --locked ===
+ + typing-extensions==4.16.0
+uv_sync_s=1
+=== cargo build --release -p mlxcache-daemon (README verbatim) ===
+    Finished `release` profile [optimized] target(s) in 54.37s
+build_s=54
+=== README quickstart, verbatim ===
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "<CLONE>/sidecar/mlxcache_sidecar/server.py", line 1165, in <module>
+    serve(
+    ~~~~~^
+        addr=os.environ.get("MLXCACHE_SIDECAR_ADDR", "127.0.0.1"),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        port=int(os.environ.get("MLXCACHE_SIDECAR_PORT", "8421")),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "<CLONE>/sidecar/mlxcache_sidecar/server.py", line 1159, in serve
+    server = BurstServer((addr, port), Handler)
+  File "<HOME>/.local/share/uv/python/cpython-3.14.4-macos-aarch64-none/lib/python3.14/socketserver.py", line 457, in __init__
+    self.server_bind()
+    ~~~~~~~~~~~~~~~~^^
+  File "<HOME>/.local/share/uv/python/cpython-3.14.4-macos-aarch64-none/lib/python3.14/http/server.py", line 148, in server_bind
+    socketserver.TCPServer.server_bind(self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "<HOME>/.local/share/uv/python/cpython-3.14.4-macos-aarch64-none/lib/python3.14/socketserver.py", line 478, in server_bind
+    self.socket.bind(self.server_address)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 48] Address already in use
+{"timestamp":"2026-10-06T00:16:07.098125Z","level":"INFO","fields":{"message":"eviction reaper armed (byte budget default 32 GiB; MLXCACHE_EVICT_MAX_BYTES=0 to disable)","interval_s":60,"entry_cap":"18446744073709551615","max_bytes":34359738368},"target":"mlxcache_daemon"}
+Error: Address already in use (os error 48)
+request1_http=200
+SECOND-REQUEST verdict: hit
+QUICKSTART DONE (this batch tree, warm cargo registry)
