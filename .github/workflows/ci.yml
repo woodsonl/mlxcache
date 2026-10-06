@@ -51,9 +51,9 @@ jobs:
       - name: Install deps
         run: uv sync --group dev --locked
       - name: Lint
-        run: uv run ruff check sidecar/
+        run: uv run ruff check sidecar/ scripts/
       - name: Format
-        run: uv run ruff format --check sidecar/
+        run: uv run ruff format --check sidecar/ scripts/
       - name: Test
         run: uv run pytest sidecar/tests/ -v
         env:

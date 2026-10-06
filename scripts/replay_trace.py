@@ -122,8 +122,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--trace", required=True, help="MLXCACHE_TRACE JSONL file")
     ap.add_argument("--daemon", help="daemon base URL to replay against")
-    ap.add_argument("--twice", action="store_true", help="replay two passes (cold then warm behavior)")
-    ap.add_argument("--summary-only", action="store_true", help="skip replay; score the capture only")
+    ap.add_argument(
+        "--twice", action="store_true", help="replay two passes (cold then warm behavior)"
+    )
+    ap.add_argument(
+        "--summary-only", action="store_true", help="skip replay; score the capture only"
+    )
     ap.add_argument("--report", help="write the JSON result to this path too")
     args = ap.parse_args()
 
