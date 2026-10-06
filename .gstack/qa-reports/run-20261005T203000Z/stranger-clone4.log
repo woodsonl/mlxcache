@@ -1,0 +1,22 @@
+=== pre-flight: quickstart ports must be FREE ===
+port 8420 free
+port 8421 free
+=== README quickstart, verbatim (clone of: 9a4c0c6 t22 harness: collect the replies warm mode exists to produce) ===
+sidecar: synthetic engine on 127.0.0.1:8421
+{"timestamp":"2026-10-06T00:21:38.191547Z","level":"INFO","fields":{"message":"eviction reaper armed (byte budget default 32 GiB; MLXCACHE_EVICT_MAX_BYTES=0 to disable)","interval_s":60,"entry_cap":"18446744073709551615","max_bytes":34359738368},"target":"mlxcache_daemon"}
+{"timestamp":"2026-10-06T00:21:38.191642Z","level":"INFO","fields":{"message":"mlxcache daemon listening","addr":"127.0.0.1:8420"},"target":"mlxcache_daemon"}
+--- server PIDs (proof of ownership): sidecar=55875 daemon=56196 ---
+55875 uv run python -m mlxcache_sidecar.server
+56196 ./target/release/mlxcache-daemon
+sidecar: "POST /tokenize HTTP/1.1" 200 -
+sidecar: "POST /prefill HTTP/1.1" 200 -
+{"timestamp":"2026-10-06T00:21:40.220263Z","level":"INFO","fields":{"message":"request","model":"demo-model","prefix_hash":"237847053515716247106516231686123470563","verdict":"miss","kv_claimed":0,"tokens_cached":0,"tokens_total":8,"ttft_ms":8},"target":"mlxcache_daemon::observability"}
+sidecar: "POST /generate HTTP/1.1" 200 -
+request1_http=200
+sidecar: "POST /tokenize HTTP/1.1" 200 -
+{"timestamp":"2026-10-06T00:21:40.232384Z","level":"INFO","fields":{"message":"request","model":"demo-model","prefix_hash":"237847053515716247106516231686123470563","verdict":"hit","kv_claimed":7,"tokens_cached":7,"tokens_total":8,"ttft_ms":0},"target":"mlxcache_daemon::observability"}
+sidecar: "POST /generate HTTP/1.1" 200 -
+SECOND-REQUEST verdict: hit
+9ac1123fe1af1736c0d199283da218fe-0000000000000001.ckpt
+QUICKSTART DONE (clone-own servers, pre-flight-verified ports)
+{"timestamp":"2026-10-06T00:21:40.252180Z","level":"INFO","fields":{"message":"mlxcache daemon stopped"},"target":"mlxcache_daemon"}

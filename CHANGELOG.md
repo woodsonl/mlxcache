@@ -2,6 +2,30 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.1.4 — 2026-10-05
+
+### Fixed
+
+- **The t22 multi-turn harness works end to end again**: the warm leg
+  never collected the replies it exists to produce (empty
+  `.replies.json`, the cold leg's parity assert could never pass) —
+  pre-existing since before 0.1.0. Fixed and verified live: warm writes
+  three nonempty replies, cold leg passes parity. The harness documents
+  that MLXCACHE_DEMO_MODEL must name a model the daemon serves.
+- Lint findings in the legacy verify/demo scripts (unused loop variable,
+  two long-lived JSONL handles that close at function end, docstring
+  line lengths).
+
+### Added
+
+- **CI lints the gate-critical scripts**: the python job's ruff check and
+  format check now cover `scripts/` alongside `sidecar/`, so a lint
+  regression in the bench/QA harnesses is visible in CI, not only locally.
+- **Stranger-clone dry-run evidence**: a fresh clone at the batch HEAD
+  builds, and the README quickstart passes verbatim (miss then hit, from
+  the clone's own servers, on pre-flight-verified ports) — the repo is
+  self-contained.
+
 ## 0.1.3 — 2026-10-05
 
 ### Fixed
