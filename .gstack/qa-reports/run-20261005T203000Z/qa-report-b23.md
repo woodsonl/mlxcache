@@ -4,7 +4,7 @@
 |---|---|
 | Date / branch / revision | 2026-10-05 / b23/batch / 196daac + t22-fix 9a4c0c6 + stranger-clone3 evidence |
 | Caller / authority / depth | batch gauntlet (implement → ponytail → review+adversarial → QA → ship → land); permitted writes: CI workflow, scripts/, report dir |
-| Surfaces / scope | `.github/workflows/ci.yml` (python job lint coverage), the seven `scripts/` files, the README quickstart's self-containedness |
+| Surfaces / scope | `.github/workflows/ci.yml` (python job lint coverage), the six `scripts/` files, the README quickstart's self-containedness |
 | Runtime / native tools | uv 0.16.9 ruff (locked), cargo, fresh git clone at 9a4c0c6 |
 | Fixture ownership / destinations | stranger clone in a temp dir; /tmp/mlxcache-blobs2 for the quickstart run |
 | Probe budget / stop reason | stranger-clone ×4 (1: harness deviation, dev-profile build; 2: README-verbatim build; 3: quickstart leg hit stale listeners, contaminated; 4: pre-flight free ports, PID ownership), t22 warm+cold end-to-end, full gates; complete |

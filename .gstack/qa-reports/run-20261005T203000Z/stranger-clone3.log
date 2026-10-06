@@ -12,7 +12,7 @@ build_s=54
 Traceback (most recent call last):
   File "<frozen runpy>", line 198, in _run_module_as_main
   File "<frozen runpy>", line 88, in _run_code
-  File "/private/var/folders/mg/8hpb2rl557g8k0k2cgsk54hc0000gn/T/opencode/mlxcache-stranger2/sidecar/mlxcache_sidecar/server.py", line 1165, in <module>
+  File "<CLONE>/sidecar/mlxcache_sidecar/server.py", line 1165, in <module>
     serve(
     ~~~~~^
         addr=os.environ.get("MLXCACHE_SIDECAR_ADDR", "127.0.0.1"),
@@ -21,7 +21,7 @@ Traceback (most recent call last):
         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     )
     ^
-  File "/private/var/folders/mg/8hpb2rl557g8k0k2cgsk54hc0000gn/T/opencode/mlxcache-stranger2/sidecar/mlxcache_sidecar/server.py", line 1159, in serve
+  File "<CLONE>/sidecar/mlxcache_sidecar/server.py", line 1159, in serve
     server = BurstServer((addr, port), Handler)
   File "<HOME>/.local/share/uv/python/cpython-3.14.4-macos-aarch64-none/lib/python3.14/socketserver.py", line 457, in __init__
     self.server_bind()
