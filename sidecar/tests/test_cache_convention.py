@@ -839,6 +839,53 @@ def test_quantize_cache_skips_already_quantized_delta_ancestor(monkeypatch):
     assert eng._quantize_cache([marker]) == [marker]
 
 
+def test_quantization_guard_refuses_hybrid_cache(monkeypatch):
+    # Boot-time guard: a hybrid prompt cache (mixed CacheList/ArraysCache
+    # entries — linear attention, SSM, GDN layers) has no to_quantized, so
+    # the q8 tier must refuse the model at boot instead of crashing on the
+    # first prefill.
+    _install_fake_mlx(monkeypatch)
+    import sys
+
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    kv_cls = type("KVCache", (), {})
+    cache_mod.KVCache = kv_cls
+    cache_mod.make_prompt_cache = lambda model: [kv_cls(), object()]  # mixed stack
+
+    eng = _engine()
+    eng.kv_bits = 8
+    eng.kv_group_size = 64
+    with pytest.raises(ValueError, match="MLXCACHE_KV_BITS"):
+        eng._assert_quantization_supported()
+
+
+def test_quantization_guard_allows_dense_cache_and_skips_f16(monkeypatch):
+    # A dense stack (every entry exactly KVCache) passes the guard; and with
+    # kv_bits=0 the guard must not even probe the cache — hybrid models run
+    # fine on the f16 tier, which is how mlx-lm's class-generic
+    # save/load_prompt_cache persists their state.
+    _install_fake_mlx(monkeypatch)
+    import sys
+
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    kv_cls = type("KVCache", (), {})
+    cache_mod.KVCache = kv_cls
+    probed = []
+    cache_mod.make_prompt_cache = lambda model: probed.append(1) or [kv_cls(), kv_cls()]
+
+    eng = _engine()
+    eng.kv_bits = 8
+    eng.kv_group_size = 64
+    eng._assert_quantization_supported()  # dense: no raise
+    assert probed == [1]
+
+    eng.kv_bits = 0
+    cache_mod.make_prompt_cache = lambda model: (_ for _ in ()).throw(
+        AssertionError("f16 must not probe the cache composition")
+    )
+    eng._assert_quantization_supported()  # f16: no probe, no raise
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 

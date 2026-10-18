@@ -541,6 +541,7 @@ class MlxLmEngine:
         if self.kv_bits and not self.kv_group_size:
             # A group size is mandatory with quantization; 64 is the proven one.
             self.kv_group_size = 64
+        self._assert_quantization_supported()
         self.prefill_count = 0
         # Metal allocator hygiene: MLX pools freed GPU buffers by size-class
         # indefinitely (set_cache_limit defaults high). A day of mixed-leg
@@ -563,6 +564,27 @@ class MlxLmEngine:
         self._eos_ids = getattr(self.tokenizer, "_eos_token_ids", None) or {
             self.tokenizer.eos_token_id
         }
+
+    def _assert_quantization_supported(self) -> None:
+        """Boot-time guard for the T12 q8 tier: parity is proven for dense
+        attention stacks only. Hybrid caches (CacheList/ArraysCache entries
+        carrying linear-attention / SSM / GDN state) have no ``to_quantized``,
+        so _quantize_cache would crash on the first prefill; refuse at boot
+        with the fix in the message instead. Cache construction allocates no
+        arrays (states fill on the first forward), so the probe is cheap."""
+        if not self.kv_bits:
+            return
+        from mlx_lm.models.cache import KVCache, make_prompt_cache  # noqa: PLC0415
+
+        cache = make_prompt_cache(self.model)
+        if not all(type(c) is KVCache for c in cache):
+            raise ValueError(
+                "MLXCACHE_KV_BITS is set but this model's prompt cache is not "
+                "a dense KV stack (a hybrid architecture: linear attention, "
+                "SSM, or GDN layers). The q8 tier is parity-proven for dense "
+                "models only; hybrid checkpoints persist their state "
+                "unquantized. Restart with MLXCACHE_KV_BITS=0."
+            )
 
     def _kv_dtype(self) -> str:
         """The KV/compute dtype this model will cache in (bf16 vs f16 changes the

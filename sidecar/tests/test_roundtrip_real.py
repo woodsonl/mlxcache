@@ -114,18 +114,51 @@ def _witness_scratch(resumed, scratch, twin_logits, scratch_logits=None):
     )
 
 
+def _state_leaves(node):
+    """Flatten one cache entry's state tree down to comparable leaves.
+
+    Hybrid architectures nest: a CacheList entry's state is a list of member
+    states, a linear-attention (ArraysCache) member state is a list of arrays
+    (with None for slots a short prompt has not filled), a KVCache state is
+    [keys, values]. Walk lists, tuples, and dicts to arrays, keeping None as
+    an explicit leaf so a one-sided None stays visible as a shape mismatch
+    instead of being skipped."""
+    if node is None or hasattr(node, "dtype"):
+        yield node
+    elif isinstance(node, dict):
+        for v in node.values():
+            yield from _state_leaves(v)
+    elif isinstance(node, (list, tuple)):
+        for v in node:
+            yield from _state_leaves(v)
+    else:
+        raise TypeError(f"unexpected cache-state leaf: {type(node).__name__}")
+
+
 def _state_max_diff(cache_a, cache_b):
-    """Max absolute elementwise difference between two prompt caches' states.
-    Bitwise-equal producer states differ by the kernel-path noise (~0.3);
-    wrong KV, an off-by-one feed, or a corrupted round-trip produces
-    differences orders of magnitude larger."""
+    """Worst per-leaf divergence as a fraction of that leaf's noise bound;
+    < 1.0 passes, mirroring the historical absolute gate.
+
+    Each leaf's bound is max(1.0, 25% of the leaf's own scale). The absolute
+    floor is the dense f16 calibration (measured composition noise 0.5, bound
+    1.0). The relative term covers hybrid state leaves, whose scales differ by
+    orders of magnitude: on Falcon-H1-4bit the f32 SSM recurrent state
+    (scale ~80) showed 9.7 max-abs of chunked-scan reassociation noise — 11.7%
+    relative — and 4-bit-model KV showed 7%; dense Qwen2-0.5B shows 2.6%. A
+    composition defect (wrong KV, wrong feed position) replaces values
+    wholesale and lands near 100% relative, far above the bound on every
+    lineage."""
     import mlx.core as mx
 
     worst = 0.0
     for ca, cb in zip(cache_a, cache_b, strict=True):
-        for sa, sb in zip(ca.state, cb.state, strict=True):
-            diff = mx.abs(sa - sb).max().item()
-            worst = max(worst, float(diff))
+        for sa, sb in zip(_state_leaves(ca.state), _state_leaves(cb.state), strict=True):
+            if sa is None or sb is None:
+                assert sa is None and sb is None, "cache-state shape mismatch (one-sided None)"
+                continue
+            diff = float(mx.abs(sa - sb).max().item())
+            scale = max(float(mx.abs(sa).max().item()), float(mx.abs(sb).max().item()))
+            worst = max(worst, diff / max(1.0, 0.25 * scale))
     return worst
 
 
@@ -395,17 +428,15 @@ def test_adapter_delta_prefill_matches_scratch(engine):
 
     # The composition gate: twin and resumed share the ancestor round-trip,
     # so twin equality alone cannot see an ancestor-adopt defect. The
-    # delta-adopted state must also sit within kernel-path noise of a fresh
-    # full prefill of the same prompt: measured composition noise on this
-    # lineage is 0.5 max-abs, so a composition defect (wrong KV, wrong feed
-    # position) lands well above the 1.0 bound. Computed BEFORE the twin
-    # generates — generation extends the cache and would break the shape
-    # pairing.
+    # delta-adopted state must also sit within per-leaf noise of a fresh
+    # full prefill of the same prompt (see _state_max_diff for the measured
+    # noise and bound rationale). Computed BEFORE the twin generates —
+    # generation extends the cache and would break the shape pairing.
     fresh_cache, _ = engine._prefill_cache(grown[:-1])
     state_diff = _state_max_diff(twin_cache, fresh_cache)
     assert state_diff < 1.0, (
-        "delta-adopted KV diverged from a fresh full prefill by "
-        f"{state_diff:.4g} — the OV3 composition is corrupt"
+        "delta-adopted state diverged from a fresh full prefill by "
+        f"{state_diff:.2f}x its noise bound — the OV3 composition is corrupt"
     )
 
     # Generation extends twin_cache past the compared prefix, so the twin

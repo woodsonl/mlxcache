@@ -117,6 +117,39 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   local-only model resolution that never downloads.
 - 30 premise-guard tests across `test_harness_readiness.py` and
   `test_bench_workloads.py` pinning every failure path above.
+## Unreleased
+
+### Added
+
+- **Hybrid-architecture models verified on the R1-5 gate**: mlx-lm's
+  `save_prompt_cache`/`load_prompt_cache` are class-generic (cache classes are
+  recorded in the blob and rebuilt via `from_state`), so the adapter's capture
+  path needs no per-architecture code. Measured token-identical on
+  `mlx-community/Falcon-H1-0.5B-Instruct-4bit`, whose every layer is a nested
+  `CacheList(ArraysCache, KVCache)`. README documents the supported hybrid
+  families and the known exclusion (models mlx-lm cannot load, e.g.
+  Qwen3.8-Flash-Next's `qwen4_exp`).
+
+### Fixed
+
+- **The R1-5 state-diff helper handles nested cache state**: `_state_max_diff`
+  assumed each entry's `.state` was a flat list of arrays; hybrid entries
+  (`CacheList`, `ArraysCache`) nest lists (and `None` for unfilled slots), so
+  the delta-prefill gate raised `TypeError` on every hybrid model. Now
+  tree-recurses with `None` kept as an explicit leaf so shape mismatches stay
+  visible. The bound also became per-leaf — `max(1.0, 25% of leaf scale)` —
+  because hybrid state leaves differ in scale by orders of magnitude: on
+  Falcon-H1-4bit the f32 SSM recurrent state (scale ~80) shows 9.7 max-abs of
+  chunked-scan reassociation noise (11.7% relative) against the dense f16
+  calibration of 1.0 absolute (measured 0.5). A composition defect replaces
+  values wholesale (~100% relative) and still fails on every lineage; dense
+  behavior is unchanged (floor governs, measured ratio 0.10).
+- **The q8 KV tier refuses hybrid models at boot** instead of crashing on the
+  first prefill: hybrid entries have no `to_quantized`, so
+  `MLXCACHE_KV_BITS=8` against e.g. Falcon-H1 / Qwen3-Next / granite-hybrid
+  died with `AttributeError` after prefill. A boot-time guard probes the cache
+  composition (cheap: no arrays allocated) and exits with the fix
+  (`MLXCACHE_KV_BITS=0`) in the message. Dense stacks are unaffected.
 
 ## 0.1.4 — 2026-10-05
 

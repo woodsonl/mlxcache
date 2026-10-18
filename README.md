@@ -184,6 +184,17 @@ MLXCACHE_SIDECAR_URL=http://127.0.0.1:8421 \
 The model id is whatever `mlx_lm.load()` accepts (an HF repo or a local path).
 First run downloads the weights.
 
+Hybrid architectures (linear attention / SSM / GDN mixed with attention —
+Falcon-H1, Qwen3-Next, granite-hybrid, Nemotron-H, RWKV7, …) work through the
+same path: mlx-lm's `save_prompt_cache`/`load_prompt_cache` are class-generic
+(they record each entry's cache class and rebuild it via `from_state`), so the
+adapter's capture path needs no per-architecture code. Verified
+token-identical on `mlx-community/Falcon-H1-0.5B-Instruct-4bit` (every layer a
+nested `CacheList(ArraysCache, KVCache)`) via the same R1-5 gate. Not included:
+models mlx-lm cannot load at all — e.g. Qwen3.8-Flash-Next (`qwen4_exp`: no
+mlx-lm 0.31.3 module, NVFP4 streaming layout) needs its own loader/adapter
+first; the engine contract is already hybrid-ready.
+
 ## Wrapper server (mlx-lm, no daemon)
 
 Any mlx-lm server gains persistent prefix reuse in one command — no daemon, no
@@ -245,7 +256,7 @@ Sidecar:
 | `MLXCACHE_ENGINE` | `synthetic` | `synthetic` (deterministic, no download) or `mlx-lm` |
 | `MLXCACHE_MODEL` | `synthetic-model` | model the sidecar loads (HF repo or local path) |
 | `MLXCACHE_SIDECAR_PORT` | `8421` | sidecar bind port |
-| `MLXCACHE_KV_BITS` | `0` | KV quantization tier: `0` = f16, `8` = q8 — the tier is folded into the fingerprint, so tiers never share blobs |
+| `MLXCACHE_KV_BITS` | `0` | KV quantization tier: `0` = f16, `8` = q8 — the tier is folded into the fingerprint, so tiers never share blobs. Dense attention models only: a hybrid model (linear attention / SSM / GDN layers — e.g. Falcon-H1, Qwen3-Next, granite-hybrid) is refused at boot with this tier set; its state persists unquantized on the f16 tier |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
 
 ## Building and testing
@@ -296,7 +307,9 @@ launchd service, and the mlx-lm version-pinning policy.
 Early. Working end to end (cache, persistence, single-flight, streaming, error
 rescues, chaos tests). The R1-5 gate has run on Qwen2-0.5B,
 Qwen2.5-7B-Instruct-4bit, and the named representative Qwen3-32B-4bit, all
-token-identical to scratch. The store is bounded by default (32 GiB eviction
+token-identical to scratch. Hybrid architectures round-trip through the same
+gate (measured on Falcon-H1-0.5B); the q8 KV tier is dense-only by boot-time
+guard. The store is bounded by default (32 GiB eviction
 budget with anchor protection) and every checkpoint carries a sha256 payload
 digest verified at boot and first serve. The engine-agnostic contract has one
 adapter (mlx-lm). No license assigned — private build, all rights reserved.
