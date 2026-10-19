@@ -1040,7 +1040,7 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
             )
             try:
                 stack.wait_ready()
-                before = stack.stats().get("evictions", 0)
+                before_stats = stack.stats()
                 corpus: list[list[int]] = []
                 noise = run_leg(stack, wl, _tokenize_for_daemon(stack), corpus=corpus)
                 # Premise checks read held/serialization fields that only
@@ -1055,28 +1055,44 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                 # ~2s after boot at a 1s interval. Probing without this wait
                 # would measure the pre-eviction cache and label it pressure.
                 evicted = 0
+                before_stats = stack.stats()
+                if "evictions" not in before_stats or "checkpoints_published" not in before_stats:
+                    raise SystemExit(
+                        "/stats did not report evictions/checkpoints_published: "
+                        "a missing counter would reconcile as zero and route "
+                        "the arm into the wrong branch"
+                    )
                 deadline = time.time() + EVICT_WAIT_S
                 while time.time() < deadline:
-                    now = stack.stats().get("evictions", 0)
-                    if now > before:
-                        evicted = now - before
+                    now = _harness.stats_delta(before_stats, stack.stats(), "evictions")
+                    if now > 0:
+                        evicted = now
                         break
                     time.sleep(0.5)
                 after_stats = stack.stats()
-                published_after = after_stats.get("checkpoints_published")
+                published_after = after_stats["checkpoints_published"]
                 # An expired wait is not a pressure result: if the store holds
                 # more than the cap, the reaper never bound and the row would
-                # measure an un-evicted cache while reading green. Per-arm disk
-                # headroom re-check: the sweep writes ~k checkpoints of ~190 MB
-                # at real sizes and the one-shot preflight cannot see a disk
-                # filling mid-sweep.
+                # measure an un-evicted cache while reading green. The noise
+                # samples still get the FULL premise treatment first — the
+                # degraded-run path is exactly where an accounting lie must
+                # abort, not print. Per-arm disk headroom re-check: the sweep
+                # writes ~k checkpoints of ~190 MB at real sizes and the
+                # one-shot preflight cannot see a disk filling mid-sweep.
                 headroom = check_disk_headroom(tempfile.gettempdir(), args.min_free_gb * 1e9)
                 if headroom:
                     raise SystemExit("PREFLIGHT (mid-sweep): " + "; ".join(headroom))
-                if evicted == 0 and (published_after or 0) > cap:
+                problems = check_premises(noise)
+                if problems:
+                    raise SystemExit(
+                        "PREMISE VIOLATION (harness/daemon bug, pressure):\n  "
+                        + "\n  ".join(problems)
+                    )
+                if evicted == 0 and published_after > cap:
                     row = summarize(
                         wl["name"], f"daemon/pressure_cap{cap}_evict_wait_timeout", noise
                     )
+                    row["samples"] = noise
                     row["evictions_observed"] = 0
                     row["published_before_probe"] = published_after
                     row["repeat_verdict"] = None
@@ -1099,6 +1115,8 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                         "PREMISE VIOLATION (harness/daemon bug):\n  " + "\n  ".join(problems)
                     )
                 row = summarize(wl["name"], f"daemon/pressure_cap{cap}", noise)
+                row["samples"] = noise
+                row["probe_sample"] = probe[0]
                 row["evictions_observed"] = evicted
                 row["published_before_probe"] = published_after
                 row["repeat_verdict"] = probe[0]["verdict"]
