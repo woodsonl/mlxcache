@@ -1739,19 +1739,24 @@ impl ChunkFramer {
                 const SSE: &[u8] = b"data: ";
                 const OPEN: &[u8] = b"\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"";
                 const TAIL: &[u8] = b"\"}]";
+                const CLOSE: &[u8] = b"}\n\n";
                 // The settle outcome rides ON the terminal chunk as a top-level
                 // extra (SDKs ignore extras): a separate frame would land after
                 // the finish chunk and no longer describe the stream's end.
                 let settle_frag = settle.as_ref().map(|s| format!(",\"settle\":{s}"));
                 let extra_len = settle_frag.as_ref().map_or(0, |s| s.len());
+                // Capacity must be EXACT: len == capacity keeps Bytes::from on
+                // its zero-alloc fast path, and a short count forces a realloc
+                // plus the Shared box (two extra allocations per done frame —
+                // the alloc gate exists to pin exactly this).
                 let mut frame = Vec::with_capacity(
                     SSE.len()
                         + self.head.len()
                         + OPEN.len()
                         + finish.len()
                         + TAIL.len()
-                        + extra_len
-                        + 2,
+                        + CLOSE.len()
+                        + extra_len,
                 );
                 frame.extend_from_slice(SSE);
                 frame.extend_from_slice(self.head.as_bytes());
@@ -1761,7 +1766,8 @@ impl ChunkFramer {
                 if let Some(frag) = &settle_frag {
                     frame.extend_from_slice(frag.as_bytes());
                 }
-                frame.extend_from_slice(b"}\n\n");
+                frame.extend_from_slice(CLOSE);
+                debug_assert_eq!(frame.len(), frame.capacity());
                 frames.push(Ok(bytes::Bytes::from(frame)));
                 frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
                 LineOutcome {
