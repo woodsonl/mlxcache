@@ -2,6 +2,51 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.1.5 — 2026-10-19
+
+### Fixed
+
+- **Benchmark gates can no longer pass on warmup traffic**: the wrapper
+  harnesses' readiness probe used a constant prompt, which the first
+  process published and every later process disk-hit during warmup —
+  inflating the cumulative `disk_hits` counters before any measured
+  request ran. Probes are now unique per spawned server, and both wrapper
+  gates (bench `_gate_ok`, qa Q4/Q5) require the `disk_hits` DELTA across
+  each measured leg with zero `reuse_errors`, failing loudly when the
+  stats endpoint omits a counter (`stats_delta`, shared in
+  `scripts/_harness.py`).
+- **`bench_workloads.py` measures what it claims**: TPOT divides by the
+  tokens actually generated (a constant divisor was a lie the moment a
+  workload changed `max_tokens` or the model stopped early); p95 is
+  withheld below a 100-sample floor instead of wearing a percentile
+  label; concurrent workers record and re-raise thread failures instead
+  of silently shrinking the sample; bursts use ceiling division so
+  `--requests 100 --concurrency 8` yields n=104, not 96; invalid numeric
+  args are rejected at parse. The synthetic-engine harness is also
+  relabeled as a plumbing check — its 8-token "prefill" can never express
+  prefix-cache benefit.
+- **A cold checkout no longer breaks the workloads harness**: the release
+  daemon is built to completion BEFORE any spawn (a cold build used to
+  run inside the 30s readiness window and fail as "not healthy" while the
+  compiler was still running); the sidecar port is picked at bind, the
+  sidecar is proven listening before the daemon spawns, both children run
+  with the repo as cwd, and any post-spawn failure SIGTERMs what already
+  runs instead of stranding it.
+- **`wait_ready`/`wait_healthy` cannot certify a server they did not
+  start**: both recheck child liveness after a successful probe (outside
+  the retry's `except`), so a stale listener on an explicit port cannot
+  be read as ready; a dead daemon fails fast with its exit code.
+
+### Added
+
+- **`scripts/_harness.py`**: the spawn/readiness/teardown rules shared by
+  `bench_wrapper`, `qa_wrapper` (and the prefix-benchmark unit of this
+  stack) live in one place — SIGTERM→SIGKILL escalation with log unlink,
+  per-child-pid warmup prompts, a monotonic SSE total deadline, and
+  local-only model resolution that never downloads.
+- 30 premise-guard tests across `test_harness_readiness.py` and
+  `test_bench_workloads.py` pinning every failure path above.
+
 ## 0.1.4 — 2026-10-05
 
 ### Fixed
