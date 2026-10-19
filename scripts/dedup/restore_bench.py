@@ -17,8 +17,8 @@ restore-relevant number is the delta between the medians.
 
 Usage:
   uv run python scripts/dedup/restore_bench.py <blob.ckpt> \
-      [--avg-kib 16] [--scope head] [--workers 8] [--reps 10] \
-      [--scratch DIR]
+      [--avg-kib 16] [--workers 8] [--reps 10] [--pack-mib 64] \
+      --scratch DIR
 """
 
 from __future__ import annotations
@@ -42,14 +42,15 @@ def materialize(
     tensors: dict,
     avg: int,
     scratch: Path,
-    scope: str = "head",
     pack_mib: int = 0,
 ):
     """Write chunks once; return the manifest: chunk items with absolute
     payload offsets, plus the inline (non-chunked) spans. pack_mib > 0 packs
     chunks sequentially into segment files (restic-style; the layout a real
-    codec needs — one file per 19 KB chunk is syscall-bound on restore)."""
-    chunks, _ = blob_chunk_sets(payload, tensors, scope, avg)
+    codec needs — one file per 19 KB chunk is syscall-bound on restore).
+    Scope is fixed at head: tensor/file chunking failed G1, so their restore
+    cost is not a number anyone needs."""
+    chunks, _ = blob_chunk_sets(payload, tensors, "head", avg)
     chunk_dir = scratch / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
     covered = bytearray(len(payload))
@@ -162,7 +163,6 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("blob", type=Path)
     ap.add_argument("--avg-kib", type=int, default=16)
-    ap.add_argument("--scope", default="head", choices=("head", "tensor", "file"))
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--reps", type=int, default=10)
     ap.add_argument("--pack-mib", type=int, default=0, help="pack chunks into N-MiB segments")
@@ -178,9 +178,7 @@ def main() -> int:
 
     if args.scratch.exists():
         shutil.rmtree(args.scratch)
-    manifest = materialize(
-        payload, tensors, avg, args.scratch, scope=args.scope, pack_mib=args.pack_mib
-    )
+    manifest = materialize(payload, tensors, avg, args.scratch, pack_mib=args.pack_mib)
 
     assembled = bytearray(len(payload))
     bench_chunked(manifest, args.scratch, args.workers, assembled)  # warm + verify
@@ -198,7 +196,7 @@ def main() -> int:
     gib = len(payload) / (1 << 30)
     print(f"blob: {args.blob.name}  payload={len(payload):,}B  tokens={meta['token_count']}")
     print(
-        f"chunks: {len(manifest['items'])}  scope={args.scope}  avg-target={args.avg_kib}KiB  "
+        f"chunks: {len(manifest['items'])}  scope=head  avg-target={args.avg_kib}KiB  "
         f"workers={args.workers}  inline={manifest['inline_bytes']:,}B"
     )
     print(f"plain   {ps}")

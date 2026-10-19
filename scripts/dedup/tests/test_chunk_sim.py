@@ -13,6 +13,8 @@ import hashlib
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from chunk_sim import token_block_chunks  # noqa: E402
@@ -103,9 +105,5 @@ def test_indivisible_head_size_fails_loudly():
     # 4 extra bytes across 4 heads leaves each head at 33 bytes: not a whole
     # number of positions, which must fail loudly rather than mis-slice.
     bad = {"kv": {"begin": 0, "end": tensors["kv"]["end"] + 4, "shape": (1, HEADS, 8, UNIT)}}
-    try:
+    with pytest.raises(SystemExit, match="not divisible"):
         token_block_chunks(payload, bad, 8, 4)
-    except SystemExit as exc:
-        assert "not divisible" in str(exc)
-    else:
-        raise AssertionError("expected a loud failure on a non-divisible tensor")

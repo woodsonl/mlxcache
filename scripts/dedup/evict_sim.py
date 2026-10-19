@@ -125,13 +125,13 @@ class ChunkStore:
     def _unique_bytes(self, e: Entry) -> int:
         return sum(sz for d, sz in e.chunks.items() if self.ref.get(d, 0) == 1)
 
-    def enforce(self, budget: int, order: str = "unique") -> dict:
+    def enforce(self, budget: int) -> dict:
+        # chunk-store policy: evict the biggest unique-tail first (freeing a
+        # shared chunk costs the store nothing, so unique bytes are the only
+        # bytes an eviction can actually reclaim)
         anchored = anchored_ancestors(self.entries)
         cands = [e for e in self.entries if e.live and id(e) not in anchored]
-        if order == "unique":
-            cands.sort(key=self._unique_bytes, reverse=True)
-        else:
-            cands.sort(key=lambda e: e.tokens, reverse=True)
+        cands.sort(key=self._unique_bytes, reverse=True)
         total = self.bytes()
         evicted = 0
         for e in cands:
@@ -179,7 +179,6 @@ def replay(
     requests: list[tuple[str, int]],
     budget: int,
     entries_by: dict[tuple[str, int], Entry],
-    order: str = "unique",
     track_restore: bool = False,
 ) -> SimResult:
     """requests: (convo, turn) in arrival order. Lookup is TOKEN-PREFIX
@@ -227,10 +226,7 @@ def replay(
             peak = max(peak, store.bytes())
             if track_restore and evictions:
                 restore += store.bytes() - before
-            if isinstance(store, ChunkStore):
-                r = store.enforce(budget, order=order)
-            else:
-                r = store.enforce(budget)
+            r = store.enforce(budget)
             evictions += r["evicted"]
             over = over or r["over_budget_held_by_anchors"]
         traj.append(store.bytes())

@@ -96,7 +96,7 @@ def compare(
     b: bytes,
     tensors_a: dict,
     tensors_b: dict,
-    record: list[dict] | None = None,
+    record: list[dict],
 ) -> None:
     print(f"-- {name}")
     exact = total = 0
@@ -123,16 +123,15 @@ def compare(
         print(f"   {tname}: heads [{' '.join(heads)}]")
     if len(tensors_a) > 4:
         print(f"   ... {len(tensors_a) - 4} more tensors")
-    if record is not None:
-        record.append(
-            {
-                "comparison": name,
-                "heads_exact": exact,
-                "heads_total": total,
-                "verdict": "exact" if exact == total else "partial",
-                "detail": detail,
-            }
-        )
+    record.append(
+        {
+            "comparison": name,
+            "heads_exact": exact,
+            "heads_total": total,
+            "verdict": "exact" if exact == total else "partial",
+            "detail": detail,
+        }
+    )
 
 
 def main() -> int:
