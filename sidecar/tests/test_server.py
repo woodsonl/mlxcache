@@ -56,6 +56,58 @@ def test_tokenize_returns_engine_hash_not_a_constant(sidecar_url):
         server.Handler.engine.tokenizer_hash = "synthetic"
 
 
+def test_tokenize_reports_engine_id_and_cache_layout(sidecar_url):
+    # Connector protocol §2/§4: the daemon folds these into the fingerprint and
+    # the key, so they must come from the ENGINE (not a handler constant) and
+    # the synthetic engine must report the DEFAULT engine id — its fingerprints
+    # have to stay byte-identical to the real mlx-lm engine's, which is the
+    # whole point of the hermetic stand-in.
+    r = httpx.post(f"{sidecar_url}/tokenize", json={"prompt": "x"}).json()
+    assert r["engine_id"] == "mlx-lm"
+    assert r["cache_layout"], "composition must be signed, never empty"
+
+    server.Handler.engine.engine_id = "llama-cpp"
+    server.Handler.engine.cache_layout = "opaque-state"
+    try:
+        r2 = httpx.post(f"{sidecar_url}/tokenize", json={"prompt": "x"}).json()
+        assert r2["engine_id"] == "llama-cpp"
+        assert r2["cache_layout"] == "opaque-state"
+    finally:
+        server.Handler.engine.engine_id = "mlx-lm"
+        server.Handler.engine.cache_layout = "synthetic-dense-kv"
+
+
+def test_synthetic_engine_reports_the_mlx_lm_engine_domain():
+    # Load-bearing: "synthetic" would be a distinct key domain and would
+    # re-key every hermetic e2e blob, hiding cross-binding drift.
+    eng = server.SyntheticEngine("test-model")
+    assert eng.engine_id == "mlx-lm"
+    assert eng.engine_id == server.MlxLmEngine.engine_id
+    assert eng.cache_layout and eng.cache_layout == server.SyntheticEngine.cache_layout
+
+
+def test_tokenize_protocol_violation_ok_to_be_400(sidecar_url):
+    # An engine that does not report the new identity fields (a future engine
+    # that forgot them) falls back to the default engine id and an UNKNOWN
+    # composition rather than raising on the hot path. The fallback is
+    # deliberately safe: unknown composition only ever serves legacy-to-legacy
+    # (mlxcache_core::policy), so a misconfigured engine loses reuse instead
+    # of serving a payload of the wrong shape.
+    class Bare:
+        tokenizer_hash = "h"
+
+        def tokenize(self, prompt):
+            return [1, 2]
+
+    server.Handler.engine = Bare()
+    try:
+        r = httpx.post(f"{sidecar_url}/tokenize", json={"prompt": "x"}).json()
+        assert r["engine_id"] == "mlx-lm"
+        assert r["cache_layout"] == ""
+    finally:
+        server.Handler.engine = server.make_engine("test-model")
+
+
 def test_tokenize_can_return_zero_tokens(sidecar_url, monkeypatch):
     # The daemon rejects empty tokenizations; the sidecar must be able to
     # produce them for that path to be testable (real HF tokenizers do).
