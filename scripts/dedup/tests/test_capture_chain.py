@@ -33,3 +33,19 @@ def test_wait_publish_waits_and_times_out_loudly(tmp_path):
     assert wait_publish(blobs, before=1) == 2
     with pytest.raises(SystemExit, match="no new blob"):
         wait_publish(blobs, before=2, timeout_s=0.15)
+
+
+def test_snapshot_blobs_hardlink_farm_is_idempotent(tmp_path):
+    """The inventory feeds turn_blobs; the exists() guard is what lets the
+    twice-per-turn snapshot call not raise on already-linked blobs."""
+    from capture_chain import snapshot_blobs
+
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    (blobs / "a.ckpt").write_bytes(b"xx")
+    inv1 = snapshot_blobs(blobs, tmp_path / "snap")
+    (blobs / "b.ckpt").write_bytes(b"yyy")
+    inv2 = snapshot_blobs(blobs, tmp_path / "snap")
+    assert [(i["name"], i["bytes"]) for i in inv1] == [("a.ckpt", 2)]
+    assert [(i["name"], i["bytes"]) for i in inv2] == [("a.ckpt", 2), ("b.ckpt", 3)]
+    assert (tmp_path / "snap" / "a.ckpt").exists()

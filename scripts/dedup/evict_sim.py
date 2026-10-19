@@ -69,7 +69,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from blob_forensics import load_blob, parse_safetensors, turn_blobs
-from chunk_sim import blob_chunk_sets, token_block_chunks
+from chunk_sim import TOKEN_BLOCK, blob_chunk_sets, token_block_chunks
 
 # "no budget": larger than any reachable store size; rows under it record
 # budget_bytes=None / binding=None so an unbudgeted row can never be misread
@@ -322,9 +322,9 @@ def build_entries(turns: list[tuple[int, Path]], avg: int, codec: str = "cdc") -
         meta, payload = load_blob(path)
         tensors, _ = parse_safetensors(payload)
         if codec == "token-block":
-            chunks = token_block_chunks(payload, tensors, meta["token_count"] - 1, 64)
+            chunks = token_block_chunks(payload, tensors, meta["token_count"] - 1, TOKEN_BLOCK)
         else:
-            chunks = blob_chunk_sets(payload, tensors, "head", avg)[0]
+            chunks = blob_chunk_sets(payload, tensors, "head", avg)
         e = Entry(
             convo="A",
             turn=turn,
@@ -474,7 +474,10 @@ def main() -> int:
             f"{bud:>10} {bind:>5} {r.evictions:>6} "
             f"{'yes' if r.over_budget else '-':>5} {win:>4}"
         )
-    s1w, s1c = results[0], results[1]
+    # select by name/kind, not position: an inserted scenario must never
+    # silently become the headline ratio
+    s1w = next(r for r in results if r.name.startswith("S1") and r.store_kind == "whole")
+    s1c = next(r for r in results if r.name.startswith("S1") and r.store_kind == "chunk")
     print(
         f"\nS1 growth: whole {s1w.final_bytes / (1 << 20):.1f} MiB vs chunk "
         f"{s1c.final_bytes / (1 << 20):.1f} MiB "

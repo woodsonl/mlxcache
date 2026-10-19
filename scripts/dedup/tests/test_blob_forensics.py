@@ -81,7 +81,9 @@ def test_layout_framing_from_file_not_reserialization(tmp_path):
     tensors, _ = parse_safetensors(pl)
     lay = layout(m, tensors, len(pl), framing)
     assert lay["framing_bytes"] == framing
-    assert lay["framing_bytes"] != 4 + len(json.dumps(m)) or framing == 4 + len(json.dumps(m))
+    # the compact header's length must differ from a spaced re-serialization
+    # (that is the point: never guess the writer's serialization)
+    assert framing != 4 + len(json.dumps(m))
 
 
 def st_payload_shapes(specs: dict[str, tuple[bytes, list[int]]]) -> bytes:
@@ -204,3 +206,23 @@ def test_block_containment_direction_and_edges():
     assert block_containment(ext, blk, 16) == (0.5, 1.0)
     assert block_containment(blk, blk, 16) == (1.0, 1.0)
     assert block_containment(b"xy" * 8, blk, 16) == (0.0, 0.0)
+
+
+def test_compare_pair_tensor_set_mismatch_is_a_labeled_error(tmp_path):
+    """A malformed capture must produce the labeled error row, not a
+    KeyError stack trace."""
+    from blob_forensics import compare_pair
+
+    def blob(name_sizes: dict[str, bytes]) -> Path:
+        meta = {"token_count": 4, "fingerprint": {"kv_bits": 0}}
+        h = json.dumps(meta).encode()
+        payload = st_payload(name_sizes)
+        p = tmp_path / f"{len(name_sizes)}-{sum(map(len, name_sizes.values()))}.ckpt"
+        p.write_bytes(struct.pack("<I", len(h)) + h + payload)
+        return p
+
+    a = blob({"k": b"12345678"})
+    b = blob({"k": b"12345678", "v": b"87654321"})
+    r = compare_pair("mismatch", a, b, 4096)
+    assert r["error"] == "tensor sets differ"
+    assert r["a"] == ["k"] and sorted(r["b"]) == ["k", "v"]

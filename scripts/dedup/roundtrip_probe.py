@@ -29,6 +29,7 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
+from blob_forensics import first_diff, parse_safetensors
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOC = REPO_ROOT / "scripts" / "fixtures" / "t22" / "design_doc.md"
@@ -113,14 +114,12 @@ def compare(
         heads = []
         for i in range(h):
             s = i * hsz
-            d = (
-                next((j for j in range(s, s + hsz) if seg_a[j] != seg_b[j]), None)
-                if seg_a[s : s + hsz] != seg_b[s : s + hsz]
-                else None
-            )
+            seg_a_head = seg_a[s : s + hsz]
+            seg_b_head = seg_b[s : s + hsz]
+            rel = first_diff(seg_a_head, seg_b_head) if seg_a_head != seg_b_head else None
             total += 1
-            exact += d is None
-            heads.append("==" if d is None else f"diff@{d - s}")
+            exact += rel is None
+            heads.append("==" if rel is None else f"diff@{rel}")
         detail.append({"tensor": tname, "heads": heads})
         print(f"   {tname}: heads [{' '.join(heads)}]")
     record.append(
@@ -175,8 +174,6 @@ def main() -> int:
 
     # E: load A and save it right back — pure round trip, no compute
     payload_e = save_cache(load_cache(payload_a))
-
-    from blob_forensics import parse_safetensors
 
     ta, _ = parse_safetensors(payload_a)
     tb, _ = parse_safetensors(payload_b)

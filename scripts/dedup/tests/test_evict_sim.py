@@ -79,20 +79,25 @@ def divergent_convo() -> dict[tuple[str, int], Entry]:
 
 
 def test_shared_chunk_survives_single_eviction():
+    """Drive the eviction through the production enforce() path (not a
+    hand-rolled copy of its bookkeeping): turn 1 becomes evictable only when
+    its successor is gone, and evicting the successor must free exactly the
+    successor's unique bytes while every shared chunk stays on disk."""
     s = ChunkStore()
     entries = synth_chain()
     s.publish(entries[("A", 1)], tick=0)
     s.publish(entries[("A", 2)], tick=1)
     before = s.bytes()
-    s.entries[0].live = False  # simulate direct eviction of turn 1
-    for d in entries[("A", 1)].chunks:
-        s.ref[d] -= 1
-        if s.ref[d] == 0:
-            del s.chunks_on_disk[d]
-    # turn 2 still holds every shared chunk; only turn-1-unique chunks freed
-    unique1 = 3 * 60_000
-    assert before - s.bytes() == unique1
-    assert len(s.chunks_on_disk) == len(entries[("A", 2)].chunks)
+    # both entries are structurally anchored while both are live; make turn 2
+    # evictable by the policy's own rules (aged out, leaf, over budget)
+    s.entries[-1].last_used = -10  # aged: tick 1 - (-10) > window 0
+    r = s.enforce(0, tick=1, window=0)
+    assert r["evicted"] == 1
+    # turn 2's unique chunks freed; the shared prefix (held by turn 1) stays
+    unique2 = 3 * 60_000
+    assert before - s.bytes() == unique2
+    assert len(s.chunks_on_disk) == len(entries[("A", 1)].chunks)
+    assert all(d in s.chunks_on_disk for d in entries[("A", 1)].chunks)
 
 
 def test_anchored_chain_never_broken():
@@ -160,6 +165,10 @@ def test_chain_growth_unique_not_full():
     assert w.evictions == c.evictions == 0
     # 8 turns: whole stores every full blob; chunk stores prefix + deltas
     assert c.final_bytes < w.final_bytes / 4
+    # unbudgeted rows must record budget_bytes/binding/window as None so an
+    # S1 row can never be misread as policy evidence
+    for r in (w, c):
+        assert r.budget_bytes is None and r.binding is None and r.window_ticks is None
 
 
 def test_binding_flag_distinguishes_pressure_from_slack():

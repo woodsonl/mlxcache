@@ -97,9 +97,7 @@ def gear_cut_candidates(arr: np.ndarray, table: np.ndarray, mask_bits: int) -> n
     start = 0
     while start + m <= arr.size:
         stop = min(start + block, arr.size)
-        # ensure every window starting in this block is complete within it
-        win_end = min(stop, arr.size)
-        seg = arr[start:win_end]
+        seg = arr[start:stop]
         if seg.size < m:
             break
         w = np.lib.stride_tricks.sliding_window_view(seg, m)
@@ -109,9 +107,10 @@ def gear_cut_candidates(arr: np.ndarray, table: np.ndarray, mask_bits: int) -> n
         acc &= np.uint64((1 << m) - 1)  # the cut condition is on the LOW m bits
         rows = np.nonzero(acc == 0)[0]
         out.append(rows.astype(np.int64) + start + m)
-        if win_end >= arr.size:
+        if stop >= arr.size:
             break
-        start = win_end - (m - 1)
+        # re-cut the windows that straddle the block edge in the next block
+        start = stop - (m - 1)
     if not out:
         return np.empty(0, dtype=np.int64)
     return np.concatenate(out)
@@ -199,7 +198,7 @@ def chunk_stream(
 
 def blob_chunk_sets(
     payload: bytes, tensors: dict, scope: str, avg: int
-) -> tuple[list[tuple[int, int, str]], dict[str, list[int]]]:
+) -> list[tuple[int, int, str]]:
     """Chunks over the payload. Scopes:
     file   — one stream over the whole payload (what a FUSE-style whole-file
              chunker sees; every head boundary shift re-cuts downstream).
@@ -207,21 +206,18 @@ def blob_chunk_sets(
     head   — per KV-head block (axis-1 slices): the layout-stable unit the
              forensics probe identified; cuts never cross a head boundary
              and appends never shift later heads' bytes.
-    Returns (chunks with payload-absolute offsets, cut map for stability)."""
+    Returns chunks with payload-absolute offsets (end, size, digest)."""
     min_size, max_size = cdc_envelope(avg)
     chunks: list[tuple[int, int, str]] = []
-    cuts_by: dict[str, list[int]] = {}
     if scope == "file":
-        cs, cuts = chunk_stream(payload, avg, min_size, max_size)
+        cs, _ = chunk_stream(payload, avg, min_size, max_size)
         chunks.extend(cs)
-        cuts_by["<file>"] = cuts
     elif scope == "tensor":
         for name in sorted(tensors):
             t = tensors[name]
             seg = payload[t["begin"] : t["end"]]
-            cs, cuts = chunk_stream(seg, avg, min_size, max_size)
+            cs, _ = chunk_stream(seg, avg, min_size, max_size)
             chunks.extend((t["begin"] + e, s, d) for e, s, d in cs)
-            cuts_by[name] = cuts
     else:
         for name in sorted(tensors):
             t = tensors[name]
@@ -229,10 +225,15 @@ def blob_chunk_sets(
             hsz = (t["end"] - t["begin"]) // n_heads
             for h in range(n_heads):
                 seg = payload[t["begin"] + h * hsz : t["begin"] + (h + 1) * hsz]
-                cs, cuts = chunk_stream(seg, avg, min_size, max_size)
+                cs, _ = chunk_stream(seg, avg, min_size, max_size)
                 chunks.extend((t["begin"] + h * hsz + e, s, d) for e, s, d in cs)
-                cuts_by[f"{name}#{h}"] = [h * hsz + c for c in cuts]
-    return chunks, cuts_by
+    return chunks
+
+
+# v1 codec block size: the first entry of chunk_sim's --token-blocks default.
+# One definition so the eviction arm always chunks with the codec the decision
+# adopts, even if that default changes.
+TOKEN_BLOCK = 64
 
 
 def token_block_chunks(payload: bytes, tensors: dict, positions: int, block: int):
@@ -367,7 +368,7 @@ def main() -> int:
 
             def chunker(payload: bytes, meta: dict, _avg=avg, _scope=scope):
                 tensors, _ = parse_safetensors(payload)
-                return blob_chunk_sets(payload, tensors, _scope, _avg)[0]
+                return blob_chunk_sets(payload, tensors, _scope, _avg)
 
             r = simulate(turns, f"cdc/{scope}/{kib}KiB", chunker)
             r["boundary_stability"] = boundary_stability(turns, avg) if scope == "head" else None

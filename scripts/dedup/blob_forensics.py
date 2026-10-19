@@ -109,8 +109,6 @@ def first_diff(a: bytes, b: bytes) -> int | None:
         if a[start : start + blk] != b[start : start + blk]:
             lo = start
             break
-    else:
-        return n
     # bisect within [lo, lo+blk]
     bad, good = lo + blk, lo
     while bad - good > 1:

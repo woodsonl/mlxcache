@@ -51,7 +51,7 @@ def materialize(
     codec needs — one file per 19 KB chunk is syscall-bound on restore).
     Scope is fixed at head: tensor/file chunking failed G1, so their restore
     cost is not a number anyone needs."""
-    chunks, _ = blob_chunk_sets(payload, tensors, "head", avg)
+    chunks = blob_chunk_sets(payload, tensors, "head", avg)
     chunk_dir = scratch / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
     items = []
