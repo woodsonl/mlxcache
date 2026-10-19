@@ -1321,10 +1321,16 @@ class MlxLmEngine:
                 # Not yielded: `stream_generate` ends before emitting EOS, so
                 # yielding it would change the token sequence callers see.
                 #
-                # The cache is exactly on the convention here: the forward that
-                # discovered the EOS consumed the last generated token, so the
-                # cache covers `prompt + generated[:-1]` and `settle` can persist
-                # it without trimming.
+                # The cache is one position DEEPER than the `tokens[:-1]`
+                # convention here, not on it: the forward that discovered the
+                # EOS is the one that consumed the last yielded token, so the
+                # cache now covers the whole `prompt + generated` sequence. A
+                # trimmable cache drops that surplus; this one cannot, so
+                # `settle` refuses the checkpoint rather than record a coverage
+                # count the cache does not hold. The answer is unaffected; the
+                # cost is that an EOS-terminated reply on a hybrid engine
+                # publishes no checkpoint. A token-budget stop, which is the
+                # path the settle tests drive, lands exactly on the convention.
                 detokenizer.finalize()
                 return
             detokenizer.add_token(token)

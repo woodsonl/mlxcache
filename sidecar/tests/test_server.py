@@ -459,3 +459,87 @@ def test_adoption_materializes_weights_for_request_threads(sidecar_url, monkeypa
 
     engine._adopt_model()
     assert run_on_request_thread(engine.model) == {"value": [[4.0, 6.0]]}
+
+
+def _untrimmable_loop_engine(script, eos_token):
+    """An engine whose model reports one cache position per forward, so the
+    loop's end position is measurable.
+
+    The tokenizer is a real `TokenizerWrapper` subclass (the loop's isinstance
+    check and its `eos_token_ids`/`detokenizer` use are the contract), with the
+    HF work stubbed out.
+    """
+    import mlx.core as mx
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    vocab = max(max(script), eos_token) + 8
+
+    class Model:
+        positions = 0
+
+        def __call__(self, ids, cache=None):
+            Model.positions += ids.shape[1]
+            logits = mx.zeros((1, 1, vocab))
+            if ids.shape[1] == 1:
+                # Decode step: emit the next scripted token. The prompt-prefill
+                # forward's logits are discarded by the loop, so it consumes no
+                # script entry.
+                logits[0, 0, script.pop(0)] = 10.0
+            return logits
+
+    class Detokenizer:
+        last_segment = ""
+
+        def add_token(self, _token):
+            pass
+
+        def finalize(self):
+            pass
+
+    class Tokenizer(TokenizerWrapper):
+        def __init__(self):  # bypass the HF tokenizer requirement
+            self._eos_token_ids = {eos_token}
+            self._detokenizer = Detokenizer()
+
+    engine = object.__new__(server.MlxLmEngine)
+    engine.model = Model()
+    engine.tokenizer = Tokenizer()
+    return engine
+
+
+def test_untrimmable_loop_ends_on_the_convention_at_a_token_budget():
+    """A token-budget stop leaves the cache on `tokens[:-1]`.
+
+    This is the path the settle tests drive: the last yielded token is never
+    fed back, so the cache covers exactly the tokens the checkpoint describes
+    minus one.
+    """
+    prompt = [1, 2, 3, 4]
+    engine = _untrimmable_loop_engine([10, 11, 12, 13], eos_token=99)
+    out = []
+    for token, _text in engine._stream_untrimmable(prompt, None):
+        out.append(token)
+        if len(out) == 3:
+            break
+    assert out == [10, 11, 12]
+    total = len(prompt) + len(out)
+    assert engine.model.positions == total - 1, "budget stop must land on the convention"
+
+
+def test_untrimmable_loop_eos_stop_is_one_position_deep():
+    """An EOS stop leaves the cache one position DEEPER than `tokens[:-1]`.
+
+    Measured, not assumed: the forward that discovers EOS is the one that
+    consumed the last yielded token, so the cache covers the whole
+    `prompt + generated` sequence. A trimmable cache drops that surplus; a
+    hybrid (recurrent-state) cache cannot, so `settle` must refuse rather than
+    record a coverage count the cache does not hold. Pinned here because the
+    inline comment claimed the opposite and nothing else exercised the EOS
+    branch.
+    """
+    prompt = [1, 2, 3, 4]
+    engine = _untrimmable_loop_engine([10, 11, 99], eos_token=99)
+    out = [token for token, _text in engine._stream_untrimmable(prompt, None)]
+    assert out == [10, 11], "EOS itself is never yielded"
+    total = len(prompt) + len(out)
+    assert engine.model.positions == total, "the EOS forward leaves the surplus position"
