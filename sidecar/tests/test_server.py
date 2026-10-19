@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import types
 
@@ -622,3 +623,31 @@ def test_generate_rejects_a_staging_shaped_path_in_a_foreign_directory(
     assert res.json()["settle"]["reason"] == "staging_path_refused"
     assert res.json()["settle"]["written"] is False
     assert not (other / ".settle-2-2-2.staging").exists()
+
+
+def test_stream_reports_a_refused_staging_path_in_the_done_frame(
+    sidecar_url, monkeypatch, tmp_path
+):
+    # The degraded refusal must reach the streaming leg too: the daemon reads
+    # the settle from the done line, so an absent field would read as "no
+    # settle was requested" instead of "one was refused".
+    _reset_staging_pin(monkeypatch, directory=tmp_path)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    with httpx.stream(
+        "POST",
+        f"{sidecar_url}/generate",
+        json={
+            "tokens": [1, 2, 3],
+            "max_tokens": 1,
+            "stream": True,
+            "settle_path": str(other / ".settle-3-3-3.staging"),
+        },
+    ) as res:
+        assert res.status_code == 200
+        lines = [json.loads(ln) for ln in res.iter_lines() if ln.strip()]
+    done = lines[-1]
+    assert done.get("done") is True
+    assert done["settle"]["written"] is False
+    assert done["settle"]["reason"] == "staging_path_refused"
+    assert not (other / ".settle-3-3-3.staging").exists()

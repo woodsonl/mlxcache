@@ -16,6 +16,7 @@ import types
 
 import pytest
 from mlxcache_sidecar import blob, server
+from mlxcache_sidecar.server import MlxLmEngine
 
 
 class FakeCache:
@@ -1151,3 +1152,32 @@ def test_settle_caps_default_when_env_unset_or_malformed(monkeypatch):
     monkeypatch.setenv("MLXCACHE_SETTLE_MAX_TOKENS", "not-a-number")
     monkeypatch.setenv("MLXCACHE_SETTLE_MAX_BYTES", "")
     assert _settle_limits() == (SETTLE_MAX_TOKENS_DEFAULT, SETTLE_MAX_BYTES_DEFAULT)
+
+
+def test_generate_collect_reports_a_settling_failure_instead_of_raising(monkeypatch, tmp_path):
+    # Regression: the collecting leg called engine.settle unguarded, so an
+    # exception in pre-settle work turned a completed generation into a 500.
+    # Remove the guard and this test fails with the raised RuntimeError.
+    _install_fake_mlx(monkeypatch)
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    monkeypatch.setattr(cache_mod, "can_trim_prompt_cache", lambda cache: True, raising=False)
+    monkeypatch.setattr(cache_mod, "trim_prompt_cache", lambda cache, n: None, raising=False)
+    engine = _engine()
+    engine.cache_layout = ""
+    engine.engine_id = "mlx-lm"
+    # One scripted token: the test targets the settle guard, not generation.
+    monkeypatch.setattr(
+        MlxLmEngine, "stream_with_cache", lambda self, tokens, cache: iter([(7, "x")])
+    )
+
+    def _boom(self, prompt, generated, cache, path):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(MlxLmEngine, "settle", _boom)
+    tokens = [1, 2, 3]
+    out, text, _cache, settle = engine.generate_collect(
+        tokens, 1, None, str(tmp_path / ".settle-1-1-1.staging")
+    )
+    assert len(out) >= 1, "generation itself must complete"
+    assert settle["written"] is False
+    assert settle["reason"].startswith("settle_failed")
