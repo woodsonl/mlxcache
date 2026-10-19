@@ -241,10 +241,10 @@ def main() -> int:
         pre = srv2.stats() or {}
         wall_re, text_re = srv2.chat(body2)
         post = srv2.stats() or {}
-        restart_stats = dict(
-            disk_hits=(post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0),
-            reuse_errors=(post.get("reuse_errors") or 0) - (pre.get("reuse_errors") or 0),
-        )
+        restart_stats = {
+            "disk_hits": (post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0),
+            "reuse_errors": (post.get("reuse_errors") or 0) - (pre.get("reuse_errors") or 0),
+        }
         results.append(_leg_result("restart-turn2", wall_re, text_re, baseline2, restart_stats))
 
     # ---- second process (another pair, SAME store): determinism ----------
@@ -253,10 +253,10 @@ def main() -> int:
         pre = srv3.stats() or {}
         wall_2nd, text_2nd = srv3.chat(body2)
         post = srv3.stats() or {}
-        second_stats = dict(
-            disk_hits=(post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0),
-            reuse_errors=(post.get("reuse_errors") or 0) - (pre.get("reuse_errors") or 0),
-        )
+        second_stats = {
+            "disk_hits": (post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0),
+            "reuse_errors": (post.get("reuse_errors") or 0) - (pre.get("reuse_errors") or 0),
+        }
         results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2, second_stats))
 
     # ---- acceptance ------------------------------------------------------

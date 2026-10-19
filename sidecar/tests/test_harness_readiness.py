@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -51,6 +52,34 @@ class _FakeProc:
 
     def kill(self):
         pass
+
+
+class _DeadProc(_FakeProc):
+    """A child whose port TOCTOU already claimed: poll() reports the exit."""
+
+    def poll(self):
+        return 17
+
+
+class _StubbornProc:
+    """Ignores SIGTERM until killed; models the stop() escalation path."""
+
+    def __init__(self):
+        self.killed = False
+
+    def poll(self):
+        return None if not self.killed else 0
+
+    def send_signal(self, _sig):
+        pass
+
+    def wait(self, timeout=None):
+        if not self.killed:
+            raise subprocess.TimeoutExpired("cmd", timeout)
+        return 0
+
+    def kill(self):
+        self.killed = True
 
 
 class _FakeResp:
@@ -165,6 +194,92 @@ def test_resolve_model_rejects_uncached_id():
     for mod in (bench, qa):
         with pytest.raises(SystemExit):
             mod.resolve_model("definitely/not-a-cached-model-xyz")
+
+
+def test_wait_ready_fails_fast_when_child_exits():
+    """The child-exited guard is the fast-fail defense against the port
+    TOCTOU free_port's own docstring names: a dead child whose port was
+    reclaimed must never be probed — the probe could be answered by whatever
+    owns the port now, and the harness would benchmark the wrong stack."""
+    srv = _server(qa.Server)
+    srv.proc = _DeadProc()
+    warmups = []
+    srv._warmup = lambda timeout: warmups.append(timeout)
+    try:
+        with pytest.raises(RuntimeError, match="exited early"):
+            srv.wait_ready(timeout_s=5.0)
+        assert warmups == []  # never probed a port its child no longer owns
+    finally:
+        srv.log_fh.close()
+        srv.log_path.unlink(missing_ok=True)
+
+
+def test_stop_escalates_to_kill_and_still_unlinks():
+    """A child that ignores SIGTERM must be SIGKILLed, and the escalation
+    must not skip the close/unlink (an unsuppressed raise there would
+    re-leak the log fd and temp file on every stuck teardown)."""
+    srv = _server(harness.Server)
+    srv.proc = proc = _StubbornProc()
+    log_path = srv.log_path
+    srv.stop()
+    assert proc.killed
+    assert not log_path.exists()
+
+
+def test_spawn_failure_cleans_up_temp_log(monkeypatch, tmp_path):
+    """If Popen fails, the log fd and temp file the constructor already
+    created must be closed and unlinked, not leaked per failed spawn."""
+
+    def fake_mkstemp(*_a, **_k):
+        # mkstemp's real contract is a RAW os-level fd with no owning Python
+        # file object; double ownership makes the cleanup close twice.
+        fd = os.open(tmp_path / "spawn.log", os.O_CREAT | os.O_WRONLY, 0o600)
+        return fd, str(tmp_path / "spawn.log")
+
+    monkeypatch.setattr(harness.tempfile, "mkstemp", fake_mkstemp)
+
+    def boom(*_a, **_k):
+        raise OSError("exec failed")
+
+    monkeypatch.setattr(harness.subprocess, "Popen", boom)
+    with pytest.raises(OSError, match="exec failed"):
+        harness.Server(["/nonexistent"], port=1, base="http://127.0.0.1:1")
+    assert not (tmp_path / "spawn.log").exists()
+
+
+def test_subclasses_choose_their_warmup_client(monkeypatch):
+    """Production wiring, not the injection point: qa's Server must probe
+    via post() (a 5xx is inspected, not raised) and bench's via chat()
+    (raises AND returns the wall time its benchmark reports). A flipped
+    default would leave one script's readiness shape untested while its
+    tests keep passing against a hand-injected value."""
+    seen = {}
+
+    class _FakePopen:
+        def __init__(self, argv, **_kw):
+            seen["argv"] = argv
+
+        def poll(self):
+            return 0
+
+        def send_signal(self, _sig):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(harness.subprocess, "Popen", _FakePopen)
+    for mod, mode in ((qa, "post"), (bench, "chat")):
+        srv = mod.Server("store", "model", 4321)
+        try:
+            assert srv.warmup == mode
+            assert srv.base == "http://127.0.0.1:4321"
+            assert seen["argv"][seen["argv"].index("--port") + 1] == "4321"
+        finally:
+            srv.stop()
 
 
 def _leg(verdict):

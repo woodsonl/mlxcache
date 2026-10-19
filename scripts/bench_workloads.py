@@ -159,10 +159,11 @@ def report(name: str, ttfts: list[float], totals: list[float], token_counts: lis
         "tokens_mean": round(statistics.fmean(token_counts), 1),
     }
     ttft_p95 = f"  p95 {row['ttft_p95_ms']:>8.2f}ms" if row["ttft_p95_ms"] is not None else ""
+    tpot_p50 = f"{row['tpot_p50_ms']:>6.2f}ms" if row["tpot_p50_ms"] is not None else "   n/a"
     tpot_p95 = f"  p95 {row['tpot_p95_ms']:>7.2f}ms/token" if row["tpot_p95_ms"] is not None else ""
     print(
         f"  {name:<34} TTFT p50 {row['ttft_p50_ms']:>8.2f}ms{ttft_p95}"
-        f"   TPOT p50 {row['tpot_p50_ms']:>6.2f}ms{tpot_p95}"
+        f"   TPOT p50 {tpot_p50}{tpot_p95}"
         f"  (n={len(ttfts)}, tokens~{row['tokens_mean']})"
     )
     return row
