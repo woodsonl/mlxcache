@@ -2,9 +2,58 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
-## 0.1.7 — 2026-10-19
+## 0.1.8 — 2026-10-19
 
-### Added
+- **`qwen4-exp` engine: Qwen3.8-Flash-Next served end to end**: a
+  self-contained engine (`MLXCACHE_ENGINE=qwen4-exp`) for a local
+  `Qwen3.8-Flash-Next` NVFP4 checkpoint (132.6 GB on disk) on one Apple
+  Silicon machine. The architecture port, NVFP4 weight reader and PLE n-gram
+  embedding live in this repo; nothing depends on another repository. The
+  checkpoint's bundled MTP head and vision tower are not loaded: neither
+  contributes cache state, and `weight_shapes()` enumerates 74,926 text
+  tensors and zero from either family. Because the checkpoint cannot be resident on 48 GB,
+  weights stream from disk under two residency knobs,
+  `MLXCACHE_Q4_EXPERT_RESIDENT_N` (decoded experts per layer, default `0`) and
+  `MLXCACHE_Q4_PLE_CACHE_MB` (decoded PLE row budget, default `512`); a budget
+  that is too small costs decode speed, not correctness. Cache integration is
+  the engine-generic path unchanged, so persistence, digests, eviction, delta
+  resume and `engine_id` namespacing apply as-is. Residency accounting and
+  troubleshooting are in `docs/ops.md`. Performance on the real checkpoint is
+  recorded in the README's Measured section: boot 4.6 s, prefill 46.1 s at 256
+  tokens to 76.6 s at 8K, decode 2.0-2.3 s/token to 2K. Decode at 8K was
+  measured under 10 GB of swap and is flagged there as contaminated rather
+  than quoted.
+- **Hybrid-architecture models verified on the R1-5 gate**: mlx-lm's
+  `save_prompt_cache`/`load_prompt_cache` are class-generic (cache classes are
+  recorded in the blob and rebuilt via `from_state`), so the adapter's capture
+  path needs no per-architecture code. Measured token-identical on
+  `mlx-community/Falcon-H1-0.5B-Instruct-4bit`, whose every layer is a nested
+  `CacheList(ArraysCache, KVCache)`. README documents the supported hybrid
+  families and the boundary for models mlx-lm cannot load at all, which the
+  self-contained `qwen4-exp` engine (above) serves instead.
+
+### Fixed
+
+- **The R1-5 state-diff helper handles nested cache state**: `_state_max_diff`
+  assumed each entry's `.state` was a flat list of arrays; hybrid entries
+  (`CacheList`, `ArraysCache`) nest lists (and `None` for unfilled slots), so
+  the delta-prefill gate raised `TypeError` on every hybrid model. Now
+  tree-recurses with `None` kept as an explicit leaf so shape mismatches stay
+  visible. The bound also became per-leaf — `max(1.0, 25% of leaf scale)` —
+  because hybrid state leaves differ in scale by orders of magnitude: on
+  Falcon-H1-4bit the f32 SSM recurrent state (scale ~80) shows 9.7 max-abs of
+  chunked-scan reassociation noise (11.7% relative) against the dense f16
+  calibration of 1.0 absolute (measured 0.5). A composition defect replaces
+  values wholesale (~100% relative) and still fails on every lineage; dense
+  behavior is unchanged (floor governs, measured ratio 0.10).
+- **The q8 KV tier refuses hybrid models at boot** instead of crashing on the
+  first prefill: hybrid entries have no `to_quantized`, so
+  `MLXCACHE_KV_BITS=8` against e.g. Falcon-H1 / Qwen3-Next / granite-hybrid
+  died with `AttributeError` after prefill. A boot-time guard probes the cache
+  composition (cheap: no arrays allocated) and exits with the fix
+  (`MLXCACHE_KV_BITS=0`) in the message. Dense stacks are unaffected.
+
+## 0.1.7 — 2026-10-19
 
 - **The chunk-granularity question is answered with primary evidence, and
   the answer is GO**: content-defined chunk dedup belongs in the blob
@@ -117,58 +166,6 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   local-only model resolution that never downloads.
 - 30 premise-guard tests across `test_harness_readiness.py` and
   `test_bench_workloads.py` pinning every failure path above.
-## 0.1.7 — 2026-10-19
-
-### Added
-
-- **`qwen4-exp` engine: Qwen3.8-Flash-Next served end to end**: a
-  self-contained engine (`MLXCACHE_ENGINE=qwen4-exp`) for a local
-  `Qwen3.8-Flash-Next` NVFP4 checkpoint (132.6 GB on disk) on one Apple
-  Silicon machine. The architecture port, NVFP4 weight reader and PLE n-gram
-  embedding live in this repo; nothing depends on another repository. The
-  checkpoint's bundled MTP head and vision tower are not loaded: neither
-  contributes cache state, and `weight_shapes()` enumerates 74,926 text
-  tensors and zero from either family. Because the checkpoint cannot be resident on 48 GB,
-  weights stream from disk under two residency knobs,
-  `MLXCACHE_Q4_EXPERT_RESIDENT_N` (decoded experts per layer, default `0`) and
-  `MLXCACHE_Q4_PLE_CACHE_MB` (decoded PLE row budget, default `512`); a budget
-  that is too small costs decode speed, not correctness. Cache integration is
-  the engine-generic path unchanged, so persistence, digests, eviction, delta
-  resume and `engine_id` namespacing apply as-is. Residency accounting and
-  troubleshooting are in `docs/ops.md`. Performance on the real checkpoint is
-  recorded in the README's Measured section: boot 4.6 s, prefill 46.1 s at 256
-  tokens to 76.6 s at 8K, decode 2.0-2.3 s/token to 2K. Decode at 8K was
-  measured under 10 GB of swap and is flagged there as contaminated rather
-  than quoted.
-- **Hybrid-architecture models verified on the R1-5 gate**: mlx-lm's
-  `save_prompt_cache`/`load_prompt_cache` are class-generic (cache classes are
-  recorded in the blob and rebuilt via `from_state`), so the adapter's capture
-  path needs no per-architecture code. Measured token-identical on
-  `mlx-community/Falcon-H1-0.5B-Instruct-4bit`, whose every layer is a nested
-  `CacheList(ArraysCache, KVCache)`. README documents the supported hybrid
-  families and the boundary for models mlx-lm cannot load at all, which the
-  self-contained `qwen4-exp` engine (above) serves instead.
-
-### Fixed
-
-- **The R1-5 state-diff helper handles nested cache state**: `_state_max_diff`
-  assumed each entry's `.state` was a flat list of arrays; hybrid entries
-  (`CacheList`, `ArraysCache`) nest lists (and `None` for unfilled slots), so
-  the delta-prefill gate raised `TypeError` on every hybrid model. Now
-  tree-recurses with `None` kept as an explicit leaf so shape mismatches stay
-  visible. The bound also became per-leaf — `max(1.0, 25% of leaf scale)` —
-  because hybrid state leaves differ in scale by orders of magnitude: on
-  Falcon-H1-4bit the f32 SSM recurrent state (scale ~80) shows 9.7 max-abs of
-  chunked-scan reassociation noise (11.7% relative) against the dense f16
-  calibration of 1.0 absolute (measured 0.5). A composition defect replaces
-  values wholesale (~100% relative) and still fails on every lineage; dense
-  behavior is unchanged (floor governs, measured ratio 0.10).
-- **The q8 KV tier refuses hybrid models at boot** instead of crashing on the
-  first prefill: hybrid entries have no `to_quantized`, so
-  `MLXCACHE_KV_BITS=8` against e.g. Falcon-H1 / Qwen3-Next / granite-hybrid
-  died with `AttributeError` after prefill. A boot-time guard probes the cache
-  composition (cheap: no arrays allocated) and exits with the fix
-  (`MLXCACHE_KV_BITS=0`) in the message. Dense stacks are unaffected.
 
 ## 0.1.4 — 2026-10-05
 
