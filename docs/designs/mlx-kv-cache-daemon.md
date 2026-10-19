@@ -172,7 +172,7 @@ Criteria 1-2 hold only if the adapter round-trip benchmark (Next Steps #3) demon
 
 ## Success Criteria
 
-- **(gated on adapter round-trip benchmark, R1-6)** A coding agent session (e.g. Claude Code pointing at local mlx-lm through the daemon) resumes warm across daemon restart: TTFT for the resumed turn < 2s at 50K+ cached prefix tokens.
+- **(gated on adapter round-trip benchmark, R1-6)** A coding agent session (pointing at local mlx-lm through the daemon) resumes warm across daemon restart: TTFT for the resumed turn < 2s at 50K+ cached prefix tokens.
 - **(gated on adapter round-trip benchmark, R1-6)** Two different processes (agent + chat app) sharing the same model get shared prefix hits: second process's TTFT for the shared prefix < 10% of cold prefill.
 - Cross-process + cross-restart hit-rate ≥ 80% of tokens on a real 1-day agent workload trace — assumes adapter-based reuse works (see the "Success-criteria gating" section); if the mlx-lm adapter proves too lossy, v1 target drops to the proxy-layer ceiling (~60-80%) and 80% becomes the stretch goal.
 - End-to-end value (the actual goal, premise 5): p95 turn latency and total prefill compute measurably lower than same workload without the daemon (A/B on captured traces, all requests counted including warming traffic).
@@ -318,7 +318,7 @@ Rollback flow: point clients at engine directly (config change, zero downtime) �
 Diagrams in this doc: none prior to this review (the architecture diagram above is new). No stale diagrams.
 
 ## Implementation Tasks
-Synthesized from this review's findings. Each task derives from a specific finding above. Run with Claude Code or Codex; checkbox as you ship.
+Synthesized from this review's findings. Each task derives from a specific finding above. Run with your coding agent or Codex; checkbox as you ship.
 
 - [x] **T0 (P1, human: ~1h / CC: ~10min)** — scaffolding — Project bootstrap: Rust workspace (daemon core crate + sidecar crate), pyproject.toml for Python sidecar, ruff/clippy configs, CI skeleton (GitHub Actions: cargo test + pytest per R6), .gitignore
   - Surfaced by: Section 2 finding 1 (no scaffolding task; every task depends on it)
