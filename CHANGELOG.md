@@ -124,9 +124,11 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 - **`qwen4-exp` engine: Qwen3.8-Flash-Next served end to end**: a
   self-contained engine (`MLXCACHE_ENGINE=qwen4-exp`) for a local
   `Qwen3.8-Flash-Next` NVFP4 checkpoint (132.6 GB on disk) on one Apple
-  Silicon machine. The architecture port, NVFP4 weight reader, PLE n-gram
-  embedding, MTP head and vision tower live in this repo; nothing depends on
-  another repository. Because the checkpoint cannot be resident on 48 GB,
+  Silicon machine. The architecture port, NVFP4 weight reader and PLE n-gram
+  embedding live in this repo; nothing depends on another repository. The
+  checkpoint's bundled MTP head and vision tower are not loaded: neither
+  contributes cache state, and `weight_shapes()` enumerates 74,926 text
+  tensors and zero from either family. Because the checkpoint cannot be resident on 48 GB,
   weights stream from disk under two residency knobs,
   `MLXCACHE_Q4_EXPERT_RESIDENT_N` (decoded experts per layer, default `0`) and
   `MLXCACHE_Q4_PLE_CACHE_MB` (decoded PLE row budget, default `512`); a budget
@@ -134,7 +136,10 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   the engine-generic path unchanged, so persistence, digests, eviction, delta
   resume and `engine_id` namespacing apply as-is. Residency accounting and
   troubleshooting are in `docs/ops.md`. Performance on the real checkpoint is
-  not measured yet; it is recorded separately.
+  recorded in the README's Measured section: boot 4.6 s, prefill 46.1 s at 256
+  tokens to 76.6 s at 8K, decode 2.0-2.3 s/token to 2K. Decode at 8K was
+  measured under 10 GB of swap and is flagged there as contaminated rather
+  than quoted.
 - **Hybrid-architecture models verified on the R1-5 gate**: mlx-lm's
   `save_prompt_cache`/`load_prompt_cache` are class-generic (cache classes are
   recorded in the blob and rebuilt via `from_state`), so the adapter's capture
