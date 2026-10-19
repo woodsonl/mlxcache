@@ -3,6 +3,9 @@
 These exercise the Server readiness loop directly with fakes: no model, no
 GPU, no subprocess. They pin the behavior the harness must have so a server
 that is not actually serving is never mistaken for ready.
+
+The spawn/ready/stop core lives in scripts/_harness.py; bench_wrapper and
+qa_wrapper subclass it and only choose which client call proves readiness.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ def _load(name: str):
     return mod
 
 
+harness = _load("_harness")
 bench = _load("bench_wrapper")
 qa = _load("qa_wrapper")
 
@@ -60,13 +64,14 @@ def _server(cls):
     srv.log_fh = os.fdopen(fd, "w")
     srv.proc = _FakeProc()
     srv.base = "http://127.0.0.1:1"
+    srv.warmup = "post" if cls is qa.Server else "chat"
     return srv
 
 
 def test_qa_warmup_non_200_is_not_ready(monkeypatch):
     """A warmup that returns 5xx must not be read as ready (post() returns
     errors as (code, body) instead of raising, so the status is checked)."""
-    monkeypatch.setattr(qa.urllib.request, "urlopen", lambda *a, **k: _FakeResp())
+    monkeypatch.setattr(harness.urllib.request, "urlopen", lambda *a, **k: _FakeResp())
     srv = _server(qa.Server)
     srv.post = lambda path, body, timeout=600: (500, {"error": "load failed"})
     try:
@@ -82,7 +87,7 @@ def test_qa_warmup_non_200_is_not_ready(monkeypatch):
 def test_bench_warmup_failure_is_bounded_and_reported(monkeypatch):
     """A warmup that keeps failing must retry with a deadline-bounded timeout
     and raise naming the error, not block on the client default (600s)."""
-    monkeypatch.setattr(bench.urllib.request, "urlopen", lambda *a, **k: _FakeResp())
+    monkeypatch.setattr(harness.urllib.request, "urlopen", lambda *a, **k: _FakeResp())
     srv = _server(bench.Server)
     seen = {}
 
@@ -104,7 +109,7 @@ def test_bench_warmup_failure_is_bounded_and_reported(monkeypatch):
 
 def test_bench_warmup_retries_then_succeeds(monkeypatch):
     """A transient warmup failure (server still loading) must retry to success."""
-    monkeypatch.setattr(bench.urllib.request, "urlopen", lambda *a, **k: _FakeResp())
+    monkeypatch.setattr(harness.urllib.request, "urlopen", lambda *a, **k: _FakeResp())
     srv = _server(bench.Server)
     calls = {"n": 0}
 

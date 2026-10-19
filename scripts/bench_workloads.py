@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
-"""B1 workload driver: end-to-end daemon+sidecar benchmark over real HTTP.
+"""Plumbing regression harness: daemon+sidecar request path over real HTTP.
 
-Complements the criterion micro-benches (which pin the daemon's in-process
-costs) with the numbers that actually matter to a client:
+This is a WIRING check, not a cache-benefit benchmark. It runs the synthetic
+engine, whose tokenizer hashes the whole prompt to 8 tokens
+(sidecar/mlxcache_sidecar/server.py `_hash_tokens`) and whose "prefill" emits
+a deterministic byte payload instead of running a model. A cold request
+therefore costs an 8-token prefill, so TTFT differences here measure proxy
+plumbing and blob writes — never prefill savings from a long shared prefix.
 
-- cold prefill (first request for a prompt)
+What it does cover, and should keep covering:
+
+- cold path (first request for a prompt)
 - warm exact hit (second request for the same prompt)
 - growing conversation (delta prefill — the OV3 lever)
 - concurrent identical load (single-flight coalescing under contention)
+- concurrent distinct load (hot-path parallelism)
 
-Every workload reports p50/p99 for TTFT (first byte of the assistant reply)
-and TPOT (per decoded token), so a regression in ANY layer — tokenize, route,
-prefill, publish, stream — shows up where the client feels it.
+Every workload reports p50 (and p95 when n>=100) for TTFT (first token of the
+assistant reply) and TPOT (per decoded token, from the REAL completion token
+count), so a regression in ANY layer — tokenize, route, prefill, publish,
+stream — shows up where the client feels it.
+
+For real-engine cache-benefit numbers (declared vs served prefix, cold/warm,
+pressure sweep) use scripts/bench_prefix.py.
 
 Usage:
     uv run python scripts/bench_workloads.py [--daemon URL] [--requests N]
@@ -102,21 +113,38 @@ def pct(values: list[float], p: float) -> float:
     return s[k]
 
 
-def report(name: str, ttfts: list[float], totals: list[float], tokens_per_req: int) -> dict:
-    tpots = [(t - ttft) / max(tokens_per_req - 1, 1) for ttft, t in zip(ttfts, totals, strict=True)]
+# A p95 over 30 samples is the second-largest sample wearing a percentile
+# label. Report tails only where the sample can actually support them.
+P95_MIN_N = 100
+
+
+def tpot_ms(total_ms: float, ttft_ms: float, tokens: int) -> float:
+    """Per-token decode cost, dividing by the tokens ACTUALLY generated.
+
+    A constant divisor here is a lie the moment a workload changes
+    max_tokens or the model stops early on EOS: the divisor and the
+    measurement drift apart and nothing fails.
+    """
+    return (total_ms - ttft_ms) / max(tokens - 1, 1)
+
+
+def report(name: str, ttfts: list[float], totals: list[float], token_counts: list[int]) -> dict:
+    tpots = [tpot_ms(t, ttft, n) for ttft, t, n in zip(ttfts, totals, token_counts, strict=True)]
     row = {
         "workload": name,
         "n": len(ttfts),
         "ttft_p50_ms": round(pct(ttfts, 50), 2),
-        "ttft_p99_ms": round(pct(ttfts, 99), 2),
+        "ttft_p95_ms": round(pct(ttfts, 95), 2) if len(ttfts) >= P95_MIN_N else None,
         "ttft_mean_ms": round(statistics.fmean(ttfts), 2),
         "tpot_p50_ms": round(pct(tpots, 50), 2),
-        "tpot_p99_ms": round(pct(tpots, 99), 2),
+        "tpot_p95_ms": round(pct(tpots, 95), 2) if len(tpots) >= P95_MIN_N else None,
+        "tokens_mean": round(statistics.fmean(token_counts), 1),
     }
+    p95 = f"  p95 {row['ttft_p95_ms']:>8.2f}ms" if row["ttft_p95_ms"] is not None else ""
     print(
-        f"  {name:<34} TTFT p50 {row['ttft_p50_ms']:>8.2f}ms  p99 {row['ttft_p99_ms']:>8.2f}ms"
-        f"   TPOT p50 {row['tpot_p50_ms']:>6.2f}ms  p99 {row['tpot_p99_ms']:>6.2f}ms"
-        f"  (n={len(ttfts)})"
+        f"  {name:<34} TTFT p50 {row['ttft_p50_ms']:>8.2f}ms{p95}"
+        f"   TPOT p50 {row['tpot_p50_ms']:>6.2f}ms"
+        f"  (n={len(ttfts)}, tokens~{row['tokens_mean']})"
     )
     return row
 
@@ -235,8 +263,9 @@ def run_workloads(url: str, args) -> list[dict]:
     rows: list[dict] = []
     print(f"daemon {url}  requests={args.requests} concurrency={args.concurrency}\n")
 
-    # 1. Cold prefill: unique prompts, each a first request.
-    ttfts, totals = [], []
+    # 1. Cold path: unique prompts, each a first request. (An 8-token
+    #    "prefill" in the synthetic engine — this is overhead, not prefill.)
+    ttfts, totals, ntoks = [], [], []
     for i in range(args.requests):
         ttft, total, ntok = stream_chat(
             url,
@@ -247,8 +276,9 @@ def run_workloads(url: str, args) -> list[dict]:
         )
         ttfts.append(ttft)
         totals.append(total)
+        ntoks.append(ntok)
         assert ntok > 0
-    rows.append(report("cold_prefill", ttfts, totals, 64))
+    rows.append(report("cold_prefill", ttfts, totals, ntoks))
 
     # 2. Warm exact hit: the same prompt twice; the 2nd+ go through the index.
     prompt = {
@@ -256,12 +286,13 @@ def run_workloads(url: str, args) -> list[dict]:
         "messages": [{"role": "user", "content": "warm exact hit prompt"}],
     }
     stream_chat(url, prompt)  # prime (cold, discarded)
-    ttfts, totals = [], []
+    ttfts, totals, ntoks = [], [], []
     for _ in range(args.requests):
         ttft, total, ntok = stream_chat(url, prompt)
         ttfts.append(ttft)
         totals.append(total)
-    rows.append(report("warm_exact_hit", ttfts, totals, 64))
+        ntoks.append(ntok)
+    rows.append(report("warm_exact_hit", ttfts, totals, ntoks))
 
     # 3. Growing conversation: each round appends a new " | "-separated
     #    segment; the synthetic tokenizer hashes each segment independently,
@@ -269,7 +300,7 @@ def run_workloads(url: str, args) -> list[dict]:
     #    only the delta (the same prefix-growth property real tokenizers
     #    have on appended text).
     content = "growing conversation seed"
-    ttfts, totals = [], []
+    ttfts, totals, ntoks = [], [], []
     for r in range(args.grow_rounds):
         content += f" | round {r}"
         ttft, total, ntok = stream_chat(
@@ -278,7 +309,8 @@ def run_workloads(url: str, args) -> list[dict]:
         )
         ttfts.append(ttft)
         totals.append(total)
-    rows.append(report("growing_conversation", ttfts, totals, 64))
+        ntoks.append(ntok)
+    rows.append(report("growing_conversation", ttfts, totals, ntoks))
 
     # Guard the workload's own premise: rounds 1+ must classify as partials
     # (round 0 is the cold miss that seeds the chain). If a tokenizer change
@@ -304,10 +336,11 @@ def run_workloads(url: str, args) -> list[dict]:
         )
         shared["ttfts"].append(ttft)
         shared["totals"].append(total)
+        shared["ntoks"].append(ntok)
 
-    ttfts, totals = [], []
+    ttfts, totals, ntoks = [], [], []
     for burst in range(max(1, args.requests // args.concurrency)):
-        shared = {"burst": burst, "ttfts": [], "totals": []}
+        shared = {"burst": burst, "ttfts": [], "totals": [], "ntoks": []}
         import threading
 
         threads = [
@@ -319,13 +352,14 @@ def run_workloads(url: str, args) -> list[dict]:
             t.join()
         ttfts += shared["ttfts"]
         totals += shared["totals"]
-    rows.append(report(f"concurrent_identical_c{args.concurrency}", ttfts, totals, 64))
+        ntoks += shared["ntoks"]
+    rows.append(report(f"concurrent_identical_c{args.concurrency}", ttfts, totals, ntoks))
 
     # 5. Concurrent distinct load: C workers on DIFFERENT prompts (no
     #    coalescing possible; pure parallelism of the hot path).
-    ttfts, totals = [], []
+    ttfts, totals, ntoks = [], [], []
     for burst in range(max(1, args.requests // args.concurrency)):
-        shared = {"ttfts": [], "totals": []}
+        shared = {"ttfts": [], "totals": [], "ntoks": []}
 
         def worker_distinct(i: int, burst: int = burst, shared: dict = shared) -> None:
             ttft, total, ntok = stream_chat(
@@ -337,6 +371,7 @@ def run_workloads(url: str, args) -> list[dict]:
             )
             shared["ttfts"].append(ttft)
             shared["totals"].append(total)
+            shared["ntoks"].append(ntok)
 
         threads = [
             threading.Thread(target=worker_distinct, args=(i,)) for i in range(args.concurrency)
@@ -347,7 +382,8 @@ def run_workloads(url: str, args) -> list[dict]:
             t.join()
         ttfts += shared["ttfts"]
         totals += shared["totals"]
-    rows.append(report(f"concurrent_distinct_c{args.concurrency}", ttfts, totals, 64))
+        ntoks += shared["ntoks"]
+    rows.append(report(f"concurrent_distinct_c{args.concurrency}", ttfts, totals, ntoks))
 
     with urllib.request.urlopen(f"{url}/stats", timeout=5) as r:
         stats = json.loads(r.read())

@@ -30,6 +30,10 @@ stdout. The model must be a local absolute snapshot path or a cached HF id,
 resolved BEFORE launch so the bench and the server child agree on the store
 fingerprint; the 7B-4bit default needs ~4GB and Apple Silicon.
 
+This harness measures the WRAPPER path's disk tier. It is not the prefix-
+caching benchmark: see scripts/bench_prefix.py for declared-vs-served prefix
+accounting and the cold/warm/pressure grid.
+
 Usage:
   uv run python scripts/bench_wrapper.py [--model PATH_OR_HF_ID] [--port N]
       [--max-tokens N] [--out PATH]
@@ -40,21 +44,19 @@ Env: MLXCACHE_BENCH_MODEL overrides the model default.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
-import os
-import signal
-import subprocess
+import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = os.environ.get(
-    "MLXCACHE_BENCH_MODEL",
-    "mlx-community/Qwen2.5-7B-Instruct-4bit",  # resolved via the HF cache
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _harness  # noqa: E402 — path insert above
+from _harness import DEFAULT_MODEL, REPO, WrapperServer  # noqa: E402
+
+_resolve_model = _harness.resolve_model
+_free_port = _harness.free_port
 
 TURN1 = {
     "messages": [
@@ -65,36 +67,17 @@ TURN1 = {
 }
 
 
-def _resolve_model(raw: str) -> str:
-    """Absolute local model dir, resolved identically for the server child
-    and the gate's store lookup.
+class Server(WrapperServer):
+    """One mlxcache_serve pair, warmup-checked through a real chat call."""
 
-    The server child runs with cwd=sidecar, and mlx_lm keeps the raw --model
-    string in its cache key; the store fingerprint is built from
-    os.path.realpath of that string, so a relative path or bare HF id
-    realpaths differently in each process and the lookup never matches —
-    the gate would then read 0% skip on a working system. Pin one absolute
-    path before launch so both sides agree.
-    """
-    m = os.path.abspath(os.path.expanduser(raw))
-    if (Path(m) / "config.json").is_file():
-        return m
-    # Resolve exactly as mlx_lm would: snapshot_download honours refs/<rev>
-    # (default main), so a cache holding several revisions selects the same
-    # snapshot the server child will load. A bare glob of the snapshot dirs
-    # would sort by commit hash — unrelated to the revision fetched.
-    try:
-        from huggingface_hub import snapshot_download
-
-        snap = snapshot_download(raw, local_files_only=True)
-        if (Path(snap) / "config.json").is_file():
-            return snap
-    except Exception:  # noqa: BLE001 — falls through to the clean SystemExit
-        pass
-    raise SystemExit(
-        f"model {raw!r} is neither a local dir nor a cached HF snapshot; "
-        "pass an absolute snapshot path or set MLXCACHE_BENCH_MODEL"
-    )
+    def __init__(self, store_dir: str, model: str, port: int):
+        super().__init__(
+            store_dir,
+            model,
+            port,
+            log_prefix="mlxcache-bench-srv-",
+            warmup="chat",
+        )
 
 
 # Turn 2 GROWS the conversation: the request stream extends turn 1's stored
@@ -112,149 +95,6 @@ def turn2_body(resp_a: str, max_tokens: int) -> dict:
         "temperature": 0.0,
         "max_tokens": max_tokens,
     }
-
-
-def _free_port() -> int:
-    import socket
-
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-class Server:
-    """One mlxcache_serve pair (wrapper spawns mlx_lm.server in-process)."""
-
-    def __init__(self, store_dir: str, model: str, port: int):
-        # Log to a FILE, never a PIPE: a child that writes more than the
-        # 64KB pipe buffer before stop() (an HF download's tqdm, a startup
-        # traceback) would block forever on a full pipe and wedge mid-startup.
-        fd, log_path = tempfile.mkstemp(prefix="mlxcache-bench-srv-", suffix=".log")
-        self.log_path = Path(log_path)
-        self.log_fh = os.fdopen(fd, "w")
-        try:
-            self.proc = subprocess.Popen(
-                [
-                    str(REPO / ".venv/bin/python"),
-                    "-m",
-                    "mlxcache_serve",
-                    "--store-dir",
-                    store_dir,
-                    "--model",
-                    model,
-                    "--port",
-                    str(port),
-                    "--log-level",
-                    "ERROR",
-                ],
-                cwd=str(REPO / "sidecar"),
-                stdout=self.log_fh,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        except Exception:
-            # A failed spawn would otherwise leak the fd and the temp file.
-            with contextlib.suppress(Exception):
-                self.log_fh.close()
-            with contextlib.suppress(Exception):
-                self.log_path.unlink()
-            raise
-        self.port = port
-        self.base = f"http://127.0.0.1:{port}"
-
-    def _log_tail(self) -> str:
-        # Best effort: the child holds its own fd, so only what it has
-        # flushed to the OS is visible here.
-        with contextlib.suppress(Exception):
-            self.log_fh.flush()
-            return self.log_path.read_text()[-2000:]
-        return "(log unreadable)"
-
-    def stats(self) -> dict:
-        """GET /mlxcache/stats: the live cache's reuse counters. This is the
-        only signal that the disk tier SERVED a request — response equality
-        at temperature 0 cannot distinguish a disk resume from a full
-        prefill."""
-        with urllib.request.urlopen(f"{self.base}/mlxcache/stats", timeout=10) as r:
-            return json.loads(r.read())
-
-    def wait_ready(self, timeout_s: float = 180.0) -> None:
-        deadline = time.time() + timeout_s
-        last_err: str | None = None
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"wrapper exited early:\n{self._log_tail()}")
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            try:
-                with urllib.request.urlopen(f"{self.base}/health", timeout=2) as r:
-                    if r.status != 200:
-                        time.sleep(1.0)
-                        continue
-            except Exception:
-                time.sleep(1.0)
-                continue
-            # The port binds before the lazy model load, so /health alone
-            # proves nothing. A 1-token warmup forces the load; the timeout
-            # is bounded by the readiness deadline so a hung request cannot
-            # outlive it. A warmup that fails (connection reset mid-load, or
-            # a 5xx) means NOT ready yet: retry until the deadline rather
-            # than crashing or reading a broken server as ready.
-            try:
-                self.chat(
-                    {
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "max_tokens": 1,
-                        "temperature": 0.0,
-                    },
-                    timeout=max(1.0, min(remaining, 30.0)),
-                )
-                return
-            except Exception as exc:
-                last_err = repr(exc)
-                time.sleep(1.0)
-        raise RuntimeError(
-            f"wrapper never became healthy (last warmup error: {last_err}):\n{self._log_tail()}"
-        )
-
-    def chat(self, body: dict, timeout: float = 600) -> tuple[float, str]:
-        """POST /v1/chat/completions (non-stream). Returns (wall_ms, text).
-        Raises on non-2xx so callers cannot mistake an error for a result."""
-        data = json.dumps(body).encode()
-        req = urllib.request.Request(
-            f"{self.base}/v1/chat/completions",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        t0 = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            payload = json.loads(r.read())
-        wall = (time.perf_counter() - t0) * 1000
-        return wall, payload["choices"][0]["message"]["content"]
-
-    def stop(self) -> None:
-        if self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                # A reaped child is not guaranteed after SIGKILL; a raise
-                # here would skip the close/unlink below and re-leak the log.
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    self.proc.wait(timeout=10)
-        with contextlib.suppress(Exception):
-            self.log_fh.close()
-        with contextlib.suppress(Exception):
-            self.log_path.unlink()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.stop()
-        return False
 
 
 def _leg_result(name, wall_ms, text, baseline, extra=None):
