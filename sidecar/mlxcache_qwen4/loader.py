@@ -2,8 +2,9 @@
 
 The checkpoint is 132.6 GB and the target machine has 48 GB of RAM, so the
 loader must never hold more than a caller-requested tensor (or row range).
-Two structures dominate: 63.3 GiB of routed NVFP4 experts (48 layers x 512
-experts) and 47.7 GiB of PLE n-gram rows split across 128 FP8 shards.
+Two structures dominate: 70.5 GB of routed NVFP4 experts (48 layers x 512
+experts) and 51.2 GB of PLE n-gram rows split across 128 FP8 shards — the
+same figures, in the same GB units, as the tables in docs/ops.md and README.
 
 Dequantisation recipes, each chosen from measurement rather than assumption
 ----------------------------------------------------------------------------
@@ -81,6 +82,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,7 +105,7 @@ DEFAULT_EXPERT_RESIDENT_N = 0
 DEFAULT_PLE_CACHE_MB = 512
 # Ceiling for one whole resident tensor. The largest legitimate resident tensor
 # is embed_tokens/lm_head at 248320*2560*2 = 1.27 GB; 4 GiB leaves headroom
-# while still making "read the 400 MB PLE shard, let alone the 47.7 GiB table"
+# while still making "read the 400 MB PLE shard, let alone the 51.2 GB table"
 # impossible through get().
 DEFAULT_RESIDENT_MAX_BYTES = 4 << 30
 
@@ -143,40 +145,54 @@ class _ByteLRU:
     Budgets are expressed in MB, so eviction has to be driven by the summed
     size of the decoded arrays; an entry larger than the whole budget is never
     inserted (it could not fit after any amount of eviction).
+
+    Thread-safety: the sidecar serves requests on ThreadingHTTPServer worker
+    threads and every worker shares one loader, so get/put race without the
+    lock — two interleaved puts corrupt the `nbytes` invariant, after which
+    the eviction loop never fires again and the cache grows without bound.
+
+    Values are stored EVALUATED: a lazy graph built on one thread cannot be
+    evaluated on another ("There is no Stream(gpu, 0) in current thread"), the
+    same failure class `_materialize_weights` exists to prevent.
     """
 
     def __init__(self, capacity_bytes: int) -> None:
         self.capacity = max(0, int(capacity_bytes))
         self._items: OrderedDict[Any, tuple[mx.array, int]] = OrderedDict()
+        self._lock = threading.Lock()
         self.nbytes = 0
         self.hits = 0
         self.misses = 0
 
     def get(self, key: Any) -> mx.array | None:
-        item = self._items.get(key)
-        if item is None:
-            self.misses += 1
-            return None
-        self._items.move_to_end(key)
-        self.hits += 1
-        return item[0]
+        with self._lock:
+            item = self._items.get(key)
+            if item is None:
+                self.misses += 1
+                return None
+            self._items.move_to_end(key)
+            self.hits += 1
+            return item[0]
 
     def put(self, key: Any, value: mx.array, nbytes: int) -> bool:
         if self.capacity == 0 or nbytes > self.capacity:
             return False
-        existing = self._items.pop(key, None)
-        if existing is not None:
-            self.nbytes -= existing[1]
-        self._items[key] = (value, nbytes)
-        self.nbytes += nbytes
-        while self.nbytes > self.capacity and len(self._items) > 1:
-            _, (_, evicted) = self._items.popitem(last=False)
-            self.nbytes -= evicted
-        return True
+        mx.eval(value)
+        with self._lock:
+            existing = self._items.pop(key, None)
+            if existing is not None:
+                self.nbytes -= existing[1]
+            self._items[key] = (value, nbytes)
+            self.nbytes += nbytes
+            while self.nbytes > self.capacity and len(self._items) > 1:
+                _, (_, evicted) = self._items.popitem(last=False)
+                self.nbytes -= evicted
+            return True
 
     def clear(self) -> None:
-        self._items.clear()
-        self.nbytes = 0
+        with self._lock:
+            self._items.clear()
+            self.nbytes = 0
 
 
 def _decoded_nbytes(entry: TensorEntry) -> int:
@@ -190,23 +206,18 @@ def _decoded_nbytes(entry: TensorEntry) -> int:
     return entry.shape[0] * width * 2
 
 
-def classify(name: str, entry: TensorEntry | None = None) -> str:
-    """Residency class of a checkpoint tensor name.
+def classify(name: str) -> str:
+    """Residency class of a checkpoint tensor name: ple, expert, or resident.
 
-    The name alone decides expert, PLE and resident membership. ``"stream"``
-    additionally needs a size, so it is only returned when an ``entry`` is
-    supplied and the decoded 2-D tensor exceeds the resident ceiling.
+    The name alone decides this. Whether a resident tensor is instead STREAMED
+    (read row-wise rather than decoded whole) depends on the loader instance's
+    configured ceiling, so that decision lives in CheckpointLoader._classify
+    and never here.
     """
     if _PLE_SHARD_RE.search(name):
         return "ple"
     if _EXPERT_RE.search(name):
         return "expert"
-    if (
-        entry is not None
-        and entry.rank == 2
-        and _decoded_nbytes(entry) > DEFAULT_RESIDENT_MAX_BYTES
-    ):
-        return "stream"
     return "resident"
 
 
@@ -241,6 +252,7 @@ class CheckpointLoader:
         # decoded bytes, so the count knob and the byte-budgeted LRU agree.
         self._experts = _ByteLRU(self._expert_budget_bytes())
         self._ple = _ByteLRU(int(self.ple_cache_mb * (1 << 20)))
+        self._ple_scales: dict[str, mx.array] = {}
         self._ple_manifest = self._load_manifest()
 
         self._expert_bytes_loaded = 0
@@ -455,7 +467,10 @@ class CheckpointLoader:
         weight_rows, wbytes = self._rows(entry, start, stop, step)
         scale_rows, sbytes = self._rows(scale_entry, start, stop, step)
         global_scale, gbytes = self._global_scale(
-            entry.name, match.group(2) if match else None, match.group(1) if match else None
+            entry.name,
+            match.group(2) if match else None,
+            match.group(1) if match else None,
+            _LAYER_RE.search(entry.name).group(1) if _LAYER_RE.search(entry.name) else None,
         )
         width = entry.shape[1] * 2
         if weight_rows.shape[1] * 2 != width:
@@ -473,17 +488,23 @@ class CheckpointLoader:
         return value, wbytes + sbytes + gbytes
 
     def _global_scale(
-        self, name: str, proj: str | None, expert: str | None
-    ) -> tuple[mx.array | None, int]:
-        """Per-expert global scale scalar and the bytes spent reading it."""
-        layer = _LAYER_RE.search(name)
+        self, name: str, proj: str | None, expert: str | None, layer: str | None
+    ) -> tuple[mx.array, int]:
+        """Per-expert global scale scalar and the bytes spent reading it.
+
+        Raises when a routed-expert name cannot be resolved to its table: the
+        dequantization is catastrophically wrong without the per-expert scale
+        (measured rms 204.0 vs 0.0135 with and without it, a ~20,500x error),
+        and a checkpoint revision that renames or drops the table must fail
+        loudly at load, not serve garbage routed experts."""
         if proj is None or expert is None or layer is None:
-            return None, 0
-        table_name = (
-            f"model.language_model.layers.{layer.group(1)}.mlp.switch_mlp.{proj}.global_scale"
-        )
+            raise ValueError(
+                f"{name!r}: routed expert name does not carry layer/projection/expert; "
+                "cannot locate its global_scale table"
+            )
+        table_name = f"model.language_model.layers.{layer}.mlp.switch_mlp.{proj}.global_scale"
         if not self._catalog.has(table_name):
-            return None, 0
+            raise ValueError(f"{name!r}: per-expert global_scale table {table_name!r} is absent")
         table = self._catalog.entry(table_name)
         index = int(expert)
         if table.rank != 1 or index >= table.shape[0]:
@@ -558,7 +579,10 @@ class CheckpointLoader:
                 b"".join(chunks), scale_entry.dtype, (len(unique), scale_entry.shape[1])
             )
             nbytes = sum(len(chunk) for chunk in chunks)
-        positions = [unique.index(block_id) for block_id in block_ids]
+        # O(1) position lookup: a linear `unique.index` scan per requested row
+        # made dequantizing a 2560-row expert matrix a rows x blocks Python loop.
+        offset = {block_id: i for i, block_id in enumerate(unique)}
+        positions = [offset[block_id] for block_id in block_ids]
         return mx.stack([table[position] for position in positions]), nbytes
 
     # raw rows -----------------------------------------------------------
@@ -618,8 +642,16 @@ class CheckpointLoader:
         prefix, _, _ = entry.name.partition(".shard_")
         if not prefix.endswith(".ngram_embedding"):
             raise ValueError(f"{entry.name!r} has no sibling ngram_embedding weight_scale")
+        cached = self._ple_scales.get(prefix)
+        if cached is not None:
+            return cached
         scale_entry = self._catalog.entry(prefix + ".weight_scale")
-        return self._catalog.array(scale_entry).astype(mx.float32)
+        value = self._catalog.array(scale_entry).astype(mx.float32)
+        # One 4-byte scalar per PLE layer, decoded once for the loader's life:
+        # re-reading it on every row-cache miss added a catalog lookup, a file
+        # read, and a host-to-device copy to each new n-gram run.
+        self._ple_scales[prefix] = value
+        return value
 
     def _ple_slice(self, entry: TensorEntry, start: int, stop: int, step: int) -> mx.array:
         index, row_count = self._ple_shard_info(entry)
@@ -627,7 +659,10 @@ class CheckpointLoader:
             raise ValueError(
                 f"{entry.name!r} shard {index} has {row_count} rows, {start}..{stop} requested"
             )
-        key = (index, start, stop, step)
+        # Keyed by the TENSOR NAME, not the bare shard index: shard tables are
+        # per-PLE-layer, so two layers' shard_0 would otherwise alias in the
+        # LRU and layer B would silently receive layer A's decoded rows.
+        key = (entry.name, start, stop, step)
         cached = self._ple.get(key)
         if cached is not None:
             return cached

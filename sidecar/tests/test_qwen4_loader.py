@@ -19,6 +19,7 @@ also inside the guards: collection must succeed with mlx absent.
 from __future__ import annotations
 
 import json
+import os
 import struct
 from pathlib import Path
 
@@ -29,7 +30,11 @@ pytest.importorskip("numpy")
 
 import numpy as np  # noqa: E402
 
-CHECKPOINT = Path("/Users/lance/models/Qwen3.8-Flash-Next-NVFP4-mlxstream")
+CHECKPOINT = Path(
+    os.environ.get(
+        "MLXCACHE_Q4_CHECKPOINT", "/Users/lance/models/Qwen3.8-Flash-Next-NVFP4-mlxstream"
+    )
+)
 
 
 def _require_real_checkpoint() -> Path:
@@ -639,3 +644,119 @@ def test_real_resident_embed_tokens_bytes():
     assert embed.shape == (248320, 2560)
     assert embed.dtype == mx.bfloat16
     assert embed.nbytes == 248320 * 2560 * 2
+
+
+# --- corruption guards --------------------------------------------------------
+
+
+def test_missing_global_scale_table_raises_instead_of_dequantizing_blind(synthetic):
+    # The per-expert global scale is the difference between correct expert
+    # weights and a ~20,500x error (measured rms 204.0 vs 0.0135 without it).
+    # A checkpoint revision that drops the table must fail loudly at load.
+    import mlx.core as mx
+    from mlxcache_qwen4.loader import CheckpointLoader
+
+    root, truth = synthetic
+    index_path = root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    victim = "model.language_model.layers.0.mlp.switch_mlp.gate_proj.global_scale"
+    assert victim in index["weight_map"], "fixture must ship the scale table"
+    del index["weight_map"][victim]
+    index_path.write_text(json.dumps(index))
+
+    loader = CheckpointLoader(str(root))
+    with pytest.raises(ValueError, match="global_scale"):
+        loader.get("model.language_model.layers.0.mlp.experts.0.gate_proj.weight")
+    mx.eval(None) if False else None  # mlx import kept for parity with siblings
+
+
+def test_ple_cache_keys_by_table_name_not_shard_index(synthetic):
+    # Two PLE layers would alias in the row cache if it keyed on the bare
+    # shard index: layer B's shard_0 slice would return layer A's rows.
+    from mlxcache_qwen4.loader import CheckpointLoader
+
+    root, _ = synthetic
+    loader = CheckpointLoader(str(root), ple_cache_mb=64)
+    first = next(
+        name for name in loader._catalog._index if ".ple_embedding.ngram_embedding.shard_" in name
+    )
+    loader._ple_slice(loader._catalog.entry(first), 0, 4, 1)
+    keys = {k[0] for k in loader._ple._items}
+    # The key must be the TENSOR NAME: a bare shard index would alias two PLE
+    # layers' shard_0 tables into one cache entry.
+    assert keys == {first}, keys
+
+
+def test_huge_or_negative_shard_header_is_rejected(synthetic):
+    # The shard header length is untrusted on-disk data: a declared 2^63-byte
+    # header must be refused before the allocation, and a negative data offset
+    # must never reach os.pread as a negative file offset.
+    from mlxcache_qwen4.shards import ShardCatalog
+
+    root, _ = synthetic
+    shard = root / "model.safetensors"
+    original = shard.read_bytes()
+
+    # Huge declared header length.
+    shard.write_bytes((1 << 63).to_bytes(8, "little") + original[8:])
+    with pytest.raises(ValueError, match="refusing the allocation"):
+        ShardCatalog(str(root))._read_header("model.safetensors")
+
+    # Negative start offset smuggled into an otherwise valid header.
+    shard.write_bytes(original)
+    catalog = ShardCatalog(str(root))
+    name = next(iter(catalog._index))
+    header, base = catalog._header_for(catalog._index[name])
+    meta = header[name]
+    meta["data_offsets"] = [-8, meta["data_offsets"][1] - meta["data_offsets"][0] - 8]
+    import struct as _struct
+
+    payload = json.dumps(header).encode()
+    shard.write_bytes(_struct.pack("<Q", len(payload)) + payload + original[base:])
+    with pytest.raises(ValueError, match="ascending span"):
+        ShardCatalog(str(root)).entry(name)
+
+
+def test_lru_stores_evaluated_values_safe_across_threads(synthetic):
+    # The sidecar serves on ThreadingHTTPServer worker threads sharing one
+    # loader. A lazy graph cached on one thread cannot be evaluated on another
+    # ("There is no Stream(gpu, 0) in current thread"), and two interleaved
+    # puts corrupt the byte accounting. Exercise both with real threads.
+    import threading
+
+    import mlx.core as mx
+    from mlxcache_qwen4.loader import _ByteLRU
+
+    lru = _ByteLRU(1 << 20)
+    made = []
+    errors = []
+
+    def producer():
+        try:
+            for i in range(64):
+                # DELIBERATELY lazy: no mx.eval on this thread.
+                lru.put(("k", i), mx.zeros((4,)) + i, 16)
+                made.append(i)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def consumer():
+        try:
+            for _ in range(64):
+                keys = list(lru._items)
+                for k in keys:
+                    # Evaluating another thread's cached graph on THIS thread
+                    # is the crash the eval-before-store rule prevents.
+                    mx.eval(lru._items[k][0])
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=producer) for _ in range(3)]
+    threads += [threading.Thread(target=consumer) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    assert lru.nbytes == len(lru._items) * 16, "byte accounting must stay exact under races"

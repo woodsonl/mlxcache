@@ -18,6 +18,7 @@ checkpoint is 132.6 GB on a 48 GB machine, so nothing may be mapped.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import struct
@@ -139,8 +140,7 @@ class ShardCatalog:
         self._headers: dict[str, tuple[dict, int]] = {}
         self._entries: dict[str, TensorEntry] = {}
         self._specs: dict[str, dict[str, tuple[tuple[int, ...], str]]] = {}
-        self._handles: dict[str, object] = {}
-        self.bytes_read = 0
+        self._handles: dict[str, int] = {}
 
     # -- catalog ---------------------------------------------------------
     def _load_index(self) -> dict[str, str]:
@@ -162,6 +162,11 @@ class ShardCatalog:
             }
         raise FileNotFoundError(f"no model.safetensors(.index.json) in {self.root}")
 
+    # safetensors itself caps headers at 100 MB; a length beyond that (or
+    # beyond the file) is corrupt or hostile on-disk data, and reading it
+    # would try to allocate up to 2^64 bytes before json.loads ever ran.
+    MAX_HEADER_BYTES = 100 << 20
+
     def _read_header(self, shard: str) -> tuple[dict, int]:
         """Parse the safetensors header: 8-byte LE length, then UTF-8 JSON."""
         path = self.root / shard
@@ -170,7 +175,16 @@ class ShardCatalog:
             if len(raw_len) != 8:
                 raise ValueError(f"{path} is not a safetensors file (truncated header length)")
             (header_len,) = struct.unpack("<Q", raw_len)
-            header = json.loads(fh.read(header_len))
+            file_size = os.fstat(fh.fileno()).st_size
+            if header_len > self.MAX_HEADER_BYTES or header_len > file_size - 8:
+                raise ValueError(
+                    f"{path} declares a {header_len}-byte header (file is {file_size}); "
+                    "refusing the allocation"
+                )
+            try:
+                header = json.loads(fh.read(header_len))
+            except RecursionError as exc:
+                raise ValueError(f"{path} header is too deeply nested") from exc
         return header, 8 + header_len
 
     def _header_for(self, shard: str) -> tuple[dict, int]:
@@ -207,9 +221,6 @@ class ShardCatalog:
     def names(self) -> list[str]:
         return list(self._index)
 
-    def shard_names(self) -> list[str]:
-        return sorted(set(self._index.values()))
-
     def has(self, name: str) -> bool:
         return name in self._index
 
@@ -234,6 +245,10 @@ class ShardCatalog:
         if itemsize is None:
             raise ValueError(f"{name}: unsupported dtype {dtype!r}")
         expected = shape_elements(shape) * itemsize
+        if not isinstance(start, int) or not isinstance(stop, int) or start < 0 or stop < start:
+            raise ValueError(
+                f"{name}: header byte range {start}..{stop} is not a valid ascending span"
+            )
         if stop - start != expected:
             raise ValueError(
                 f"{name}: header byte range {start}..{stop} does not match {dtype}{list(shape)}"
@@ -271,33 +286,27 @@ class ShardCatalog:
                 f"{entry.name}: range {start}..{start + nbytes} outside tensor "
                 f"of {entry.nbytes} bytes"
             )
-        path = self.root / entry.shard
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            buf = os.pread(fd, nbytes, entry.abs_start + start)
-        finally:
-            os.close(fd)
+        fd = self._handle_for(entry.shard)
+        buf = os.pread(fd, nbytes, entry.abs_start + start)
         if len(buf) != nbytes:
             raise ValueError(f"{entry.name}: pread returned {len(buf)} of {nbytes} bytes")
-        self.bytes_read += len(buf)
         return buf
+
+    def _handle_for(self, shard: str) -> int:
+        cached = self._handles.get(shard)
+        if cached is None:
+            cached = os.open(self.root / shard, os.O_RDONLY)
+            self._handles[shard] = cached
+        return cached
 
     def array(self, entry: TensorEntry) -> mx.array:
         return array_from_bytes(self.read(entry), entry.dtype, entry.shape)
 
-    def array_range(
-        self, entry: TensorEntry, start: int, nbytes: int, shape: tuple[int, ...]
-    ) -> mx.array:
-        return array_from_bytes(self.read(entry, start, nbytes), entry.dtype, shape)
-
-    def open_shards(self) -> dict[str, list[str]]:
-        """Shard -> tensor names, in shard order (used by PLE shard discovery)."""
-        out: dict[str, list[str]] = {}
-        for name, shard in self._index.items():
-            out.setdefault(shard, []).append(name)
-        return out
-
     def close(self) -> None:
+        for fd in self._handles.values():
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self._handles.clear()
         self._specs.clear()
         self._entries.clear()
         self._headers.clear()
