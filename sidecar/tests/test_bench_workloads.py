@@ -67,6 +67,58 @@ def test_report_fails_loudly_on_zero_token_drift():
         bw.report("bad", [100.0], [150.0], [0])
 
 
+class _FakePopenProc:
+    pid = 99
+
+    def poll(self):
+        return None
+
+    def send_signal(self, _sig):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+def test_start_stack_spawns_prebuilt_daemon_not_cargo_run(monkeypatch, tmp_path):
+    """Regression: start_stack spawned `cargo run --release`, folding a cold
+    release build (minutes on a fresh checkout) into the daemon's 30s
+    readiness window; the harness then failed as "not healthy" while the
+    compiler was still running. The build must complete BEFORE spawn.
+    Found by /qa on 2026-10-19
+    Report: .gstack/qa-reports/qa-report-bench-workloads-2026-10-19.md
+
+    Value: protects=start_stack spawns the prebuilt release daemon only after
+    `cargo build --release` completed; fails_when=start_stack uses `cargo run`
+    (build inside the readiness window); why_new=no other test covers
+    start_stack's spawn shape; seam=none; no_claim=none beyond protects."""
+    import subprocess as _subprocess
+
+    builds, spawns = [], []
+
+    def fake_run(cmd, *a, **k):
+        builds.append(cmd)
+        return _subprocess.CompletedProcess(cmd, 0)
+
+    def fake_popen(argv, *a, **k):
+        spawns.append(argv)
+        return _FakePopenProc()
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    monkeypatch.setattr(bw.subprocess, "Popen", fake_popen)
+
+    bw.start_stack(str(tmp_path))
+
+    assert builds, "daemon must be built before spawn"
+    assert builds[0][1:4] == ["run", "cargo", "build"]
+    daemon_argv = spawns[-1]
+    assert "cargo" not in daemon_argv
+    assert str(daemon_argv[0]).endswith("target/release/mlxcache-daemon")
+
+
 def test_report_mismatched_lengths_raise():
     with pytest.raises(ValueError):
         bw.report("bad", [1.0], [1.0, 2.0], [1])

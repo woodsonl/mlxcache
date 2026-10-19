@@ -210,16 +210,18 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
         env=env,
     )
     daemon_port = _free_port()
+    # Build to completion BEFORE spawning: `cargo run --release` folds a
+    # cold build (minutes on a fresh checkout) into the daemon's 30s
+    # readiness window, and the harness then fails as "not healthy" while
+    # the compiler is still running. The build output stays visible so a
+    # cold machine shows progress instead of silence.
+    subprocess.run(
+        ["uv", "run", "cargo", "build", "--release", "-p", "mlxcache-daemon"],
+        check=True,
+    )
     daemon = subprocess.Popen(
         [
-            "uv",
-            "run",
-            "cargo",
-            "run",
-            "--release",
-            "-p",
-            "mlxcache-daemon",
-            "--",
+            str(Path(__file__).resolve().parents[1] / "target" / "release" / "mlxcache-daemon"),
         ],
         env=dict(
             env,
