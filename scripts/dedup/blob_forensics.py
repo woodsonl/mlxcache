@@ -58,7 +58,17 @@ def parse_safetensors(payload: bytes) -> tuple[dict, int]:
     return tensors, data_start
 
 
-def layout(meta: dict, tensors: dict, payload_len: int) -> dict:
+def kv_heads(tensor: dict) -> int:
+    """KV-cache tensors are [1, H, S, D]; anything else is one stream.
+
+    Single source for this layout assumption: blob_forensics, chunk_sim and
+    roundtrip_probe all slice per KV head, and a missed copy would silently
+    mis-slice analysis output.
+    """
+    return tensor["shape"][1] if len(tensor["shape"]) == 4 else 1
+
+
+def layout(meta: dict, tensors: dict, payload_len: int, framing_bytes: int) -> dict:
     positions = meta["token_count"] - 1  # a blob covers tokens[:-1] (§3.2)
     rows = []
     for name in sorted(tensors):
@@ -79,7 +89,9 @@ def layout(meta: dict, tensors: dict, payload_len: int) -> dict:
         "token_count": meta["token_count"],
         "positions": positions,
         "payload_bytes": payload_len,
-        "framing_bytes": 4 + len(json.dumps(meta)),
+        # authoritative framing: file bytes minus payload, not a re-serialized
+        # guess at the header (json.dumps spacing need not match the writer's)
+        "framing_bytes": framing_bytes,
         "kv_bits": meta["fingerprint"].get("kv_bits", 0),
         "tensors": rows,
     }
@@ -167,7 +179,7 @@ def compare_pair(label: str, a_path: Path, b_path: Path, block: int) -> dict:
     rows = []
     for name in sorted(ta):
         a_bytes = payload_a[ta[name]["begin"] : ta[name]["end"]]
-        n_heads = ta[name]["shape"][1] if len(ta[name]["shape"]) == 4 else 1
+        n_heads = kv_heads(ta[name])
         hsz_a = len(a_bytes) // n_heads
         hsz_b = (tb[name]["end"] - tb[name]["begin"]) // n_heads
         unit = hsz_a // (meta_a["token_count"] - 1)
@@ -229,7 +241,8 @@ def main() -> int:
     for turn, path in turns:
         meta, payload = load_blob(path)
         tensors, _ = parse_safetensors(payload)
-        lay.append({"turn": turn, **layout(meta, tensors, len(payload))})
+        framing = path.stat().st_size - len(payload)
+        lay.append({"turn": turn, **layout(meta, tensors, len(payload), framing)})
     report["layout"] = lay
 
     last = lay[-1]
@@ -269,7 +282,6 @@ def main() -> int:
         grow_final = turns[-1][1]
         p3 = compare_pair("P3 grow-final vs single", grow_final, single_blob(args.single), block)
         report["p3_cross_shape"] = p3
-        print("\n== P3 cross-shape (grow final vs single-shot)")
         heads_ok = sum(x["heads_equal"] for x in p3["tensors"])
         heads_all = sum(x["n_heads"] for x in p3["tensors"])
         print("\n== P3 cross-shape (grow final vs single-shot)")

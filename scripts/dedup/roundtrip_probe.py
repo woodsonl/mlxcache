@@ -58,36 +58,38 @@ def feed(model, cache, tokens: list[int]):
     return logits
 
 
-def head_blocks(shape: list[int], nbytes: int) -> int:
+def head_blocks(shape: list[int]) -> int:
     """Number of KV-head blocks along axis 1 (the smoke divergence sat at
     exactly one such boundary)."""
     return shape[1] if len(shape) == 4 else 1
 
 
 def diagnose_heads(tname, a, b, d, e, ta, tb, td, te) -> None:
-    """Where did A's second KV-head block GO? Zero check, tail check, and
+    """Where did A's later KV-head blocks GO? Zero check, tail check, and
     whether a pure re-save (E) agrees with the appended view (B)."""
     na = ta[tname]["end"] - ta[tname]["begin"]
-    hsz = na // 2
+    h = head_blocks(ta[tname]["shape"])
+    hsz = na // h
     seg = {
         "A": a[ta[tname]["begin"] : ta[tname]["end"]],
         "B": b[tb[tname]["begin"] : tb[tname]["begin"] + na],
         "D": d[td[tname]["begin"] : td[tname]["begin"] + na],
         "E": e[te[tname]["begin"] : te[tname]["begin"] + na],
     }
-    print(f"-- head diagnosis {tname}")
+    print(f"-- head diagnosis {tname} ({h} heads)")
     for k, s in seg.items():
-        h0, h1 = s[:hsz], s[hsz:]
-        print(
-            f"   {k}: head0 nonzero={sum(1 for x in h0[:4096] if x)}/4096 "
-            f"head1 nonzero={sum(1 for x in h1[:4096] if x)}/4096"
-        )
+        counts = [sum(1 for x in s[i * hsz : (i + 1) * hsz][:4096] if x) for i in range(h)]
+        print(f"   {k}: head nonzero/4096 = {counts}")
     b_full = b[tb[tname]["begin"] : tb[tname]["end"]]
-    hsz_b = len(b_full) // 2
-    a_h1 = seg["A"][hsz:]
-    print(f"   A.head1 == B.head1 tail  : {a_h1 == b_full[-hsz:]}")
-    print(f"   A.head1 == B.head1 [na:] : {a_h1 == b_full[hsz_b : hsz_b + hsz]}")
-    print(f"   E.head1[:hsz] == B.head1[:hsz]: {seg['E'][hsz:] == b_full[hsz_b : hsz_b + hsz]}")
+    hsz_b = len(b_full) // h
+    for i in range(1, h):
+        a_hi = seg["A"][i * hsz : (i + 1) * hsz]
+        print(f"   A.head{i} == B.head{i} tail  : {a_hi == b_full[-(h - i) * hsz :]}")
+        print(f"   A.head{i} == B.head{i} [na:] : {a_hi == b_full[i * hsz_b : i * hsz_b + hsz]}")
+        print(
+            f"   E.head{i}[:hsz] == B.head{i}[:hsz]: "
+            f"{seg['E'][i * hsz : (i + 1) * hsz] == b_full[i * hsz_b : i * hsz_b + hsz]}"
+        )
 
 
 def compare(
@@ -101,12 +103,12 @@ def compare(
     print(f"-- {name}")
     exact = total = 0
     detail: list[dict] = []
-    for tname in sorted(tensors_a)[:4]:
+    for tname in sorted(tensors_a):  # every tensor: per-layer anomalies must be visible
         ta, tb = tensors_a[tname], tensors_b[tname]
         na = ta["end"] - ta["begin"]
         seg_a = a[ta["begin"] : ta["end"]]
         seg_b = b[tb["begin"] : tb["begin"] + na]
-        h = head_blocks(ta["shape"], na)
+        h = head_blocks(ta["shape"])
         hsz = na // h
         heads = []
         for i in range(h):
@@ -121,8 +123,6 @@ def compare(
             heads.append("==" if d is None else f"diff@{d - s}")
         detail.append({"tensor": tname, "heads": heads})
         print(f"   {tname}: heads [{' '.join(heads)}]")
-    if len(tensors_a) > 4:
-        print(f"   ... {len(tensors_a) - 4} more tensors")
     record.append(
         {
             "comparison": name,

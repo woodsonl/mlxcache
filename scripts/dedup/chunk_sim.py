@@ -7,7 +7,8 @@ Two chunkings, measured side by side on the SAME captured bytes:
     recurrence's low m bits depend only on the last m bytes, so the cut
     condition (h & ((1<<m)-1)) == 0 over every eligible position is a
     sliding-window sum — vectorizable, and verified bit-for-bit against a
-    naive sequential implementation on a sample (--verify). Envelope:
+    naive sequential implementation on a sample (default on; --no-verify to
+    skip). Envelope:
     min = avg/4, max = 4*avg (FastCDC-style).
   token-block — per-tensor slices of B covered positions, keyed by content
     digest. Exact by construction because we KNOW the token boundaries (the
@@ -21,10 +22,10 @@ Reported per config: per-turn NEW bytes vs the cumulative store (the honest
 store view — chunks from earlier turns stay stored), chunk size percentiles,
 and CDC boundary stability across turns.
 
-Usage:
+Usage (defaults reproduce the committed tables):
   uv run python scripts/dedup/chunk_sim.py <grow_run_dir> \
-      [--avg-kib 16,64,256,1024] [--token-blocks 64,256,1024] \
-      [--scopes tensor,file] [--json PATH] [--verify]
+      [--avg-kib 16,64,256] [--token-blocks 64,256] \
+      [--scopes head,tensor,file] [--json PATH] [--no-verify]
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from blob_forensics import load_blob, parse_safetensors, turn_blobs
+from blob_forensics import kv_heads, load_blob, parse_safetensors, turn_blobs
 
 _MASK64 = (1 << 64) - 1
 
@@ -57,23 +58,63 @@ def gear_table() -> np.ndarray:
 
 _TABLE = gear_table()
 
+# Byte-block size for the windowed gear gather: bounds peak temporaries to
+# ~3x this value regardless of payload size. Tests shrink it to force the
+# multi-block path.
+_GATHER_BLOCK = 1 << 24
+
+
+def mask_bits_for(avg: int) -> int:
+    """log2(avg): a cut probability of 1/avg per byte. Single definition —
+    the verifier must exercise the same mask the chunker uses."""
+    return max(avg.bit_length() - 1, 8)
+
+
+def cdc_envelope(avg: int) -> tuple[int, int]:
+    """FastCDC-style min/max chunk sizes. Single definition — boundary
+    stability must be measured over the exact envelope the store simulation
+    chunks with."""
+    return avg // 4, avg * 4
+
 
 def gear_cut_candidates(arr: np.ndarray, table: np.ndarray, mask_bits: int) -> np.ndarray:
     """Candidate chunk-end offsets where the gear hash's low bits are zero.
 
     The window at row r covers bytes [r, r+mask_bits); its cut would end the
     chunk at r+mask_bits. Eligible positions always have full history within
-    the chunk because min_size >> mask_bits."""
+    the chunk because min_size >> mask_bits.
+
+    Processed in bounded blocks (with a mask_bits-1 carry between them) so a
+    426 MB payload does not materialize ~24x itself in uint64 temporaries;
+    the unblocked math is identical. Output is identical to computing all
+    windows at once."""
     m = mask_bits
     if arr.size < m:
         return np.empty(0, dtype=np.int64)
-    w = np.lib.stride_tricks.sliding_window_view(arr, m)
     g = table & np.uint64((1 << m) - 1)
-    acc = np.zeros(w.shape[0], dtype=np.uint64)
-    for j in range(m):
-        acc += g[w[:, j]] << np.uint64(m - 1 - j)
-    acc &= np.uint64((1 << m) - 1)  # the cut condition is on the LOW m bits
-    return np.nonzero(acc == 0)[0] + m
+    block = _GATHER_BLOCK
+    out: list[np.ndarray] = []
+    start = 0
+    while start + m <= arr.size:
+        stop = min(start + block, arr.size)
+        # ensure every window starting in this block is complete within it
+        win_end = min(stop, arr.size)
+        seg = arr[start:win_end]
+        if seg.size < m:
+            break
+        w = np.lib.stride_tricks.sliding_window_view(seg, m)
+        acc = np.zeros(w.shape[0], dtype=np.uint64)
+        for j in range(m):
+            acc += g[w[:, j]] << np.uint64(m - 1 - j)
+        acc &= np.uint64((1 << m) - 1)  # the cut condition is on the LOW m bits
+        rows = np.nonzero(acc == 0)[0]
+        out.append(rows.astype(np.int64) + start + m)
+        if win_end >= arr.size:
+            break
+        start = win_end - (m - 1)
+    if not out:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(out)
 
 
 def apply_envelope(candidates: np.ndarray, n: int, min_size: int, max_size: int) -> list[int]:
@@ -144,10 +185,8 @@ def chunk_stream(
     """(chunks, cuts): per chunk (end_offset, size, sha256) relative to
     `data`, and the raw cut list (for boundary-stability)."""
     arr = np.frombuffer(data, dtype=np.uint8)
-    # mask_bits = log2(avg): a cut probability of 1/avg per byte.
-    mask_bits = max(avg.bit_length() - 1, 8)
     cuts = apply_envelope(
-        gear_cut_candidates(arr, _TABLE, mask_bits), len(data), min_size, max_size
+        gear_cut_candidates(arr, _TABLE, mask_bits_for(avg)), len(data), min_size, max_size
     )
     out = []
     start = 0
@@ -169,7 +208,7 @@ def blob_chunk_sets(
              forensics probe identified; cuts never cross a head boundary
              and appends never shift later heads' bytes.
     Returns (chunks with payload-absolute offsets, cut map for stability)."""
-    min_size, max_size = avg // 4, avg * 4
+    min_size, max_size = cdc_envelope(avg)
     chunks: list[tuple[int, int, str]] = []
     cuts_by: dict[str, list[int]] = {}
     if scope == "file":
@@ -186,7 +225,7 @@ def blob_chunk_sets(
     else:
         for name in sorted(tensors):
             t = tensors[name]
-            n_heads = t["shape"][1] if len(t["shape"]) == 4 else 1
+            n_heads = kv_heads(t)
             hsz = (t["end"] - t["begin"]) // n_heads
             for h in range(n_heads):
                 seg = payload[t["begin"] + h * hsz : t["begin"] + (h + 1) * hsz]
@@ -206,7 +245,7 @@ def token_block_chunks(payload: bytes, tensors: dict, positions: int, block: int
     for name in sorted(tensors):
         t = tensors[name]
         nbytes = t["end"] - t["begin"]
-        n_heads = t["shape"][1] if len(t["shape"]) == 4 else 1
+        n_heads = kv_heads(t)
         hsz = nbytes // n_heads
         unit, rem = divmod(hsz, positions)
         if rem:
@@ -251,6 +290,11 @@ def simulate(turns: list[Path], cfg_name: str, chunker) -> dict:
             }
         )
         store.update(d for _, _, d in chunks)
+    if len(rows) < 2:
+        raise SystemExit(
+            "simulate: need >= 2 turns for a new-bytes mean "
+            f"(got {len(rows)} for config {cfg_name})"
+        )
     mean_new = sum(r["new_bytes"] for r in rows[1:]) / sum(r["payload_bytes"] for r in rows[1:])
     return {
         "config": cfg_name,
@@ -263,7 +307,7 @@ def simulate(turns: list[Path], cfg_name: str, chunker) -> dict:
 def boundary_stability(turns: list[Path], avg: int) -> float:
     """Fraction of turn k's CDC cuts (per KV-HEAD block, within the shared
     byte range) that reappear identically in turn k+1."""
-    min_size, max_size = avg // 4, avg * 4
+    min_size, max_size = cdc_envelope(avg)
     total, shared_total = 0, 0
     prev: dict[str, tuple[int, list[int]]] | None = None
     for _, path in turns:
@@ -272,7 +316,7 @@ def boundary_stability(turns: list[Path], avg: int) -> float:
         cur: dict[str, tuple[int, list[int]]] = {}
         for name in sorted(tensors):
             t = tensors[name]
-            n_heads = t["shape"][1] if len(t["shape"]) == 4 else 1
+            n_heads = kv_heads(t)
             hsz = (t["end"] - t["begin"]) // n_heads
             for h in range(n_heads):
                 seg = payload[t["begin"] + h * hsz : t["begin"] + (h + 1) * hsz]
@@ -304,12 +348,15 @@ def main() -> int:
 
     turns = turn_blobs(args.grow_dir)
     if not args.no_verify:
-        sample = load_blob(turns[0][1])[1][: (2 << 20)]
         for kib in (int(x) for x in args.avg_kib.split(",")):
             avg = kib * 1024
-            verify_vectorized(sample, avg.bit_length() - 1, avg // 4, avg * 4)
+            # the sample must hold enough natural cuts to make the equality
+            # meaningful: at avg=256 KiB a fixed 2 MiB sample has a handful,
+            # and at 1024 KiB nearly none, so scale with the target size
+            sample = load_blob(turns[0][1])[1][: max(2 << 20, 32 * avg)]
+            verify_vectorized(sample, mask_bits_for(avg), *cdc_envelope(avg))
         print(
-            "CDC verifier: vectorized == naive on 2 MiB sample "
+            "CDC verifier: vectorized == naive "
             f"({', '.join(x.strip() for x in args.avg_kib.split(','))} KiB configs)"
         )
 

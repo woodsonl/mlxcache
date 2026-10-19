@@ -6,7 +6,7 @@
    "token_count": 5305,
    "positions": 5304,
    "payload_bytes": 304157920,
-   "framing_bytes": 29436,
+   "framing_bytes": 24112,
    "kv_bits": 0,
    "tensors": [
     {
@@ -744,7 +744,7 @@
    "token_count": 5604,
    "positions": 5603,
    "payload_bytes": 321303778,
-   "framing_bytes": 31180,
+   "framing_bytes": 25557,
    "kv_bits": 0,
    "tensors": [
     {
@@ -1482,7 +1482,7 @@
    "token_count": 5908,
    "positions": 5907,
    "payload_bytes": 338736356,
-   "framing_bytes": 32901,
+   "framing_bytes": 26974,
    "kv_bits": 0,
    "tensors": [
     {
@@ -2220,7 +2220,7 @@
    "token_count": 6205,
    "positions": 6204,
    "payload_bytes": 355767526,
-   "framing_bytes": 34647,
+   "framing_bytes": 28423,
    "kv_bits": 0,
    "tensors": [
     {
@@ -2958,7 +2958,7 @@
    "token_count": 6520,
    "positions": 6519,
    "payload_bytes": 373830888,
-   "framing_bytes": 36499,
+   "framing_bytes": 29960,
    "kv_bits": 0,
    "tensors": [
     {
@@ -3696,7 +3696,7 @@
    "token_count": 6826,
    "positions": 6825,
    "payload_bytes": 391378152,
-   "framing_bytes": 38289,
+   "framing_bytes": 31444,
    "kv_bits": 0,
    "tensors": [
     {
@@ -4434,7 +4434,7 @@
    "token_count": 7127,
    "positions": 7126,
    "payload_bytes": 408638698,
-   "framing_bytes": 40026,
+   "framing_bytes": 32880,
    "kv_bits": 0,
    "tensors": [
     {
@@ -5172,7 +5172,7 @@
    "token_count": 7435,
    "positions": 7434,
    "payload_bytes": 426300650,
-   "framing_bytes": 41803,
+   "framing_bytes": 34349,
    "kv_bits": 0,
    "tensors": [
     {
@@ -19747,7 +19747,7 @@
    "tokens": 7435
   },
   "b": {
-   "path": "/private/var/folders/mg/8hpb2rl557g8k0k2cgsk54hc0000gn/T/opencode/mlxcache-dedup/g7b-f16-single/snapshots/single/91f2102be01d08367974f18968216a04-0000000000000001.ckpt",
+   "path": "/private/var/folders/mg/8hpb2rl557g8k0k2cgsk54hc0000gn/T/opencode/mlxcache-dedup/s-f16-a/snapshots/single/91f2102be01d08367974f18968216a04-0000000000000001.ckpt",
    "tokens": 7435
   },
   "tensors": [
@@ -21719,11 +21719,11 @@
  "p2_cold_twice": {
   "label": "P2 single vs single2",
   "a": {
-   "path": "/private/var/folders/mg/8hpb2rl557g8k0k2cgsk54hc0000gn/T/opencode/mlxcache-dedup/g7b-f16-single/snapshots/single/91f2102be01d08367974f18968216a04-0000000000000001.ckpt",
+   "path": "/private/var/folders/mg/8hpb2rl557g8k0k2cgsk54hc0000gn/T/opencode/mlxcache-dedup/s-f16-a/snapshots/single/91f2102be01d08367974f18968216a04-0000000000000001.ckpt",
    "tokens": 7435
   },
   "b": {
-   "path": "/private/var/folders/mg/8hpb2rl557g8k0k2cgsk54hc0000gn/T/opencode/mlxcache-dedup/g7b-f16-single2/snapshots/single/91f2102be01d08367974f18968216a04-0000000000000001.ckpt",
+   "path": "/private/var/folders/mg/8hpb2rl557g8k0k2cgsk54hc0000gn/T/opencode/mlxcache-dedup/s-f16-b/snapshots/single/91f2102be01d08367974f18968216a04-0000000000000001.ckpt",
    "tokens": 7435
   },
   "tensors": [

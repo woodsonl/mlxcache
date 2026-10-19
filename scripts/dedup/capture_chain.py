@@ -128,13 +128,13 @@ def wait_publish(blobs_dir: Path, before: int, timeout_s: float = 120.0) -> int:
     raise SystemExit(f"timeout: no new blob after {timeout_s}s (have {before})")
 
 
-def spawn(env_extra: dict, argv: list[str], log: Path | None = None) -> subprocess.Popen:
+def spawn(env_extra: dict, argv: list[str], log: Path) -> tuple[subprocess.Popen, object]:
     env = {**os.environ, **env_extra}
-    out = open(log, "wb") if log else subprocess.DEVNULL  # noqa: SIM115 — closed in teardown
-    return subprocess.Popen(argv, cwd=REPO_ROOT, env=env, stdout=out, stderr=subprocess.STDOUT)
+    out = open(log, "wb")  # noqa: SIM115 — handle returned to caller; closed in teardown
+    return subprocess.Popen(argv, cwd=REPO_ROOT, env=env, stdout=out, stderr=subprocess.STDOUT), out
 
 
-def teardown(procs: list[subprocess.Popen]) -> None:
+def teardown(procs: list[subprocess.Popen], log_handles: list[object]) -> None:
     for p in procs:
         if p.poll() is None:
             p.send_signal(signal.SIGTERM)
@@ -144,6 +144,8 @@ def teardown(procs: list[subprocess.Popen]) -> None:
         except subprocess.TimeoutExpired:
             p.kill()
             p.wait(timeout=10)
+    for fh in log_handles:
+        fh.close()
 
 
 def user_msg(base_doc: str, idx: int) -> str:
@@ -188,7 +190,8 @@ def main() -> int:
             )
 
     sidecar_port, daemon_port = free_port(), free_port()
-    sidecar = spawn(
+    log_handles: list[object] = []
+    sidecar, fh = spawn(
         {
             "MLXCACHE_ENGINE": "mlx-lm",
             "MLXCACHE_MODEL": args.model,
@@ -196,27 +199,34 @@ def main() -> int:
             "MLXCACHE_KV_BITS": str(args.kv_bits),
         },
         [sys.executable, "-m", "mlxcache_sidecar.server"],
-        log=out / "sidecar.log",
+        out / "sidecar.log",
     )
+    log_handles.append(fh)
     wait_http(f"http://127.0.0.1:{sidecar_port}/health", args.health_timeout_s)
 
-    daemon = spawn(
-        {
-            "MLXCACHE_ADDR": f"127.0.0.1:{daemon_port}",
-            "MLXCACHE_MODELS": args.model,
-            "MLXCACHE_SIDECAR_URL": f"http://127.0.0.1:{sidecar_port}",
-            "MLXCACHE_BLOBS": str(out / "blobs"),
-            "MLXCACHE_TRACE": str(out / "trace.jsonl"),
-            "MLXCACHE_EVICT_MAX_BYTES": "0",
-            "MLXCACHE_EVICT_INTERVAL_S": "0",
-            "MLXCACHE_SHUTDOWN_GRACE_S": "2",
-            "RUST_LOG": "mlxcache_daemon=debug,info",
-        },
-        [str(REPO_ROOT / "target" / "release" / "mlxcache-daemon")],
-        log=out / "daemon.log",
-    )
-    base = f"http://127.0.0.1:{daemon_port}"
+    # The manifest is rewritten after every turn: a capture that aborts midway
+    # (request timeout, a no-publish event) still leaves an analyzable
+    # manifest for the turns that did land, instead of discarding hours of
+    # model time behind a run that never reached the final write.
+    daemon = None
     try:
+        daemon, fh = spawn(
+            {
+                "MLXCACHE_ADDR": f"127.0.0.1:{daemon_port}",
+                "MLXCACHE_MODELS": args.model,
+                "MLXCACHE_SIDECAR_URL": f"http://127.0.0.1:{sidecar_port}",
+                "MLXCACHE_BLOBS": str(out / "blobs"),
+                "MLXCACHE_TRACE": str(out / "trace.jsonl"),
+                "MLXCACHE_EVICT_MAX_BYTES": "0",
+                "MLXCACHE_EVICT_INTERVAL_S": "0",
+                "MLXCACHE_SHUTDOWN_GRACE_S": "2",
+                "RUST_LOG": "mlxcache_daemon=debug,info",
+            },
+            [str(REPO_ROOT / "target" / "release" / "mlxcache-daemon")],
+            out / "daemon.log",
+        )
+        log_handles.append(fh)
+        base = f"http://127.0.0.1:{daemon_port}"
         wait_http(f"{base}/healthz", 60.0)
         manifest = {
             "mode": args.mode,
@@ -235,15 +245,14 @@ def main() -> int:
         # single: ONE request carrying the entire pinned conversation (the
         # same message list the grow run's final turn saw).
         history: list[dict] = [{"role": "system", "content": SYSTEM}]
+        single_messages: list[dict] | None = None
         if args.mode == "single":
             for i in range(args.turns):
                 history.append({"role": "user", "content": user_msg(doc, i)})
                 if i < args.turns - 1:  # the request ends at the final user
                     # turn, exactly like the grow run's final request
                     history.append({"role": "assistant", "content": replies[i]})
-            requests = [(args.turns, list(history))]
-        else:
-            requests = None  # built incrementally below
+            single_messages = list(history)
         n_req = 1 if args.mode == "single" else args.turns
         for i in range(1, n_req + 1):
             if args.mode == "grow":
@@ -251,7 +260,7 @@ def main() -> int:
                 messages = list(history)
                 turn_no = i
             else:
-                messages = requests[0][1]
+                messages = single_messages
                 turn_no = args.turns
             n_before = len(list((out / "blobs").glob("*.ckpt")))
             snap_rel = None
@@ -280,6 +289,9 @@ def main() -> int:
                     "mlxcache": resp.get("mlxcache"),
                 }
             )
+            # checkpoint: an aborted capture still leaves every landed turn
+            # analyzable (turn_blobs() requires this file)
+            (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
             print(
                 f"turn {turn_no}: verdict={resp.get('mlxcache', {}).get('verdict')} "
                 f"cached={resp.get('mlxcache', {}).get('tokens_cached')}/"
@@ -296,7 +308,8 @@ def main() -> int:
         n_trace = sum(1 for _ in trace.open()) if trace.exists() else 0
         print(f"manifest -> {out / 'manifest.json'}; trace lines: {n_trace}")
     finally:
-        teardown([daemon, sidecar])
+        procs = [p for p in (daemon, sidecar) if p is not None]
+        teardown(procs, log_handles)
     return 0
 
 

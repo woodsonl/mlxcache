@@ -28,14 +28,14 @@ a flat leading-bytes comparison reads the shift as corruption.
 
 `scripts/dedup/roundtrip_probe.py` isolates the steps (no daemon involved). Its
 committed output table is `scripts/dedup/tables/layout-probe-0.5b.json` (Qwen2-0.5B,
-prefix 1500 + delta 300, per-head verdicts for every tensor):
+prefix 1500 + delta 300; per-head verdicts for ALL 48 KV tensors, 96 heads):
 
 | Comparison | Result | Heads exact |
 |---|---|---|
-| `B vs A` — pure in-memory append | head0 exact, later heads shifted (`A.head1 == B.head1[:len]` **true**) | 4/8 |
-| `C vs B` — load→append→save vs append | **byte-exact** — the adapter round trip is lossless | 8/8 |
-| `E vs A` — load→save, no compute | **byte-exact** — save/load is stable | 8/8 |
-| `D vs B` — one-shot prefill vs appended | K exact everywhere; V exact in the shared prefix, diverging only in the newly computed region | 2/8 |
+| `B vs A` — pure in-memory append | head0 pairs exact, later heads shifted (`A.head1 == B.head1[:len]` **true**) | 48/96 |
+| `C vs B` — load→append→save vs append | **byte-exact** — the adapter round trip is lossless | 96/96 |
+| `E vs A` — load→save, no compute | **byte-exact** — save/load is stable | 96/96 |
+| `D vs B` — one-shot prefill vs appended | shared prefix preserved: every one of the 94 differing heads diverges at byte ≥192,000 — the first recomputed position (1500 tokens × 128 B) — and never inside the prefix; fully byte-exact only in layer 0's first tensor | 2/96 |
 
 So: the store/adapter path is not lossy, and identity is **per head block**, not
 per file offset. That single fact decides the chunking scope.
@@ -137,27 +137,30 @@ medians. `plain` = read the whole blob file + sha256 payload (today's fetch path
 
 | Layout | f16 median delta | q8 median delta | G2 (≤ +300 ms) |
 |---|---|---|---|
-| packed 64 MiB segments, 64 KiB chunks | **−91.6 ms** (faster than plain) | **−46.1 ms** (faster) | **PASS** |
-| packed 64 MiB segments, 16 KiB chunks | **+131.6 ms** | **+75.3 ms** | **PASS** |
-| unpacked, one file per 16 KiB chunk | **+674.8 ms** | **+377.4 ms** | **FAIL — exceeds G2, and f16 exceeds N2** |
+| packed 64 MiB segments, 64 KiB chunks | **−67.9 ms** (faster than plain) | **−40.0 ms** (faster) | **PASS** |
+| packed 64 MiB segments, 16 KiB chunks | **+171.1 ms** | **+140.1 ms** | **PASS** |
+| unpacked, one file per 16 KiB chunk | **+749.9 ms** | **+663.8 ms** | **FAIL — exceeds G2, and BOTH tiers exceed the N2 +600 ms line** |
 
-Absolute numbers, f16 packed 16 KiB: plain 200 ms, chunked 332 ms, 1.20 GiB/s.
+Absolute numbers, f16 packed 16 KiB: plain 215 ms, chunked 386 ms, 1.03 GiB/s.
 Parallel `pread` across 8 workers beats a single-threaded whole-file read at
-64 KiB chunks (3.59 GiB/s vs 0.45 GiB/s unpacked); at 16 KiB the syscall count
-still costs ~130 ms.
+64 KiB chunks (2.05 GiB/s vs 0.40 GiB/s unpacked); at 16 KiB the syscall count
+still costs ~170 ms.
 
-Repeat-run variance, stated because it is visible in the artifacts: two
-independent capture+bench sets put the f16 packed-16 KiB delta at +81 ms and
-+132 ms, so report G2 as the range **+81 to +132 ms f16** (headroom 2.3× to 3.7×)
-rather than a point. The committed tables (`scripts/dedup/tables/`) are the second
-set and are what this report cites; both runs pass G2, and the sign of the 64 KiB
-result (faster than plain) was stable across both.
+Repeat-run variance, stated because it is visible in the artifacts: three
+independent capture+bench sets put the f16 packed-16 KiB delta at +81, +132,
+and +171 ms, so report G2 as the range **+81 to +171 ms f16** (headroom 1.75×
+to 3.7×) rather than a point. The committed tables
+(`scripts/dedup/tables/*.txt`) are the third set and are what this report
+cites; every run passes G2, and the sign of the 64 KiB result (faster than
+plain) was stable across all three. The unpacked layout failed N2 in f16 on
+the first two sets and fails it in both tiers on the third (+749.9 / +663.8 ms).
 
 **Packing is mandatory, not an optimization.** One file per chunk fails the
-pre-registered N2 line (+636 ms > +600 ms, 2.9× plain) — the post's author
-suspected as much and the measurement confirms it. With packing the cost is inside
-budget at 16 KiB with **2.28× headroom at f16** and **3.98× at q8** (300 ms allowed
-against +131.6 ms and +75.3 ms), and is *negative* at 64 KiB.
+pre-registered N2 line in both tiers (+749.9 ms and +663.8 ms, both > +600 ms;
+3.1× and 5.7× the plain median) — the post's author suspected as much and the measurement
+confirms it. With packing the cost is inside budget at 16 KiB with **1.75×
+headroom at f16** and **2.14× at q8** (300 ms allowed against +171.1 ms and
++140.1 ms), and is *negative* at 64 KiB.
 
 Caveats, stated rather than hidden: macOS page-cache control is poor, so both sides
 are measured warm and cold-start is bounded by the post's +15–70% cold band rather
@@ -166,82 +169,94 @@ per-chunk metadata, which this bench models as the manifest walk (in-memory).
 
 ## E5 — Eviction under a chunk store (G3)
 
-Simulation mirrors `store.py`'s `_enforce_budget` and `index.py`'s structural
-anchors (an entry is anchored while a live published entry extends it).
+The whole-blob arm mirrors the sidecar's `store.py::_enforce_budget` and
+`index.py` anchor semantics: candidates are non-anchors ordered by token_count
+DESCENDING, anchor status is STRUCTURAL (a live published entry extends this
+one) OR RECENCY (served within the anchor window — `MLXCACHE_EVICT_ANCHOR_WINDOW_S`,
+default 900 s, same shape in the daemon's `orchestrator.rs::evict_cold`), and a
+store still over budget with only anchored entries HOLDS. The chunk arm's
+ordering (biggest unique-tail first) is the policy this gate exists to test —
+no real chunk store exists yet.
 
-Budgets are fractions of one whole final blob. **`bind` matters more than any number
-in this table**: a budget larger than the chunk store's entire contents cannot evict
-anything, so its hit rate says nothing about policy. Earlier revisions of this report
-used `×2/×4/×8` (852 MB and up at f16) against a 430 MiB chunk store, so the chunk
-side never evicted once and "never evicts" was read as policy merit. It was capacity.
-The ladder below includes budgets that bind.
+The window is modeled in request ticks, so both regimes that matter are run:
+**aged** (window=0 — every request arrives after earlier windows expired; the
+steady-state reaper) and **fast** (all requests inside one window — a burst
+replay). An earlier revision of this report omitted the recency term entirely
+and also expressed budgets as ×2/×4/×8 of one blob, which never bound the
+chunk store; both defects are why the tables below were regenerated. Two
+chunking arms are measured: CDC/head/16 KiB (the fallback codec) and
+token-block/64 (the codec the decision adopts).
 
-| Scenario | Store | Hit rate | Final MiB | Budget MiB | Bind | Evictions |
-|---|---|---|---|---|---|---|
-| S1 chain growth, no budget (f16) | whole | 0.8540 | 2,785.1 | — | — | 0 |
-| S1 chain growth, no budget (f16) | chunk | **0.8540** | **430.2** | — | — | 0 |
-| S1 chain growth, no budget (q8) | whole | 0.8536 | 1,482.2 | — | — | 0 |
-| S1 chain growth, no budget (q8) | chunk | **0.8536** | **280.4** | — | — | 0 |
-| S2 interleaved ×0.9 (f16) | whole | 0.7812 | 290.1 | 365.9 | yes | 14 |
-| S2 interleaved ×0.9 (f16) | chunk | **0.8465** | 356.5 | 365.9 | yes | 10 |
-| S2 interleaved ×1.0 (f16) | whole | 0.7812 | 290.1 | 406.6 | yes | 14 |
-| S2 interleaved ×1.0 (f16) | chunk | **0.8702** | 406.6 | 406.6 | yes | 7 |
-| S2 interleaved ×1.25 (f16) | whole | 0.7812 | 290.1 | 508.2 | yes | 14 |
-| S2 interleaved ×1.25 (f16) | chunk | **0.9031** | 506.7 | 508.2 | yes | 2 |
-| S2 interleaved ×0.9 (q8) | whole | 0.7799 | 154.1 | 195.2 | yes | 14 |
-| S2 interleaved ×0.9 (q8) | chunk | **0.8397** | 189.8 | 195.2 | yes | 10 |
-| S2 interleaved ×1.0 (q8) | whole | 0.7799 | 154.1 | 216.9 | yes | 14 |
-| S2 interleaved ×1.0 (q8) | chunk | **0.8635** | 216.9 | 216.9 | yes | 7 |
-| S2 interleaved ×1.25 (q8) | whole | 0.7799 | 154.1 | 271.2 | yes | 14 |
-| S2 interleaved ×1.25 (q8) | chunk | **0.8936** | 270.1 | 271.2 | yes | 4 |
-| S2 interleaved ×2.0 (f16) | whole | 0.7988 | 596.5 | 813.2 | yes | 13 |
-| S2 interleaved ×2.0 (f16) | chunk | 0.9061 | 546.7 | 813.2 | **no** | 0 |
-| S2 interleaved ×2.0 (q8) | whole | 0.7976 | 317.0 | 433.9 | yes | 13 |
-| S2 interleaved ×2.0 (q8) | chunk | 0.9056 | 343.2 | 433.9 | **no** | 0 |
-| S3 evict-then-re-request ×1.0 (f16) | whole | 0.7812 | 290.1 | 406.6 | yes | 21 |
-| S3 evict-then-re-request ×1.0 (f16) | chunk | **0.9151** | 390.2 | 406.6 | yes | 4 |
-| S3 evict-then-re-request ×1.0 (q8) | whole | 0.7799 | 154.1 | 216.9 | yes | 21 |
-| S3 evict-then-re-request ×1.0 (q8) | chunk | **0.8780** | 207.3 | 216.9 | yes | 8 |
+| Scenario (aged unless noted) | Store | Hit | Final MiB | Budget MiB | Bind | Evict | Held over |
+|---|---|---|---|---|---|---|---|
+| S1 no budget (f16) | whole | 0.8540 | 2,784.8 | — | — | 0 | — |
+| S1 no budget (f16) | chunk cdc / **tb** | 0.8540 | **430.2 / 422.3** | — | — | 0 | — |
+| S1 no budget (q8) | whole | 0.8536 | 1,482.0 | — | — | 0 | — |
+| S1 no budget (q8) | chunk cdc / **tb** | 0.8536 | **280.4 / 223.1** | — | — | 0 | — |
+| S2 ×0.9 (f16) | whole | 0.7812 | 696.6 | 365.9 | yes | 13 | yes |
+| S2 ×0.9 (f16) | chunk cdc / **tb** | **0.8313 / 0.8313** | 446.5 / 444.5 | 365.9 | yes | 10 | yes |
+| S2 ×1.0 (f16) | whole | 0.7812 | 696.6 | 406.6 | yes | 13 | yes |
+| S2 ×1.0 (f16) | chunk cdc / **tb** | **0.8579 / 0.8579** | 466.3 / 461.8 | 406.6 | yes | 8 | yes |
+| S2 ×1.25 (f16) | whole | 0.7812 | 696.6 | 508.2 | yes | 13 | yes |
+| S2 ×1.25 (f16) | chunk cdc / **tb** | **0.9002 / 0.9031** | 506.7 / 520.7 | 508.2 | yes | 3 / 2 | yes |
+| S2 ×0.9 (q8) | whole | 0.7799 | 371.0 | 195.2 | yes | 13 | yes |
+| S2 ×0.9 (q8) | chunk cdc / **tb** | **0.7976 / 0.8303** | 234.3 / 237.2 | 195.2 | yes | 12 / 10 | yes |
+| S2 ×1.0 (q8) | whole | 0.7799 | 371.0 | 216.9 | yes | 13 | yes |
+| S2 ×1.0 (q8) | chunk cdc / **tb** | **0.8303 / 0.8572** | 252.2 / 246.7 | 216.9 | yes | 10 / 8 | yes |
+| S2 ×1.25 (q8) | whole | 0.7799 | 371.0 | 271.1 | yes | 13 | yes |
+| S2 ×1.25 (q8) | chunk cdc / **tb** | **0.8784 / 0.9026** | 288.4 / 275.4 | 271.1 | yes | 6 / 2 | yes |
+| S2 ×2.0 (f16) | chunk cdc / **tb** | 0.9061 | 546.7 / 538.8 | 813.1 | **no** | 0 | — |
+| S2 ×2.0 (q8) | chunk cdc / **tb** | 0.9056 | 343.2 / 285.8 | 433.8 | **no** | 0 | — |
+| S2 ×1.0 **fast** (f16) | whole | 0.9061 | 5,279.6 | 406.6 | yes | **0** | yes |
+| S2 ×1.0 **fast** (f16) | chunk cdc / **tb** | 0.9061 | 546.7 / 538.8 | 406.6 | yes | **0** | yes |
+| S2 ×1.0 **fast** (q8) | whole | 0.9056 | 2,809.9 | 216.9 | yes | **0** | yes |
+| S2 ×1.0 **fast** (q8) | chunk cdc / **tb** | 0.9056 | 343.2 / 285.8 | 216.9 | yes | **0** | yes |
 
-At every non-degenerate budget where the chunk store reaches the ceiling (×0.9 and
-up), it **holds the budget, keeps its anchors, evicts fewer entries, and has a
-higher hit rate** than whole-blob (f16 0.8465/0.8702/0.9031 vs 0.7812; q8
-0.8397/0.8635/0.8936 vs 0.7799). The direction of the gap is worth stating
-exactly: whole-blob is pinned at 0.7812 across all three rungs because one blob
-is all it can ever retain, while the chunk store climbs as the budget loosens, so
-the gap *widens* as the budget loosens — the chunk store converts headroom into
-hit rate and the whole-blob store cannot.
+Three findings, in the order they matter:
 
-Two budgets are degenerate and labeled as such rather than dropped: at ×0.5 both
-stores thrash to zero bytes (17 evictions whole / 16 chunk, hit rate 0.0000). A
-budget below one blob cannot serve that iteration and the numbers are meaningless
-for policy comparison. That is why S3 uses ×1.0 rather than the tightest rung.
+1. **The chunk store's hit rate is ≥ whole-blob at every rung of every arm**
+   (f16 0.8313/0.8579/0.9002–0.9031 vs 0.7812; q8 0.7976–0.8303/0.8572/0.8784–0.9026
+   vs 0.7799), asserted by `evict_sim.py` itself on every run. The whole-blob
+   store is pinned at 0.7812/0.7799 because its anchored chain is all it ever
+   retains; the chunk store climbs as the budget loosens. At ×0.5 both stores
+   score identically (0.7812/0.7799, 13 evictions each) — the rung where
+   neither representation can outserve the other.
+2. **Inside one anchor window NEITHER store can enforce a budget** (fast rows:
+   0 evictions, both held over). That is the daemon's documented
+   hold-and-continue rule, not a failure of the policy — and the exposure
+   differs by an order of magnitude: held over budget at ×1.0, the whole store
+   carries 5,279.6 MiB (f16) / 2,809.9 MiB (q8) while the chunk store carries
+   546.7 / 343.2 MiB (cdc) or 538.8 / 285.8 MiB (tb).
+3. **Republish after the reaper cascades (S3)** — grow under a binding budget,
+   run the background reaper until anchors expire and it stops making progress,
+   then re-request the chain:
 
-**Republish after eviction (S3), the result that is new here:**
+| Tier | Whole re-stored | Chunk re-stored (cdc) | Chunk re-stored (**tb**) | Ratio (tb) |
+|---|---|---|---|---|
+| f16 | 2,494.8 MiB | 40.0 MiB | **18.0 MiB** | **139×** |
+| q8 | 1,327.9 MiB | 73.1 MiB | **10.5 MiB** | **127×** |
 
-| Tier | Whole-blob bytes re-stored | Chunk bytes re-stored | Ratio |
-|---|---|---|---|
-| f16 | 7,178.5 MiB | **92.7 MiB** | **77×** |
-| q8 | 3,821.3 MiB | **234.8 MiB** | **16×** |
+An earlier revision printed 7,178.5 / 92.7 MiB here; those numbers were
+inflated by a republish bug (an evicted entry re-published by the re-request
+was appended to the store ledger twice, double-counting its bytes), caught and
+fixed with a regression test during pre-landing review.
 
-A whole-blob store re-stores every evicted blob in full when the chain is requested
-again. A chunk store re-stores only chunks whose refcount hit zero — for a chain,
-the unique tail. This is the policy property G3(a)–(c) was asking about, and it
-belongs next to the disk ratio rather than being inferred from "never evicts".
+- **S1 disk ratio: 6.5× / 6.6× (f16 whole vs cdc / tb) and 5.3× / 6.6× (q8)** at
+  identical hit rate. The adopted codec is the better of the two arms in both
+  tiers, so the eviction evidence is measured on the codec the decision ships,
+  not a stand-in.
+- Invariants asserted in `scripts/dedup/tests/` (30 tests, green, collected by
+  CI): a chunk leaves disk only at refcount 0; anchored entries are never
+  evicted; the budget holds after EVERY sweep with candidates; recency
+  anchoring holds recent entries inside a window and expires them after; a
+  republished entry is counted once (the regression test for the S3 bug);
+  chunked hit rate is never worse than whole-blob; a non-binding budget
+  reports `binding=False`.
 
-- **6.5× (f16) / 5.3× (q8) less disk for the same conversation at identical hit
-  rate** (S1). A chain that fills a budget as whole blobs fits in a fraction as
-  chunks.
-- Invariants asserted in `scripts/dedup/tests/test_evict_sim.py` (8 tests, green,
-  collected by CI):
-  a chunk leaves disk only at refcount 0; anchored entries are never evicted; the
-  budget holds after every sweep unless only anchors remain; chunked hit rate is
-  never worse than whole-blob **at a binding budget**; a non-binding budget reports
-  `binding=False` so it cannot be read as policy evidence.
-
-S2's second conversation is synthetic-derived: it shares turn 1 exactly (realistic
-— same system + doc + first question) and diverges with per-turn deltas sized from
-the measured deltas. It is labeled as such; the direction of the result does not
+S2's second conversation is synthetic-derived: it shares turn 1 exactly
+(realistic — same system + doc + first question) and diverges with per-turn
+deltas sized from the measured deltas, with CUMULATIVE chunk sets the way a
+real chain nests. It is labeled as such; the direction of the result does not
 depend on that construction, since the S1 row alone establishes the disk ratio.
 
 ## Verdict against pre-registered thresholds
@@ -249,10 +264,10 @@ depend on that construction, since the S1 row alone establishes the disk ratio.
 | Gate | Threshold | f16 | q8 | Verdict |
 |---|---|---|---|---|
 | **G1** chain new bytes | ≤ 10% both tiers, ≥6 turns reaching ≥8K tokens | 5.30% (token-block/64), 5.62% (CDC/head/16K) | 5.19%, 9.52% | **PASS at 6+ turns; token floor 7,435 / 7,466 tokens (90.8% / 91.1% of 8K)** |
-| **G2** restore | ≤ plain + 300 ms at 459 MB scale | +131.6 ms (16 KiB packed), 2.28× headroom | +75.3 ms at 227 MB, 3.98× headroom | **PASS (measured at 426 MB, warm page cache)** |
-| **G3** eviction policy | holds a binding budget, keeps anchors, ≥ whole-blob hit rate, pytest-asserted | 6.5× disk; hit 0.8465–0.9031 ≥ 0.7812 at binding budgets; republish 92.7 vs 7,178.5 MiB | 5.3× disk; hit 0.8397–0.8936 ≥ 0.7799; republish 234.8 vs 3,821.3 MiB | **PASS** |
+| **G2** restore | ≤ plain + 300 ms at 459 MB scale | +171.1 ms (16 KiB packed), 1.75× headroom | +140.1 ms at 227 MB, 2.14× headroom | **PASS (measured at 426 MB, warm page cache)** |
+| **G3** eviction policy | holds a binding budget, keeps anchors, ≥ whole-blob hit rate, pytest-asserted | 6.6× disk (tb arm); hit 0.8313–0.9031 ≥ 0.7812 aged; fast-window holds by anchors in both stores; republish 18.0 vs 2,494.8 MiB | 6.6× disk (tb arm); hit 0.8303–0.9026 ≥ 0.7799; republish 10.5 vs 1,327.9 MiB | **PASS under the faithful anchor model (structural + recency), both regimes run** |
 | N1 | > 25% new bytes | — | — | not triggered |
-| N2 | > 2× plain or > +600 ms | — | — | not triggered (unpacked layout would trigger it) |
+| N2 | > 2× plain or > +600 ms | — | — | not triggered for the packed layout; the UNPACKED layout triggers it in both tiers (+749.9 / +663.8 ms) and is thereby excluded |
 | N3 | no viable policy | — | — | not triggered |
 
 Three scope notes, because each gate was measured slightly narrower than its locked
@@ -264,7 +279,7 @@ wording:
    f16 token-block/64 goes 0.0634, 0.0574, 0.0509, 0.0575, 0.0529, 0.0480, 0.0444),
    so the shortfall biases G1 *against* the measured configs, not for them.
 2. **G2 was measured at 426 MB (f16) rather than 459 MB.** Extrapolating the measured
-   0.331 s/GiB rate adds ~11 ms, well inside the margin.
+   0.431 s/GiB rate adds ~13 ms, well inside the margin.
 3. **G2 is warm-only.** Both sides read through the page cache, so the number is
    assembly + syscall overhead, not a cold restart. A cold restart pays disk read on
    both layouts; the post's +15–70% cold band is the only estimate available and it
@@ -336,11 +351,14 @@ would otherwise have silently corrupted the tables:
    why both tiers were recaptured and all tables regenerated from the clean runs.
 
 Both tiers' committed tables come from captures with 8/8 publishes and identical
-token counts across independent reruns. The second full recapture reproduced the G1
-tables **byte-for-byte** — `chunk_sim.json` is unchanged in the commit that added the
-binding-budget run, so every per-turn new-byte count and every mean is a twice-measured
-number. G3 ratios reproduced too; only the restore timings and the eviction ladder
-(which was redesigned) moved, as noted above.
+token counts across independent reruns. Two full recaptures each reproduced the G1
+tables **byte-for-byte** — `chunk_sim.json` is unchanged through both, so every
+per-turn new-byte count and every mean is a thrice-measured number, and the
+refactors made during pre-landing review (blocked gear gather, shared
+mask/envelope helpers) are proven output-identical, not assumed. The third
+recapture additionally regenerated the eviction ladder under the faithful
+anchor model, the restore timings under the fixed bench, and the layout probe
+at full tensor coverage, as noted above.
 
 ## Falsifying workloads (what would overturn this)
 
@@ -362,7 +380,8 @@ number. G3 ratios reproduced too; only the restore timings and the eviction ladd
 ## Reproducing
 
 ```sh
-# capture (needs the model + ~3 GB per tier)
+# capture (needs the model + ~3 GB per tier; build the daemon the harness spawns)
+cargo build --release
 uv run python scripts/dedup/capture_chain.py --out <dir> --model <id> --kv-bits 0
 uv run python scripts/dedup/capture_chain.py --out <dir> --model <id> --kv-bits 8
 uv run python scripts/dedup/capture_chain.py --out <dir2> --model <id> --kv-bits 0 \
@@ -371,8 +390,10 @@ uv run python scripts/dedup/capture_chain.py --out <dir2> --model <id> --kv-bits
 # analysis (all numbers in this report)
 uv run python scripts/dedup/blob_forensics.py <dir> --single <dir2> --single2 <dir3>
 uv run python scripts/dedup/chunk_sim.py <dir>          # verifies the chunker by default
-uv run python scripts/dedup/evict_sim.py <dir> --avg-kib 16
-uv run python scripts/dedup/restore_bench.py <dir>/snapshots/turn-08 --pack-mib 64
+uv run python scripts/dedup/evict_sim.py <dir>                       # CDC arm
+uv run python scripts/dedup/evict_sim.py <dir> --codec token-block  # adopted-codec arm
+uv run python scripts/dedup/restore_bench.py <dir>/snapshots/turn-08 --avg-kib 64 \
+    --pack-mib 64 --scratch /tmp/rb-scratch
 uv run python scripts/dedup/roundtrip_probe.py --json scripts/dedup/tables/layout-probe-0.5b.json
 uv run pytest scripts/dedup/tests/
 ```

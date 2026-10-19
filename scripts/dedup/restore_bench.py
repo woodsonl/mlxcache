@@ -30,11 +30,12 @@ import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
 from pathlib import Path
 
 from blob_forensics import load_blob, parse_safetensors
 from chunk_sim import blob_chunk_sets
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def materialize(
@@ -53,13 +54,12 @@ def materialize(
     chunks, _ = blob_chunk_sets(payload, tensors, "head", avg)
     chunk_dir = scratch / "chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    covered = bytearray(len(payload))
     items = []
     seg_size = pack_mib * (1 << 20) if pack_mib else 0
     seg_idx = -1
     seg_off = 0
     seg_fh = None
-    with ExitStack() as stack:
+    try:
         for end, size, digest in sorted(chunks):
             start = end - size
             data = payload[start:end]
@@ -69,7 +69,7 @@ def materialize(
                         seg_fh.close()
                     seg_idx += 1
                     seg_off = 0
-                    seg_fh = stack.enter_context(open(chunk_dir / f"seg-{seg_idx:04d}", "wb"))
+                    seg_fh = open(chunk_dir / f"seg-{seg_idx:04d}", "wb")  # noqa: SIM115 — rotated manually; closed on rotation and in the finally below
                 seg_fh.write(data)
                 loc = {
                     "seg": seg_idx,
@@ -83,21 +83,32 @@ def materialize(
                 (chunk_dir / digest).write_bytes(data)
                 loc = {"digest": digest, "size": size, "offset": start}
             items.append(loc)
-            covered[start:end] = b"\x01" * size
-    if seg_fh is not None:
-        seg_fh.close()
+    finally:
+        if seg_fh is not None:
+            seg_fh.close()
+
+    # Inline spans are the gaps between the (sorted, disjoint) chunks —
+    # derivable in one pass over the chunk list instead of a per-byte scan
+    # over a full-payload coverage map.
     inline = []
-    i = 0
-    n = len(covered)
-    while i < n:
-        if covered[i]:
-            i += 1
-            continue
-        j = i
-        while j < n and not covered[j]:
-            j += 1
-        inline.append({"offset": i, "size": j - i, "data": payload[i:j]})
-        i = j
+    covered_to = 0
+    for it in items:
+        start = it["offset"]
+        if start < covered_to:
+            raise SystemExit(f"overlapping chunks at payload offset {start}")
+        if start > covered_to:
+            inline.append(
+                {
+                    "offset": covered_to,
+                    "size": start - covered_to,
+                    "data": payload[covered_to:start],
+                }
+            )
+        covered_to = start + it["size"]
+    if covered_to < len(payload):
+        inline.append(
+            {"offset": covered_to, "size": len(payload) - covered_to, "data": payload[covered_to:]}
+        )
     total = sum(it["size"] for it in items) + sum(s["size"] for s in inline)
     if total != len(payload):
         raise SystemExit(f"coverage {total} != payload {len(payload)}")
@@ -123,30 +134,29 @@ def bench_chunked(manifest: dict, scratch: Path, workers: int, out: bytearray) -
     for span in manifest["inline"]:
         out[span["offset"] : span["offset"] + span["size"]] = span["data"]
     chunk_dir = scratch / "chunks"
-    if manifest["packed"]:
-        fhs = {
-            i: os.open(str(chunk_dir / f"seg-{i:04d}"), os.O_RDONLY)
-            for i in range(max(it["seg"] for it in manifest["items"]) + 1)
-        }
+    fhs: dict[int, int] = {}
 
-        def read_one(item: dict) -> None:
-            data = os.pread(fhs[item["seg"]], item["size"], item["seg_off"])
-            hashlib.sha256(data).hexdigest()
-            out[item["offset"] : item["offset"] + item["size"]] = data
+    def fetch(item: dict) -> bytes:
+        if manifest["packed"]:
+            return os.pread(fhs[item["seg"]], item["size"], item["seg_off"])
+        return (chunk_dir / item["digest"]).read_bytes()
 
+    def read_one(item: dict) -> None:
+        data = fetch(item)
+        hashlib.sha256(data).hexdigest()
+        out[item["offset"] : item["offset"] + item["size"]] = data
+
+    try:
+        if manifest["packed"]:
+            fhs = {
+                i: os.open(str(chunk_dir / f"seg-{i:04d}"), os.O_RDONLY)
+                for i in range(max(it["seg"] for it in manifest["items"]) + 1)
+            }
         with ThreadPoolExecutor(max_workers=workers) as ex:
             list(ex.map(read_one, manifest["items"]))
+    finally:
         for fd in fhs.values():
             os.close(fd)
-    else:
-
-        def read_one(item: dict) -> None:
-            data = (chunk_dir / item["digest"]).read_bytes()
-            hashlib.sha256(data).hexdigest()
-            out[item["offset"] : item["offset"] + item["size"]] = data
-
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(read_one, manifest["items"]))
     return time.perf_counter() - t0
 
 
@@ -157,6 +167,33 @@ def stats(times: list[float]) -> dict:
         "median_s": round(s[len(s) // 2], 4),
         "p90_s": round(s[min(len(s) - 1, int(len(s) * 0.9))], 4),
     }
+
+
+_MARKER = ".restore-bench-scratch"
+
+
+def _refuse_dangerous(scratch: Path) -> None:
+    resolved = scratch.resolve()
+    for forbidden in (Path("/"), Path.home(), Path.cwd(), REPO_ROOT):
+        if resolved == forbidden.resolve():
+            raise SystemExit(f"refusing to use {resolved} as scratch")
+
+
+def _reset_scratch(scratch: Path) -> None:
+    """Remove a previous run's tree (or create the dir) — but never a
+    directory this script did not create: the marker file is written on
+    every run, so a typo'd or foreign path fails loudly instead of being
+    rmtree'd."""
+    _refuse_dangerous(scratch)
+    if scratch.exists():
+        if not (scratch / _MARKER).exists():
+            raise SystemExit(
+                f"{scratch} exists but has no {_MARKER} marker; refusing to "
+                "delete a directory this script did not create"
+            )
+        shutil.rmtree(scratch)
+    scratch.mkdir(parents=True)
+    (scratch / _MARKER).write_text("restore_bench scratch\n")
 
 
 def main() -> int:
@@ -176,20 +213,22 @@ def main() -> int:
     tensors, _ = parse_safetensors(payload)
     avg = args.avg_kib * 1024
 
-    if args.scratch.exists():
-        shutil.rmtree(args.scratch)
-    manifest = materialize(payload, tensors, avg, args.scratch, pack_mib=args.pack_mib)
+    _reset_scratch(args.scratch)
+    try:
+        manifest = materialize(payload, tensors, avg, args.scratch, pack_mib=args.pack_mib)
 
-    assembled = bytearray(len(payload))
-    bench_chunked(manifest, args.scratch, args.workers, assembled)  # warm + verify
-    if bytes(assembled) != payload:
-        raise SystemExit("FATAL: assembled chunks != payload")
+        assembled = bytearray(len(payload))
+        bench_chunked(manifest, args.scratch, args.workers, assembled)  # warm + verify
+        if bytes(assembled) != payload:
+            raise SystemExit("FATAL: assembled chunks != payload")
 
-    plain_times = [bench_plain(blob, len(payload)) for _ in range(args.reps)]
-    chunk_times = [
-        bench_chunked(manifest, args.scratch, args.workers, bytearray(len(payload)))
-        for _ in range(args.reps)
-    ]
+        plain_times = [bench_plain(blob, len(payload)) for _ in range(args.reps)]
+        chunk_times = [
+            bench_chunked(manifest, args.scratch, args.workers, bytearray(len(payload)))
+            for _ in range(args.reps)
+        ]
+    finally:
+        shutil.rmtree(args.scratch, ignore_errors=True)
 
     ps, cs = stats(plain_times), stats(chunk_times)
     delta = round((cs["median_s"] - ps["median_s"]) * 1000, 1)
@@ -203,8 +242,6 @@ def main() -> int:
     print(f"chunked {cs}  ({gib / cs['median_s']:.2f} GiB/s)")
     print(f"median delta: {delta:+.1f} ms  ({delta / 1000 / gib:+.3f} s/GiB)")
     print(f"chunk-store bytes on disk (this blob): {manifest['chunk_bytes']:,}B")
-
-    shutil.rmtree(args.scratch)
     return 0
 
 
