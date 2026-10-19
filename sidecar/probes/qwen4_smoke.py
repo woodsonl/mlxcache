@@ -32,6 +32,15 @@ def argmax_token(logits) -> int:
 
 
 def main() -> int:
+    from probe_lock import checkpoint_lock
+
+    # Two probes sharing the 132 GB checkpoint swap the machine, which turns
+    # every duration in this probe into a filesystem measurement.
+    with checkpoint_lock("qwen4_smoke"):
+        return _smoke()
+
+
+def _smoke() -> int:
     import mlx.core as mx
     from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
     from mlxcache_sidecar.engine_qwen4 import Qwen4ExpEngine
