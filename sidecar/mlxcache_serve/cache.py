@@ -29,6 +29,7 @@ import hashlib
 import io
 import logging
 import os
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -84,47 +85,50 @@ def _artifact_bytes(path: Path) -> bytes | None:
     blob contents or plant a regular file. Anything resolving elsewhere — a
     link pointing at another model's artifact or at an arbitrary file — is
     still refused. The final open uses ``O_NOFOLLOW`` so a swap of the FINAL
-    component between the check and the open fails closed; the fd's
-    (st_dev, st_ino) is then reconciled against the checked path so an
-    intermediate-directory swap mid-window is caught too (usual inode-reuse
-    caveat applies). A target that is a directory (a corrupt pull can leave
-    the link at ``blobs/`` itself) reads as missing, not as an error.
+    component between the check and the open fails closed; the opened
+    file's ``(st_dev, st_ino)`` is then reconciled against the checked
+    path's so an intermediate-directory swap mid-window is caught too
+    (usual inode-reuse caveat applies). A target that is a directory (a
+    corrupt pull can leave the link at ``blobs/`` itself) reads as missing,
+    not as an error. Swap DETECTION is restart-scoped: the fingerprint is
+    memoized for the process lifetime, so a tokenizer swapped under a live
+    server is caught on its next restart, not mid-run.
     """
     target = path
     if path.is_symlink():
         resolved = Path(os.path.realpath(path))
         model_dir = Path(os.path.realpath(path.parent))
         # HF cache: <hub>/models--org--name/{snapshots/<rev>,blobs/<sha>} with
-        # model_dir being the SNAPSHOT dir, so blobs/ sits two levels up; a
-        # plain local model may keep a blobs/ sibling one level up. Anything
-        # resolving outside those — another model's artifact, an arbitrary
-        # file — is a forgery and stays refused.
-        allowed = (
-            model_dir,
-            model_dir.parent / "blobs",
-            model_dir.parent.parent / "blobs",
-        )
+        # model_dir being the SNAPSHOT dir, so blobs/ sits two levels up —
+        # trusted ONLY in that shape; a plain local model may keep a blobs/
+        # sibling one level up. Anything resolving outside those — another
+        # model's artifact, an arbitrary file — is a forgery and stays
+        # refused.
+        allowed = [model_dir, model_dir.parent / "blobs"]
+        if model_dir.parent.name == "snapshots":
+            allowed.append(model_dir.parent.parent / "blobs")
         if not any(resolved.is_relative_to(root) for root in allowed):
             return None
         target = resolved
     try:
         checked = os.stat(target)
-        if os.path.isdir(target):
+        if stat.S_ISDIR(checked.st_mode):
             return None  # a directory is not an artifact (corrupt-pull shape)
         fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
         return None
     try:
-        # Reconcile the OPENED file with the CHECKED path: O_NOFOLLOW only
-        # guards the final component, so an intermediate directory swapped
-        # for a symlink mid-window would otherwise be followed silently.
-        opened = os.fstat(fd)
-        if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
-            return None
+        # The context manager owns the fd from here (a manual close would
+        # double-close on a read error and leak on the mismatch return).
+        # O_NOFOLLOW only guards the final component, so an intermediate
+        # directory swapped for a symlink mid-window would otherwise be
+        # followed silently; the inode reconciliation catches it.
         with os.fdopen(fd, "rb") as fh:
+            opened = os.fstat(fh.fileno())
+            if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
+                return None
             return fh.read()
     except OSError:
-        os.close(fd)
         return None
 
 
