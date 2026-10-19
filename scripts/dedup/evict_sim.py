@@ -16,8 +16,8 @@ captured chain and reports, per scenario and byte budget:
      with per-turn deltas sized from A's measured deltas (synthetic-derived,
      labeled as such in the report).
   S3 evict-then-re-request — cascade-evict the chain, replay it: republish
-     cost is full bytes (whole) vs zero new bytes (chunk, gated on the
-     cross-run byte identity the forensics probe measured).
+     cost is full bytes (whole) vs the chunks whose refcount hit zero
+     (chunk; measured ~1.3-6% of whole-blob republish at the x1 budget).
 
 Budgets are expressed as a fraction of ONE whole final blob, so a budget can
 land below the chunk store's steady-state size. That distinction is the whole
@@ -30,9 +30,9 @@ budget held after every sweep unless only anchors remain; chunks with
 refcount > 0 never freed; structurally anchored entries never evicted;
 chunked hit rate >= whole-blob hit rate at a binding budget.
 
-Usage:
+Usage (defaults reproduce the committed tables):
   uv run python scripts/dedup/evict_sim.py <grow_run_dir> \
-      [--avg-kib 64] [--budgets 0.25,0.5,1,2] [--json PATH]
+      [--avg-kib 16] [--budgets 0.5,0.9,1,1.25,2] [--json PATH]
 """
 
 from __future__ import annotations
@@ -343,12 +343,14 @@ def run_scenarios(
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("grow_dir", type=Path)
-    ap.add_argument("--avg-kib", type=int, default=64)
+    # defaults reproduce the committed tables/evict_sim.json rows
+    ap.add_argument("--avg-kib", type=int, default=16)
     ap.add_argument(
         "--budgets",
-        default="0.25,0.5,1,2",
+        default="0.5,0.9,1,1.25,2",
         help="budgets as a fraction of one whole final blob; values below 1 "
-        "are the only ones that can bind on a deduped store",
+        "are the only ones that can bind on a deduped store, and 0.5 is the "
+        "degenerate floor where both stores thrash to zero",
     )
     ap.add_argument("--json", type=Path)
     args = ap.parse_args()

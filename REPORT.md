@@ -203,10 +203,14 @@ The ladder below includes budgets that bind.
 | S3 evict-then-re-request ×1.0 (q8) | whole | 0.7799 | 154.1 | 216.9 | yes | 21 |
 | S3 evict-then-re-request ×1.0 (q8) | chunk | **0.8780** | 207.3 | 216.9 | yes | 8 |
 
-At every budget where the chunk store actually reaches the ceiling, it **holds the
-budget, keeps its anchors, evicts fewer entries, and has a higher hit rate** than
-whole-blob (f16 0.8465/0.8702/0.9031 vs 0.7812; q8 0.8397/0.8635/0.8936 vs 0.7799).
-The gap widens as the budget tightens, which is the direction that matters.
+At every non-degenerate budget where the chunk store reaches the ceiling (×0.9 and
+up), it **holds the budget, keeps its anchors, evicts fewer entries, and has a
+higher hit rate** than whole-blob (f16 0.8465/0.8702/0.9031 vs 0.7812; q8
+0.8397/0.8635/0.8936 vs 0.7799). The direction of the gap is worth stating
+exactly: whole-blob is pinned at 0.7812 across all three rungs because one blob
+is all it can ever retain, while the chunk store climbs as the budget loosens, so
+the gap *widens* as the budget loosens — the chunk store converts headroom into
+hit rate and the whole-blob store cannot.
 
 Two budgets are degenerate and labeled as such rather than dropped: at ×0.5 both
 stores thrash to zero bytes (17 evictions whole / 16 chunk, hit rate 0.0000). A
@@ -255,9 +259,10 @@ Three scope notes, because each gate was measured slightly narrower than its loc
 wording:
 
 1. **G1's 8K token floor was not reached.** The chain ran 8 turns to 7,435 / 7,466
-   tokens, 90.8% / 91.1% of 8K. New-byte fraction falls monotonically with context
-   growth (the first delta dominates), so the shortfall biases G1 *against* the
-   measured configs, not for them.
+   tokens, 90.8% / 91.1% of 8K. New-byte fraction declines as context grows in
+   every measured config (a trend, not strict monotonicity — single turns wiggle:
+   f16 token-block/64 goes 0.0634, 0.0574, 0.0509, 0.0575, 0.0529, 0.0480, 0.0444),
+   so the shortfall biases G1 *against* the measured configs, not for them.
 2. **G2 was measured at 426 MB (f16) rather than 459 MB.** Extrapolating the measured
    0.331 s/GiB rate adds ~11 ms, well inside the margin.
 3. **G2 is warm-only.** Both sides read through the page cache, so the number is
@@ -372,8 +377,9 @@ uv run python scripts/dedup/roundtrip_probe.py --json scripts/dedup/tables/layou
 uv run pytest scripts/dedup/tests/
 ```
 
-`chunk_sim.py` defaults match the committed tables (`--avg-kib 16,64,256`,
-`--token-blocks 64,256`); pass `--avg-kib 1024` or `--token-blocks 1024` to extend,
+`chunk_sim.py` and `evict_sim.py` defaults match the committed tables
+(chunk_sim: `--avg-kib 16,64,256`, `--token-blocks 64,256`; evict_sim: `--avg-kib 16`,
+`--budgets 0.5,0.9,1,1.25,2`); pass `--avg-kib 1024` or `--token-blocks 1024` to extend,
 and `--no-verify` to skip the naive-reference cross-check (it is on by default
 because the vectorized gear hash has carried a boundary bug before).
 
