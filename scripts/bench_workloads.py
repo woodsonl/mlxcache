@@ -280,8 +280,9 @@ def main() -> int:
     finally:
         # The blob dir is GB-scale at real-model sizes; stranding it in $TMPDIR
         # on every run is how a machine fills the volume the harness itself
-        # needs for temp logs.
-        if args.blobs is None:
+        # needs for temp logs. (``--blobs ""`` counts as unset: argparse
+        # cannot express "empty string means reuse" sanely.)
+        if not args.blobs:
             import shutil
 
             shutil.rmtree(blob_dir, ignore_errors=True)

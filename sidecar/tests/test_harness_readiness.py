@@ -41,6 +41,8 @@ qa = _load("qa_wrapper")
 
 
 class _FakeProc:
+    pid = 4242
+
     def poll(self):
         return None
 
@@ -59,6 +61,17 @@ class _DeadProc(_FakeProc):
 
     def poll(self):
         return 17
+
+
+class _ExitDuringWarmupProc(_FakeProc):
+    """Alive at loop top (probe is answered by a stale listener), dead by the
+    time the probe returns — poll() flips once _warmup has run."""
+
+    def __init__(self):
+        self.probed = False
+
+    def poll(self):
+        return 17 if self.probed else None
 
 
 class _StubbornProc:
@@ -214,6 +227,29 @@ def test_wait_ready_fails_fast_when_child_exits():
         srv.log_path.unlink(missing_ok=True)
 
 
+def test_wait_ready_rejects_child_that_exits_during_warmup():
+    """The sneakier TOCTOU half: the child is alive when the loop starts and
+    the probe SUCCEEDS (a stale listener on the explicit port answered it),
+    but the child died mid-probe. Certifying ready would benchmark the stale
+    listener, so the post-probe liveness check must raise — from OUTSIDE the
+    retry's except, or the raise is swallowed and retried."""
+    srv = _server(qa.Server)
+    srv.proc = _ExitDuringWarmupProc()
+
+    def successful_probe(_timeout):
+        # Simulate a probe answered by a stale listener: it "succeeds", and
+        # the child dies while it ran.
+        srv.proc.probed = True
+
+    srv._warmup = successful_probe
+    try:
+        with pytest.raises(RuntimeError, match="exited during warmup"):
+            srv.wait_ready(timeout_s=5.0)
+    finally:
+        srv.log_fh.close()
+        srv.log_path.unlink(missing_ok=True)
+
+
 def test_stop_escalates_to_kill_and_still_unlinks():
     """A child that ignores SIGTERM must be SIGKILLed, and the escalation
     must not skip the close/unlink (an unsuppressed raise there would
@@ -256,6 +292,8 @@ def test_subclasses_choose_their_warmup_client(monkeypatch):
     seen = {}
 
     class _FakePopen:
+        pid = 4243
+
         def __init__(self, argv, **_kw):
             seen["argv"] = argv
 

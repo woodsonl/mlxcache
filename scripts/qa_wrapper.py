@@ -122,6 +122,14 @@ def _grown_body(chat_body: dict, chat1: str) -> dict:
     }
 
 
+def _delta(pre: dict, post: dict, key: str) -> int:
+    # `or 0` coercion reads a MISSING counter as "zero hits" — the opposite
+    # of what a gate wants. Fail loudly instead.
+    if pre.get(key) is None or post.get(key) is None:
+        raise RuntimeError(f"/mlxcache/stats did not report {key!r}: cannot gate on it")
+    return post[key] - pre[key]
+
+
 def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, port):
     srv.wait_ready()
 
@@ -176,7 +184,7 @@ def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, 
             expect(code == 200, f"status {code}")
             state["grown"] = body["choices"][0]["message"]["content"]
             post = srv2.stats() or {}
-            hits = (post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0)
+            hits = _delta(pre, post, "disk_hits")
             expect(hits > 0, f"restart served without a disk hit (delta disk_hits={hits})")
 
     @probe("Q5 disk-resume identity (second fresh process)")
@@ -195,7 +203,7 @@ def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, 
                 f" A={grown_state[:80]!r}\n B={body['choices'][0]['message']['content'][:80]!r}",
             )
             post = srv3.stats() or {}
-            hits = (post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0)
+            hits = _delta(pre, post, "disk_hits")
             expect(hits > 0, f"second process served without a disk hit (delta disk_hits={hits})")
 
     @probe("Q7 store hygiene")

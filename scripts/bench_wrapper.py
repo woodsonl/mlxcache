@@ -177,7 +177,9 @@ def main() -> int:
     tmp = tempfile.mkdtemp(prefix="mlxcache-bench-")
     # The store holds GB-scale checkpoints at real-model sizes; strand it in
     # $TMPDIR on every run and the machine eventually fills the volume the
-    # harness itself needs. atexit covers the SystemExit failure paths too.
+    # harness itself needs. atexit covers normal return, SystemExit and
+    # KeyboardInterrupt; a SIGTERM/SIGKILL mid-run still strands the dir —
+    # the known, accepted limit of this cleanup.
     atexit.register(shutil.rmtree, tmp, True)
     store_dir = str(Path(tmp) / "store")
 
@@ -202,12 +204,21 @@ def main() -> int:
     finally:
         srv.stop()
 
-    # Snapshot the store's answer for body2 BEFORE any restart leg runs.
-    # Each later leg publishes its own full stream, and the deepest-match
-    # lookup against those self-published entries always returns ~100% —
-    # measuring the legs' own output instead of the turn-1 state they were
-    # supposed to resume from, so the skip gate could never fail.
+    # Snapshot the store's answer for body2 BEFORE any restart leg runs, so
+    # the lookup provably reads the turn-1 state the legs resume from (each
+    # leg publishes its own longer stream; today the index cannot match a
+    # longer entry, so ordering is belt-and-braces against future index
+    # changes, not a live self-match bug). The gate that cannot be fooled is
+    # the disk_hits DELTA below.
     from mlxcache_store import Store as _Store
+
+    def _delta(pre: dict, post: dict, key: str) -> int:
+        # `or 0` coercion would report "0 hits" when the counter is actually
+        # MISSING from /mlxcache/stats — the opposite of what a gate wants
+        # to hear. Fail loudly instead.
+        if pre.get(key) is None or post.get(key) is None:
+            raise RuntimeError(f"/mlxcache/stats did not report {key!r}: cannot gate on it")
+        return post[key] - pre[key]
 
     st = _Store(store_dir, byte_budget=0)
     tok = _mlxcache_tokenize(model, body2)
@@ -242,8 +253,8 @@ def main() -> int:
         wall_re, text_re = srv2.chat(body2)
         post = srv2.stats() or {}
         restart_stats = {
-            "disk_hits": (post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0),
-            "reuse_errors": (post.get("reuse_errors") or 0) - (pre.get("reuse_errors") or 0),
+            "disk_hits": _delta(pre, post, "disk_hits"),
+            "reuse_errors": _delta(pre, post, "reuse_errors"),
         }
         results.append(_leg_result("restart-turn2", wall_re, text_re, baseline2, restart_stats))
 
@@ -254,8 +265,8 @@ def main() -> int:
         wall_2nd, text_2nd = srv3.chat(body2)
         post = srv3.stats() or {}
         second_stats = {
-            "disk_hits": (post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0),
-            "reuse_errors": (post.get("reuse_errors") or 0) - (pre.get("reuse_errors") or 0),
+            "disk_hits": _delta(pre, post, "disk_hits"),
+            "reuse_errors": _delta(pre, post, "reuse_errors"),
         }
         results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2, second_stats))
 

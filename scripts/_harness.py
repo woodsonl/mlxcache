@@ -180,17 +180,20 @@ class Server:
                 break
             try:
                 self._warmup(max(1.0, min(remaining, WARMUP_CAP_S)))
-                # The probe can be answered by whatever NOW owns an explicit
-                # --port (a stale, protocol-compatible listener): our own
-                # child's bind failure surfaces as an exit during the
-                # multi-second warmup, so re-check before certifying ready —
-                # otherwise the harness benchmarks a server it never started.
-                if self.proc.poll() is not None:
-                    raise RuntimeError(f"server exited during warmup:\n{self._log_tail()}")
-                return
             except Exception as exc:  # noqa: BLE001 — not ready yet, retry
                 last_err = repr(exc)
                 time.sleep(RETRY_SLEEP_S)
+                continue
+            # Post-probe liveness, OUTSIDE the retry's except (a raise inside
+            # the try is just swallowed into the retry loop): the probe can
+            # be answered by whatever NOW owns an explicit --port — a stale,
+            # protocol-compatible listener — while our own child's bind
+            # failure surfaces as an exit during the multi-second warmup.
+            # Certifying ready without this re-check would benchmark a
+            # server this harness never started.
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"server exited during warmup:\n{self._log_tail()}")
+            return
         raise RuntimeError(
             f"server never became healthy (last warmup error: {last_err}):\n{self._log_tail()}"
         )
@@ -292,6 +295,16 @@ class WrapperServer(Server):
         log_prefix: str = "mlxcache-srv-",
         warmup: str = "chat",
     ):
+        # "chat" raises on failure (bench form); "post" returns (code, body)
+        # so a 5xx is inspected rather than raised (QA form). Both must be
+        # treated as NOT-ready and retried; the choice only decides which
+        # client method the caller's tests patch. Anything else is a typo
+        # that would silently select the chat probe and leave the subclass's
+        # real warmup shape untested — and it must fail BEFORE the spawn in
+        # super().__init__, or the child process and its log leak (no `with`
+        # block is entered for a constructor that raises).
+        if warmup not in ("chat", "post"):
+            raise ValueError(f"warmup mode {warmup!r} must be 'chat' or 'post'")
         super().__init__(
             [
                 str(REPO / ".venv/bin/python"),
@@ -311,25 +324,19 @@ class WrapperServer(Server):
             base=f"http://127.0.0.1:{port}",
             log_prefix=log_prefix,
         )
-        # "chat" raises on failure (bench form); "post" returns (code, body)
-        # so a 5xx is inspected rather than raised (QA form). Both must be
-        # treated as NOT-ready and retried; the choice only decides which
-        # client method the caller's tests patch. Anything else is a typo
-        # that would silently select the chat probe and leave the subclass's
-        # real warmup shape untested, so it fails at construction.
-        if warmup not in ("chat", "post"):
-            raise ValueError(f"warmup mode {warmup!r} must be 'chat' or 'post'")
+        # Validated above, before the spawn.
         self.warmup = warmup
 
     def _warmup(self, timeout: float) -> None:
         self.health_ok(min(timeout, HEALTH_CAP_S))
-        # UNIQUE per process: a constant probe prompt would be published by
-        # the first process (the store publishes any assistant stream of
-        # >= 2 tokens) and disk-hit by every later process during ITS
-        # warmup, inflating disk_hits before any measured request runs and
-        # letting reuse gates pass on warmup traffic alone.
+        # UNIQUE per spawned SERVER (the CHILD's pid, not this harness
+        # process's: one run spawns several stacks from one parent). A
+        # constant probe prompt would be published by the first server (the
+        # store publishes any assistant stream of >= 2 tokens) and disk-hit
+        # by every later server during ITS warmup, inflating disk_hits
+        # before any measured request runs.
         body = {
-            "messages": [{"role": "user", "content": f"harness warmup {os.getpid()}"}],
+            "messages": [{"role": "user", "content": f"harness warmup {self.proc.pid}"}],
             "max_tokens": 1,
             "temperature": 0.0,
         }
