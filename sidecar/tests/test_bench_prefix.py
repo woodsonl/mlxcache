@@ -536,8 +536,10 @@ def test_post_stream_merges_leading_verdict_and_trailing_timing_extras():
 
 
 def test_post_stream_cross_checks_the_server_usage_count():
-    """Where the server reports usage.completion_tokens, it must equal the
-    client's frame count or the token accounting has drifted."""
+    """Every text-bearing frame carries at least one token, so the server's
+    completion-token count may exceed the frame count (multi-token chunks)
+    but never fall below it; where the server count exists it becomes the
+    token count TPOT divides by."""
     base, srv = _sse_base(
         [
             {"choices": [{"delta": {"content": "He"}}]},
@@ -546,10 +548,23 @@ def test_post_stream_cross_checks_the_server_usage_count():
         ]
     )
     try:
-        with pytest.raises(RuntimeError, match="token accounting has drifted"):
-            bench._post_stream(base, "/v1/chat/completions", {}, 10)
+        timing, _ = bench._post_stream(base, "/v1/chat/completions", {}, 10)
+        assert timing["tokens"] == 3  # server count wins over the 2 frames
     finally:
         srv.shutdown()
+
+    base2, srv2 = _sse_base(
+        [
+            {"choices": [{"delta": {"content": "a"}}]},
+            {"choices": [{"delta": {"content": "b"}}]},
+            {"usage": {"completion_tokens": 1}},
+        ]
+    )
+    try:
+        with pytest.raises(RuntimeError, match="token accounting has drifted"):
+            bench._post_stream(base2, "/v1/chat/completions", {}, 10)
+    finally:
+        srv2.shutdown()
 
 
 def test_join_trace_refuses_an_overlength_capture(tmp_path):

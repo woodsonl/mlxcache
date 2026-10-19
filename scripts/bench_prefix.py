@@ -413,11 +413,19 @@ def _post_stream(base: str, path: str, body: dict, timeout: float) -> tuple[dict
     if ttft is None:
         raise RuntimeError("stream closed before any token frame")
     server_count = (usage or {}).get("completion_tokens")
-    if server_count is not None and server_count != tokens:
+    if server_count is not None and server_count < tokens:
+        # Every text-bearing frame carries at least one token, so the
+        # server's token count can exceed the client's frame count (a chunk
+        # may pack several tokens) but never fall below it — fewer tokens
+        # than frames means frames were counted that carry no token.
         raise RuntimeError(
-            f"server counted {server_count} completion tokens, "
-            f"client counted {tokens} frames — token accounting has drifted"
+            f"server counted {server_count} completion tokens, client counted "
+            f"{tokens} text frames — token accounting has drifted"
         )
+    if server_count is not None:
+        # The server's count is the true token count; the frame count only
+        # lower-bounds it (multi-token chunks), so TPOT divides by this.
+        tokens = server_count
     return {"ttft_ms": ttft, "total_ms": total, "tokens": tokens}, meta
 
 
