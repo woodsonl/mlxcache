@@ -26,7 +26,9 @@ pytest.importorskip("mlx.core")
 if TYPE_CHECKING:
     from mlxcache_qwen4.config import Qwen4TextConfig
 
-REAL_CHECKPOINT = "/Users/lance/models/Qwen3.8-Flash-Next-NVFP4-mlxstream"
+REAL_CHECKPOINT = os.environ.get(
+    "MLXCACHE_Q4_CHECKPOINT", "/Users/lance/models/Qwen3.8-Flash-Next-NVFP4-mlxstream"
+)
 
 
 # ---------------------------------------------------------------------- fixture

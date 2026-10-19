@@ -27,8 +27,6 @@ EMBED_NAME = "model.language_model.embed_tokens.weight"
 LM_HEAD_NAME = "lm_head.weight"
 MIXER_PREFIX = "model.language_model.hyper_connection_mixer"
 
-# QSA block scales are stored in 128x128 blocks for the fp8 PLE shards.
-FP8_BLOCK = 128
 
 # Query rows the indexer processes per vectorised step. Keeps the gathered
 # block-key tensor bounded: queries x budget x ratio x head_dim.
@@ -156,7 +154,7 @@ class Qwen4RotaryEmbedding(nn.Module):
             running = running | mask
         self.axis_masks = masks
 
-    def frequency_grid(self, position_ids: mx.array, batch: int = 0) -> mx.array:
+    def frequency_grid(self, position_ids: mx.array) -> mx.array:
         """Normalise position ids to [3, B, S] (the reference's `[1:]` slice)."""
         if position_ids.ndim == 1:
             position_ids = position_ids[None, None, :]
@@ -246,23 +244,6 @@ def _split_last(x: mx.array, *sizes: int) -> list[mx.array]:
         total += size
         bounds.append(total)
     return mx.split(x, bounds, axis=-1)
-
-
-def _dequant_fp8_blocks(payload: mx.array, scale_inv: mx.array, block: int = FP8_BLOCK) -> mx.array:
-    """fp8 e4m3 payload with one bf16 scale per `block` x `block` tile.
-
-    The stored grid is `ceil(out/block) x ceil(in/block)`; a partial trailing
-    tile still occupies a full stored scale, so the expanded grid is trimmed
-    back to the payload shape.
-
-    The loader owns this step for checkpoint reads (it has the byte ranges); this
-    copy is for callers holding an already-decoded fp8 payload and its scale
-    grid, which is what the shape tables describe.
-    """
-    values = mx.from_fp8(payload, dtype=mx.float32)
-    rows, cols = payload.shape
-    expanded = mx.repeat(mx.repeat(scale_inv.astype(mx.float32), block, axis=0), block, axis=1)
-    return (values * expanded[:rows, :cols]).astype(mx.bfloat16)
 
 
 # --------------------------------------------------------------- linear attention
@@ -518,21 +499,27 @@ class Qwen4QSAIndexer(nn.Module):
 
         selected = mx.zeros((batch, seq_len, kv_len), dtype=mx.bool_)
         for b in range(batch):
+            # Pool once per batch element, not once per query tile: every
+            # block's pooled key is independent, so the tile with the deepest
+            # prefix produces a superset of what any smaller tile needs and
+            # each tile slices its own prefix below.
+            blocks_all = int(counts[b].max().item()) // self.ratio
+            pooled = self._pool(keys[b], rope, blocks_all)
             for start in range(0, seq_len, INDEXER_QUERY_TILE):
                 stop = start + INDEXER_QUERY_TILE
                 selected[b, start:stop] = self._select(
-                    keys[b], rope, queries[b, start:stop], counts[b, start:stop]
+                    pooled, queries[b, start:stop], counts[b, start:stop], kv_len
                 )
         return selected[:, None, :, :], keys
 
     def _select(
         self,
-        keys: mx.array,
-        rope: Qwen4RotaryEmbedding,
+        pooled: mx.array,
         queries: mx.array,
         counts: mx.array,
+        kv_len: int,
     ) -> mx.array:
-        tile, kv_len = queries.shape[0], keys.shape[0]
+        tile = queries.shape[0]
         blocks = int(counts.max().item()) // self.ratio
         out = mx.zeros((tile, kv_len + 1), dtype=mx.bool_)
         tail = (counts // self.ratio * self.ratio)[:, None] + mx.arange(self.ratio)[None, :]
@@ -542,7 +529,7 @@ class Qwen4QSAIndexer(nn.Module):
             return out[:, :kv_len]
 
         keep = min(self.block_topk, blocks)
-        pooled = self._pool(keys, rope, blocks)
+        pooled = pooled[:blocks]
         scores = mx.matmul(queries.astype(mx.float32), pooled.astype(mx.float32).swapaxes(-1, -2))
         oriented = scores.swapaxes(-1, -2)  # [T, blocks, heads]
         scores = mx.maximum(oriented, 0.0).sum(axis=-1) * self.scale
@@ -665,12 +652,8 @@ class Qwen4SparseMoeBlock(nn.Module):
         self.shared_up_proj = weights.get(f"{prefix}.shared_expert.up_proj.weight")
         self.shared_down_proj = weights.get(f"{prefix}.shared_expert.down_proj.weight")
         self.shared_expert_gate = weights.get(f"{prefix}.shared_expert_gate.weight")
-        self.expert_loader: Any = None
 
     def _expert(self, index: int, name: str) -> mx.array:
-        key = (self.prefix, index, name)
-        if self.expert_loader is not None:
-            return self.expert_loader(key, f"{self.prefix}.experts.{index}.{name}.weight")
         return self.weights.get(f"{self.prefix}.experts.{index}.{name}.weight")
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -1070,7 +1053,7 @@ class Qwen4TextModel(nn.Module):
 
     # --------------------------------------------------------------- caches
 
-    def make_cache(self, batch: int = 1) -> list[Any]:
+    def make_cache(self) -> list[Any]:
         """One cache entry per layer, every slot populated.
 
         Layout (documented in `docs/designs/qwen4-exp-engine.md`):
@@ -1158,11 +1141,6 @@ class Qwen4TextModel(nn.Module):
 
         mixed = self.mixer(hidden)[0]
         return _linear(mixed, self.lm_head)
-
-    # ------------------------------------------------------------- weight table
-
-    def weight_shapes(self) -> dict[str, tuple[int, ...]]:
-        return weight_shapes(self.config)
 
 
 def _cache_offset(cache: list[Any]) -> int:

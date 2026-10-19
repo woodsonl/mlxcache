@@ -4,7 +4,8 @@ The checkpoint's `config.json` is a wrapper whose `text_config` is the text
 stack; this dataclass flattens that subtree and validates the invariants the
 reference enforces at load time. Construction never touches weights: the
 derived tables (n-gram head vocabularies, hash multipliers) are arithmetic on
-config fields and are cross-checked against the stored buffers by the tests.
+config fields; the tests cross-check their NAMES and SHAPES against the real
+checkpoint's headers (values are not compared).
 """
 
 from __future__ import annotations
@@ -15,6 +16,10 @@ from typing import Any
 
 LINEAR = "linear_attention"
 FULL = "full_attention"
+# One default for the PLE shard count, shared by the dataclass default and the
+# from_checkpoint fallback: the two previously disagreed (128 vs 512), so a
+# config.json without the field silently diverged from a direct construction.
+DEFAULT_SPLIT_NGRAM_PARTS = 128
 
 # The reference names indexed full-attention layers "qwen_sparse_attention";
 # both spellings appear in configs and both mean "full attention + QSA
@@ -76,7 +81,7 @@ class Qwen4TextConfig:
     ngram_vocab_size_base: int = 20_000_000
     make_ngram_vocab_size_divisible_by: int = 128
     seed: int = 1234
-    split_ngram_parts: int = 128
+    split_ngram_parts: int = DEFAULT_SPLIT_NGRAM_PARTS
 
     # QSA indexer on full-attention layers.
     indexer_n_heads: int | None = 4
@@ -156,10 +161,7 @@ class Qwen4TextConfig:
             raise ValueError(
                 "moe_intermediate_size and shared_expert_intermediate_size must be > 0."
             )
-        if (
-            self.hidden_size % self.hc_count
-            or (self.hc_count * self.hidden_size) % self.hidden_size
-        ):
+        if self.hidden_size % self.hc_count:
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) must divide the hyper-connection width."
             )
@@ -279,7 +281,7 @@ class Qwen4TextConfig:
                 raw.get("make_ngram_vocab_size_divisible_by", 128)
             ),
             seed=int(raw.get("seed", 1234)),
-            split_ngram_parts=int(raw.get("split_ngram_parts", 512)),
+            split_ngram_parts=int(raw.get("split_ngram_parts", DEFAULT_SPLIT_NGRAM_PARTS)),
             indexer_n_heads=_as_int(raw.get("indexer_n_heads"), None),
             indexer_kv_heads=_as_int(raw.get("indexer_kv_heads"), None),
             indexer_head_dim=_as_int(raw.get("indexer_head_dim"), None),
@@ -353,9 +355,6 @@ class Qwen4TextConfig:
     @property
     def eos_token(self) -> int:
         return self.eos_token_id[0] if isinstance(self.eos_token_id, list) else self.eos_token_id
-
-    def num_conv_slots(self) -> int:
-        return 4 if self.ple_layer_ids else 3
 
 
 def _splitmix64(value: int) -> int:
