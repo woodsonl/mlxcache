@@ -7,7 +7,9 @@ rows live with the gated suites (B2.1).
 """
 
 import copy
+import hashlib
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -155,6 +157,58 @@ def test_fingerprint_determinism_and_inputs(tmp_path, tmp_path_factory):
 
     fo = fingerprint_for_model_dir(d1, model_id_override="daemon-model")
     assert fo.model_id == "daemon-model"
+
+
+def test_fingerprint_follows_an_hf_cache_symlink(tmp_path):
+    """HF cache snapshots symlink every artifact into a sibling blobs/ dir.
+
+    A blanket O_NOFOLLOW hashed nothing for every cached model, so the
+    fingerprint said "missing" and the wrapper path and the daemon path (which
+    hashes the vocabulary) could never share a store.
+    """
+    hub = tmp_path / "hub"
+    entry = hub / "models--org--name"
+    snap = entry / "snapshots" / "rev1"
+    blobs = entry / "blobs"
+    snap.mkdir(parents=True)
+    blobs.mkdir(parents=True)
+    payload = b'{"tok": "cached"}'
+    blob = blobs / "abc123"
+    blob.write_bytes(payload)
+    (snap / "tokenizer.json").symlink_to(Path("../../blobs/abc123"))
+
+    fp = fingerprint_for_model_dir(snap)
+    assert fp.tokenizer_hash == hashlib.sha256(payload).hexdigest()
+    assert fp.tokenizer_hash != "missing"
+
+
+def test_fingerprint_refuses_a_symlink_escaping_the_model(tmp_path):
+    """Following a link that leaves the model tree would fingerprint one model
+    with another file's bytes, so it must still read as missing."""
+    model = tmp_path / "model"
+    model.mkdir()
+    outside = tmp_path / "outside-tokenizer.json"
+    outside.write_bytes(b'{"tok": "not-this-model"}')
+    (model / "tokenizer.json").symlink_to(outside)
+
+    assert fingerprint_for_model_dir(model).tokenizer_hash == "missing"
+
+
+def test_fingerprint_refuses_a_symlink_to_a_sibling_model(tmp_path):
+    """The refusal must be about escaping the model, not merely about being a
+    symlink: a link into a DIFFERENT model's artifact is still a forgery."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (b / "tokenizer.json").write_bytes(b'{"tok": "b"}')
+    (a / "tokenizer.json").symlink_to(b / "tokenizer.json")
+
+    assert fingerprint_for_model_dir(a).tokenizer_hash == "missing"
+
+
+def test_fingerprint_missing_tokenizer_stays_missing(tmp_path):
+    assert fingerprint_for_model_dir(tmp_path).tokenizer_hash == "missing"
 
 
 # --- CLI seam ----------------------------------------------------------------

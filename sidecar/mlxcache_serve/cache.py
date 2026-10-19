@@ -64,6 +64,44 @@ def _default_load(payload: bytes) -> Any:
     return load_prompt_cache(blob)
 
 
+def _artifact_bytes(path: Path) -> bytes | None:
+    """Read a model artifact's bytes, refusing a symlink that escapes the model.
+
+    HF cache layouts symlink every snapshot file into a sibling ``blobs/``
+    directory (``snapshots/<rev>/tokenizer.json -> ../../blobs/<sha>``), so a
+    blanket ``O_NOFOLLOW`` hashes nothing for EVERY cached model — the
+    fingerprint then says ``"missing"`` and the wrapper path and the daemon
+    path (which hashes the vocabulary) can never share a store.
+
+    The guard's intent survives: a link is followed only when its target
+    resolves inside the model directory itself or inside the ``blobs/`` sibling
+    that HF cache entries use. Anything else — a link planted at
+    ``tokenizer.json`` pointing at another model's artifact or at an arbitrary
+    file — is still refused. The final open uses ``O_NOFOLLOW`` so a swap
+    between the check and the open fails closed rather than followed.
+    """
+    target = path
+    if path.is_symlink():
+        resolved = Path(os.path.realpath(path))
+        model_dir = Path(os.path.realpath(path.parent))
+        # HF cache: <hub>/models--org--name/{snapshots/<rev>,blobs/<sha>}, so
+        # blobs/ is the model dir's parent's sibling.
+        allowed = (
+            model_dir,
+            model_dir.parent / "blobs",
+            model_dir.parent.parent / "blobs",
+        )
+        if not any(resolved.is_relative_to(root) for root in allowed):
+            return None
+        target = resolved
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read()
+
+
 def fingerprint_for_model_dir(
     model_path: str | os.PathLike,
     kv_bits: int = 0,
@@ -74,18 +112,11 @@ def fingerprint_for_model_dir(
 
     ``model_id`` is the REALPATH of the model directory (stable across
     restarts and ~ vs absolute invocations). The tokenizer hash reads the
-    artifact bytes without following a symlink planted at tokenizer.json.
+    artifact bytes without following a symlink that escapes the model tree.
     """
     p = Path(model_path)
-    tokenizer = p / "tokenizer.json"
-    tokenizer_hash = "missing"
-    try:
-        fd = os.open(tokenizer, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        tokenizer_hash = "missing"
-    else:
-        with os.fdopen(fd, "rb") as fh:
-            tokenizer_hash = hashlib.sha256(fh.read()).hexdigest()
+    payload = _artifact_bytes(p / "tokenizer.json")
+    tokenizer_hash = hashlib.sha256(payload).hexdigest() if payload is not None else "missing"
     return Fingerprint(
         model_id=model_id_override or os.path.realpath(p),
         tokenizer_hash=tokenizer_hash,
