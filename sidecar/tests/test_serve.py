@@ -7,7 +7,9 @@ rows live with the gated suites (B2.1).
 """
 
 import copy
+import hashlib
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -155,6 +157,105 @@ def test_fingerprint_determinism_and_inputs(tmp_path, tmp_path_factory):
 
     fo = fingerprint_for_model_dir(d1, model_id_override="daemon-model")
     assert fo.model_id == "daemon-model"
+
+
+def test_fingerprint_follows_an_hf_cache_symlink(tmp_path):
+    """HF cache snapshots symlink every artifact into a sibling blobs/ dir.
+
+    A blanket O_NOFOLLOW hashed nothing for every cached model, so every
+    HF-cached model fingerprinted as "missing" — tokenizer identity pinning
+    was erased for all of them.
+    """
+    hub = tmp_path / "hub"
+    entry = hub / "models--org--name"
+    snap = entry / "snapshots" / "rev1"
+    blobs = entry / "blobs"
+    snap.mkdir(parents=True)
+    blobs.mkdir(parents=True)
+    payload = b'{"tok": "cached"}'
+    blob = blobs / "abc123"
+    blob.write_bytes(payload)
+    (snap / "tokenizer.json").symlink_to(Path("../../blobs/abc123"))
+
+    fp = fingerprint_for_model_dir(snap)
+    assert fp.tokenizer_hash == hashlib.sha256(payload).hexdigest()
+    assert fp.tokenizer_hash != "missing"
+
+
+def test_fingerprint_refuses_a_symlink_escaping_the_model(tmp_path):
+    """Following a link that leaves the model tree would fingerprint one model
+    with another file's bytes, so it must still read as missing."""
+    model = tmp_path / "model"
+    model.mkdir()
+    outside = tmp_path / "outside-tokenizer.json"
+    outside.write_bytes(b'{"tok": "not-this-model"}')
+    (model / "tokenizer.json").symlink_to(outside)
+
+    assert fingerprint_for_model_dir(model).tokenizer_hash == "missing"
+
+
+def test_fingerprint_refuses_a_symlink_to_a_sibling_model(tmp_path):
+    """The refusal must be about escaping the model, not merely about being a
+    symlink: a link into a DIFFERENT model's artifact is still a forgery."""
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (b / "tokenizer.json").write_bytes(b'{"tok": "b"}')
+    (a / "tokenizer.json").symlink_to(b / "tokenizer.json")
+
+    assert fingerprint_for_model_dir(a).tokenizer_hash == "missing"
+
+
+def test_fingerprint_follows_a_local_blobs_sibling(tmp_path):
+    """The one-level-up blobs/ sibling: a plain local model dir that keeps its
+    artifacts in a sibling blobs/ (no HF snapshots/ level) fingerprints
+    through the link too — the guard is about escaping the model's own
+    storage, not about which of the two layouts a cache uses."""
+    root = tmp_path / "local"
+    model = root / "model"
+    blobs = root / "blobs"
+    model.mkdir(parents=True)
+    blobs.mkdir(parents=True)
+    payload = b'{"tok": "local"}'
+    (blobs / "def456").write_bytes(payload)
+    (model / "tokenizer.json").symlink_to(Path("../blobs/def456"))
+
+    fp = fingerprint_for_model_dir(model)
+    assert fp.tokenizer_hash == hashlib.sha256(payload).hexdigest()
+
+
+def test_fingerprint_treats_a_directory_artifact_as_missing(tmp_path):
+    """Regression: a corrupt/truncated HF pull can leave tokenizer.json
+    pointing at the blobs/ DIRECTORY itself. os.open() succeeds on a
+    directory, so the read raised IsADirectoryError out of the public
+    fingerprint_for_model_dir — crashing direct callers and silently
+    degrading the wrapper to memory-only reuse.
+    Found by review on 2026-10-19.
+
+    Value: protects=_artifact_bytes reads a directory artifact as "missing";
+    fails_when=the OSError guard alone is relied on (open succeeds on dirs);
+    why_new=the five layout tests never hit the open-succeeds/read-fails
+    branch; seam=none; no_claim=none beyond protects."""
+    entry = tmp_path / "models--org--name"
+    snap = entry / "snapshots" / "rev1"
+    (entry / "blobs").mkdir(parents=True)
+    snap.mkdir(parents=True)
+    (snap / "tokenizer.json").symlink_to(Path("../../blobs"))
+    assert fingerprint_for_model_dir(snap).tokenizer_hash == "missing"
+
+
+def test_fingerprint_follows_a_symlink_inside_the_model_dir(tmp_path):
+    """The first allowed root: a link that stays inside the model dir (no
+    blobs/ level at all) must hash, not read as missing."""
+    (tmp_path / "real.json").write_bytes(b'{"tok": "in-model"}')
+    (tmp_path / "tokenizer.json").symlink_to("real.json")
+    fp = fingerprint_for_model_dir(tmp_path)
+    assert fp.tokenizer_hash == hashlib.sha256(b'{"tok": "in-model"}').hexdigest()
+
+
+def test_fingerprint_missing_tokenizer_stays_missing(tmp_path):
+    assert fingerprint_for_model_dir(tmp_path).tokenizer_hash == "missing"
 
 
 # --- CLI seam ----------------------------------------------------------------

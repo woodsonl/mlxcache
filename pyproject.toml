@@ -12,7 +12,7 @@ asyncio_mode = "auto"
 
 [project]
 name = "mlxcache-sidecar"
-version = "0.1.5"
+version = "0.1.6"
 description = "mlx-lm compatibility sidecar for the mlxcache daemon"
 requires-python = ">=3.12"
 license = { text = "UNLICENSED" }
@@ -34,10 +34,6 @@ dev = [
     "pytest-asyncio==1.4.0",
     "httpx==0.28.1",
     "ruff==0.16.9",
-    # Direct dep of scripts/dedup/ (the chunker/sim toolchain), which the CI
-    # python job tests; without this pin numpy only enters the lock via the
-    # mlx extra, and `uv sync --group dev` provably uninstalls it.
-    "numpy==2.5.3",
 ]
 
 [build-system]
