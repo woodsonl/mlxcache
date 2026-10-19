@@ -117,7 +117,7 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   local-only model resolution that never downloads.
 - 30 premise-guard tests across `test_harness_readiness.py` and
   `test_bench_workloads.py` pinning every failure path above.
-## Unreleased
+## 0.1.7 — 2026-10-19
 
 ### Added
 
