@@ -145,6 +145,20 @@ that publication's file — never a fresh republish that replaced it. A generic
 `500`/transport failure never retires a healthy checkpoint. Legacy
 version-1 blobs (written before digests existed) stay readable, unverified.
 
+**Identity.** A blob's header pins the model id, tokenizer hash, KV dtype,
+KV layout version, quantization tier AND cache composition — the ordered
+tuple of cache-entry classes the engine builds for the model (a dense KV
+stack vs. a hybrid model's `CacheList`/`ArraysCache` recurrent state). Two
+architectures can agree on everything else while their payloads have
+mutually unloadable shapes, so composition is folded into the filename key
+and compared on every lookup: a checkpoint is never served to an engine
+that would deserialize it as a different shape. A blob written before
+compositions were recorded stays usable by an engine that also reports no
+composition (legacy-to-legacy); the moment an engine knows its composition,
+those older blobs are unreachable and get rewritten on the next publish.
+Keys themselves are unchanged for the default engine and an unrecorded
+composition, so upgrading does not re-key an existing store.
+
 **Eviction.** A background reaper bounds the store. Every
 `MLXCACHE_EVICT_INTERVAL_S` (default 60s) it measures the published blobs and,
 if the store exceeds `MLXCACHE_EVICT_MAX_BYTES` (default **32 GiB** — on by
@@ -190,10 +204,41 @@ same path: mlx-lm's `save_prompt_cache`/`load_prompt_cache` are class-generic
 (they record each entry's cache class and rebuild it via `from_state`), so the
 adapter's capture path needs no per-architecture code. Verified
 token-identical on `mlx-community/Falcon-H1-0.5B-Instruct-4bit` (every layer a
-nested `CacheList(ArraysCache, KVCache)`) via the same R1-5 gate. Not included:
-models mlx-lm cannot load at all — e.g. Qwen3.8-Flash-Next (`qwen4_exp`: no
-mlx-lm 0.31.3 module, NVFP4 streaming layout) needs its own loader/adapter
-first; the engine contract is already hybrid-ready.
+nested `CacheList(ArraysCache, KVCache)`) via the same R1-5 gate. Models
+mlx-lm has no module for are served by their own engine instead; see
+`qwen4-exp` below.
+
+### Qwen3.8-Flash-Next (`qwen4-exp`)
+
+`MLXCACHE_ENGINE=qwen4-exp` serves a local `Qwen3.8-Flash-Next` NVFP4
+checkpoint (132.6 GB on disk) on one Apple Silicon machine through the same
+daemon, protocol, and store as mlx-lm. The engine is self-contained: the
+architecture port, the NVFP4 weight reader, the vision tower, the
+multi-token-prediction head, and the PLE n-gram embedding table all live in
+this repo, and nothing depends on another repository.
+
+```bash
+MLXCACHE_ENGINE=qwen4-exp \
+MLXCACHE_MODEL=/path/to/Qwen3.8-Flash-Next-NVFP4 \
+uv run python -m mlxcache_sidecar.server &
+
+MLXCACHE_MODELS=/path/to/Qwen3.8-Flash-Next-NVFP4 \
+MLXCACHE_SIDECAR_URL=http://127.0.0.1:8421 \
+./target/release/mlxcache-daemon
+```
+
+The checkpoint cannot be resident (132.6 GB of weights, 48 GB of RAM), so
+weights stream from disk and residency is a knob: `MLXCACHE_Q4_EXPERT_RESIDENT_N`
+(decoded experts kept per layer, default `0`) and `MLXCACHE_Q4_PLE_CACHE_MB`
+(byte budget for decoded PLE rows, default `512`). The memory accounting, the
+tradeoff each knob buys, and the thrashing failure mode are in
+[`docs/ops.md`](docs/ops.md#qwen38-flash-next-residency-qwen4-exp).
+
+Status: the cache integration is the engine-generic path, so identity
+(`engine_id` plus `cache_layout`), persistence, digest checks, and delta
+resume apply unchanged. Performance on the real checkpoint (TTFT, decode
+throughput, resume latency) is not measured yet and is recorded separately;
+no numbers are claimed here.
 
 ## Wrapper server (mlx-lm, no daemon)
 
@@ -253,11 +298,15 @@ Sidecar:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MLXCACHE_ENGINE` | `synthetic` | `synthetic` (deterministic, no download) or `mlx-lm` |
+| `MLXCACHE_ENGINE` | `synthetic` | `synthetic` (deterministic, no download), `mlx-lm`, or `qwen4-exp` (local NVFP4 Qwen3.8-Flash-Next checkpoint) |
 | `MLXCACHE_MODEL` | `synthetic-model` | model the sidecar loads (HF repo or local path) |
 | `MLXCACHE_SIDECAR_PORT` | `8421` | sidecar bind port |
 | `MLXCACHE_KV_BITS` | `0` | KV quantization tier: `0` = f16, `8` = q8 — the tier is folded into the fingerprint, so tiers never share blobs. Dense attention models only: a hybrid model (linear attention / SSM / GDN layers — e.g. Falcon-H1, Qwen3-Next, granite-hybrid) is refused at boot with this tier set; its state persists unquantized on the f16 tier |
+| `MLXCACHE_KV_GROUP_SIZE` | `0` | quantization group size; `0` with a nonzero `MLXCACHE_KV_BITS` resolves to `64` |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
+| `MLXCACHE_Q4_EXPERT_RESIDENT_N` | `0` | `qwen4-exp` only: decoded experts per layer kept in an LRU. Larger = faster steady-state decode, more RAM |
+| `MLXCACHE_Q4_PLE_CACHE_MB` | `512` | `qwen4-exp` only: byte budget for decoded PLE n-gram rows (rows are cached, never the 51.2 GB table) |
+| `MLXCACHE_METAL_CACHE_MB` | `1024` | MLX allocator cache limit; freed buffers beyond it return to the OS instead of pooling |
 
 ## Building and testing
 
@@ -309,10 +358,14 @@ rescues, chaos tests). The R1-5 gate has run on Qwen2-0.5B,
 Qwen2.5-7B-Instruct-4bit, and the named representative Qwen3-32B-4bit, all
 token-identical to scratch. Hybrid architectures round-trip through the same
 gate (measured on Falcon-H1-0.5B); the q8 KV tier is dense-only by boot-time
-guard. The store is bounded by default (32 GiB eviction
+guard. Cache composition is part of every fingerprint (dense KV stack vs.
+hybrid recurrent state), so a payload of one shape is never served as
+another. The store is bounded by default (32 GiB eviction
 budget with anchor protection) and every checkpoint carries a sha256 payload
-digest verified at boot and first serve. The engine-agnostic contract has one
-adapter (mlx-lm). No license assigned — private build, all rights reserved.
+digest verified at boot and first serve. The engine-agnostic contract has two
+adapters: mlx-lm, and `qwen4-exp` (Qwen3.8-Flash-Next NVFP4, self-contained,
+weights streamed from disk). No license assigned — private build, all rights
+reserved.
 
 The chunk-granularity question is answered: GO, with token-block/64 as the
 v1 codec ([REPORT.md](REPORT.md)).

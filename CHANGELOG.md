@@ -121,14 +121,28 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
 ### Added
 
+- **`qwen4-exp` engine: Qwen3.8-Flash-Next served end to end**: a
+  self-contained engine (`MLXCACHE_ENGINE=qwen4-exp`) for a local
+  `Qwen3.8-Flash-Next` NVFP4 checkpoint (132.6 GB on disk) on one Apple
+  Silicon machine. The architecture port, NVFP4 weight reader, PLE n-gram
+  embedding, MTP head and vision tower live in this repo; nothing depends on
+  another repository. Because the checkpoint cannot be resident on 48 GB,
+  weights stream from disk under two residency knobs,
+  `MLXCACHE_Q4_EXPERT_RESIDENT_N` (decoded experts per layer, default `0`) and
+  `MLXCACHE_Q4_PLE_CACHE_MB` (decoded PLE row budget, default `512`); a budget
+  that is too small costs decode speed, not correctness. Cache integration is
+  the engine-generic path unchanged, so persistence, digests, eviction, delta
+  resume and `engine_id` namespacing apply as-is. Residency accounting and
+  troubleshooting are in `docs/ops.md`. Performance on the real checkpoint is
+  not measured yet; it is recorded separately.
 - **Hybrid-architecture models verified on the R1-5 gate**: mlx-lm's
   `save_prompt_cache`/`load_prompt_cache` are class-generic (cache classes are
   recorded in the blob and rebuilt via `from_state`), so the adapter's capture
   path needs no per-architecture code. Measured token-identical on
   `mlx-community/Falcon-H1-0.5B-Instruct-4bit`, whose every layer is a nested
   `CacheList(ArraysCache, KVCache)`. README documents the supported hybrid
-  families and the known exclusion (models mlx-lm cannot load, e.g.
-  Qwen3.8-Flash-Next's `qwen4_exp`).
+  families and the boundary for models mlx-lm cannot load at all, which the
+  self-contained `qwen4-exp` engine (above) serves instead.
 
 ### Fixed
 
