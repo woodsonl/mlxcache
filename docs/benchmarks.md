@@ -148,7 +148,7 @@ uv run python scripts/bench_prefix.py --arms pressure --k 0,1,2,4,8,16 \
 
 What the grid says:
 
-1. **Cross-restart reuse is real**: warm TTFT is about 20× lower than the cold leg (3.2 s → ~0.15 s) with 99.93–99.95% of requested prefix tokens served after both processes were killed and restarted from disk. No in-process cache can do this tier at all.
+1. **Cross-restart reuse is real**: warm TTFT drops per workload as the table shows — W1 3,178 → 154 ms (~21× lower), W1np 3,183 → 155 ms (~21×), W2 2,021 → 147 ms (~14×), W3 164 → 87 ms (~1.9×; short prompts, reuse cannot help much). W1, W1np and W2 serve 99.93–99.95% of requested prefix tokens after both processes were killed and restarted from disk (W3: 95%). No in-process cache can do this tier at all.
 2. **TPOT is flat (~12–13 ms) cold vs warm everywhere.** Caching moves prefill, not decode; W3 exists to keep that measured rather than assumed.
 3. **Mid-document divergence is never served**: W2's near-miss traffic (a long shared opening that diverges before either document's end) gets exactly 0% cold, as the end-anchored rule requires.
 4. **Priming matters once**: W1's first question is served ~1,959 tokens because the prefix was published alone; W1np's first question gets 0. After each request publishes its own full-length key, both warm legs converge to ~99.95%.
