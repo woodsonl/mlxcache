@@ -1,0 +1,229 @@
+{
+ "model": "Qwen/Qwen2-0.5B-Instruct",
+ "prefix_tokens": 1500,
+ "delta_tokens": 300,
+ "comparisons": [
+  {
+   "comparison": "B vs A (pure in-memory append)",
+   "heads_exact": 4,
+   "heads_total": 8,
+   "verdict": "partial",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "C vs B (load round trip vs append)",
+   "heads_exact": 8,
+   "heads_total": 8,
+   "verdict": "exact",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "C vs A (daemon delta path, P1)",
+   "heads_exact": 4,
+   "heads_total": 8,
+   "verdict": "partial",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "D vs B (one-shot vs appended, P3)",
+   "heads_exact": 2,
+   "heads_total": 8,
+   "verdict": "partial",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "diff@195228",
+      "diff@192900"
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "diff@196374",
+      "diff@194382"
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "diff@194314",
+      "diff@194328"
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "E vs A (pure re-save, no compute)",
+   "heads_exact": 8,
+   "heads_total": 8,
+   "verdict": "exact",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "E vs B head-prefix (re-save vs appended)",
+   "heads_exact": 0,
+   "heads_total": 8,
+   "verdict": "partial",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    }
+   ]
+  }
+ ],
+ "payload_bytes": {
+  "A": 18436459,
+  "B": 22122869,
+  "C": 22122869,
+  "D": 22122869
+ }
+}
