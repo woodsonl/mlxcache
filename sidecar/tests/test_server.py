@@ -544,3 +544,65 @@ def test_untrimmable_loop_eos_stop_is_one_position_deep():
     assert out == [10, 11], "EOS itself is never yielded"
     total = len(prompt) + len(out)
     assert engine.model.positions == total, "the EOS forward leaves the surplus position"
+
+
+# --- settle_path confinement -------------------------------------------------
+
+
+def _reset_staging_pin(monkeypatch, directory=None):
+    """One pinned staging directory per process; tests settle into fresh
+    tmp dirs, so reset the pin and point it where this test wants it."""
+    pin = [str(directory)] if directory is not None else [None]
+    monkeypatch.setattr(server, "_SETTLE_DIR_PIN", pin)
+
+
+def test_generate_rejects_settle_path_outside_the_staging_convention(
+    sidecar_url, monkeypatch, tmp_path
+):
+    # The sidecar is unauthenticated loopback HTTP: without the confinement
+    # any local process could make the engine write a file anywhere the
+    # server user can write. Only the daemon's own staging naming convention
+    # is accepted.
+    # Pin the daemon's directory first so every target is judged against it.
+    _reset_staging_pin(monkeypatch, directory=tmp_path)
+    targets = [
+        str(tmp_path / "ordinary.ckpt"),
+        str(tmp_path / ".settle-1-1-1.staging/../../escape"),
+        "/etc/.settle-1-1-1.staging",
+    ]
+    for bad in targets:
+        res = httpx.post(
+            f"{sidecar_url}/generate",
+            json={"tokens": [1, 2, 3], "max_tokens": 1, "settle_path": bad},
+        )
+        assert res.status_code == 400, bad
+        assert "staging" in res.json()["error"]
+
+
+def test_generate_rejects_a_staging_shaped_path_in_a_foreign_directory(
+    sidecar_url, monkeypatch, tmp_path
+):
+    # The parent-directory pin: after the first accepted settle, a
+    # convention-named path in a DIFFERENT directory must also be refused.
+    _reset_staging_pin(monkeypatch, directory=tmp_path)
+    ok = str(tmp_path / ".settle-1-1-1.staging")
+    res = httpx.post(
+        f"{sidecar_url}/generate",
+        json={"tokens": [1, 2, 3], "max_tokens": 1, "settle_path": ok},
+    )
+    assert res.status_code == 200, res.text
+    assert (tmp_path / ".settle-1-1-1.staging").exists()
+
+    _reset_staging_pin(monkeypatch, directory=tmp_path)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    res = httpx.post(
+        f"{sidecar_url}/generate",
+        json={
+            "tokens": [1, 2, 3],
+            "max_tokens": 1,
+            "settle_path": str(other / ".settle-2-2-2.staging"),
+        },
+    )
+    assert res.status_code == 400, "a pinned daemon must not be redirected to another directory"
+    assert not (other / ".settle-2-2-2.staging").exists()

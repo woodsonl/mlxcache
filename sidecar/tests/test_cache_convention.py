@@ -1050,3 +1050,85 @@ def test_engine_id_and_granularity_round_trip():
     m3, _ = blob.decode(blob.encode(legacy, b"kv"))
     assert m3.engine_id is None, "absent engine_id reads as the default"
     assert m3.granularity is None, "absent granularity reads as ANY_PREFIX"
+
+
+# --- settle reconciliation (B6 negative paths) --------------------------------
+
+
+class _DepthCache:
+    """A prompt-cache stand-in whose entries report a chosen depth."""
+
+    def __init__(self, depth: int) -> None:
+        self.depth = depth
+
+    def __iter__(self):
+        entry = types.SimpleNamespace(size=lambda: self.depth)
+        return iter([entry])
+
+
+def _settle_engine(monkeypatch, depth: int, trim_to: int | None = None, trimmable=True):
+    _install_fake_mlx(monkeypatch)
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    monkeypatch.setattr(cache_mod, "can_trim_prompt_cache", lambda cache: trimmable, raising=False)
+    monkeypatch.setattr(
+        cache_mod,
+        "trim_prompt_cache",
+        lambda cache, n: setattr(cache, "depth", trim_to if trim_to is not None else cache.depth),
+        raising=False,
+    )
+    # settle serializes through save_prompt_cache; emit placeholder payload
+    # bytes so the write path is real (the caps test reads the byte length).
+    monkeypatch.setattr(cache_mod, "save_prompt_cache", lambda fh, cache: fh.write(b"p" * 64))
+    engine = _engine()
+    engine.cache_layout = ""
+    engine.engine_id = "mlx-lm"
+    return engine, _DepthCache(depth)
+
+
+def test_settle_trims_deeper_cache_and_reports_post_trim_depth(monkeypatch, tmp_path):
+    # Generation left the cache one position deeper than the tokens[:-1]
+    # convention: settle must trim to target and report the depth it PERSISTED,
+    # not the depth it first measured.
+    engine, cache = _settle_engine(monkeypatch, depth=9, trim_to=7)
+    path = tmp_path / ".settle-1-1-1.staging"
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report["written"] is True, report
+    assert report["covered"] == 7, "covered must describe the state as persisted"
+    assert path.exists()
+
+
+def test_settle_refuses_untrimmable_deeper_cache(monkeypatch, tmp_path):
+    engine, cache = _settle_engine(monkeypatch, depth=9, trimmable=False)
+    path = tmp_path / ".settle-1-1-1.staging"
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report == {"written": False, "tokens": 8, "reason": "untrimmable_cache"}
+    assert not path.exists()
+
+
+def test_settle_refuses_shallower_cache_instead_of_shortening(monkeypatch, tmp_path):
+    # The daemon requires the settled sequence to equal request+generated
+    # exactly, so a shortened file was always discarded downstream: writing it
+    # was dead work reporting written:true. Refuse instead.
+    engine, cache = _settle_engine(monkeypatch, depth=3)
+    path = tmp_path / ".settle-1-1-1.staging"
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report == {"written": False, "tokens": 8, "reason": "shallow_cache"}
+    assert not path.exists(), "a settle the daemon will discard must not be written"
+
+
+def test_settle_cap_of_zero_refuses_rather_than_disables(monkeypatch, tmp_path):
+    # 0 is the natural "turn settling off"; treating it as falsy-disabled did
+    # the opposite of the operator's intent.
+    engine, cache = _settle_engine(monkeypatch, depth=7)
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_TOKENS", "0")
+    path = tmp_path / ".settle-1-1-1.staging"
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report["reason"] == "token_cap"
+    assert report["written"] is False
+
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_TOKENS", "")
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_BYTES", "0")
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report["reason"] == "size_cap"
+    assert report["written"] is False
+    assert not path.exists()

@@ -2175,22 +2175,10 @@ async fn multi_turn_end_divergent_serves_t22() {
         "stream": false,
     })
     .to_string();
-    for path in state.persistence.list_blobs().unwrap() {
-        let (m, _) = state.persistence.load(&path).unwrap();
-        eprintln!(
-            "PROBE cov={} first9={:?}",
-            m.tokens.len(),
-            &m.tokens[..m.tokens.len().min(10)]
-        );
-    }
     let res = post(turn2.clone()).await;
     assert_eq!(res.status(), 200);
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    eprintln!(
-        "PROBE turn2 tokens_total={} verdict={}",
-        v["mlxcache"]["tokens_total"], v["mlxcache"]["verdict"]
-    );
     assert_eq!(
         v["mlxcache"]["verdict"], "hit",
         "turn 2 must reuse turn 1's checkpoint through the end-anchored rule: {v}"
@@ -2214,20 +2202,6 @@ async fn multi_turn_end_divergent_serves_t22() {
         "turn 1: prefix + settle; turn 2: settle only"
     );
 
-    for path in state.persistence.list_blobs().unwrap() {
-        let (m, _) = state.persistence.load(&path).unwrap();
-        eprintln!(
-            "AFTER2 cov={} first9={:?} last={:?}",
-            m.tokens.len(),
-            &m.tokens[..9],
-            &m.tokens[m.tokens.len() - 3..]
-        );
-    }
-    eprintln!(
-        "AFTER2 published_count={} quarantined={}",
-        state.orchestrator.published_count(),
-        state.orchestrator.quarantined_count()
-    );
     // Replay turn 2: the same hit, byte-identical routing.
     let res = post(turn2).await;
     assert_eq!(res.status(), 200);
@@ -2907,4 +2881,60 @@ async fn legacy_unrecorded_layout_is_never_served_to_a_composition_aware_request
     legacy_child.wait().expect("reap sidecar");
     modern_child.kill().expect("kill sidecar");
     modern_child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_settle_report_omitting_the_digest_is_discarded() {
+    // The engine's report is the only integrity claim about the staged file.
+    // An engine that reports written:true with no digest used to publish
+    // unverified; the daemon now treats the omission as a declined settle.
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "omit")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "settle without a digest").await;
+    assert_eq!(res["status"], "ok", "generation itself must not fail");
+    assert_eq!(
+        blob_coverages(&state).len(),
+        1,
+        "only the prefill prefix; a digestless settle publishes nothing"
+    );
+    assert!(
+        !staging_files(blobs.path()),
+        "no staging file or temp may survive"
+    );
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_settle_report_with_a_wrong_digest_is_discarded() {
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "bad")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "settle with a wrong digest").await;
+    assert_eq!(res["status"], "ok");
+    assert_eq!(
+        blob_coverages(&state).len(),
+        1,
+        "a digest mismatch means the file is not this request's product"
+    );
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+/// Any `.settle-*` staging or `.part` temp left in the blob dir: the RAII
+/// guard plus the boot sweep should make this identically false.
+fn staging_files(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(".settle-"))
+        })
 }
