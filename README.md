@@ -391,6 +391,16 @@ both KV tiers, f16 and q8).
 
 Full numbers and caveats in the [design doc](docs/designs/mlx-kv-cache-daemon.md) (R1-5).
 
+Prefix-cache benchmark (Qwen2.5-7B-Instruct-4bit, ~2,000-token shared prefix,
+concurrency 1, premise-guarded): after a restart, the daemon serves 99.97% of
+requested prefix tokens and cuts TTFT 5.3 s → 0.22 s, with TPOT flat at ~13 ms
+— but a raw local `mlx_lm.server` re-prefills the same 3,260-token prompt in
+~0.15 s, faster than the cached path. At short prefixes on a fast local engine
+the cache buys restart-proof reuse, not latency. Under a 3-entry cap the
+reaper evicts the longest (highest-value) prefix first once pressure binds, and
+anchor chains delay but do not prevent it. Methodology, guards, and the full
+grid: [docs/benchmarks.md](docs/benchmarks.md).
+
 ## Operating it
 
 See [`docs/ops.md`](docs/ops.md) — bypassing the daemon (SPOF), rollback,
