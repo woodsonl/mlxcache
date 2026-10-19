@@ -38,7 +38,6 @@ class Qwen4TextConfig:
     rms_norm_eps: float = 1e-6
     max_position_embeddings: int = 262144
     attention_bias: bool = False
-    tie_word_embeddings: bool = False
     layer_types: list[str] = field(default_factory=list)
     full_attention_interval: int = 4
 
@@ -252,7 +251,6 @@ class Qwen4TextConfig:
             rms_norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
             max_position_embeddings=int(raw.get("max_position_embeddings", 32768)),
             attention_bias=bool(raw.get("attention_bias", False)),
-            tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
             layer_types=list(layer_types),
             full_attention_interval=int(raw.get("full_attention_interval", 4)),
             rope_theta=float(rope.get("rope_theta", raw.get("rope_theta", 10000.0))),

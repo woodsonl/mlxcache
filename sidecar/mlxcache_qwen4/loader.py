@@ -372,12 +372,6 @@ class CheckpointLoader:
         self._ple.clear()
         self._catalog.close()
 
-    def __enter__(self) -> CheckpointLoader:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
     # -- internals -------------------------------------------------------
     def _classify(self, entry: TensorEntry) -> str:
         cls = classify(entry.name)

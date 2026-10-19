@@ -17,10 +17,14 @@ import json
 import os
 import struct
 import zlib
+from typing import TYPE_CHECKING
 
 import pytest
 
 pytest.importorskip("mlx.core")
+
+if TYPE_CHECKING:
+    from mlxcache_qwen4.config import Qwen4TextConfig
 
 REAL_CHECKPOINT = "/Users/lance/models/Qwen3.8-Flash-Next-NVFP4-mlxstream"
 
@@ -510,6 +514,61 @@ def _real_config():
         return json.load(handle)
 
 
+def stored_weight_shapes(config: Qwen4TextConfig) -> dict[str, tuple[int, ...]]:
+    """The checkpoint's own tensor table: names and STORED shapes.
+
+    `weight_shapes` answers "what does the model request", which is dense
+    matrices because the loader dequantizes. This answers "what is on disk",
+    which is what a header-only check against the real index can verify:
+    NVFP4 experts are packed two values per byte with a group scale and two
+    per-tensor scalars beside them, and each MoE layer carries one global scale
+    per expert per projection.
+
+    Moved here from model.py: this is test infrastructure against the real
+    checkpoint's shard headers, and the model itself never calls it.
+    """
+    from mlxcache_qwen4.model import (
+        EMBED_NAME,
+        LAYER_PREFIX,
+        LM_HEAD_NAME,
+        NVFP4_GROUP,
+        NVFP4_PACKED_DIVISOR,
+        weight_shapes,
+    )
+
+    stored: dict[str, tuple[int, ...]] = {}
+    for name, shape in weight_shapes(config).items():
+        if name in {EMBED_NAME, LM_HEAD_NAME}:
+            stored[name] = shape
+            continue
+        if ".mlp.experts." in name and name.endswith(".weight"):
+            rows, cols = shape
+            stored[name] = (rows, cols // NVFP4_PACKED_DIVISOR)
+            stored[name.replace(".weight", ".weight_scale")] = (rows, cols // NVFP4_GROUP)
+            stored[name.replace(".weight", ".weight_scale_2")] = ()
+            stored[name.replace(".weight", ".input_scale")] = ()
+            continue
+        if ".ple_embedding.ngram_embedding.shard_" in name:
+            stored[name] = shape
+            continue
+        stored[name] = shape
+
+    # Each sharded PLE table carries one per-tensor scale.
+    for index in range(config.num_hidden_layers):
+        prefix = f"{LAYER_PREFIX}.{index}"
+        if config.ple_rank(index) is None:
+            continue
+        stored[f"{prefix}.ple.ple_embedding.ngram_embedding.weight_scale"] = (1,)
+
+    # One global scale per expert, per routed projection, per MoE layer.
+    for index in range(config.num_hidden_layers):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            stored[f"{LAYER_PREFIX}.{index}.mlp.switch_mlp.{projection}.global_scale"] = (
+                config.num_experts,
+            )
+    return stored
+
+
 def _safetensors_header(path: str) -> dict:
     with open(path, "rb") as handle:
         length = struct.unpack("<Q", handle.read(8))[0]
@@ -525,7 +584,6 @@ def test_weight_table_matches_real_checkpoint():
     scales), because a header knows nothing about dequantization.
     """
     from mlxcache_qwen4 import Qwen4TextConfig
-    from mlxcache_qwen4.model import stored_weight_shapes
 
     config = Qwen4TextConfig.from_checkpoint(_real_config())
     index_path = os.path.join(REAL_CHECKPOINT, "model.safetensors.index.json")
