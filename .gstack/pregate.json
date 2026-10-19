@@ -44,6 +44,10 @@
     ],
     "scripts/bench_prefix.py": [
       "sidecar/tests/test_bench_prefix.py"
+    ],
+    "Cargo.lock": [
+      "sidecar/tests/test_version_agreement.py"
     ]
-  }
+  },
+  "runner": "uv run python -m pytest {files}"
 }
