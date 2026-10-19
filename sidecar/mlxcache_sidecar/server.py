@@ -35,10 +35,12 @@ import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import PurePath
 
 
 class CheckpointRejectedError(Exception):
@@ -236,19 +238,27 @@ SETTLE_MAX_TOKENS_DEFAULT = 32768
 SETTLE_MAX_BYTES_DEFAULT = 2 * 1024 * 1024 * 1024
 
 
-def _settle_limits() -> tuple[int, int]:
+def _settle_limits() -> tuple[int | None, int | None]:
     """(max_tokens, max_bytes) for one settled checkpoint. A malformed value
-    falls back to the default rather than disabling settling silently."""
+    falls back to the default rather than disabling settling silently.
 
-    def read(name: str, default: int) -> int:
+    An explicitly-set 0 means REFUSE EVERYTHING, not "no cap": `0` is the
+    natural "turn this off" for the two knobs that bound on-disk writes, so
+    treating it as falsy-disabled would invert the operator's intent. Only an
+    unset (or unparsable) variable keeps the default."""
+
+    def read(name: str, default: int) -> int | None:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return None
         try:
-            return int(os.environ.get(name, "") or default)
+            return int(raw)
         except ValueError:
-            return default
+            return None
 
     return (
-        max(0, read("MLXCACHE_SETTLE_MAX_TOKENS", SETTLE_MAX_TOKENS_DEFAULT)),
-        max(0, read("MLXCACHE_SETTLE_MAX_BYTES", SETTLE_MAX_BYTES_DEFAULT)),
+        read("MLXCACHE_SETTLE_MAX_TOKENS", SETTLE_MAX_TOKENS_DEFAULT),
+        read("MLXCACHE_SETTLE_MAX_BYTES", SETTLE_MAX_BYTES_DEFAULT),
     )
 
 
@@ -304,11 +314,11 @@ def settle_checkpoint(
         # read_wire_checkpoint): publishing it would index a checkpoint that
         # can never be resumed from.
         return {"written": False, "tokens": len(tokens), "reason": "too_short"}
-    if max_tokens and len(tokens) > max_tokens:
+    if max_tokens is not None and len(tokens) > max_tokens:
         return {"written": False, "tokens": len(tokens), "reason": "token_cap"}
     if not payload:
         return {"written": False, "tokens": len(tokens), "reason": "empty_payload"}
-    if max_bytes and len(payload) > max_bytes:
+    if max_bytes is not None and len(payload) > max_bytes:
         return {"written": False, "tokens": len(tokens), "reason": "size_cap"}
 
     from .blob import CheckpointMeta, encode  # noqa: PLC0415
@@ -327,19 +337,28 @@ def settle_checkpoint(
     digest = hashlib.sha256(payload).hexdigest()
     # A unique sibling temp + os.replace keeps a concurrent reader (the daemon
     # reading the staging file after this response) from ever seeing a torn
-    # write, without requiring the caller to coordinate a lock.
-    tmp_path = f"{settle_path}.part"
+    # write, without requiring the caller to coordinate a lock. mkstemp gives
+    # the uniqueness: a FIXED ".part" name would let two overlapping requests
+    # (a daemon retry racing an abandoned attempt) corrupt each other's temp.
+    tmp_path: str | None = None
     try:
-        with open(tmp_path, "wb") as fh:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(settle_path) or ".",
+            prefix=os.path.basename(settle_path) + ".",
+            suffix=".part",
+        )
+        with os.fdopen(fd, "wb") as fh:
             fh.write(wire)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_path, settle_path)
     except OSError as exc:
-        # Leave nothing behind: a stranded .part in the blob dir would be
-        # invisible to every reader and accumulate per request.
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
+        # Leave nothing behind: a stranded temp in the blob dir would be
+        # invisible to every reader and accumulate per request. mkstemp can
+        # itself fail (a read-only blob dir), in which case there is no temp.
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
         return {"written": False, "tokens": len(tokens), "reason": f"write_failed: {exc}"}
     return {
         "written": True,
@@ -356,6 +375,38 @@ def _engine_id_meta(engine: object) -> str | None:
     byte-identical to a pre-namespacing one."""
     engine_id = str(getattr(engine, "engine_id", "mlx-lm") or "mlx-lm")
     return None if engine_id == "mlx-lm" else engine_id
+
+
+def _is_daemon_staging_path(path: str) -> bool:
+    """True when `path` is shaped like the daemon's own settle staging path.
+
+    The daemon generates `.settle-<pid>-<seq>-<nanos>.staging` inside its blob
+    dir (crates/mlxcache-daemon/src/http.rs :: settle_staging_path) and passes
+    the absolute path. This server is an unauthenticated loopback HTTP server,
+    so the confinement is: the BASENAME must match the daemon's exact staging
+    shape, no component may traverse (`..`), and the parent directory is PINNED
+    to the one the first accepted settle used — in real deployments that is the
+    daemon's blob dir, and after the pin nothing outside it can be targeted.
+    An attacker who loses the race to the daemon's first settle cannot pick a
+    directory of their own; even the pre-pin window only allows creating a
+    hidden, oddly-shaped name, never clobbering a chosen file.
+    """
+    import re
+
+    if re.fullmatch(r"\.settle-\d+-\d+-\d+\.staging", os.path.basename(path)) is None:
+        return False
+    parts = PurePath(path).parts
+    if any(part in ("..", ".") for part in parts):
+        return False
+    parent = os.path.realpath(os.path.dirname(path) or ".")
+    with _SETTLE_DIR_LOCK:
+        if _SETTLE_DIR_PIN[0] is None:
+            _SETTLE_DIR_PIN[0] = parent
+        return _SETTLE_DIR_PIN[0] == parent
+
+
+_SETTLE_DIR_LOCK = threading.Lock()
+_SETTLE_DIR_PIN: list[str | None] = [None]
 
 
 def _cache_positions(cache) -> int | None:
@@ -719,7 +770,17 @@ class SyntheticEngine:
         total = list(prompt_tokens) + list(generated)
         if not generated:
             return {"written": False, "tokens": len(total), "reason": "no_generated_tokens"}
-        return settle_checkpoint(self, settle_path, total, self._kv_bytes(total))
+        report = settle_checkpoint(self, settle_path, total, self._kv_bytes(total))
+        # Test knob (same family as MLXCACHE_GENERATE_FAIL): let a e2e spawn
+        # an engine that lies about its digest, or omits it, so the daemon's
+        # publish-time guards are exercised over the real HTTP path.
+        lie = os.environ.get("MLXCACHE_SETTLE_LIE", "")
+        if lie and report.get("written"):
+            if lie == "omit":
+                report.pop("sha256", None)
+            elif lie == "bad":
+                report["sha256"] = "0" * 64
+        return report
 
     def generate_collect(
         self,
@@ -1130,8 +1191,11 @@ class MlxLmEngine:
           makes the next turn re-feed a token the cache already holds, which
           degrades output silently instead of failing.
         - Shallower than the convention (immediate EOS, a prompt-only run):
-          shorten the recorded prefix to what is actually resident. Claiming
-          coverage the cache lacks would make the next turn skip tokens.
+          REFUSE. The earlier behavior shortened the recorded prefix and wrote
+          the file, but the daemon requires the settled sequence to equal
+          request+generated exactly (publish_settled_blob discards anything
+          else), so a shortened settle was dead work that still reported
+          `written: true` — a report nothing downstream ever acted on.
         """
         from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
 
@@ -1153,17 +1217,17 @@ class MlxLmEngine:
         if positions > target:
             if not _trim_cache_to(cache, target):
                 return {"written": False, "tokens": len(total), "reason": "untrimmable_cache"}
+            # `covered` must describe the state as persisted, not as first
+            # measured: the trim above is what makes them differ.
+            positions = _cache_positions(cache)
+            if positions is None or positions != target:
+                return {"written": False, "tokens": len(total), "reason": "untrimmable_cache"}
         elif positions < target:
-            total = total[: positions + 1]
-            if len(total) < 2:
-                return {"written": False, "tokens": len(total), "reason": "too_short"}
+            return {"written": False, "tokens": len(total), "reason": "shallow_cache"}
         buf = io.BytesIO()
         save_prompt_cache(buf, cache)
         payload = buf.getvalue()
-        report = settle_checkpoint(self, settle_path, total, payload, covered=positions)
-        if not report.get("written"):
-            return report
-        return report
+        return settle_checkpoint(self, settle_path, total, payload, covered=positions)
 
     def generate_with_text(
         self,
@@ -1689,11 +1753,22 @@ class Handler(BaseHTTPRequestHandler):
                 # checkpoint to. Validated before any generation work starts: a
                 # bad type here must be a clean 400, and an empty-string path
                 # would silently mean "settle somewhere unusable".
+                #
+                # The path is ALSO confined to the daemon's staging naming
+                # convention (`.settle-<pid>-<seq>-<nanos>.staging`, generated
+                # by the daemon inside its own blob dir). This server is an
+                # unauthenticated loopback HTTP server: without the confinement
+                # any local process could hand it an arbitrary path and make
+                # the engine create or clobber a file there. The daemon is the
+                # only intended caller and always sends a convention-named
+                # path, so anything else is refused rather than written.
                 settle_path = req.get("settle_path")
                 if settle_path is not None and (
-                    not isinstance(settle_path, str) or not settle_path
+                    not isinstance(settle_path, str)
+                    or not settle_path
+                    or not _is_daemon_staging_path(settle_path)
                 ):
-                    self._json(400, {"error": "settle_path must be a non-empty string"})
+                    self._json(400, {"error": "settle_path must be a daemon staging path"})
                     return
 
                 if req.get("stream"):

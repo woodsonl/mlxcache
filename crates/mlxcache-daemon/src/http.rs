@@ -1131,7 +1131,16 @@ async fn publish_settled_blob(
     // A mismatch means the file is not the one this request produced (a stale
     // staging file, a concurrent writer, a torn write) and publishing it would
     // key a blob whose bytes belong to another sequence.
-    if let Some(reported) = reported_sha256 {
+    //
+    // The digest is REQUIRED when the engine reports written:true. Skipping
+    // the check for an engine that omits the field would publish exactly the
+    // unverified writes the check exists to catch; both bundled engines always
+    // report it, so an absent digest is treated as a declined settle.
+    let Some(reported) = reported_sha256 else {
+        tracing::warn!("settle discarded: engine reported no payload digest");
+        return;
+    };
+    {
         use sha2::Digest;
         let actual = format!("{:x}", sha2::Sha256::digest(&payload));
         if !actual.eq_ignore_ascii_case(reported) {
@@ -1165,6 +1174,7 @@ async fn publish_settled_blob(
         && meta.fingerprint.kv_dtype == fingerprint.kv_dtype
         && meta.fingerprint.kv_bits == fingerprint.kv_bits
         && meta.fingerprint.kv_group_size == fingerprint.kv_group_size
+        && meta.fingerprint.kv_layout_version == fingerprint.kv_layout_version
         && meta.fingerprint.cache_layout == fingerprint.cache_layout;
     if !same_shape {
         tracing::warn!("settle discarded: header identity does not match the request");
@@ -1249,6 +1259,39 @@ fn discard_settle_staging(path: &std::path::Path) {
             error = %e,
             "could not remove settle staging file"
         ),
+    }
+    // The sidecar writes through a uniquely-named `<staging>.<rand>.part`
+    // sibling before the rename. A crash between create and rename strands
+    // it, list_blobs ignores the suffix, and no scan would ever reap it —
+    // so the same guard removes any leftover part files for this staging
+    // path. NotFound is the ordinary case.
+    let dir = path.parent().map(std::path::Path::to_path_buf);
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| format!("{n}."));
+    if let (Some(dir), Some(stem)) = (dir, stem) {
+        let leftovers = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&stem) && n.ends_with(".part"))
+            })
+            .map(|e| e.path());
+        for leftover in leftovers {
+            match std::fs::remove_file(&leftover) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    path = %leftover.display(),
+                    error = %e,
+                    "could not remove settle staging temp file"
+                ),
+            }
+        }
     }
 }
 
@@ -2284,14 +2327,11 @@ async fn stream_response(
                     while let Some(pos) = st.buf.iter().position(|b| *b == b'\n') {
                         let line = st.buf.split_to(pos + 1);
                         let outcome = st.framer.push_line(&mut frames, &line);
-                        if let Some(id) = outcome.token {
-                            // The settle key covers prompt + these ids; the done
-                            // frame reports only a count.
-                            st.generated.push(id);
-                        }
-                        if let Some(report) = outcome.settle {
-                            st.settle_report = Some(report);
-                        }
+                        // The settle key covers prompt + these ids; the done
+                        // frame reports only a count. Option<u32> iterates 0 or
+                        // 1 times, so extend consumes it directly.
+                        st.generated.extend(outcome.token);
+                        st.settle_report = st.settle_report.take().or(outcome.settle);
                         let last_done = frames.last().is_some_and(|f| {
                             f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
                         });
@@ -2337,12 +2377,8 @@ async fn stream_response(
                     if !st.buf.is_empty() {
                         let line = std::mem::take(&mut st.buf);
                         let outcome = st.framer.push_line(&mut frames, &line);
-                        if let Some(id) = outcome.token {
-                            st.generated.push(id);
-                        }
-                        if let Some(report) = outcome.settle {
-                            st.settle_report = Some(report);
-                        }
+                        st.generated.extend(outcome.token);
+                        st.settle_report = st.settle_report.take().or(outcome.settle);
                         if frames.last().is_some_and(|f| {
                             f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
                         }) {
