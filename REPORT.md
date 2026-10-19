@@ -245,7 +245,7 @@ fixed with a regression test during pre-landing review.
   identical hit rate. The adopted codec is the better of the two arms in both
   tiers, so the eviction evidence is measured on the codec the decision ships,
   not a stand-in.
-- Invariants asserted in `scripts/dedup/tests/` (48 tests, green, collected by
+- Invariants asserted in `scripts/dedup/tests/` (52 tests, green, collected by
   CI): a chunk leaves disk only at refcount 0; anchored entries are never
   evicted; the budget holds after EVERY sweep with candidates; recency
   anchoring holds recent entries inside a window and expires them after; a
