@@ -1,0 +1,968 @@
+[
+ {
+  "config": "cdc/head/16KiB",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 15057,
+    "new_bytes": 304152576,
+    "new_frac": 1.0,
+    "chunk_p50": 15550,
+    "chunk_p95": 53923
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 15942,
+    "new_bytes": 20961105,
+    "new_frac": 0.0652,
+    "chunk_p50": 15509,
+    "chunk_p95": 53863
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 16807,
+    "new_bytes": 20971290,
+    "new_frac": 0.0619,
+    "chunk_p50": 15520,
+    "chunk_p95": 53991
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 17657,
+    "new_bytes": 20763190,
+    "new_frac": 0.0584,
+    "chunk_p50": 15509,
+    "chunk_p95": 53863
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 18532,
+    "new_bytes": 21534077,
+    "new_frac": 0.0576,
+    "chunk_p50": 15550,
+    "chunk_p95": 53812
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 19397,
+    "new_bytes": 20798250,
+    "new_frac": 0.0531,
+    "chunk_p50": 15558,
+    "chunk_p95": 53812
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 20280,
+    "new_bytes": 20633319,
+    "new_frac": 0.0505,
+    "chunk_p50": 15535,
+    "chunk_p95": 53653
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 21162,
+    "new_bytes": 21273549,
+    "new_frac": 0.0499,
+    "chunk_p50": 15558,
+    "chunk_p95": 53689
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.0562,
+  "store_unique_bytes": 451087356,
+  "boundary_stability": 1.0
+ },
+ {
+  "config": "cdc/head/64KiB",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 3852,
+    "new_bytes": 304152576,
+    "new_frac": 1.0,
+    "chunk_p50": 61408,
+    "chunk_p95": 212362
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 4080,
+    "new_bytes": 31807836,
+    "new_frac": 0.099,
+    "chunk_p50": 60724,
+    "chunk_p95": 214150
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 4280,
+    "new_bytes": 30331230,
+    "new_frac": 0.0895,
+    "chunk_p50": 61578,
+    "chunk_p95": 212362
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 4495,
+    "new_bytes": 31751248,
+    "new_frac": 0.0892,
+    "chunk_p50": 61558,
+    "chunk_p95": 212756
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 4719,
+    "new_bytes": 33266928,
+    "new_frac": 0.089,
+    "chunk_p50": 61287,
+    "chunk_p95": 214348
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 4948,
+    "new_bytes": 32001731,
+    "new_frac": 0.0818,
+    "chunk_p50": 61504,
+    "chunk_p95": 214348
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 5174,
+    "new_bytes": 30926781,
+    "new_frac": 0.0757,
+    "chunk_p50": 60867,
+    "chunk_p95": 214352
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 5410,
+    "new_bytes": 31101578,
+    "new_frac": 0.073,
+    "chunk_p50": 60889,
+    "chunk_p95": 213611
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.0846,
+  "store_unique_bytes": 525339908,
+  "boundary_stability": 1.0
+ },
+ {
+  "config": "cdc/head/256KiB",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 1089,
+    "new_bytes": 304152576,
+    "new_frac": 1.0,
+    "chunk_p50": 219505,
+    "chunk_p95": 722437
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 1148,
+    "new_bytes": 75252804,
+    "new_frac": 0.2342,
+    "chunk_p50": 220329,
+    "chunk_p95": 734851
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 1190,
+    "new_bytes": 73497977,
+    "new_frac": 0.217,
+    "chunk_p50": 222615,
+    "chunk_p95": 739605
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 1253,
+    "new_bytes": 75004772,
+    "new_frac": 0.2108,
+    "chunk_p50": 220953,
+    "chunk_p95": 739605
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 1308,
+    "new_bytes": 71398799,
+    "new_frac": 0.191,
+    "chunk_p50": 222819,
+    "chunk_p95": 746978
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 1363,
+    "new_bytes": 70967146,
+    "new_frac": 0.1813,
+    "chunk_p50": 222819,
+    "chunk_p95": 747472
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 1421,
+    "new_bytes": 70450484,
+    "new_frac": 0.1724,
+    "chunk_p50": 221894,
+    "chunk_p95": 747472
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 1488,
+    "new_bytes": 69779530,
+    "new_frac": 0.1637,
+    "chunk_p50": 222308,
+    "chunk_p95": 746978
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.1936,
+  "store_unique_bytes": 810504088,
+  "boundary_stability": 1.0
+ },
+ {
+  "config": "cdc/tensor/16KiB",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 14932,
+    "new_bytes": 304152576,
+    "new_frac": 1.0,
+    "chunk_p50": 15707,
+    "chunk_p95": 54328
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 15814,
+    "new_bytes": 24040032,
+    "new_frac": 0.0748,
+    "chunk_p50": 15652,
+    "chunk_p95": 54282
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 16684,
+    "new_bytes": 23957165,
+    "new_frac": 0.0707,
+    "chunk_p50": 15635,
+    "chunk_p95": 54282
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 17533,
+    "new_bytes": 23741802,
+    "new_frac": 0.0667,
+    "chunk_p50": 15633,
+    "chunk_p95": 54197
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 18410,
+    "new_bytes": 24452593,
+    "new_frac": 0.0654,
+    "chunk_p50": 15659,
+    "chunk_p95": 54218
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 19268,
+    "new_bytes": 23880415,
+    "new_frac": 0.061,
+    "chunk_p50": 15685,
+    "chunk_p95": 54184
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 20153,
+    "new_bytes": 23664746,
+    "new_frac": 0.0579,
+    "chunk_p50": 15633,
+    "chunk_p95": 53959
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 21030,
+    "new_bytes": 24336140,
+    "new_frac": 0.0571,
+    "chunk_p50": 15654,
+    "chunk_p95": 53933
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.0642,
+  "store_unique_bytes": 472225469,
+  "boundary_stability": null
+ },
+ {
+  "config": "cdc/tensor/64KiB",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 3726,
+    "new_bytes": 304152576,
+    "new_frac": 1.0,
+    "chunk_p50": 63163,
+    "chunk_p95": 220394
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 3954,
+    "new_bytes": 44360785,
+    "new_frac": 0.1381,
+    "chunk_p50": 62715,
+    "chunk_p95": 221440
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 4156,
+    "new_bytes": 41872741,
+    "new_frac": 0.1236,
+    "chunk_p50": 63124,
+    "chunk_p95": 219697
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 4368,
+    "new_bytes": 43272563,
+    "new_frac": 0.1216,
+    "chunk_p50": 62906,
+    "chunk_p95": 220117
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 4591,
+    "new_bytes": 44768731,
+    "new_frac": 0.1198,
+    "chunk_p50": 62747,
+    "chunk_p95": 219697
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 4818,
+    "new_bytes": 43955750,
+    "new_frac": 0.1123,
+    "chunk_p50": 62760,
+    "chunk_p95": 220117
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 5048,
+    "new_bytes": 42339601,
+    "new_frac": 0.1036,
+    "chunk_p50": 62458,
+    "chunk_p95": 219858
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 5281,
+    "new_bytes": 42080855,
+    "new_frac": 0.0987,
+    "chunk_p50": 62523,
+    "chunk_p95": 218808
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.1157,
+  "store_unique_bytes": 606803602,
+  "boundary_stability": null
+ },
+ {
+  "config": "cdc/tensor/256KiB",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 955,
+    "new_bytes": 304152576,
+    "new_frac": 1.0,
+    "chunk_p50": 236080,
+    "chunk_p95": 851485
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 1014,
+    "new_bytes": 124293685,
+    "new_frac": 0.3868,
+    "chunk_p50": 240006,
+    "chunk_p95": 822538
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 1058,
+    "new_bytes": 119224443,
+    "new_frac": 0.352,
+    "chunk_p50": 242604,
+    "chunk_p95": 834790
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 1117,
+    "new_bytes": 121748036,
+    "new_frac": 0.3422,
+    "chunk_p50": 241391,
+    "chunk_p95": 845339
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 1172,
+    "new_bytes": 120580369,
+    "new_frac": 0.3226,
+    "chunk_p50": 240124,
+    "chunk_p95": 861890
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 1229,
+    "new_bytes": 118482124,
+    "new_frac": 0.3027,
+    "chunk_p50": 241391,
+    "chunk_p95": 836767
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 1290,
+    "new_bytes": 118591796,
+    "new_frac": 0.2902,
+    "chunk_p50": 238660,
+    "chunk_p95": 833093
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 1360,
+    "new_bytes": 117251758,
+    "new_frac": 0.275,
+    "chunk_p50": 239135,
+    "chunk_p95": 809034
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.3212,
+  "store_unique_bytes": 1144324787,
+  "boundary_stability": null
+ },
+ {
+  "config": "cdc/file/16KiB",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 14896,
+    "new_bytes": 304157920,
+    "new_frac": 1.0,
+    "chunk_p50": 15749,
+    "chunk_p95": 54513
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 15777,
+    "new_bytes": 24857571,
+    "new_frac": 0.0774,
+    "chunk_p50": 15689,
+    "chunk_p95": 54511
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 16646,
+    "new_bytes": 24729872,
+    "new_frac": 0.073,
+    "chunk_p50": 15690,
+    "chunk_p95": 54328
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 17495,
+    "new_bytes": 24562941,
+    "new_frac": 0.069,
+    "chunk_p50": 15671,
+    "chunk_p95": 54239
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 18370,
+    "new_bytes": 25221192,
+    "new_frac": 0.0675,
+    "chunk_p50": 15698,
+    "chunk_p95": 54265
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 19232,
+    "new_bytes": 24682221,
+    "new_frac": 0.0631,
+    "chunk_p50": 15707,
+    "chunk_p95": 54218
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 20116,
+    "new_bytes": 24415162,
+    "new_frac": 0.0597,
+    "chunk_p50": 15668,
+    "chunk_p95": 53999
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 20993,
+    "new_bytes": 25147383,
+    "new_frac": 0.059,
+    "chunk_p50": 15689,
+    "chunk_p95": 53999
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.0664,
+  "store_unique_bytes": 477774262,
+  "boundary_stability": null
+ },
+ {
+  "config": "cdc/file/64KiB",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 3683,
+    "new_bytes": 304157920,
+    "new_frac": 1.0,
+    "chunk_p50": 64052,
+    "chunk_p95": 223314
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 3909,
+    "new_bytes": 48996417,
+    "new_frac": 0.1525,
+    "chunk_p50": 63724,
+    "chunk_p95": 222079
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 4111,
+    "new_bytes": 46219981,
+    "new_frac": 0.1364,
+    "chunk_p50": 64091,
+    "chunk_p95": 221716
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 4325,
+    "new_bytes": 47565350,
+    "new_frac": 0.1337,
+    "chunk_p50": 63857,
+    "chunk_p95": 221716
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 4548,
+    "new_bytes": 49410580,
+    "new_frac": 0.1322,
+    "chunk_p50": 63488,
+    "chunk_p95": 221725
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 4777,
+    "new_bytes": 48317887,
+    "new_frac": 0.1235,
+    "chunk_p50": 63500,
+    "chunk_p95": 221652
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 5005,
+    "new_bytes": 46583710,
+    "new_frac": 0.114,
+    "chunk_p50": 63073,
+    "chunk_p95": 221221
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 5236,
+    "new_bytes": 46174035,
+    "new_frac": 0.1083,
+    "chunk_p50": 62959,
+    "chunk_p95": 219697
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.1274,
+  "store_unique_bytes": 637425880,
+  "boundary_stability": null
+ },
+ {
+  "config": "cdc/file/256KiB",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 914,
+    "new_bytes": 304157920,
+    "new_frac": 1.0,
+    "chunk_p50": 249357,
+    "chunk_p95": 890094
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 973,
+    "new_bytes": 139266472,
+    "new_frac": 0.4334,
+    "chunk_p50": 249602,
+    "chunk_p95": 850937
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 1016,
+    "new_bytes": 133165927,
+    "new_frac": 0.3931,
+    "chunk_p50": 260490,
+    "chunk_p95": 850937
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 1075,
+    "new_bytes": 135719147,
+    "new_frac": 0.3815,
+    "chunk_p50": 252945,
+    "chunk_p95": 866895
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 1131,
+    "new_bytes": 134908409,
+    "new_frac": 0.3609,
+    "chunk_p50": 248262,
+    "chunk_p95": 889616
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 1184,
+    "new_bytes": 134037695,
+    "new_frac": 0.3425,
+    "chunk_p50": 252096,
+    "chunk_p95": 863699
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 1247,
+    "new_bytes": 132887678,
+    "new_frac": 0.3252,
+    "chunk_p50": 247905,
+    "chunk_p95": 850937
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 1317,
+    "new_bytes": 132585615,
+    "new_frac": 0.311,
+    "chunk_p50": 248833,
+    "chunk_p95": 833604
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.3603,
+  "store_unique_bytes": 1246728863,
+  "boundary_stability": null
+ },
+ {
+  "config": "token-block/64",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 4648,
+    "new_bytes": 304152576,
+    "new_frac": 1.0,
+    "chunk_p50": 65536,
+    "chunk_p95": 65536
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 4928,
+    "new_bytes": 20357120,
+    "new_frac": 0.0634,
+    "chunk_p50": 65536,
+    "chunk_p95": 65536
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 5208,
+    "new_bytes": 19439616,
+    "new_frac": 0.0574,
+    "chunk_p50": 65536,
+    "chunk_p95": 65536
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 5432,
+    "new_bytes": 18120704,
+    "new_frac": 0.0509,
+    "chunk_p50": 65536,
+    "chunk_p95": 65536
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 5712,
+    "new_bytes": 21504000,
+    "new_frac": 0.0575,
+    "chunk_p50": 65536,
+    "chunk_p95": 65536
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 5992,
+    "new_bytes": 20701184,
+    "new_frac": 0.0529,
+    "chunk_p50": 65536,
+    "chunk_p95": 65536
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 6272,
+    "new_bytes": 19611648,
+    "new_frac": 0.048,
+    "chunk_p50": 65536,
+    "chunk_p95": 65536
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 6552,
+    "new_bytes": 18923520,
+    "new_frac": 0.0444,
+    "chunk_p50": 65536,
+    "chunk_p95": 65536
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.053,
+  "store_unique_bytes": 442810368
+ },
+ {
+  "config": "token-block/256",
+  "turns": [
+   {
+    "turn": 1,
+    "tokens": 5305,
+    "payload_bytes": 304157920,
+    "chunks": 1176,
+    "new_bytes": 304152576,
+    "new_frac": 1.0,
+    "chunk_p50": 262144,
+    "chunk_p95": 262144
+   },
+   {
+    "turn": 2,
+    "tokens": 5604,
+    "payload_bytes": 321303778,
+    "chunks": 1232,
+    "new_bytes": 27697152,
+    "new_frac": 0.0862,
+    "chunk_p50": 262144,
+    "chunk_p95": 262144
+   },
+   {
+    "turn": 3,
+    "tokens": 5908,
+    "payload_bytes": 338736356,
+    "chunks": 1344,
+    "new_bytes": 30449664,
+    "new_frac": 0.0899,
+    "chunk_p50": 262144,
+    "chunk_p95": 262144
+   },
+   {
+    "turn": 4,
+    "tokens": 6205,
+    "payload_bytes": 355767526,
+    "chunks": 1400,
+    "new_bytes": 18120704,
+    "new_frac": 0.0509,
+    "chunk_p50": 262144,
+    "chunk_p95": 262144
+   },
+   {
+    "turn": 5,
+    "tokens": 6520,
+    "payload_bytes": 373830888,
+    "chunks": 1456,
+    "new_bytes": 21504000,
+    "new_frac": 0.0575,
+    "chunk_p50": 262144,
+    "chunk_p95": 262144
+   },
+   {
+    "turn": 6,
+    "tokens": 6826,
+    "payload_bytes": 391378152,
+    "chunks": 1512,
+    "new_bytes": 24371200,
+    "new_frac": 0.0623,
+    "chunk_p50": 262144,
+    "chunk_p95": 262144
+   },
+   {
+    "turn": 7,
+    "tokens": 7127,
+    "payload_bytes": 408638698,
+    "chunks": 1568,
+    "new_bytes": 26951680,
+    "new_frac": 0.066,
+    "chunk_p50": 262144,
+    "chunk_p95": 262144
+   },
+   {
+    "turn": 8,
+    "tokens": 7435,
+    "payload_bytes": 426300650,
+    "chunks": 1680,
+    "new_bytes": 29933568,
+    "new_frac": 0.0702,
+    "chunk_p50": 262144,
+    "chunk_p95": 262144
+   }
+  ],
+  "mean_new_frac_turns2plus": 0.0684,
+  "store_unique_bytes": 483180544
+ }
+]
