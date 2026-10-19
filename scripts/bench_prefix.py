@@ -1208,6 +1208,12 @@ def main() -> int:
             f"unknown workload(s) {unknown_w} / arm(s) {unknown_a}; "
             f"workloads: {sorted(KNOWN_WORKLOADS)}, arms: {sorted(KNOWN_ARMS)}"
         )
+    if "W4" in args.workloads and "pressure" not in args.arms:
+        raise SystemExit("W4 is pressure-only: select it with --arms pressure")
+    if "daemon" in args.arms and not set(args.workloads) & {"W1", "W1np", "W2", "W3"}:
+        raise SystemExit("the daemon arm has nothing to run: no W1/W1np/W2/W3 selected")
+    if "direct" in args.arms and not set(args.workloads) & {"W1", "W3"}:
+        raise SystemExit("the direct arm has nothing to run: no W1/W3 selected")
     if set(args.workloads) & {"W1np", "W2"} and "direct" in args.arms:
         print("note: W1np/W2 have no direct-baseline analogue; direct arm runs W1/W3 only")
 

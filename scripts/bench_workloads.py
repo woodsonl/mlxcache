@@ -404,6 +404,11 @@ def run_workloads(url: str, args) -> list[dict]:
     #    have on appended text).
     content = "growing conversation seed"
     ttfts, totals, ntoks = [], [], []
+    # Snapshot BEFORE the loop: /stats is cumulative for the process, so
+    # comparing the post-loop count against a pre-loop baseline is the only
+    # way this guard measures THIS workload rather than everything before it.
+    with urllib.request.urlopen(f"{url}/stats", timeout=5) as r:
+        partials_before = json.loads(r.read()).get("partials", 0)
     for r in range(args.grow_rounds):
         content += f" | round {r}"
         ttft, total, ntok = stream_chat(
@@ -418,14 +423,18 @@ def run_workloads(url: str, args) -> list[dict]:
     # Guard the workload's own premise: rounds 1+ must classify as partials
     # (round 0 is the cold miss that seeds the chain). If a tokenizer change
     # ever breaks the prefix property, this bench must fail loudly instead of
-    # quietly benchmarking full prefills.
+    # quietly benchmarking full prefills. Measured as the DELTA across this
+    # workload's own requests.
     with urllib.request.urlopen(f"{url}/stats", timeout=5) as r:
         grow_stats = json.loads(r.read())
+    partials_delta = grow_stats.get("partials", 0) - partials_before
     expected_partials = max(args.grow_rounds - 1, 0)
-    assert grow_stats["partials"] >= expected_partials, (
-        f"growing_conversation produced {grow_stats['partials']} partials, "
-        f"expected >= {expected_partials} — the token prefix chain is broken"
-    )
+    if partials_delta < expected_partials:
+        raise RuntimeError(
+            f"growing_conversation produced {partials_delta} partials across its "
+            f"own requests, expected >= {expected_partials} — the token prefix "
+            "chain is broken"
+        )
 
     # 4. Concurrent identical load: C workers fire the SAME uncached prompt at
     #    once; single-flight must coalesce them into one prefill.
