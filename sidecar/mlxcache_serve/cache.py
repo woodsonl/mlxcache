@@ -69,16 +69,26 @@ def _artifact_bytes(path: Path) -> bytes | None:
 
     HF cache layouts symlink every snapshot file into a sibling ``blobs/``
     directory (``snapshots/<rev>/tokenizer.json -> ../../blobs/<sha>``), so a
-    blanket ``O_NOFOLLOW`` hashes nothing for EVERY cached model — the
-    fingerprint then says ``"missing"`` and the wrapper path and the daemon
-    path (which hashes the vocabulary) can never share a store.
+    blanket ``O_NOFOLLOW`` hashed nothing for EVERY cached model — every
+    HF-cached model then fingerprinted as ``"missing"``, erasing tokenizer
+    identity for all of them (a tokenizer swap under the same model dir went
+    undetected, and all symlinked models aliased one sentinel). The two
+    engine paths hash different artifacts by design (the wrapper hashes
+    these file bytes; the daemon hashes the vocabulary), so this guard
+    restores identity pinning WITHIN each path, not agreement between them.
 
     The guard's intent survives: a link is followed only when its target
-    resolves inside the model directory itself or inside the ``blobs/`` sibling
-    that HF cache entries use. Anything else — a link planted at
-    ``tokenizer.json`` pointing at another model's artifact or at an arbitrary
-    file — is still refused. The final open uses ``O_NOFOLLOW`` so a swap
-    between the check and the open fails closed rather than followed.
+    resolves inside the model directory itself or inside a ``blobs/``
+    sibling of it — the model's own storage, which is the declared trust
+    boundary: an attacker with write access to that tree could already swap
+    blob contents or plant a regular file. Anything resolving elsewhere — a
+    link pointing at another model's artifact or at an arbitrary file — is
+    still refused. The final open uses ``O_NOFOLLOW`` so a swap of the FINAL
+    component between the check and the open fails closed; the fd's
+    (st_dev, st_ino) is then reconciled against the checked path so an
+    intermediate-directory swap mid-window is caught too (usual inode-reuse
+    caveat applies). A target that is a directory (a corrupt pull can leave
+    the link at ``blobs/`` itself) reads as missing, not as an error.
     """
     target = path
     if path.is_symlink():
@@ -98,11 +108,24 @@ def _artifact_bytes(path: Path) -> bytes | None:
             return None
         target = resolved
     try:
+        checked = os.stat(target)
+        if os.path.isdir(target):
+            return None  # a directory is not an artifact (corrupt-pull shape)
         fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
         return None
-    with os.fdopen(fd, "rb") as fh:
-        return fh.read()
+    try:
+        # Reconcile the OPENED file with the CHECKED path: O_NOFOLLOW only
+        # guards the final component, so an intermediate directory swapped
+        # for a symlink mid-window would otherwise be followed silently.
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
+            return None
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read()
+    except OSError:
+        os.close(fd)
+        return None
 
 
 def fingerprint_for_model_dir(
