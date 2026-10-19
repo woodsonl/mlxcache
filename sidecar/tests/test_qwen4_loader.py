@@ -362,29 +362,40 @@ def test_lru_evicts_by_bytes(synthetic):
     import mlx.core as mx
 
     root, _truth = synthetic
-    # gate_proj is stored as 32x32 U8 (32 columns = in/2), so it decodes to
-    # 32*64*2 = 4096 bytes, and with N=1 the budget is exactly one such matrix:
-    # a second one must evict the first.
+    # Each fixture expert decodes to three bf16 matrices of 32*64*2 = 4096
+    # bytes (gate, up, down), so one expert is 12288 bytes and N=1 provisions
+    # exactly one expert: fetching a second expert's matrix must evict the
+    # first expert's.
     loader = _loader(root, expert_resident_n=1)
-    assert loader._experts.capacity == 4096
-    first = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
-    second = "model.language_model.layers.0.mlp.experts.1.gate_proj.weight"
-    loader.get(first)
-    assert loader._experts.nbytes == 4096
-    loader.get(second)
-    after_two = loader.stats()
-    assert after_two.expert_misses == 2
-    assert loader._experts.nbytes == 4096
-    # The first entry was evicted, so this is a miss again -- a byte-budgeted
-    # LRU of one expert cannot hold two.
-    loader.get(first)
-    after_third = loader.stats()
-    assert after_third.expert_misses == 3
-    assert after_third.expert_hits == 0
+    per_expert = 3 * 4096
+    assert loader._experts.capacity == per_expert
+    assert loader._experts.capacity % 3 == 0, "an expert is three matrices, not one"
+    prefix = "model.language_model.layers.0.mlp.experts"
+    matrices = [
+        f"{prefix}.{expert}.{proj}.weight"
+        for expert in (0, 1)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+    ]
+    # One expert's three matrices fill the budget exactly.
+    for name in matrices[:3]:
+        loader.get(name)
+    assert loader._experts.nbytes == per_expert
+    assert loader.stats().expert_misses == 3
+    # Any matrix of the next expert evicts one of the first expert's, so the
+    # first expert cannot be held whole alongside the second -- which is what
+    # "N experts" has to mean.
+    loader.get(matrices[3])
+    assert loader.stats().expert_misses == 4
     assert loader._experts.nbytes <= loader._experts.capacity
-    assert isinstance(loader.get(first), mx.array)
-    # A hit needs no read at all.
+    miss_before = loader.stats().expert_misses
+    # The entry fetched last survives: a hit needs no read at all.
+    assert isinstance(loader.get(matrices[3]), mx.array)
+    assert loader.stats().expert_misses == miss_before
     assert loader.stats().expert_hits == 1
+    # ...while the expert evicted to make room for it does not.
+    assert isinstance(loader.get(matrices[0]), mx.array)
+    assert loader.stats().expert_misses == miss_before + 1
+    assert loader._experts.nbytes <= loader._experts.capacity
     loader.close()
 
 

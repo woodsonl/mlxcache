@@ -255,6 +255,10 @@ def _dequant_fp8_blocks(payload: mx.array, scale_inv: mx.array, block: int = FP8
     The stored grid is `ceil(out/block) x ceil(in/block)`; a partial trailing
     tile still occupies a full stored scale, so the expanded grid is trimmed
     back to the payload shape.
+
+    The loader owns this step for checkpoint reads (it has the byte ranges); this
+    copy is for callers holding an already-decoded fp8 payload and its scale
+    grid, which is what the shape tables describe.
     """
     values = mx.from_fp8(payload, dtype=mx.float32)
     rows, cols = payload.shape
@@ -1129,7 +1133,15 @@ class Qwen4TextModel(nn.Module):
         input_ids: mx.array,
         cache: list[Any] | None = None,
         position_ids: mx.array | None = None,
+        return_hidden: bool = False,
     ) -> mx.array:
+        """Logits, or `(logits, hidden)` when `return_hidden`.
+
+        The MTP head conditions on the stack's final hidden state, and that
+        state is only reachable from inside this forward pass: the mixer
+        collapses it into the logits, so a caller that only got logits would
+        have to rebuild the whole stack to recover it.
+        """
         ids = input_ids.astype(mx.int32)
         batch, seq_len = ids.shape
         if cache is None:
@@ -1152,8 +1164,14 @@ class Qwen4TextModel(nn.Module):
         for layer, layer_cache in zip(self.layers, cache, strict=True):
             hidden = layer(hidden, self.rope, position_ids, mask, layer_cache, ids)
 
-        hidden = self.mixer(hidden)[0]
-        return _linear(hidden, self.lm_head)
+        mixed = self.mixer(hidden)[0]
+        logits = _linear(mixed, self.lm_head)
+        if return_hidden:
+            # The WIDE pre-mixer state, not `mixed`: the MTP head normalises it
+            # at `hc_hidden_size` and averages the streams itself, so handing it
+            # the collapsed vector would double-reduce and mismatch its norm.
+            return logits, hidden
+        return logits
 
     # ------------------------------------------------------------- weight table
 
@@ -1391,9 +1409,11 @@ class Qwen4MTPModel(nn.Module):
     the ordering above is a reading of the stored shapes rather than a port.
 
     Routed experts are 128x128 block-scaled fp8 rather than the main model's
-    NVFP4: `get` must hand back the raw `uint8` payload, and the dequantization
-    happens here because the block grid is part of the tensor, not of the
-    residency policy.
+    NVFP4. That difference is the loader's business, not the head's: `get`
+    returns a dequantized matrix for both, applying the block scales it reads
+    from the `.weight_scale_inv` companion. Dequantizing again here would apply
+    the scales twice, so the head requests experts exactly like the text stack
+    does.
     """
 
     def __init__(self, config: Qwen4TextConfig, weights: WeightSource):
@@ -1470,15 +1490,6 @@ class Qwen4MTPDecoderLayer(nn.Module):
         self.mlp = Qwen4SparseMoeBlock(config, weights, f"{prefix}.mlp")
         self.attn_hyper = Qwen4GatedResidual(config, weights, f"{prefix}.attn_hyper_connection")
         self.mlp_hyper = Qwen4GatedResidual(config, weights, f"{prefix}.mlp_hyper_connection")
-        # The head's experts are fp8 with block scales, so they bypass the
-        # loader's dense `get` and are dequantized here on first use.
-        self.mlp.expert_loader = self._fp8_expert
-
-    def _fp8_expert(self, key: Any, name: str) -> mx.array:
-        prefix, index, kind = key
-        payload = self.mlp.weights.get(name)
-        scale = self.mlp.weights.get(name.replace(".weight", ".weight_scale_inv"))
-        return _dequant_fp8_blocks(payload, scale)
 
     def make_cache(self) -> Any:
         keys = ArraysCache(size=1)

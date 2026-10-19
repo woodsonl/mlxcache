@@ -806,6 +806,7 @@ class MlxLmEngine:
         streaming loader over an architecture mlx-lm cannot construct) calls
         this same method, so the identity fields and boot guards have exactly
         one implementation and cannot drift apart from the load path."""
+        self._materialize_weights()
         # Hash the vocabulary, not the model name: R1-2 pins the tokenizer
         # artifact, and two different tokenizers can share a name_or_path-free
         # identity. The vocab is deterministic and artifact-derived.
@@ -850,6 +851,35 @@ class MlxLmEngine:
         self._eos_ids = getattr(self.tokenizer, "_eos_token_ids", None) or {
             self.tokenizer.eos_token_id
         }
+
+    def _materialize_weights(self) -> None:
+        """Evaluate every model parameter on the boot thread.
+
+        MLX defers array construction, and a lazy graph built on one thread
+        cannot be evaluated on another: doing so raises
+        `RuntimeError: There is no Stream(gpu, 0) in current thread`. The engine
+        is built on the thread that calls `serve()`, while
+        `ThreadingHTTPServer` dispatches each request on a worker thread, so a
+        model whose weights are still unevaluated when the first request arrives
+        fails on the very first forward pass — a 500 on `/prefill`, before any
+        token is produced.
+
+        `parameters()` is a lazy view, so this is one `mx.eval` over the whole
+        weight tree, on the thread that owns it. It costs the load's own I/O,
+        which the loader is already streaming at boot; it does not hold a second
+        copy. Engines whose model is not an MLX module (the synthetic engine, a
+        third-party adapter) are skipped.
+        """
+        parameters = getattr(self.model, "parameters", None)
+        if parameters is None:
+            return
+        try:
+            import mlx.core as mx  # noqa: PLC0415
+        except ImportError:
+            return
+        tree = parameters()
+        if tree:
+            mx.eval(tree)
 
     def _prompt_cache_probe(self):
         """One freshly constructed prompt cache for this model, shared by the
@@ -1226,14 +1256,80 @@ class MlxLmEngine:
         yield from self.stream_with_cache(prompt, cache)
 
     def stream_with_cache(self, tokens, cache):
-        """Yield (token_id, text_piece) per decode step from mlx-lm."""
-        import mlx.core as mx  # noqa: PLC0415
-        from mlx_lm import stream_generate  # noqa: PLC0415
+        """Yield (token_id, text_piece) per decode step.
 
-        for resp in stream_generate(
-            self.model, self.tokenizer, prompt=mx.array(tokens), prompt_cache=cache
-        ):
-            yield resp.token, resp.text
+        Two loops, chosen by what the cache can do, because they differ by
+        exactly the position `settle` has to reconcile.
+
+        `mlx_lm.stream_generate` runs one forward per token PLUS one: the token
+        it yielded last is fed back before the budget check, so after N tokens
+        the cache holds N+1 positions. `settle` trims that surplus back to the
+        `tokens[:-1]` convention, which is fine for a KV cache —
+        `KVCache.trim` drops positions.
+
+        A hybrid cache cannot. This architecture's GDN layers accumulate
+        recurrent state with no position axis, so `is_trimmable()` is False and
+        the surplus is unfixable after the fact: `settle` refuses every
+        checkpoint, and without a checkpoint every turn re-prefills from
+        scratch. For those caches the loop below forwards only when the consumer
+        asks for another token, so the last forward is the one that produced the
+        last yielded token and the cache lands on the convention exactly. That
+        also saves one forward per request.
+
+        Token choice is identical either way: `stream_generate`'s default
+        sampler is argmax over the log-probabilities, which is argmax over the
+        logits.
+        """
+        from mlx_lm.models.cache import can_trim_prompt_cache  # noqa: PLC0415
+
+        if can_trim_prompt_cache(cache):
+            import mlx.core as mx  # noqa: PLC0415
+            from mlx_lm import stream_generate  # noqa: PLC0415
+
+            for resp in stream_generate(
+                self.model, self.tokenizer, prompt=mx.array(tokens), prompt_cache=cache
+            ):
+                yield resp.token, resp.text
+            return
+        yield from self._stream_untrimmable(tokens, cache)
+
+    def _stream_untrimmable(self, tokens, cache):
+        """Decode loop that ends on the cache convention, for caches without trim.
+
+        The prompt is fed up to but excluding its last token; that tail is the
+        first input to the loop, so its output predicts the first generated token
+        with the whole prompt already resident.
+        """
+        import mlx.core as mx  # noqa: PLC0415
+        from mlx_lm.tokenizer_utils import TokenizerWrapper  # noqa: PLC0415
+
+        if not tokens:
+            raise ValueError("stream_with_cache needs at least one prompt token")
+        tokenizer = self.tokenizer
+        if not isinstance(tokenizer, TokenizerWrapper):
+            tokenizer = TokenizerWrapper(tokenizer)
+        eos = set(getattr(tokenizer, "eos_token_ids", ()) or ())
+        detokenizer = tokenizer.detokenizer
+
+        if len(tokens) > 1:
+            self.model(mx.array([tokens[:-1]]), cache=cache)
+        pending = tokens[-1]
+        while True:
+            logits = self.model(mx.array([[pending]]), cache=cache)
+            token = int(mx.argmax(logits[0, -1]).item())
+            if token in eos:
+                # Not yielded: `stream_generate` ends before emitting EOS, so
+                # yielding it would change the token sequence callers see.
+                #
+                # The cache is exactly on the convention here: the forward that
+                # discovered the EOS consumed the last generated token, so the
+                # cache covers `prompt + generated[:-1]` and `settle` can persist
+                # it without trimming.
+                detokenizer.finalize()
+                return
+            detokenizer.add_token(token)
+            yield token, detokenizer.last_segment
+            pending = token
 
     def _generate_with_cache(self, tokens: list[int], max_tokens: int, cache) -> list[int]:
         """Collect a bounded generation from the streaming path, so the

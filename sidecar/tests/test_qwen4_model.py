@@ -139,11 +139,13 @@ class RandomWeightSource:
             return mx.random.uniform(0.01, 1.0, shape)
         if name.endswith("dt_bias"):
             return mx.ones(shape)
-        if ".mlp.experts." in name and name.endswith(".weight") and not name.startswith("mtp."):
-            # Main-model experts are resident-dense for the tiny fixture.
+        if ".mlp.experts." in name and name.endswith(".weight"):
+            # Every routed expert, main model or MTP, arrives already
+            # dequantized: the loader applies nvfp4 or fp8 block scales itself
+            # and `get` returns bf16 either way. Handing back a raw fp8 payload
+            # here would let the model believe it must dequantize again, which
+            # is exactly the double-scaled bug this fixture must not hide.
             return mx.random.normal(shape).astype(mx.bfloat16) * 0.05
-        if name.startswith("mtp.") and ".mlp.experts." in name and name.endswith(".weight"):
-            return mx.to_fp8(mx.random.uniform(0.5, 1.5, shape).astype(mx.float32))
         if ".mlp.experts." in name and name.endswith(".weight_scale_inv"):
             return mx.random.uniform(0.5, 1.5, shape).astype(mx.bfloat16)
         if name.endswith("layer_multipliers") or name.endswith("ngram_heads_vocab_sizes"):
@@ -507,12 +509,17 @@ def test_contradictory_layer_types_rejected():
 
 
 def test_mtp_forward(bundle):
-    """The MTP head runs end to end and dequantizes its fp8 experts.
+    """The MTP head runs end to end over the loader's dequantized experts.
 
     The hidden state enters at the hyper-connected width, not at `hidden_size`:
     the head consumes every residual stream (`pre_fc_norm_hidden` is
     `hc_hidden_size` wide in the checkpoint), while the token embedding enters as
     a single `hidden_size` stream.
+
+    The scale-table assertion is a guard against the head dequantizing a second
+    time. `get` already applies the fp8 block scales and returns bf16, so a head
+    that asks for `.weight_scale_inv` on its own is applying them twice; the
+    fixture used to hand back raw fp8 for MTP experts and thereby hid that.
     """
     import mlx.core as mx
 
@@ -524,8 +531,10 @@ def test_mtp_forward(bundle):
     assert out.shape == (1, 5, config.vocab_size)
     assert mx.all(mx.isfinite(out))
 
-    scales = [name for name, _ in source.calls if name.endswith("weight_scale_inv")]
-    assert scales, "the MTP path must read the fp8 block scales"
+    expert_weights = [n for n, _ in source.calls if ".mlp.experts." in n and n.endswith(".weight")]
+    assert expert_weights, "the MTP layer must route to its experts"
+    scaled = [n for n, _ in source.calls if n.endswith(".weight_scale_inv")]
+    assert not scaled, f"the head dequantized what the loader already dequantized: {scaled[:2]}"
 
 
 def _real_config():

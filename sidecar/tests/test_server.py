@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import types
 
 import httpx
 import pytest
@@ -397,3 +398,64 @@ def test_engine_without_generate_with_text_collects_text_from_stream(sidecar_url
         assert body["text"] == "piece0 piece1 ", body
     finally:
         server.Handler.engine = server.make_engine("test-model")
+
+
+def test_adoption_materializes_weights_for_request_threads(sidecar_url, monkeypatch):
+    """Adopting a model must leave it usable from a request thread.
+
+    MLX records the stream that built a lazy array, and a graph built on one
+    thread cannot be evaluated on another: the worker raises `There is no
+    Stream(gpu, 0) in current thread`. The engine is built on the thread that
+    calls `serve()` while ThreadingHTTPServer dispatches requests on workers, so
+    a model whose weights are still unevaluated fails on the first forward pass
+    — a 500 on /prefill, before any token exists.
+
+    The hermetic engine never evaluates an array, so this cannot be seen without
+    a real MLX model; the fake below is the smallest one that reproduces it.
+    """
+    mx = pytest.importorskip("mlx.core")
+
+    class LazyModel:
+        def __init__(self):
+            # Deliberately not evaluated: a loader that materialises on demand
+            # leaves exactly this shape behind.
+            self.w = mx.array([[1.0, 2.0], [3.0, 4.0]]) * 1.0
+
+        def parameters(self):
+            return {"w": self.w}
+
+        def __call__(self, x):
+            return x @ self.w
+
+    def run_on_request_thread(model):
+        result = {}
+
+        def work():
+            try:
+                result["value"] = model(mx.array([[1.0, 1.0]])).tolist()
+            except RuntimeError as exc:
+                result["error"] = str(exc)
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        thread.join()
+        return result
+
+    # The hazard is real: unevaluated weights cannot be used off the boot thread.
+    unmaterialized = run_on_request_thread(LazyModel())
+    assert "Stream(gpu, 0)" in unmaterialized.get("error", ""), unmaterialized
+
+    # Adoption is what makes them usable, and it must be part of adopting —
+    # not something a caller has to remember.
+    engine = object.__new__(server.MlxLmEngine)
+    engine.model = LazyModel()
+    engine.tokenizer = types.SimpleNamespace(_eos_token_ids={1})
+    engine.tokenizer_hash = ""  # set by the real method; stubbed below
+    monkeypatch.setattr(engine, "_hash_vocab", lambda: "h", raising=False)
+    monkeypatch.setattr(engine, "_kv_dtype", lambda: "bfloat16", raising=False)
+    monkeypatch.setattr(engine, "_prompt_cache_probe", lambda: [], raising=False)
+    monkeypatch.setattr(engine, "_cache_layout_of", staticmethod(lambda cache: "layout"))
+    monkeypatch.setattr(engine, "_assert_quantization_supported", lambda cache: None, raising=False)
+
+    engine._adopt_model()
+    assert run_on_request_thread(engine.model) == {"value": [[4.0, 6.0]]}

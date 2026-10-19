@@ -109,7 +109,7 @@ Two consequences an operator sees:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `MLXCACHE_Q4_EXPERT_RESIDENT_N` | `0` | decoded experts per layer kept in an LRU. Raising it trades RAM for steady-state decode speed: a router that picks an expert already decoded skips the read and the dequantize. `0` keeps no expert between tokens, so every routed expert is read and dequantized again. |
+| `MLXCACHE_Q4_EXPERT_RESIDENT_N` | `0` | decoded experts kept in an LRU, counted in whole experts (gate, up and down together). Raising it trades RAM for decode speed: a routed expert already decoded skips the read and the dequantize. `0` keeps nothing between tokens. **Measure before setting it.** One decode step routes to `num_hidden_layers x num_experts_per_tok` experts across 48 layers, so a budget below that working set cannot survive one step and yields zero hits. Measured here: `N=16` (157 MB) and `N=128` (1.3 GB) hit nothing; `N=480` (4.7 GB) hits 5,931 times over 16 steps and decodes 40% slower, because the bookkeeping and memory pressure cost more than the 25% of expert reads it saves. |
 | `MLXCACHE_Q4_PLE_CACHE_MB` | `512` | byte budget for decoded PLE rows. The table is a hash lookup, so the touch set per token is small; the LRU caches rows, never the table. Raising it buys hit rate on repeated n-gram heads across a conversation; lowering it forces re-reads from the shards. |
 
 Both knobs are per process; the daemon's own memory and the KV checkpoint

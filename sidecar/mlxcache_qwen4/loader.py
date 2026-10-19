@@ -239,8 +239,8 @@ class CheckpointLoader:
         self._catalog = ShardCatalog(checkpoint_dir)
         self._root = self._catalog.root
         self._resident: dict[str, mx.array] = {}
-        # Capacity for "N experts per layer" is N times the largest decoded
-        # expert matrix, so the count knob and the byte-budgeted LRU below agree.
+        # Capacity for "N experts per layer" is N times one whole expert's
+        # decoded bytes, so the count knob and the byte-budgeted LRU agree.
         self._experts = _ByteLRU(self._expert_budget_bytes())
         self._ple = _ByteLRU(int(self.ple_cache_mb * (1 << 20)))
         self._ple_manifest = self._load_manifest()
@@ -252,21 +252,35 @@ class CheckpointLoader:
 
     # -- configuration derived once -------------------------------------
     def _expert_budget_bytes(self) -> int:
-        """Bytes for N experts per layer: N x the largest decoded expert matrix.
+        """Bytes for N experts: N x one expert's decoded gate/up/down matrices.
 
-        The largest matrix here is down_proj at 2560x640 bf16 (3.28 MB);
-        deriving it from the header keeps the knob honest if the expert
-        geometry changes.
+        An expert is not one matrix. A routed expert is read and dequantized as
+        three projections, and the block requests all three for every assigned
+        expert, so budgeting N x the single largest matrix provisions only a
+        third of an expert's footprint. With the budget that low the LRU is
+        smaller than one token's routed set and never produces a hit.
+
+        The per-expert total is derived from the catalog (the largest layer's
+        gate+up+down sizes) rather than hardcoded, so the knob stays honest if
+        the expert geometry changes.
         """
         if self.expert_resident_n == 0:
             return 0
-        largest = 0
+        # Keyed by (module prefix, expert index), not layer number alone: the MTP
+        # experts live at `mtp.layers.0.mlp.experts.N` and would otherwise be
+        # summed into text layer 0.
+        per_expert: dict[tuple[str, str], int] = {}
         for name in self._catalog.names():
-            if not _EXPERT_RE.search(name) or not name.endswith(".weight"):
+            match = _EXPERT_RE.search(name)
+            if not match or not name.endswith(".weight"):
                 continue
             entry = self._catalog.entry(name)
-            if entry.rank == 2:
-                largest = max(largest, _decoded_nbytes(entry))
+            if entry.rank != 2:
+                continue
+            prefix = name.split(".mlp.experts.", 1)[0]
+            key = (prefix, match.group(1))
+            per_expert[key] = per_expert.get(key, 0) + _decoded_nbytes(entry)
+        largest = max(per_expert.values(), default=0)
         return self.expert_resident_n * largest
 
     def _load_manifest(self) -> dict | None:

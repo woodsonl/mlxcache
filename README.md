@@ -236,9 +236,21 @@ tradeoff each knob buys, and the thrashing failure mode are in
 
 Status: the cache integration is the engine-generic path, so identity
 (`engine_id` plus `cache_layout`), persistence, digest checks, and delta
-resume apply unchanged. Performance on the real checkpoint (TTFT, decode
-throughput, resume latency) is not measured yet and is recorded separately;
-no numbers are claimed here.
+resume apply unchanged. Measured on the real checkpoint (48 GB machine,
+NVFP4 on disk, no residency): boot 4.6 s, prefill 46-77 s for 256-2048
+tokens, decode 2.0-2.3 s/token, checkpoint ≈132 MB fixed GDN recurrent state
+plus ≈58 KB/token. The 2 s resume budget holds: loading a checkpoint takes
+17-90 ms at every measured context, so warm TTFT is dominated by the tokens
+the next turn adds, not by the restore. A served conversation settles a real
+checkpoint and resumes from it (verified end to end over HTTP: prefill 14
+tokens → generate 10 → settle 119 MB covering 25 positions → next turn
+answers from the settled blob without re-prefilling the prompt).
+
+The knob's useful range is narrow and documented in
+[`docs/ops.md`](docs/ops.md#qwen38-flash-next-residency-qwen4-exp): a decoded
+expert is three matrices (gate/up/down), and one decode step routes to
+`48 layers x top_k 10` of them, so anything below that working set produces no
+hits at all.
 
 ## Wrapper server (mlx-lm, no daemon)
 
@@ -338,6 +350,34 @@ serialize 20 ms, deserialize <1 ms. Qwen2.5-7B-Instruct-4bit: 57,344 bytes/token
 serialize 526 ms, deserialize <1 ms, prefill 10.2 s. Qwen3-32B-4bit: 262,150
 bytes/token, serialize 203 ms, deserialize 1 ms, prefill 11.1 s. A hit eliminates
 that prefill, and the 2 s TTFT resume budget holds with margin at every size.
+
+Qwen3.8-Flash-Next (`qwen4-exp`, NVFP4, 48 GB machine, weights streamed from a
+132.6 GB checkpoint, residency `0`): boot 4.6 s; prefill 46.1 s at 256 tokens,
+53.0 s at 1K, 71.6 s at 2K, 76.6 s at 8K; decode 2.0 s/token at 256, 2.2 s at
+2K. Decode at 8K measured 17.3 s/token, which is NOT a clean scaling point: it
+is 7.8x the 2K figure while prefill at 8K is only 1.07x the 2K prefill, and a
+single decode step cannot cost 23% of the whole 8K prefill. That run had 10 GB
+of swap in use, so treat it as machine-state contamination and re-measure
+before quoting a long-context decode number. Checkpoint
+bytes: 132.4 MB at 256 tokens, 174.8 MB at 1K, 231.5 MB at 2K, 571.2 MB at 8K —
+a ≈110 MB fixed floor (36 GDN layers x 3.1 MB float32 recurrent state) plus
+≈58 KB/token. Saving is 0.04-0.12 s and loading 17-90 ms at every size, so the
+2 s resume budget holds up to 8K and is expected to hold at 20K: restore is two
+orders of magnitude under the budget, and the cost of a warm turn is the delta
+tokens the next turn adds.
+
+The design doc's 2 s budget for a 20K context is therefore met on restore. It is
+NOT met on a fully cold 20K prefill, which extrapolates to several minutes from
+the 8K measurement. A cold start of that length has no cache to hit; the budget
+describes a resume.
+
+`MLXCACHE_Q4_EXPERT_RESIDENT_N` measured on the same checkpoint, 16 decode steps
+after a 256-token prefill: `N=16` (157 MB) and `N=128` (1.3 GB) produce zero
+expert hits, `N=480` (4.7 GB) produces 5,931 hits but decodes slower (2.34 vs
+1.65 s/token) because the LRU's bookkeeping and the extra resident memory cost
+more than the 25% of reads it saves. The knob is correct and off by default for
+a reason; it is only worth setting above one decode step's working set
+(`layers x top_k` experts), which is 4.7 GB here.
 
 Restart resume (the claim that matters for a cache): a 19,847-token agent
 context on Qwen2.5-7B-Instruct-4bit goes 34.5 s cold → 1.56 s warm → **1.59 s
