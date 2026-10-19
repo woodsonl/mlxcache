@@ -84,8 +84,11 @@ def _artifact_bytes(path: Path) -> bytes | None:
     if path.is_symlink():
         resolved = Path(os.path.realpath(path))
         model_dir = Path(os.path.realpath(path.parent))
-        # HF cache: <hub>/models--org--name/{snapshots/<rev>,blobs/<sha>}, so
-        # blobs/ is the model dir's parent's sibling.
+        # HF cache: <hub>/models--org--name/{snapshots/<rev>,blobs/<sha>} with
+        # model_dir being the SNAPSHOT dir, so blobs/ sits two levels up; a
+        # plain local model may keep a blobs/ sibling one level up. Anything
+        # resolving outside those — another model's artifact, an arbitrary
+        # file — is a forgery and stays refused.
         allowed = (
             model_dir,
             model_dir.parent / "blobs",

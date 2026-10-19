@@ -207,6 +207,24 @@ def test_fingerprint_refuses_a_symlink_to_a_sibling_model(tmp_path):
     assert fingerprint_for_model_dir(a).tokenizer_hash == "missing"
 
 
+def test_fingerprint_follows_a_local_blobs_sibling(tmp_path):
+    """The one-level-up blobs/ sibling: a plain local model dir that keeps its
+    artifacts in a sibling blobs/ (no HF snapshots/ level) fingerprints
+    through the link too — the guard is about escaping the model's own
+    storage, not about which of the two layouts a cache uses."""
+    root = tmp_path / "local"
+    model = root / "model"
+    blobs = root / "blobs"
+    model.mkdir(parents=True)
+    blobs.mkdir(parents=True)
+    payload = b'{"tok": "local"}'
+    (blobs / "def456").write_bytes(payload)
+    (model / "tokenizer.json").symlink_to(Path("../blobs/def456"))
+
+    fp = fingerprint_for_model_dir(model)
+    assert fp.tokenizer_hash == hashlib.sha256(payload).hexdigest()
+
+
 def test_fingerprint_missing_tokenizer_stays_missing(tmp_path):
     assert fingerprint_for_model_dir(tmp_path).tokenizer_hash == "missing"
 
