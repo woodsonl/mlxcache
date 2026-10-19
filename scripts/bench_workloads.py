@@ -165,17 +165,22 @@ def report(name: str, ttfts: list[float], totals: list[float], token_counts: lis
     return row
 
 
-def wait_healthy(url: str, daemon: subprocess.Popen, deadline_s: float = 30.0) -> None:
+def wait_healthy(
+    url: str, daemon: subprocess.Popen | None = None, deadline_s: float = 30.0
+) -> None:
     # The daemon exposes no /health; a 404 from /stats proves the listener is
     # accepting and routing (any response but connection-refused works).
-    # Liveness is checked every iteration too: a daemon that exits at startup
-    # (bad env, bind failure after the free_port TOCTOU) must fail FAST with
-    # its exit status, not burn the whole deadline on "not healthy".
+    # Liveness is checked every iteration too (when we own the process): a
+    # daemon that exits at startup (bad env, bind failure after the free_port
+    # TOCTOU) must fail FAST with its exit status, not burn the whole
+    # deadline on "not healthy". With --daemon we do not own the process,
+    # so only the URL is probed.
     deadline = time.time() + deadline_s
     while time.time() < deadline:
-        rc = daemon.poll()
-        if rc is not None:
-            raise RuntimeError(f"daemon exited during startup (code {rc}) at {url}")
+        if daemon is not None:
+            rc = daemon.poll()
+            if rc is not None:
+                raise RuntimeError(f"daemon exited during startup (code {rc}) at {url}")
         try:
             with urllib.request.urlopen(f"{url}/stats", timeout=1) as r:
                 if r.status == 200:
@@ -224,8 +229,8 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
         ],
         env=env,
     )
-    daemon_port = _free_port()
     try:
+        daemon_port = _free_port()
         daemon = subprocess.Popen(
             [
                 str(Path(__file__).resolve().parents[1] / "target" / "release" / "mlxcache-daemon"),
@@ -241,9 +246,11 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
     except BaseException:
         sidecar.send_signal(signal.SIGTERM)
         try:
-            sidecar.wait(timeout=10)
+            sidecar.wait(timeout=TERM_WAIT_S)
         except subprocess.TimeoutExpired:
             sidecar.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                sidecar.wait(timeout=KILL_WAIT_S)
         raise
     return sidecar, daemon, daemon_port
 

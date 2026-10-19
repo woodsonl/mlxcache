@@ -129,7 +129,31 @@ def test_main_cleans_own_blob_dir_but_not_a_given_one(monkeypatch, tmp_path):
     dirs strand in $TMPDIR) or inverted (a user's --blobs dir is deleted);
     why_new=the only main() test exits at validation; seam=none; no_claim=
     run_workloads is stubbed, so workload behavior is not exercised here."""
-    monkeypatch.setattr(bw, "wait_healthy", lambda url, daemon=None, deadline_s=30.0: None)
+
+    class _FakeDaemonProc:
+        pid = 77
+
+        def poll(self):
+            return None
+
+        def send_signal(self, _sig):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    seen_daemons = []
+
+    def fake_wait_healthy(url, daemon=None, deadline_s=30.0):
+        # The REAL signature contract: an owned daemon is always passed and
+        # must not be None on the auto-start path; --daemon passes None.
+        seen_daemons.append(daemon)
+        return None
+
+    monkeypatch.setattr(bw, "wait_healthy", fake_wait_healthy)
     monkeypatch.setattr(bw, "run_workloads", lambda url, args: [])
 
     mine = tmp_path / "mine"
@@ -147,6 +171,27 @@ def test_main_cleans_own_blob_dir_but_not_a_given_one(monkeypatch, tmp_path):
     )
     bw.main()
     assert given.exists(), "caller-provided --blobs dir must be preserved"
+    assert seen_daemons == [None, None], "--daemon mode must pass daemon=None"
+
+
+def test_wait_healthy_tolerates_an_unowned_daemon(monkeypatch):
+    """Regression: the liveness-poll hardening made `daemon` a required
+    positional, so `--daemon URL` mode (no owned process) crashed with
+    AttributeError: 'NoneType' object has no attribute 'poll' before any
+    probe ran. Found by the c548e08 verification pass."""
+    monkeypatch.setattr(bw.time, "sleep", lambda s: None)
+    _clock = iter([0.0, 0.1, 5.0])  # two loop iterations, then past deadline
+    monkeypatch.setattr(bw.time, "time", lambda: next(_clock))
+    monkeypatch.setattr(
+        bw.urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("refused")),
+    )
+    # The poll loop MUST run with daemon=None (--daemon mode owns no
+    # process): the regression crashed with AttributeError on `None.poll()`
+    # inside the first iteration, before any URL probe.
+    with pytest.raises(RuntimeError, match="did not become healthy"):
+        bw.wait_healthy("http://127.0.0.1:1", None, deadline_s=1.0)
 
 
 def test_report_mismatched_lengths_raise():
