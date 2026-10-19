@@ -251,6 +251,51 @@ def test_forward_shape_and_determinism(bundle):
     assert any(".ple_embedding.ngram_embedding.shard_" in name for name, _ in source.calls)
 
 
+def test_hyper_streams_are_tiled_not_interleaved(bundle):
+    """The embedding must widen into `hc_count` WHOLE copies of the hidden vector.
+
+    The hyper-connection mixer unflattens the width into (hc_count, hidden_size),
+    so stream `s` has to occupy the `s`-th contiguous block. `mx.repeat(x, n,
+    axis=-1)` interleaves elements instead (1,2,3 -> 1,1,1,2,2,2), which puts
+    every stream's features in all four slots and feeds every layer a
+    permutation of the intended input. That is a whole-model error that still
+    produces finite logits, so shape and finiteness checks cannot see it; this
+    asserts the layout directly.
+    """
+    import mlx.core as mx
+
+    config, model = bundle["config"], bundle["model"]
+    ids = mx.array([[1, 5, 9, 17]])
+    embedded = mx.take(model.embed, ids.reshape(-1), axis=0).reshape(1, -1, config.hidden_size)
+    expected = mx.tile(embedded, (1, 1, config.hc_count))
+
+    # Record what the first layer's attention mixer is handed: it is the first
+    # consumer of the widened width. Special methods resolve on the type, so the
+    # class is patched for the duration rather than the instance.
+    from mlxcache_qwen4.model import Qwen4GatedResidual
+
+    observed = {}
+    original_call = Qwen4GatedResidual.__call__
+
+    def spy(self, hyper):
+        observed.setdefault("hyper", hyper)
+        return original_call(self, hyper)
+
+    Qwen4GatedResidual.__call__ = spy
+    try:
+        model(ids, cache=model.make_cache())
+    finally:
+        Qwen4GatedResidual.__call__ = original_call
+
+    hyper = observed["hyper"]
+    assert hyper.shape == expected.shape
+    if not mx.array_equal(hyper, expected):
+        raise AssertionError(
+            "embedding was widened by interleaving, not tiling: hyper-connection "
+            "stream `s` is not the s-th contiguous block of the hidden width"
+        )
+
+
 def test_cache_layout_and_roundtrip(bundle):
     """The cache is mlx-lm's own classes and survives a save/load cycle intact."""
     import mlx.core as mx

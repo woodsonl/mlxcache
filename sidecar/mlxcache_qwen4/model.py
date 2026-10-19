@@ -1127,7 +1127,12 @@ class Qwen4TextModel(nn.Module):
             position_ids = mx.broadcast_to(position_ids, (3, batch, seq_len))
 
         hidden = mx.take(self.embed, ids.reshape(-1), axis=0).reshape(batch, seq_len, -1)
-        hidden = mx.repeat(hidden, self.config.hc_count, axis=-1)
+        # Tile, not repeat: the hyper-connection mixer unflattens the width into
+        # (hc_count, hidden_size), so stream `s` must occupy the `s`-th whole
+        # block of `hidden` features. `mx.repeat` interleaves elements instead
+        # (1,2,3 -> 1,1,1,2,2,2), which would scatter every stream across all
+        # four and feed the mixer a permutation of the intended input.
+        hidden = mx.tile(hidden, (1, 1, self.config.hc_count))
 
         mask = _causal_mask(seq_len, _cache_offset(cache) + seq_len)
         mask = mx.broadcast_to(mask[None, None], (batch, 1, seq_len, mask.shape[1]))
@@ -1426,7 +1431,7 @@ class Qwen4MTPModel(nn.Module):
         fused = _linear(reduced, self.fc_hidden) + _linear(
             self.pre_norm_embedding(embed), self.fc_embedding
         )
-        streams = mx.repeat(fused, self.hc_count, axis=-1)
+        streams = mx.tile(fused, (1, 1, self.hc_count))
         if cache is None:
             cache = self.make_cache()
         if position_ids is None:
