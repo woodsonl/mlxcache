@@ -130,6 +130,81 @@ def test_t12_blobs_still_decode_after_default_fingerprint_write():
     assert meta2.fingerprint.kv_group_size == 64
 
 
+def test_decode_accepts_daemon_blobs_with_cache_layout():
+    # Regression guard for the B1 field, by the same discipline as the T12
+    # tier fields above: a daemon that records cache composition serializes
+    # one more fingerprint field. The reader must adopt it (not strip it, not
+    # TypeError), and a header WITHOUT it must read as "" (unrecorded).
+    rust_style = {
+        "fingerprint": {
+            "model_id": "Qwen/REDACTED-MODEL",
+            "tokenizer_hash": "1a2b3c4d5e6f7081",
+            "kv_dtype": "float16",
+            "kv_layout_version": 1,
+            "kv_bits": 0,
+            "kv_group_size": 0,
+            "cache_layout": "9f8e7d6c5b4a3928",
+        },
+        "token_count": 4,
+        "tokens": [1, 2, 3, 4],
+        "format_version": 1,
+    }
+    header = json.dumps(rust_style).encode()
+    meta, _ = blob.decode(struct.pack("<I", len(header)) + header + b"KV")
+    assert meta.fingerprint.cache_layout == "9f8e7d6c5b4a3928"
+
+    legacy = dict(rust_style)
+    legacy["fingerprint"] = {
+        k: v for k, v in rust_style["fingerprint"].items() if k != "cache_layout"
+    }
+    header = json.dumps(legacy).encode()
+    meta, _ = blob.decode(struct.pack("<I", len(header)) + header + b"KV")
+    assert meta.fingerprint.cache_layout == "", "absent layout means unrecorded"
+
+
+def test_encode_omits_an_unrecorded_cache_layout():
+    # An empty layout is "composition unknown", which is exactly what a pre-B1
+    # header says by saying nothing. Emitting `"cache_layout":""` would make
+    # every publish differ from the pinned cross-language wire golden while
+    # carrying no information.
+    encoded = blob.encode(_meta([1, 2]), b"kv")
+    (header_len,) = struct.unpack("<I", encoded[:4])
+    header = json.loads(encoded[4 : 4 + header_len])
+    assert "cache_layout" not in header["fingerprint"]
+
+    recorded = _meta([1, 2])
+    recorded.fingerprint.cache_layout = "abc123"
+    encoded = blob.encode(recorded, b"kv")
+    (header_len,) = struct.unpack("<I", encoded[:4])
+    header = json.loads(encoded[4 : 4 + header_len])
+    assert header["fingerprint"]["cache_layout"] == "abc123"
+
+
+def test_decode_rejects_non_string_cache_layout():
+    # Untrusted header field: a non-str layout would raise on the fold's
+    # .encode() outside every guarded region — the nested poison-pill path.
+    for bad in (5, None, ["x"], {"a": 1}):
+        rust_style = {
+            "fingerprint": {
+                "model_id": "m",
+                "tokenizer_hash": "h",
+                "kv_dtype": "f16",
+                "kv_layout_version": 1,
+                "cache_layout": bad,
+            },
+            "token_count": 2,
+            "tokens": [1, 2],
+            "format_version": 1,
+        }
+        header = json.dumps(rust_style).encode()
+        try:
+            blob.decode(struct.pack("<I", len(header)) + header + b"KV")
+        except blob.HeaderRejected as exc:
+            assert exc.kind == "header", bad
+        else:
+            raise AssertionError(f"non-string cache_layout {bad!r} must be rejected")
+
+
 def test_decode_rejects_version_mismatch():
     meta = _meta([1])
     meta.format_version = 99

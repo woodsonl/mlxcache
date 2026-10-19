@@ -160,7 +160,10 @@ impl PrefixIndex {
         fingerprint: Option<&ModelFingerprint>,
     ) -> Option<(IndexEntry, usize)> {
         use std::sync::atomic::Ordering::Relaxed;
-        let fp_ok = |entry: &IndexEntry| fingerprint.is_none_or(|f| entry.meta.fingerprint == *f);
+        let fp_ok = |entry: &IndexEntry| {
+            fingerprint
+                .is_none_or(|f| crate::policy::identity_compatible(&entry.meta.fingerprint, f))
+        };
         let root = self.read_lock();
         let mut node: &Node = &root;
         // Borrow-walk: track the best entry by REFERENCE and clone once at
@@ -169,9 +172,41 @@ impl PrefixIndex {
         // walk passed — once per turn, quadratic in conversation length, on
         // the hottest function in the daemon (performance review 2026-10-04).
         let mut best: Option<(&IndexEntry, usize)> = None;
+        // T22 end-anchored divergence: an entry whose key the request matches
+        // through `len(key) - 1` may serve it, because the blob holds KV for
+        // exactly that prefix and the KV at position j depends only on tokens
+        // `..=j`. Trie-wise such an entry is a SIBLING of a child the walk takes
+        // (its key token differs from the request's at the same depth) or a
+        // child of the node where the walk breaks.
+        //
+        // This is evaluated at EVERY depth, not just the deepest: publishing a
+        // longer checkpoint whose prefix is the request's own tokens turns those
+        // tokens into internal trie nodes, so the walk can pass the divergence
+        // point and end in a node that holds no entry at all. Scanning only the
+        // final node then loses the ancestor that legitimately serves the
+        // request. Deeper candidates cover more positions, so the deepest
+        // qualifying sibling wins.
+        //
+        // A candidate is adoptable ONLY when the request is at least as long as
+        // its key: the adapter holds KV for `len(key) - 1` positions and must
+        // still be fed the key's final token as part of its delta
+        // (prefix_len > len(tokens) is rejected as unusable → scratch).
+        let mut divergent: Option<(&IndexEntry, usize)> = None;
         for (i, t) in tokens.iter().enumerate() {
             match node.children.get(t) {
                 Some(child) => {
+                    // Siblings of the child being taken diverge here. More than
+                    // one child means a sibling exists; the length check keeps
+                    // the common single-child chain free of any child scan.
+                    if node.children.len() > 1 {
+                        if let Some(sib) =
+                            Self::hottest_published_child(node, fingerprint, Some(*t))
+                        {
+                            if tokens.len() >= sib.key.len() {
+                                divergent = Some((sib, i + 1));
+                            }
+                        }
+                    }
                     node = child;
                     if let Some(entry) = &node.entry {
                         if entry.state == CheckpointState::Published && fp_ok(entry) {
@@ -184,44 +219,33 @@ impl PrefixIndex {
                         }
                     }
                 }
-                None => break,
+                None => {
+                    // The walk breaks here: every published child diverges from
+                    // the request at this position.
+                    if let Some(sib) = Self::hottest_published_child(node, fingerprint, None) {
+                        if tokens.len() >= sib.key.len() {
+                            divergent = Some((sib, i + 1));
+                        }
+                    }
+                    break;
+                }
             }
         }
-        // T22 end-anchored divergence: a published DIRECT child of the
-        // deepest-reached node has key length depth+1; whether the walk
-        // broke on a request token or consumed the request exactly, the
-        // request agrees with such a child through depth = len(key) - 1 —
-        // exactly the serve rule — PROVIDED the request is long enough
-        // (checked below). Deeper descendants need LCP >= len(key)-1 >
-        // depth: never qualify.
-        //
-        // The child is adoptable ONLY when the request is at least as long as
-        // the child's key: the sidecar covers len(key)-1 positions and must
-        // still receive the key's final token as part of the delta it feeds
-        // (prefix_len > len(tokens) is rejected as unusable → scratch). A
-        // shorter request therefore can NEVER be served by the child branch —
-        // serving it would report a hit/partial while the adapter runs from
-        // scratch (an accounting lie) and would mask a usable exact entry at
-        // the walk-end node. The break shape satisfies len(key) <= len(tokens)
-        // by construction; the walk-end shape never does, so the guard simply
-        // makes the walk-end branch inert. Prefer the hottest eligible child
-        // (recency tie-break: lowest token, deterministic); its coverage
-        // (len(key)-1) beats any walk best, which ends at depth < len(key)-1.
-        if let Some(child_entry) = Self::hottest_published_child(node, fingerprint) {
-            if tokens.len() >= child_entry.key.len() {
-                // Touch through the reference, INSIDE the eligibility guard:
-                // only an entry this lookup actually serves counts as recently
-                // served (the contract at the top of this function) — a touch
-                // before the guard let unserved walk-end traffic extend a
-                // child's anchor window (review 2026-10-04). The touch must
-                // still hit the REAL trie entry: a clone's last_used_millis is
-                // a copy, and storing into it would leave the base of a live
-                // multi-turn chain cold for the reaper.
-                child_entry.last_used_millis.store(now_millis(), Relaxed);
-                let matched = child_entry.key.len();
-                if matched >= 2 {
-                    best = Some((child_entry, matched));
-                }
+        // Precedence: a divergent sibling is only adopted when it covers MORE
+        // of the request than the best exact entry. An exact entry that reaches
+        // the same depth is full containment of a longer prefix — strictly
+        // better than adopting a key that differs at its last token.
+        if let Some((entry, matched)) = divergent {
+            let beats_best = best.as_ref().is_none_or(|(_, depth)| matched > *depth);
+            if matched >= 2 && beats_best {
+                // Touch through the reference, only for the entry this lookup
+                // actually serves: a touch before the eligibility check let
+                // unserved walk traffic extend a child's anchor window (review
+                // 2026-10-04). The touch must hit the REAL trie entry: a clone's
+                // last_used_millis is a copy, and storing into it would leave the
+                // base of a live multi-turn chain cold for the reaper.
+                entry.last_used_millis.store(now_millis(), Relaxed);
+                return Some((entry.clone(), matched));
             }
         }
         best.map(|(entry, depth)| (entry.clone(), depth))
@@ -238,9 +262,15 @@ impl PrefixIndex {
     fn hottest_published_child<'a>(
         node: &'a Node,
         fingerprint: Option<&ModelFingerprint>,
+        // A token to EXCLUDE (the child the walk is already taking): a sibling
+        // candidate must differ from the request at this depth.
+        exclude: Option<u32>,
     ) -> Option<&'a IndexEntry> {
         let mut best: Option<(u64, u32, &IndexEntry)> = None;
         for (t, child) in &node.children {
+            if Some(*t) == exclude {
+                continue;
+            }
             let Some(entry) = &child.entry else {
                 continue;
             };
@@ -248,7 +278,7 @@ impl PrefixIndex {
                 continue;
             }
             if let Some(f) = fingerprint {
-                if entry.meta.fingerprint != *f {
+                if !crate::policy::identity_compatible(&entry.meta.fingerprint, f) {
                     continue;
                 }
             }
@@ -708,6 +738,72 @@ mod tests {
     }
 
     #[test]
+    fn pre_b1_blobs_deserialize_with_unknown_cache_layout() {
+        // Back-compat (B1): a blob written before cache composition was
+        // recorded has no cache_layout field at all. It must deserialize to
+        // "" (composition unknown) — the value the serving rule treats as
+        // legacy-to-legacy-only — and serialize back WITHOUT the field, so a
+        // legacy header stays byte-identical on any rewrite path.
+        let old_json = serde_json::json!({
+            "model_id": "test-model",
+            "tokenizer_hash": "abc123",
+            "kv_dtype": "f16",
+            "kv_layout_version": 1
+        });
+        let fp: ModelFingerprint = serde_json::from_value(old_json).unwrap();
+        assert_eq!(fp.cache_layout, "", "absent layout means unrecorded");
+        assert_eq!(fp, fingerprint(), "defaults match the test fingerprint");
+        let back = serde_json::to_value(&fp).unwrap();
+        assert!(
+            back.get("cache_layout").is_none(),
+            "an unrecorded layout must not appear on the wire: {back}"
+        );
+
+        // A recorded layout round-trips and is a different identity.
+        let mut hybrid = fingerprint();
+        hybrid.cache_layout = "CacheList-ArraysCache-KV".into();
+        let back: ModelFingerprint =
+            serde_json::from_slice(&serde_json::to_vec(&hybrid).unwrap()).unwrap();
+        assert_eq!(back, hybrid);
+        assert_ne!(fingerprint(), hybrid);
+    }
+
+    #[test]
+    fn cache_layout_gates_the_index_like_any_fingerprint_field() {
+        // The index's fp gate uses the shared identity relation, so a layout
+        // mismatch is invisible to a lookup at EVERY shape: not the exact
+        // entry, not the end-anchored child. This is the mechanism the B1
+        // serving rule needs; policy::classify carries the legacy branch.
+        let index = PrefixIndex::new();
+        let gen = index.reserve_generation();
+        let mut dense = fingerprint();
+        dense.cache_layout = "KV-KV".into();
+        assert!(index.publish(
+            &[1, 2, 3],
+            CheckpointMeta {
+                fingerprint: dense.clone(),
+                token_count: 3,
+                tokens: vec![1, 2, 3],
+                format_version: 1,
+                payload_sha256: None,
+                engine_id: None,
+                granularity: None,
+            },
+            "dense".into(),
+            gen,
+            |_| {}
+        ));
+        let mut hybrid = fingerprint();
+        hybrid.cache_layout = "CacheList-ArraysCache-KV".into();
+        assert!(index.lookup(&[1, 2, 3], Some(&hybrid)).is_none());
+        assert!(index.lookup(&[1, 2, 9], Some(&hybrid)).is_none());
+        // An unrecorded-layout request matches nothing here either: the entry
+        // has a KNOWN composition and the relation is exact equality.
+        assert!(index.lookup(&[1, 2, 3], Some(&fingerprint())).is_none());
+        assert!(index.lookup(&[1, 2, 3], Some(&dense)).is_some());
+    }
+
+    #[test]
     fn pre_quantization_blobs_deserialize_with_default_f16_tier() {
         // Back-compat (T12 adoption): blobs written before kv_bits/kv_group_size
         // existed have neither field in their meta JSON. They must deserialize
@@ -1138,6 +1234,45 @@ mod tests {
         // Re-publish rebuilds the branch.
         let _ = publish_entry(&index, &[7, 7, 7], "solo2");
         assert!(index.lookup(&[7, 7, 7], None).is_some());
+    }
+
+    #[test]
+    fn end_anchored_serve_survives_a_deeper_settled_checkpoint() {
+        // A settled checkpoint covers prompt + generated, so its key EXTENDS the
+        // request that produced it: publishing it turns that request's own tokens
+        // into internal trie nodes. A replay of a request that diverges at its
+        // last token must still be served by the ancestor there - the walk now
+        // ends in an entry-less node, so the end-anchored rule has to be
+        // evaluated where the divergence happens, not only at the walk's end.
+        let index = PrefixIndex::new();
+        // turn 1: prefix key [10,1,3] plus its settled continuation.
+        let _ = publish_entry(&index, &[10, 1, 3], "turn1");
+        let _ = publish_entry(&index, &[10, 1, 3, 7, 8, 9], "settle1");
+        // turn 2's own request [10,1,4] diverges at the last token; its settle
+        // extends that request, making [10,1,4] an internal node.
+        let _ = publish_entry(&index, &[10, 1, 4, 7, 8, 9], "settle2");
+
+        // Replay of turn 2: the walk consumes all of [10,1,4] and lands on an
+        // entry-less node. Pre-fix this missed; the divergent sibling [10,1,3]
+        // covers len(key)-1 = 2 positions and must serve, matched = 3.
+        let (entry, matched) = index.lookup(&[10, 1, 4], None).unwrap();
+        assert_eq!(entry.blob_path, "turn1", "the ancestor must still serve");
+        assert_eq!(matched, 3, "matched caps at the request length");
+
+        // Full containment always wins over a divergent sibling.
+        let (entry, matched) = index.lookup(&[10, 1, 3], None).unwrap();
+        assert_eq!(entry.blob_path, "turn1");
+        assert_eq!(matched, 3);
+
+        // An exact long key serves itself.
+        let (entry, matched) = index.lookup(&[10, 1, 3, 7, 8, 9], None).unwrap();
+        assert_eq!(entry.blob_path, "settle1");
+        assert_eq!(matched, 6);
+
+        // Diverging at the settled key's last token serves the settled entry.
+        let (entry, matched) = index.lookup(&[10, 1, 3, 7, 8, 5], None).unwrap();
+        assert_eq!(entry.blob_path, "settle1");
+        assert_eq!(matched, 6);
     }
 
     #[test]

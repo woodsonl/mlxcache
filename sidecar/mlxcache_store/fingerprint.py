@@ -24,6 +24,43 @@ DEFAULT_ENGINE = "mlx-lm"
 _DOMAIN_SEP = 0xFFFFFFFF
 
 
+def cache_layout_compatible(entry_layout: str, request_layout: str) -> bool:
+    """Cache-composition compatibility (the B1 identity rule).
+
+    `cache_layout` is a signature of the ordered tuple of cache-entry classes
+    an engine builds for a model — the SHAPE of the persisted payload. `""`
+    means "composition unknown", the value every pre-B1 blob carries.
+
+    An entry is compatible only with a request reporting the SAME layout:
+
+    - a request with a KNOWN (non-empty) layout is never served an
+      unknown-layout entry — nothing proves that payload has the shape this
+      engine will deserialize, and a dense KV stack loaded as a hybrid
+      model's recurrent state is silent wrong output, not an error;
+    - an unknown-layout request may still be served an unknown-layout entry,
+      so a store written before layouts were recorded keeps working until the
+      engine rewrites its blobs (legacy-to-legacy only: the moment either
+      side knows its composition the comparison is exact).
+    """
+    return entry_layout == request_layout
+
+
+def identity_compatible(entry: Fingerprint, request: Fingerprint) -> bool:
+    """The single identity relation every matching site uses. Field-by-field
+    on purpose: the composition rule is a named decision, not an accident of
+    dataclass equality, so adding a fingerprint field cannot silently drop
+    it."""
+    return (
+        entry.model_id == request.model_id
+        and entry.tokenizer_hash == request.tokenizer_hash
+        and entry.kv_dtype == request.kv_dtype
+        and entry.kv_layout_version == request.kv_layout_version
+        and entry.kv_bits == request.kv_bits
+        and entry.kv_group_size == request.kv_group_size
+        and cache_layout_compatible(entry.cache_layout, request.cache_layout)
+    )
+
+
 def _fnv1a(seed: int, prime: int, words: list[int]) -> int:
     h = seed
     for w in words:
@@ -56,24 +93,30 @@ def blob_key(fp: Fingerprint, engine_id: str | None, tokens: list[int]) -> int:
     Non-default engines fold their length-prefixed id closed by a domain
     separator BEFORE all fingerprint bytes; the default engine (and None)
     contributes zero bytes, so legacy keys are byte-identical.
+
+    The same zero-byte rule applies to `fingerprint.cache_layout`: a NON-EMPTY
+    layout folds as one more length-prefixed field AFTER kv_group_size and
+    before the closing domain separator, so two cache compositions of the same
+    model can never share a key; an EMPTY layout (composition unrecorded, as
+    on every pre-B1 blob) contributes zero bytes and leaves existing keys
+    byte-identical.
     """
     words: list[int] = []
     engine = engine_id or DEFAULT_ENGINE
     if engine != DEFAULT_ENGINE:
         words.extend(_chunks_of_concat([engine]))
         words.append(_DOMAIN_SEP)
-    words.extend(
-        _chunks_of_concat(
-            [
-                fp.model_id,
-                fp.tokenizer_hash,
-                fp.kv_dtype,
-                str(fp.kv_layout_version),
-                str(fp.kv_bits),
-                str(fp.kv_group_size),
-            ]
-        )
-    )
+    fields = [
+        fp.model_id,
+        fp.tokenizer_hash,
+        fp.kv_dtype,
+        str(fp.kv_layout_version),
+        str(fp.kv_bits),
+        str(fp.kv_group_size),
+    ]
+    if fp.cache_layout:
+        fields.append(fp.cache_layout)
+    words.extend(_chunks_of_concat(fields))
     words.append(_DOMAIN_SEP)
     words.extend(t & 0xFFFFFFFF for t in tokens)
     return _prefix_hash(words)

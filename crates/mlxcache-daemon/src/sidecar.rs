@@ -43,10 +43,59 @@ pub struct TokenizeResponse {
     /// distinct formats for R1-1, not tunable variants.
     #[serde(default)]
     pub kv_group_size: u32,
+    /// The engine that owns this key domain (connector protocol §4). Defaults
+    /// to the default engine, which contributes zero fold bytes.
+    #[serde(default = "default_engine_id")]
+    pub engine_id: String,
+    /// Signature of the engine's cache COMPOSITION: the ordered tuple of cache
+    /// entry class names it builds for this model. Distinguishes architectures
+    /// whose payload shapes are mutually unloadable but whose model id,
+    /// tokenizer, dtype and quantization all agree. Empty = unrecorded, which
+    /// serves legacy-to-legacy only (see `mlxcache_core::policy`).
+    #[serde(default)]
+    pub cache_layout: String,
 }
 
 fn default_kv_dtype() -> String {
     "unknown".to_string()
+}
+
+/// What the engine reports about a settle it was asked to perform.
+///
+/// `written` is the engine's own verdict, never the daemon's inference from the
+/// path existing: an engine that cannot produce a settle (no KV, too few
+/// tokens, a refused write) writes NOTHING and says so. A checkpoint is never
+/// fabricated on the daemon's side either — a report of `written: false` means
+/// there is no blob to publish.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SettleReport {
+    /// True only when a wire checkpoint now exists at the requested path.
+    pub written: bool,
+    /// Total tokens the checkpoint covers (prompt + generated), as the engine
+    /// recorded them in the header.
+    #[serde(default)]
+    pub tokens: u64,
+    /// sha256 (hex) of the payload bytes, when written. The daemon re-derives
+    /// it from the file before publishing, so this is a cross-check, not the
+    /// source of truth.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Why nothing was written (diagnostic only).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A non-streaming generation: the completion plus (when settling was
+/// requested) the engine's settle report.
+#[derive(Debug, Clone)]
+pub struct GenerateOutcome {
+    pub tokens: Vec<u32>,
+    pub text: String,
+    pub settle: Option<SettleReport>,
+}
+
+fn default_engine_id() -> String {
+    mlxcache_core::contract::DEFAULT_ENGINE.to_string()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -246,7 +295,8 @@ impl SidecarClient {
         tokens: &[u32],
         max_tokens: usize,
         blob_path: Option<&str>,
-    ) -> Result<(Vec<u32>, String), SidecarError> {
+        settle_path: Option<&str>,
+    ) -> Result<GenerateOutcome, SidecarError> {
         let url = format!("{}/generate", self.config.base_url);
         let resp = self
             .http
@@ -255,6 +305,10 @@ impl SidecarClient {
                 "tokens": tokens,
                 "max_tokens": max_tokens,
                 "blob_path": blob_path,
+                // Absent (not null) when the daemon is not settling: an older
+                // sidecar must not even see the key, and a null would ask it to
+                // settle at an unusable path.
+                "settle_path": settle_path,
             }))
             .send()
             .await
@@ -274,10 +328,18 @@ impl SidecarClient {
             /// `choices[].message.content` is then the empty string.
             #[serde(default)]
             text: String,
+            /// Additive and optional: absent from older sidecars and from
+            /// requests that did not ask to settle.
+            #[serde(default)]
+            settle: Option<SettleReport>,
         }
         resp.json::<GenResponse>()
             .await
-            .map(|r| (r.tokens, r.text))
+            .map(|r| GenerateOutcome {
+                tokens: r.tokens,
+                text: r.text,
+                settle: r.settle,
+            })
             .map_err(|e| SidecarError::Protocol(format!("bad generate response: {e}")))
     }
 
@@ -292,6 +354,7 @@ impl SidecarClient {
         tokens: &[u32],
         max_tokens: usize,
         blob_path: Option<&str>,
+        settle_path: Option<&str>,
     ) -> Result<reqwest::Response, SidecarError> {
         let url = format!("{}/generate", self.config.base_url);
         let open = self.stream_open;
@@ -303,6 +366,7 @@ impl SidecarClient {
                     "max_tokens": max_tokens,
                     "blob_path": blob_path,
                     "stream": true,
+                    "settle_path": settle_path,
                 }))
                 .send()
                 .await
@@ -515,7 +579,7 @@ mod tests {
         .expect("client builds");
         let start = std::time::Instant::now();
         let e = c
-            .generate_stream(&[1, 2, 3], 4, None)
+            .generate_stream(&[1, 2, 3], 4, None, None)
             .await
             .expect_err("stalled stream open must error");
         assert!(

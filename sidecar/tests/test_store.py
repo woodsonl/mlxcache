@@ -23,6 +23,8 @@ from mlxcache_store import (
     Store,
     Unavailable,
     blob_key,
+    cache_layout_compatible,
+    identity_compatible,
 )
 
 # --- fixtures -------------------------------------------------------------
@@ -43,6 +45,78 @@ def test_cross_language_key_goldens():
     assert f"{blob_key(FP_GOLDEN, 'mlx-lm', tokens):032x}" == GOLDEN_KEY_8
     assert f"{blob_key(FP_GOLDEN, None, []):032x}" == GOLDEN_KEY_0
     assert f"{blob_key(FP_GOLDEN, 'llama-cpp', tokens):032x}" == GOLDEN_KEY_LLAMA
+
+
+# --- cache composition (B1) -------------------------------------------------
+# Same fixtures and same expected u128 values as the Rust twin
+# (blob_key_cache_layout_and_engine_goldens in http.rs). The fold is one
+# definition across bindings or it is not a definition.
+DENSE = Fingerprint("golden-model", "golden-tok", "f16", 1, cache_layout="KV-KV")
+HYBRID = Fingerprint(
+    "golden-model", "golden-tok", "f16", 1, cache_layout="CacheList-ArraysCache-KV"
+)
+GOLDEN_KEY_DENSE = "e21b343efc207f88a45df7f9530fbe62"
+GOLDEN_KEY_HYBRID = "c42837b2930d326f652585408b9b20eb"
+GOLDEN_KEY_DENSE_LLAMA = "01d9e1aadc1b180c8d8580d70683df4e"
+
+
+def test_cache_layout_key_goldens():
+    tokens = list(range(1, 9))
+    # (a) An empty layout contributes ZERO bytes: legacy keys are unchanged.
+    legacy = Fingerprint("golden-model", "golden-tok", "f16", 1)
+    assert f"{blob_key(legacy, None, tokens):032x}" == GOLDEN_KEY_8
+    # (b) Two cache compositions of the same model are different keys.
+    assert f"{blob_key(DENSE, None, tokens):032x}" == GOLDEN_KEY_DENSE
+    assert f"{blob_key(HYBRID, None, tokens):032x}" == GOLDEN_KEY_HYBRID
+    assert GOLDEN_KEY_DENSE != GOLDEN_KEY_HYBRID
+    # (c) Same layout, different engine domain: a different key.
+    assert f"{blob_key(DENSE, 'llama-cpp', tokens):032x}" == GOLDEN_KEY_DENSE_LLAMA
+
+
+def test_cache_layout_is_unambiguous_against_a_stretched_field():
+    # The layout is the LAST fingerprint field and is length-prefixed like
+    # every other one: a layout string crafted to look like "previous field
+    # plus this layout" must not alias the honest encoding.
+    stretched = Fingerprint("golden-model", "golden-tok", "f16", 1, cache_layout="06:KV-KV")
+    tokens = list(range(1, 9))
+    assert blob_key(DENSE, None, tokens) != blob_key(stretched, None, tokens)
+
+
+def test_cache_layout_compatibility_rule():
+    # The B1 serving rule: exact layout equality, with `""` meaning
+    # "composition unrecorded". A request that knows its composition is never
+    # served an unrecorded blob; an unrecorded request may still use one, so
+    # pre-B1 stores keep working (legacy-to-legacy).
+    assert cache_layout_compatible("", "")
+    assert cache_layout_compatible("KV-KV", "KV-KV")
+    assert not cache_layout_compatible("", "KV-KV"), "known is never served unknown"
+    assert not cache_layout_compatible("KV-KV", ""), "unknown is not provably known"
+    assert not cache_layout_compatible("KV-KV", "CacheList-ArraysCache-KV")
+
+
+def test_fingerprint_identity_includes_cache_layout():
+    # identity_compatible is the single matching relation every store/index
+    # site uses; a layout difference must break it on its own.
+    base = Fingerprint("m", "t", "f16", 1)
+    assert identity_compatible(base, Fingerprint("m", "t", "f16", 1))
+    hybrid = Fingerprint("m", "t", "f16", 1, cache_layout="CacheList-ArraysCache-KV")
+    assert not identity_compatible(base, hybrid)
+    assert not identity_compatible(hybrid, base)
+    assert identity_compatible(hybrid, hybrid)
+
+
+def test_store_never_cross_serves_cache_layouts(tmp_path):
+    # End-to-end through the store: a dense blob must not answer a hybrid
+    # request, and vice versa, even at the same engine/tokens.
+    s = Store(tmp_path, byte_budget=0)
+    ref = s.put("mlx-lm", DENSE, [1, 2, 3], b"dense")
+    assert s.lookup("mlx-lm", DENSE, [1, 2, 3, 4]) == (3, ref)
+    assert s.lookup("mlx-lm", HYBRID, [1, 2, 3, 4]) == (0, None)
+    # Legacy-to-legacy: an unrecorded blob serves an unrecorded request only.
+    legacy = Fingerprint("golden-model", "golden-tok", "f16", 1)
+    s.put("mlx-lm", legacy, [5, 6], b"legacy")
+    assert s.lookup("mlx-lm", legacy, [5, 6, 7])[0] == 2
+    assert s.lookup("mlx-lm", DENSE, [5, 6, 7]) == (0, None)
 
 
 # --- store semantics --------------------------------------------------------
