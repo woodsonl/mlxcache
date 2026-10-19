@@ -147,7 +147,9 @@ Registers `MLXCACHE_ENGINE=qwen4-exp`. Mirrors `MlxLmEngine`'s surface exactly
 (`tokenize`, `prefill`, `generate_with_text`, `stream`, `prepare_stream`,
 `stream_prepared`, `kv_dtype`, `tokenizer_hash`, `kv_bits`, `kv_group_size`,
 `engine_id`, `cache_layout`) so the daemon is unchanged apart from the
-engine identity it now fingerprints.
+engine identity it now fingerprints. `content_digest` is computed in the
+daemon, not the adapter: the messages are the only place media is still
+distinguishable, and token ids alone cannot tell two images apart.
 
 ### B5 — performance
 
@@ -172,6 +174,9 @@ it. `engine_id` namespaces keys (connector protocol section 4) and is now
 reported by every adapter; `cache_layout` is a signature of the model's cache
 composition, so a dense model and a hybrid model sharing a tokenizer can never
 exchange blobs.
+
+`content_digest` covers the other half of that problem: media renders as
+ordinary token ids, so the token prefix alone cannot separate two images.
 
 `cache_layout` is `mlx-lm`'s own class layout signature: the ordered tuple of
 cache entry class names, folded into a short hash. It is computed by building

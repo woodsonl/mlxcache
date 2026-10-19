@@ -104,6 +104,11 @@ Two consequences an operator sees:
   recurrent state plus the PLE token context. That is why checkpoint
   identity carries a `cache_layout` signature: a payload of one composition
   is never served to an engine that would deserialize it as another.
+- **Media needs a second identity axis.** An image tokenizes to ordinary
+  ids, so two different images at the same prompt produce the same token
+  prefix and different KV. `content_digest` records the request's non-text
+  content and is compared exactly, so image A's checkpoint is never served
+  to image B. Text-only requests carry no digest and keep their old keys.
 
 `MLXCACHE_ENGINE` is read when the sidecar starts; changing it on a running
 process does nothing. From there the daemon adopts the identity the sidecar

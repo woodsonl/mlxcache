@@ -35,7 +35,7 @@ JSON header fields `[CURRENT, plus B0.2 additions marked]`:
 
 | field | type | notes |
 |---|---|---|
-| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size`, `cache_layout` `[CURRENT]`. `tokenizer_hash` is sha256 of the model's `tokenizer.json` bytes, read symlink-safely: HF-cache snapshot symlinks are followed only while the target resolves inside the model dir or its own `blobs/` storage (fail-closed otherwise, directories read as absent), and the opened file's inode is reconciled against the checked path |
+| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size`, `cache_layout`, `content_digest` `[CURRENT]`. `tokenizer_hash` is sha256 of the model's `tokenizer.json` bytes, read symlink-safely: HF-cache snapshot symlinks are followed only while the target resolves inside the model dir or its own `blobs/` storage (fail-closed otherwise, directories read as absent), and the opened file's inode is reconciled against the checked path |
 | `token_count` | u64 | cross-checked against `len(tokens)` at read `[CURRENT]` |
 | `tokens` | [u32] | the exact token-ID prefix this entry is keyed by `[CURRENT]` |
 | `format_version` | u32 | see §5 `[CURRENT]` |
@@ -57,11 +57,22 @@ and is served only legacy-to-legacy (§3.3). An engine that reports no
 engine explicitly, so default-engine headers stay byte-identical to
 pre-namespacing ones.
 
+`fingerprint.content_digest` is the identity of the request's **non-text
+content**: a sha256 over the canonicalized non-text parts of the messages
+(images today; the rule is "not a text part", so a future modality is
+covered without a per-type table). The index keys on token ids, and media
+renders as ordinary ids — every image is the same `<|image_pad|>` — so two
+different images at one prompt produce one token sequence and two different
+KV states. Without this axis one image's checkpoint would be served to the
+other. An empty digest means **no non-text content**, which is a claim
+about the request rather than a missing measurement, so the rule is exact
+equality (§3.3) and a writer that records no digest MUST omit the field.
+
 **Unknown fields**: readers MUST ignore header fields they do not
 recognize; an unknown field is never corruption. `engine_id` and
 `granularity` are additions WITHIN `format_version` 2, which writers MUST
-still emit; `cache_layout` is an addition to the fingerprint object
-(defaulted, omitted when empty). (Precedent: the T12 incident — strict
+still emit; `cache_layout` and `content_digest` are additions to the
+fingerprint object (defaulted, omitted when empty). (Precedent: the T12 incident — strict
 parsing quarantined every healthy ancestor when a newer daemon added a
 field.) `[CURRENT: blob.py _known_fields strips unknowns; Rust serde
 ignores unknown fields]`
@@ -117,6 +128,11 @@ gone raises `Unavailable(io)`.
     unrecorded-layout entry — nothing proves that payload has the shape the
     caller's engine will deserialize, and deserializing the wrong shape is
     silent wrong output, not an error;
+  - **Non-text content** `[CURRENT]`: an entry matches only when its
+  `fingerprint.content_digest` equals the caller's, exactly. Unlike cache
+  composition there is no legacy-tolerant branch: `""` asserts that the
+  prefix carries no media, so it never matches a request that does and is
+  never matched by one.
   - a request reporting `""` may be served a `""` entry, so a store written
     before compositions were recorded stays usable until the current engine
     rewrites its blobs (legacy-to-legacy only: the moment either side knows
@@ -184,19 +200,22 @@ The fold is **normative by reference and by construction**:
   AFTER `kv_group_size` and before the closing domain separator. An EMPTY
   layout contributes ZERO bytes, on the same rule as the default engine id:
   every blob whose composition is unrecorded keeps its previous key.
+- **Non-text content** `[CURRENT]`: a NON-EMPTY
+  `fingerprint.content_digest` folds as the LAST length-prefixed field,
+  after `cache_layout`. Empty contributes ZERO bytes, so text-only keys are
+  unchanged.
 
-Full order, with `?` marking the two fields that fold only when
-non-default:
+Full order, with `?` marking the fields that fold only when non-default:
 
 ```
 engine_chunks? ‖ SEP ‖ model_id ‖ tokenizer_hash ‖ kv_dtype
                        ‖ kv_layout_version ‖ kv_bits ‖ kv_group_size
-                       ‖ cache_layout?          ‖ SEP ‖ tokens
+                       ‖ cache_layout? ‖ content_digest? ‖ SEP ‖ tokens
 ```
 
 Every field is length-prefixed, so no field's bytes can be re-split across
-a boundary to alias another identity — including a `cache_layout` crafted
-to look like "previous field plus this one".
+a boundary to alias another identity — including a `cache_layout` or
+`content_digest` crafted to look like "previous field plus this one".
 
 Cross-engine `lookup` returns `matched_len = 0` by construction (the
 fingerprint check in §3.3 additionally re-verifies identity). `engine_id` is
