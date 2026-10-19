@@ -2,6 +2,59 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.2.0 — 2026-10-19
+
+### Added
+
+- **`scripts/bench_prefix.py`: the real-engine prefix-cache benchmark.**
+  Runs the W1/W1np/W2/W3 grid plus a W4 pressure sweep against the real
+  mlx-lm engine through the daemon, with cross-restart cold and warm legs,
+  and aborts (rather than reports) if any premise breaks. Premises:
+  serialization parity (the daemon's token count for our serialization of
+  the same messages must equal the trace's), served == held
+  (`prefill_from` == `matched_tokens - 1`), served <= declared (the cache
+  cannot serve reuse the traffic never offered), a trace-joined sample may
+  never lose its served meta, the W5 cross-check (the trace slice, the
+  response bodies AND the `/stats` request-counter delta must agree per
+  leg), and a disk preflight (a failed publish reads as a miss, so a full
+  disk silently zeroes the result). The shared-prefix size is CALIBRATED
+  at runtime against the real tokenizer — a guessed divisor shipped a
+  ~3,250-token prefix under a `--prefix-tokens 2000` knob and flipped a
+  headline conclusion.
+- **`docs/benchmarks.md`: the measured grid, baseline and pressure
+  results** with methodology and the guard list. Measured (Qwen2.5-7B-4bit,
+  M3 Max, calibrated ~1,975-token prefix): cross-restart warm TTFT 3.2 s →
+  0.15 s at 99.95% served; the cached path (154 ms) now beats raw
+  re-prefill (189 ms) at 2K — the earlier opposite claim was the
+  calibration artifact; under a 3-entry cap the reaper takes the longest
+  (highest-value) prefix first once pressure binds, and anchor chains
+  delay but do not prevent the loss.
+- 36 premise-guard tests in `sidecar/tests/test_bench_prefix.py` pinning
+  every failure path: corpus threading, the two-frame meta merge, the
+  usage token cross-check, exact-count trace joins, the served-required
+  premise, n/a-vs-zero reuse legs, calibration, stream deadlines, and
+  the pressure reconciliation.
+
+### Fixed
+
+- The direct baseline sends the daemon's exact serde serialization
+  through `/v1/completions` (the daemon applies no chat template — the
+  first run's templated baseline answered a different prompt and reported
+  0 tokens with TPOT that was really end-to-end minus TTFT).
+- The W5 cross-check is enforced, not decorative: a trace/response or
+  `/stats` disagreement aborts the leg; the trace join requires the
+  record count to match exactly (an over-length capture silently shifted
+  every later sample onto its predecessor's record).
+- Both stacks ride the shared `_harness.Server` readiness loop
+  (inheriting the post-probe liveness check); the model reaches the
+  sidecar through env, never interpolated into executable source;
+  daemon-arm traces use `mkstemp` names; streams run under a monotonic
+  total deadline with the server's completion-token count cross-checked.
+- Unknown workload/arm ids abort instead of silently running nothing;
+  the pressure sweep reconciles its eviction wait (a timed-out sweep with
+  a full store is tagged, never reported as a pressure result) and
+  re-checks disk headroom per arm.
+
 ## 0.1.8 — 2026-10-19
 
 - **`qwen4-exp` engine: Qwen3.8-Flash-Next served end to end**: a
