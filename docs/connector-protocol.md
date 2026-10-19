@@ -35,7 +35,7 @@ JSON header fields `[CURRENT, plus B0.2 additions marked]`:
 
 | field | type | notes |
 |---|---|---|
-| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size`, `cache_layout` `[CURRENT]` |
+| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size`, `cache_layout` `[CURRENT]`. `tokenizer_hash` is sha256 of the model's `tokenizer.json` bytes, read symlink-safely: HF-cache snapshot symlinks are followed only while the target resolves inside the model dir or its own `blobs/` storage (fail-closed otherwise, directories read as absent), and the opened file's inode is reconciled against the checked path |
 | `token_count` | u64 | cross-checked against `len(tokens)` at read `[CURRENT]` |
 | `tokens` | [u32] | the exact token-ID prefix this entry is keyed by `[CURRENT]` |
 | `format_version` | u32 | see §5 `[CURRENT]` |
