@@ -30,6 +30,11 @@ stdout. The model must be a local absolute snapshot path or a cached HF id,
 resolved BEFORE launch so the bench and the server child agree on the store
 fingerprint; the 7B-4bit default needs ~4GB and Apple Silicon.
 
+This harness measures the WRAPPER path's disk tier. It is not the prefix-
+caching benchmark: see scripts/bench_prefix.py (it lands with the
+prefix-benchmark unit of this change stack) for declared-vs-served prefix
+accounting and the cold/warm/pressure grid.
+
 Usage:
   uv run python scripts/bench_wrapper.py [--model PATH_OR_HF_ID] [--port N]
       [--max-tokens N] [--out PATH]
@@ -40,20 +45,23 @@ Env: MLXCACHE_BENCH_MODEL overrides the model default.
 from __future__ import annotations
 
 import argparse
-import contextlib
+import atexit
 import json
-import os
-import signal
-import subprocess
+import shutil
+import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = os.environ.get(
-    "MLXCACHE_BENCH_MODEL",
-    "mlx-community/Qwen2.5-7B-Instruct-4bit",  # resolved via the HF cache
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _harness import (  # noqa: E402 — path insert above
+    DEFAULT_MODEL,
+    REPO,
+    WrapperServer,
+    free_port,
+    resolve_model,
+    stats_delta,
 )
 
 TURN1 = {
@@ -65,36 +73,17 @@ TURN1 = {
 }
 
 
-def _resolve_model(raw: str) -> str:
-    """Absolute local model dir, resolved identically for the server child
-    and the gate's store lookup.
+class Server(WrapperServer):
+    """One mlxcache_serve pair, warmup-checked through a real chat call."""
 
-    The server child runs with cwd=sidecar, and mlx_lm keeps the raw --model
-    string in its cache key; the store fingerprint is built from
-    os.path.realpath of that string, so a relative path or bare HF id
-    realpaths differently in each process and the lookup never matches —
-    the gate would then read 0% skip on a working system. Pin one absolute
-    path before launch so both sides agree.
-    """
-    m = os.path.abspath(os.path.expanduser(raw))
-    if (Path(m) / "config.json").is_file():
-        return m
-    # Resolve exactly as mlx_lm would: snapshot_download honours refs/<rev>
-    # (default main), so a cache holding several revisions selects the same
-    # snapshot the server child will load. A bare glob of the snapshot dirs
-    # would sort by commit hash — unrelated to the revision fetched.
-    try:
-        from huggingface_hub import snapshot_download
-
-        snap = snapshot_download(raw, local_files_only=True)
-        if (Path(snap) / "config.json").is_file():
-            return snap
-    except Exception:  # noqa: BLE001 — falls through to the clean SystemExit
-        pass
-    raise SystemExit(
-        f"model {raw!r} is neither a local dir nor a cached HF snapshot; "
-        "pass an absolute snapshot path or set MLXCACHE_BENCH_MODEL"
-    )
+    def __init__(self, store_dir: str, model: str, port: int):
+        super().__init__(
+            store_dir,
+            model,
+            port,
+            log_prefix="mlxcache-bench-srv-",
+            warmup="chat",
+        )
 
 
 # Turn 2 GROWS the conversation: the request stream extends turn 1's stored
@@ -112,149 +101,6 @@ def turn2_body(resp_a: str, max_tokens: int) -> dict:
         "temperature": 0.0,
         "max_tokens": max_tokens,
     }
-
-
-def _free_port() -> int:
-    import socket
-
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-class Server:
-    """One mlxcache_serve pair (wrapper spawns mlx_lm.server in-process)."""
-
-    def __init__(self, store_dir: str, model: str, port: int):
-        # Log to a FILE, never a PIPE: a child that writes more than the
-        # 64KB pipe buffer before stop() (an HF download's tqdm, a startup
-        # traceback) would block forever on a full pipe and wedge mid-startup.
-        fd, log_path = tempfile.mkstemp(prefix="mlxcache-bench-srv-", suffix=".log")
-        self.log_path = Path(log_path)
-        self.log_fh = os.fdopen(fd, "w")
-        try:
-            self.proc = subprocess.Popen(
-                [
-                    str(REPO / ".venv/bin/python"),
-                    "-m",
-                    "mlxcache_serve",
-                    "--store-dir",
-                    store_dir,
-                    "--model",
-                    model,
-                    "--port",
-                    str(port),
-                    "--log-level",
-                    "ERROR",
-                ],
-                cwd=str(REPO / "sidecar"),
-                stdout=self.log_fh,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        except Exception:
-            # A failed spawn would otherwise leak the fd and the temp file.
-            with contextlib.suppress(Exception):
-                self.log_fh.close()
-            with contextlib.suppress(Exception):
-                self.log_path.unlink()
-            raise
-        self.port = port
-        self.base = f"http://127.0.0.1:{port}"
-
-    def _log_tail(self) -> str:
-        # Best effort: the child holds its own fd, so only what it has
-        # flushed to the OS is visible here.
-        with contextlib.suppress(Exception):
-            self.log_fh.flush()
-            return self.log_path.read_text()[-2000:]
-        return "(log unreadable)"
-
-    def stats(self) -> dict:
-        """GET /mlxcache/stats: the live cache's reuse counters. This is the
-        only signal that the disk tier SERVED a request — response equality
-        at temperature 0 cannot distinguish a disk resume from a full
-        prefill."""
-        with urllib.request.urlopen(f"{self.base}/mlxcache/stats", timeout=10) as r:
-            return json.loads(r.read())
-
-    def wait_ready(self, timeout_s: float = 180.0) -> None:
-        deadline = time.time() + timeout_s
-        last_err: str | None = None
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"wrapper exited early:\n{self._log_tail()}")
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            try:
-                with urllib.request.urlopen(f"{self.base}/health", timeout=2) as r:
-                    if r.status != 200:
-                        time.sleep(1.0)
-                        continue
-            except Exception:
-                time.sleep(1.0)
-                continue
-            # The port binds before the lazy model load, so /health alone
-            # proves nothing. A 1-token warmup forces the load; the timeout
-            # is bounded by the readiness deadline so a hung request cannot
-            # outlive it. A warmup that fails (connection reset mid-load, or
-            # a 5xx) means NOT ready yet: retry until the deadline rather
-            # than crashing or reading a broken server as ready.
-            try:
-                self.chat(
-                    {
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "max_tokens": 1,
-                        "temperature": 0.0,
-                    },
-                    timeout=max(1.0, min(remaining, 30.0)),
-                )
-                return
-            except Exception as exc:
-                last_err = repr(exc)
-                time.sleep(1.0)
-        raise RuntimeError(
-            f"wrapper never became healthy (last warmup error: {last_err}):\n{self._log_tail()}"
-        )
-
-    def chat(self, body: dict, timeout: float = 600) -> tuple[float, str]:
-        """POST /v1/chat/completions (non-stream). Returns (wall_ms, text).
-        Raises on non-2xx so callers cannot mistake an error for a result."""
-        data = json.dumps(body).encode()
-        req = urllib.request.Request(
-            f"{self.base}/v1/chat/completions",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        t0 = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            payload = json.loads(r.read())
-        wall = (time.perf_counter() - t0) * 1000
-        return wall, payload["choices"][0]["message"]["content"]
-
-    def stop(self) -> None:
-        if self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                # A reaped child is not guaranteed after SIGKILL; a raise
-                # here would skip the close/unlink below and re-leak the log.
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    self.proc.wait(timeout=10)
-        with contextlib.suppress(Exception):
-            self.log_fh.close()
-        with contextlib.suppress(Exception):
-            self.log_path.unlink()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.stop()
-        return False
 
 
 def _leg_result(name, wall_ms, text, baseline, extra=None):
@@ -289,10 +135,13 @@ def _fp_for(model: str):
     return default_fingerprint_for((model, None, None))
 
 
-def _gate_ok(results, skip_pct, observed_hits) -> tuple[bool, list[str]]:
+def _gate_ok(results, skip_pct, observed_hits, reuse_errors=None) -> tuple[bool, list[str]]:
     """The acceptance predicate. Returns (ok, reasons). A reusable blob
     is not reuse: the disk legs must have OBSERVED a disk hit, so a store
-    that is populated but never read cannot pass."""
+    that is populated but never read cannot pass. The hits are DELTAS across
+    each measured leg (the counters are process-cumulative and the warmup
+    probe can itself hit the disk tier), and a leg that logged reuse errors
+    fails even when its hit count is positive."""
     reasons = []
     bad = [r["leg"] for r in results if r["verdict"] != "token-identical"]
     if bad:
@@ -302,23 +151,37 @@ def _gate_ok(results, skip_pct, observed_hits) -> tuple[bool, list[str]]:
     reused = all(v is not None and v > 0 for v in observed_hits.values())
     if not reused:
         reasons.append(f"disk tier not observed serving (disk_hits={observed_hits})")
+    errored = {k: v for k, v in (reuse_errors or {}).items() if v}
+    if errored:
+        reasons.append(f"reuse errors on measured legs: {errored}")
     return (not reasons), reasons
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=DEFAULT_MODEL)
-    ap.add_argument("--port", type=int, default=_free_port())
+    ap.add_argument("--port", type=int, default=free_port())
     ap.add_argument("--max-tokens", type=int, default=24)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    model = _resolve_model(args.model)
+    model = resolve_model(args.model)
+    if args.port == 0:
+        # A literal 0 would be passed to the child, which then binds a
+        # kernel-assigned port while we probe 127.0.0.1:0 until the 180s
+        # deadline; pick the port here instead.
+        args.port = free_port()
     TURN1["max_tokens"] = args.max_tokens
 
     print(f"model: {model}")
 
     results: list[dict] = []
     tmp = tempfile.mkdtemp(prefix="mlxcache-bench-")
+    # The store holds GB-scale checkpoints at real-model sizes; strand it in
+    # $TMPDIR on every run and the machine eventually fills the volume the
+    # harness itself needs. atexit covers normal return, SystemExit and
+    # KeyboardInterrupt; a SIGTERM/SIGKILL mid-run still strands the dir —
+    # the known, accepted limit of this cleanup.
+    atexit.register(shutil.rmtree, tmp, True)
     store_dir = str(Path(tmp) / "store")
 
     # ---- one server serves turn 1 (cold + warm) AND the memory turn-2
@@ -342,31 +205,15 @@ def main() -> int:
     finally:
         srv.stop()
 
-    # ---- restart turn 2 (fresh process, SAME store): the request stream
-    # extends the persisted turn-1 stream, so the disk tier should cover the
-    # whole first exchange minus one position (§3.2). Compared against the
-    # MEMORY reference.
-    with Server(store_dir, model, args.port) as srv2:
-        srv2.wait_ready()
-        wall_re, text_re = srv2.chat(body2)
-        restart_stats = srv2.stats()
-        results.append(_leg_result("restart-turn2", wall_re, text_re, baseline2, restart_stats))
-
-    # ---- second process (another pair, SAME store): determinism ----------
-    with Server(store_dir, model, args.port) as srv3:
-        srv3.wait_ready()
-        wall_2nd, text_2nd = srv3.chat(body2)
-        second_stats = srv3.stats()
-        results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2, second_stats))
-
-    # ---- acceptance ------------------------------------------------------
-    # Prefill-skip, measured as WORK not wall: the restart/second legs'
-    # requests are full two-turn streams; a disk hit covers (matched-1)
-    # positions of the turn-1 prefix, so the prefill actually computed is
-    # the remainder. Coverage (how MUCH a blob holds) is read from the
-    # shared store; the disk_hits counter from /mlxcache/stats proves the
-    # server actually TOOK that blob rather than the memory twin.
+    # Snapshot the store's answer for body2 BEFORE any restart leg runs, so
+    # the lookup provably reads the turn-1 state the legs resume from (each
+    # leg publishes its own longer stream; today the index cannot match a
+    # longer entry, so ordering is belt-and-braces against future index
+    # changes, not a live self-match bug). The gate that cannot be fooled is
+    # the disk_hits DELTA below.
     from mlxcache_store import Store as _Store
+
+    _delta = stats_delta
 
     st = _Store(store_dir, byte_budget=0)
     tok = _mlxcache_tokenize(model, body2)
@@ -387,9 +234,51 @@ def main() -> int:
         )
     covered = max(matched - 1, 0)
     skip_pct = round(100 * covered / max(len(tok) - 1, 1))
+
+    # ---- restart turn 2 (fresh process, SAME store): the request stream
+    # extends the persisted turn-1 stream, so the disk tier should cover the
+    # whole first exchange minus one position (§3.2). Compared against the
+    # MEMORY reference.
+    with Server(store_dir, model, args.port) as srv2:
+        srv2.wait_ready()
+        # disk_hits is process-CUMULATIVE and the warmup itself can hit the
+        # disk tier; gate on the DELTA across the measured request, or the
+        # warmup alone could satisfy a "store was read" gate.
+        pre = srv2.stats() or {}
+        wall_re, text_re = srv2.chat(body2)
+        post = srv2.stats() or {}
+        restart_stats = {
+            "disk_hits": _delta(pre, post, "disk_hits"),
+            "reuse_errors": _delta(pre, post, "reuse_errors"),
+        }
+        results.append(_leg_result("restart-turn2", wall_re, text_re, baseline2, restart_stats))
+
+    # ---- second process (another pair, SAME store): determinism ----------
+    with Server(store_dir, model, args.port) as srv3:
+        srv3.wait_ready()
+        pre = srv3.stats() or {}
+        wall_2nd, text_2nd = srv3.chat(body2)
+        post = srv3.stats() or {}
+        second_stats = {
+            "disk_hits": _delta(pre, post, "disk_hits"),
+            "reuse_errors": _delta(pre, post, "reuse_errors"),
+        }
+        results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2, second_stats))
+
+    # ---- acceptance ------------------------------------------------------
+    # Prefill-skip, measured as WORK not wall, from the PRE-LEG snapshot
+    # above: a disk hit covers (matched-1) positions of the turn-1 prefix,
+    # so the prefill actually computed is the remainder. The disk_hits
+    # DELTAS prove the restart legs actually took a blob from disk rather
+    # than re-prefilling (at temp 0 the two are token-identical, so the
+    # token verdict alone cannot).
     observed_hits = {
-        "restart-turn2": (restart_stats or {}).get("disk_hits"),
-        "second-turn2": (second_stats or {}).get("disk_hits"),
+        "restart-turn2": restart_stats["disk_hits"],
+        "second-turn2": second_stats["disk_hits"],
+    }
+    reuse_errors = {
+        "restart-turn2": restart_stats["reuse_errors"],
+        "second-turn2": second_stats["reuse_errors"],
     }
     for r in results:
         if r["leg"] in ("restart-turn2", "second-turn2"):
@@ -398,8 +287,9 @@ def main() -> int:
             r["reused"]["disk_covered"] = covered
     # A blob existing is not reuse. At temperature 0 a full prefill and a
     # disk resume are token-identical, so the token verdict cannot prove the
-    # disk tier served anything; the counter can. Require an observed hit.
-    ok, reasons = _gate_ok(results, skip_pct, observed_hits)
+    # disk tier served anything; the delta can. Require an observed hit and
+    # zero reuse errors on the measured legs.
+    ok, reasons = _gate_ok(results, skip_pct, observed_hits, reuse_errors)
 
     out_path = args.out or str(REPO / "bench" / f"wrapper-bench-{int(time.time())}.json")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
