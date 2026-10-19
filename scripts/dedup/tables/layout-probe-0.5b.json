@@ -1,0 +1,2077 @@
+{
+ "model": "Qwen/Qwen2-0.5B-Instruct",
+ "prefix_tokens": 1500,
+ "delta_tokens": 300,
+ "comparisons": [
+  {
+   "comparison": "B vs A (pure in-memory append)",
+   "heads_exact": 48,
+   "heads_total": 96,
+   "verdict": "partial",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "10.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "10.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "11.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "11.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "12.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "12.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "13.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "13.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "14.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "14.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "15.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "15.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "16.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "16.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "17.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "17.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "18.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "18.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "19.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "19.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "2.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "2.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "20.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "20.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "21.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "21.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "22.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "22.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "23.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "23.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "3.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "3.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "4.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "4.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "5.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "5.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "6.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "6.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "7.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "7.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "8.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "8.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "9.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "9.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "C vs B (load round trip vs append)",
+   "heads_exact": 96,
+   "heads_total": 96,
+   "verdict": "exact",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "10.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "10.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "11.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "11.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "12.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "12.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "13.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "13.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "14.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "14.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "15.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "15.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "16.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "16.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "17.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "17.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "18.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "18.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "19.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "19.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "2.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "2.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "20.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "20.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "21.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "21.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "22.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "22.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "23.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "23.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "3.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "3.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "4.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "4.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "5.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "5.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "6.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "6.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "7.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "7.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "8.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "8.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "9.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "9.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "C vs A (daemon delta path, P1)",
+   "heads_exact": 48,
+   "heads_total": 96,
+   "verdict": "partial",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "10.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "10.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "11.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "11.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "12.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "12.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "13.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "13.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "14.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "14.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "15.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "15.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "16.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "16.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "17.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "17.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "18.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "18.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "19.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "19.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "2.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "2.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "20.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "20.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "21.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "21.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "22.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "22.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "23.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "23.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "3.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "3.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "4.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "4.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "5.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "5.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "6.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "6.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "7.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "7.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "8.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "8.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "9.0",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "9.1",
+     "heads": [
+      "==",
+      "diff@0"
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "D vs B (one-shot vs appended, P3)",
+   "heads_exact": 2,
+   "heads_total": 96,
+   "verdict": "partial",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "diff@195228",
+      "diff@192900"
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "diff@196374",
+      "diff@194382"
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "diff@194314",
+      "diff@194328"
+     ]
+    },
+    {
+     "tensor": "10.0",
+     "heads": [
+      "diff@192000",
+      "diff@192004"
+     ]
+    },
+    {
+     "tensor": "10.1",
+     "heads": [
+      "diff@192002",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "11.0",
+     "heads": [
+      "diff@192004",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "11.1",
+     "heads": [
+      "diff@192002",
+      "diff@192006"
+     ]
+    },
+    {
+     "tensor": "12.0",
+     "heads": [
+      "diff@192000",
+      "diff@192004"
+     ]
+    },
+    {
+     "tensor": "12.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "13.0",
+     "heads": [
+      "diff@192004",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "13.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "14.0",
+     "heads": [
+      "diff@192002",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "14.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "15.0",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "15.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "16.0",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "16.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "17.0",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "17.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "18.0",
+     "heads": [
+      "diff@192000",
+      "diff@192002"
+     ]
+    },
+    {
+     "tensor": "18.1",
+     "heads": [
+      "diff@192000",
+      "diff@192002"
+     ]
+    },
+    {
+     "tensor": "19.0",
+     "heads": [
+      "diff@192002",
+      "diff@192004"
+     ]
+    },
+    {
+     "tensor": "19.1",
+     "heads": [
+      "diff@192004",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "2.0",
+     "heads": [
+      "diff@192004",
+      "diff@192002"
+     ]
+    },
+    {
+     "tensor": "2.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "20.0",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "20.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "21.0",
+     "heads": [
+      "diff@192000",
+      "diff@192002"
+     ]
+    },
+    {
+     "tensor": "21.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "22.0",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "22.1",
+     "heads": [
+      "diff@192002",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "23.0",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "23.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "3.0",
+     "heads": [
+      "diff@192000",
+      "diff@192004"
+     ]
+    },
+    {
+     "tensor": "3.1",
+     "heads": [
+      "diff@192000",
+      "diff@192004"
+     ]
+    },
+    {
+     "tensor": "4.0",
+     "heads": [
+      "diff@192006",
+      "diff@192006"
+     ]
+    },
+    {
+     "tensor": "4.1",
+     "heads": [
+      "diff@192000",
+      "diff@192004"
+     ]
+    },
+    {
+     "tensor": "5.0",
+     "heads": [
+      "diff@192016",
+      "diff@192010"
+     ]
+    },
+    {
+     "tensor": "5.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "6.0",
+     "heads": [
+      "diff@192002",
+      "diff@192004"
+     ]
+    },
+    {
+     "tensor": "6.1",
+     "heads": [
+      "diff@192000",
+      "diff@192002"
+     ]
+    },
+    {
+     "tensor": "7.0",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "7.1",
+     "heads": [
+      "diff@192000",
+      "diff@192002"
+     ]
+    },
+    {
+     "tensor": "8.0",
+     "heads": [
+      "diff@192008",
+      "diff@192002"
+     ]
+    },
+    {
+     "tensor": "8.1",
+     "heads": [
+      "diff@192000",
+      "diff@192002"
+     ]
+    },
+    {
+     "tensor": "9.0",
+     "heads": [
+      "diff@192004",
+      "diff@192000"
+     ]
+    },
+    {
+     "tensor": "9.1",
+     "heads": [
+      "diff@192000",
+      "diff@192000"
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "E vs A (pure re-save, no compute)",
+   "heads_exact": 96,
+   "heads_total": 96,
+   "verdict": "exact",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "10.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "10.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "11.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "11.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "12.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "12.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "13.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "13.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "14.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "14.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "15.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "15.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "16.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "16.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "17.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "17.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "18.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "18.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "19.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "19.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "2.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "2.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "20.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "20.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "21.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "21.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "22.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "22.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "23.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "23.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "3.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "3.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "4.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "4.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "5.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "5.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "6.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "6.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "7.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "7.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "8.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "8.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "9.0",
+     "heads": [
+      "==",
+      "=="
+     ]
+    },
+    {
+     "tensor": "9.1",
+     "heads": [
+      "==",
+      "=="
+     ]
+    }
+   ]
+  },
+  {
+   "comparison": "E vs B head-prefix (re-save vs appended)",
+   "heads_exact": 0,
+   "heads_total": 96,
+   "verdict": "partial",
+   "detail": [
+    {
+     "tensor": "0.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "0.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "1.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "10.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "10.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "11.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "11.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "12.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "12.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "13.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "13.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "14.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "14.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "15.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "15.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "16.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "16.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "17.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "17.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "18.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "18.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "19.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "19.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "2.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "2.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "20.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "20.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "21.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "21.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "22.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "22.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "23.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "23.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "3.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "3.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "4.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "4.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "5.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "5.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "6.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "6.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "7.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "7.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "8.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "8.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "9.0",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    },
+    {
+     "tensor": "9.1",
+     "heads": [
+      "diff@192000",
+      "diff@0"
+     ]
+    }
+   ]
+  }
+ ],
+ "payload_bytes": {
+  "A": 18436459,
+  "B": 22122869,
+  "C": 22122869,
+  "D": 22122869
+ }
+}
