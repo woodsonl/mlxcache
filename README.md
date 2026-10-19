@@ -213,9 +213,10 @@ mlx-lm has no module for are served by their own engine instead; see
 `MLXCACHE_ENGINE=qwen4-exp` serves a local `Qwen3.8-Flash-Next` NVFP4
 checkpoint (132.6 GB on disk) on one Apple Silicon machine through the same
 daemon, protocol, and store as mlx-lm. The engine is self-contained: the
-architecture port, the NVFP4 weight reader, the vision tower, the
-multi-token-prediction head, and the PLE n-gram embedding table all live in
-this repo, and nothing depends on another repository.
+architecture port, the NVFP4 weight reader, and the PLE n-gram embedding
+table all live in this repo, and nothing depends on another repository. The
+checkpoint's bundled vision tower and MTP head are out of scope: neither
+contributes cache state.
 
 ```bash
 MLXCACHE_ENGINE=qwen4-exp \

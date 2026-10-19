@@ -89,8 +89,6 @@ def tiny_config_dict() -> dict:
         "indexer_head_dim": 16,
         "indexer_budget": 8,
         "indexer_compress_ratio": 4,
-        "mtp_num_hidden_layers": 1,
-        "mtp": {"num_hidden_layers": 1, "layer_types": ["full_attention"]},
         "eos_token_id": 127,
         "bos_token_id": 1,
     }
@@ -99,7 +97,7 @@ def tiny_config_dict() -> dict:
 class RandomWeightSource:
     """Deterministic in-memory stand-in for the checkpoint reader.
 
-    Shapes come from the model's own tables (`weight_shapes`, `mtp_weight_shapes`),
+    Shapes come from the model's own table (`weight_shapes`),
     so the fixture cannot drift from the architecture: a name the model asks for
     that the tables do not describe is a test failure, not a silent zero. Values
     are seeded per name so two sources built from the same config agree bit for
@@ -107,7 +105,7 @@ class RandomWeightSource:
 
     Three encodings are reproduced because the model depends on each:
 
-    - MTP routed experts: `uint8` fp8 payload plus a bf16 `weight_scale_inv`
+    - fp8 tensors: `uint8` payload plus a bf16 `weight_scale_inv`
       grid, so the dequantization path runs.
     - PLE n-gram shards: rows served through `get_slice`, the way a 51 GiB table
       is actually read.
@@ -140,7 +138,7 @@ class RandomWeightSource:
         if name.endswith("dt_bias"):
             return mx.ones(shape)
         if ".mlp.experts." in name and name.endswith(".weight"):
-            # Every routed expert, main model or MTP, arrives already
+            # Every routed expert arrives already
             # dequantized: the loader applies nvfp4 or fp8 block scales itself
             # and `get` returns bf16 either way. Handing back a raw fp8 payload
             # here would let the model believe it must dequantize again, which
@@ -185,24 +183,20 @@ class RandomWeightSource:
 @pytest.fixture(scope="module")
 def bundle():
     import mlx.core as mx
-    from mlxcache_qwen4 import Qwen4MTPModel, Qwen4TextConfig, Qwen4TextModel
-    from mlxcache_qwen4.model import mtp_weight_shapes, weight_shapes
+    from mlxcache_qwen4 import Qwen4TextConfig, Qwen4TextModel
+    from mlxcache_qwen4.model import weight_shapes
 
     config = Qwen4TextConfig.from_checkpoint(tiny_config_dict())
     shapes = weight_shapes(config)
-    mtp_shapes = mtp_weight_shapes(config)
-    source = RandomWeightSource(config, {**shapes, **mtp_shapes})
+    source = RandomWeightSource(config, shapes)
     mx.random.seed(7)
     model = Qwen4TextModel(config, source)
-    mtp = Qwen4MTPModel(config, source)
-    mx.eval(model.parameters(), mtp.parameters())
+    mx.eval(model.parameters())
     return {
         "config": config,
         "model": model,
-        "mtp": mtp,
         "source": source,
         "shapes": shapes,
-        "mtp_shapes": mtp_shapes,
     }
 
 
@@ -245,9 +239,9 @@ def test_forward_shape_and_determinism(bundle):
 
     # Every name the model asked for is one the table describes, with that shape.
     requested = {name for name, _ in source.calls}
-    assert requested <= set(bundle["shapes"]) | set(bundle["mtp_shapes"])
+    assert requested <= set(bundle["shapes"])
     for name, shape in source.calls:
-        expected = bundle["shapes"].get(name, bundle["mtp_shapes"].get(name))
+        expected = bundle["shapes"].get(name)
         if isinstance(shape, tuple):
             assert shape == expected, name
     assert any(".ple_embedding.ngram_embedding.shard_" in name for name, _ in source.calls)
@@ -506,35 +500,6 @@ def test_contradictory_layer_types_rejected():
     wrong_length["layer_types"] = ["linear_attention"] * 3
     with pytest.raises(ValueError, match="entries but num_hidden_layers"):
         Qwen4TextConfig.from_checkpoint(wrong_length)
-
-
-def test_mtp_forward(bundle):
-    """The MTP head runs end to end over the loader's dequantized experts.
-
-    The hidden state enters at the hyper-connected width, not at `hidden_size`:
-    the head consumes every residual stream (`pre_fc_norm_hidden` is
-    `hc_hidden_size` wide in the checkpoint), while the token embedding enters as
-    a single `hidden_size` stream.
-
-    The scale-table assertion is a guard against the head dequantizing a second
-    time. `get` already applies the fp8 block scales and returns bf16, so a head
-    that asks for `.weight_scale_inv` on its own is applying them twice; the
-    fixture used to hand back raw fp8 for MTP experts and thereby hid that.
-    """
-    import mlx.core as mx
-
-    config, head, source = bundle["config"], bundle["mtp"], bundle["source"]
-    ids = mx.array([[1, 5, 9, 17, 23]])
-    hidden = mx.random.normal((1, 5, config.hc_hidden_size)).astype(mx.bfloat16)
-    out = head(hidden, ids, cache=head.make_cache())
-    mx.eval(out)
-    assert out.shape == (1, 5, config.vocab_size)
-    assert mx.all(mx.isfinite(out))
-
-    expert_weights = [n for n, _ in source.calls if ".mlp.experts." in n and n.endswith(".weight")]
-    assert expert_weights, "the MTP layer must route to its experts"
-    scaled = [n for n, _ in source.calls if n.endswith(".weight_scale_inv")]
-    assert not scaled, f"the head dequantized what the loader already dequantized: {scaled[:2]}"
 
 
 def _real_config():

@@ -26,9 +26,8 @@ LAYER_PREFIX = "model.language_model.layers"
 EMBED_NAME = "model.language_model.embed_tokens.weight"
 LM_HEAD_NAME = "lm_head.weight"
 MIXER_PREFIX = "model.language_model.hyper_connection_mixer"
-MTP_PREFIX = "mtp"
 
-# QSA block scales are stored in 128x128 blocks for the fp8 MTP experts.
+# QSA block scales are stored in 128x128 blocks for the fp8 PLE shards.
 FP8_BLOCK = 128
 
 # Query rows the indexer processes per vectorised step. Keeps the gathered
@@ -1133,15 +1132,8 @@ class Qwen4TextModel(nn.Module):
         input_ids: mx.array,
         cache: list[Any] | None = None,
         position_ids: mx.array | None = None,
-        return_hidden: bool = False,
     ) -> mx.array:
-        """Logits, or `(logits, hidden)` when `return_hidden`.
-
-        The MTP head conditions on the stack's final hidden state, and that
-        state is only reachable from inside this forward pass: the mixer
-        collapses it into the logits, so a caller that only got logits would
-        have to rebuild the whole stack to recover it.
-        """
+        """Next-token logits for `input_ids`, advancing `cache` in place."""
         ids = input_ids.astype(mx.int32)
         batch, seq_len = ids.shape
         if cache is None:
@@ -1165,13 +1157,7 @@ class Qwen4TextModel(nn.Module):
             hidden = layer(hidden, self.rope, position_ids, mask, layer_cache, ids)
 
         mixed = self.mixer(hidden)[0]
-        logits = _linear(mixed, self.lm_head)
-        if return_hidden:
-            # The WIDE pre-mixer state, not `mixed`: the MTP head normalises it
-            # at `hc_hidden_size` and averages the streams itself, so handing it
-            # the collapsed vector would double-reduce and mismatch its norm.
-            return logits, hidden
-        return logits
+        return _linear(mixed, self.lm_head)
 
     # ------------------------------------------------------------- weight table
 
@@ -1381,175 +1367,4 @@ def stored_weight_shapes(config: Qwen4TextConfig) -> dict[str, tuple[int, ...]]:
             stored[f"{LAYER_PREFIX}.{index}.mlp.switch_mlp.{projection}.global_scale"] = (
                 config.num_experts,
             )
-    # MTP experts are fp8 with 128x128 block scales; they carry no global scale.
-    stored.update(mtp_weight_shapes(config))
     return stored
-
-
-class Qwen4MTPModel(nn.Module):
-    """Multi-token-prediction head: one full-attention layer over a mixed input.
-
-    The head conditions on the target hidden state and the embedding of the token
-    that follows it: both are normalised, projected to `hidden_size`, summed,
-    expanded back to the hyper-connected width, run through one stack layer, and
-    finally mixed down by the same stream mixer the text stack ends with.
-
-    The two entry points are deliberately different widths, and the checkpoint
-    makes that explicit: `pre_fc_norm_embedding` is `hidden_size` (an embedding is
-    one stream) while `pre_fc_norm_hidden` is `hc_hidden_size` (the hidden state
-    carries every residual stream, normalised with the same grouped RMSNorm the
-    stack layers use). The head holds no weight at the hyper-connected width other
-    than `hyper_connection_mixer`, and that one is the final reduction, so the
-    stream collapse before `fc_hidden` is an unweighted mean. Every stored tensor
-    is therefore read exactly once, and `fc_hidden`/`fc_embedding` split a single
-    `2 * hidden_size -> hidden_size` fusion into its two halves.
-
-    The transformers reference ignores `mtp.*` entirely
-    (`_keys_to_ignore_on_load_unexpected`), so there is no forward pass to port and
-    the ordering above is a reading of the stored shapes rather than a port.
-
-    Routed experts are 128x128 block-scaled fp8 rather than the main model's
-    NVFP4. That difference is the loader's business, not the head's: `get`
-    returns a dequantized matrix for both, applying the block scales it reads
-    from the `.weight_scale_inv` companion. Dequantizing again here would apply
-    the scales twice, so the head requests experts exactly like the text stack
-    does.
-    """
-
-    def __init__(self, config: Qwen4TextConfig, weights: WeightSource):
-        super().__init__()
-        self.config = config
-        self.hc_count = config.hc_count
-        self.weights = weights
-        self.fc_embedding = weights.get(f"{MTP_PREFIX}.fc_embedding.weight")
-        self.fc_hidden = weights.get(f"{MTP_PREFIX}.fc_hidden.weight")
-        self.pre_norm_embedding = Qwen4RMSNorm(
-            weights,
-            f"{MTP_PREFIX}.pre_fc_norm_embedding.weight",
-            config.rms_norm_eps,
-            config.hidden_size,
-        )
-        self.pre_norm_hidden = Qwen4RMSNorm(
-            weights,
-            f"{MTP_PREFIX}.pre_fc_norm_hidden.weight",
-            config.rms_norm_eps,
-            config.hidden_size,
-        )
-        self.rope = Qwen4RotaryEmbedding(config)
-        self.layers = [
-            Qwen4MTPDecoderLayer(config, weights, index, f"{MTP_PREFIX}.layers.{index}")
-            for index in range(config.mtp_num_hidden_layers)
-        ]
-        self.mixer = Qwen4GatedResidual(
-            config, weights, f"{MTP_PREFIX}.hyper_connection_mixer", use_combine=False
-        )
-
-    def make_cache(self) -> list[Any]:
-        return self.layers[0].make_cache()
-
-    def __call__(
-        self,
-        hidden: mx.array,
-        input_ids: mx.array,
-        cache: list[Any] | None = None,
-        position_ids: mx.array | None = None,
-    ) -> mx.array:
-        batch, seq_len, _ = hidden.shape
-        ids = input_ids.astype(mx.int32)
-        embed = mx.take(self.weights.get(EMBED_NAME), ids.reshape(-1), axis=0)
-        embed = embed.reshape(batch, seq_len, -1)
-        normed = self.pre_norm_hidden(hidden)
-        per_stream = normed.reshape(batch, seq_len, self.hc_count, self.config.hidden_size)
-        reduced = mx.mean(per_stream, axis=-2)
-        fused = _linear(reduced, self.fc_hidden) + _linear(
-            self.pre_norm_embedding(embed), self.fc_embedding
-        )
-        streams = mx.tile(fused, (1, 1, self.hc_count))
-        if cache is None:
-            cache = self.make_cache()
-        if position_ids is None:
-            offset = _cache_offset(cache)
-            position_ids = mx.broadcast_to(
-                mx.arange(offset, offset + seq_len)[None, None, :], (3, batch, seq_len)
-            )
-        mask = _causal_mask(seq_len, _cache_offset(cache) + seq_len)
-        mask = mx.broadcast_to(mask[None, None], (batch, 1, seq_len, mask.shape[1]))
-        for layer, layer_cache in zip(self.layers, cache, strict=True):
-            streams = layer(streams, self.rope, position_ids, mask, layer_cache)
-        head = self.mixer(streams)[0]
-        return _linear(head, self.weights.get(LM_HEAD_NAME))
-
-
-class Qwen4MTPDecoderLayer(nn.Module):
-    """MTP layer: full attention plus MoE, both wrapped in hyper-connections."""
-
-    def __init__(self, config: Qwen4TextConfig, weights: WeightSource, layer_idx: int, prefix: str):
-        super().__init__()
-        self.hc_count = config.hc_count
-        self.self_attn = Qwen4Attention(config, weights, f"{prefix}.self_attn")
-        self.mlp = Qwen4SparseMoeBlock(config, weights, f"{prefix}.mlp")
-        self.attn_hyper = Qwen4GatedResidual(config, weights, f"{prefix}.attn_hyper_connection")
-        self.mlp_hyper = Qwen4GatedResidual(config, weights, f"{prefix}.mlp_hyper_connection")
-
-    def make_cache(self) -> Any:
-        keys = ArraysCache(size=1)
-        keys[0] = mx.zeros((1, 0, self.self_attn.indexer.head_dim), dtype=mx.bfloat16)
-        return [CacheList(KVCache(), keys)]
-
-    def __call__(
-        self,
-        hidden: mx.array,
-        rope: Qwen4RotaryEmbedding,
-        position_ids: mx.array,
-        mask: mx.array,
-        cache: Any,
-    ) -> mx.array:
-        streams, hyper, inject = self.attn_hyper(hidden)
-        out = self.self_attn(streams, rope, position_ids, mask, cache)
-        hidden = _inject(hyper, out, inject, self.hc_count)
-        streams, hyper, inject = self.mlp_hyper(hidden)
-        return _inject(hyper, self.mlp(streams), inject, self.hc_count)
-
-
-def mtp_weight_shapes(config: Qwen4TextConfig) -> dict[str, tuple[int, ...]]:
-    """Stored shapes of the MTP head, including its fp8 block scales."""
-    hidden = config.hidden_size
-    inter = config.moe_intermediate_size
-    shapes: dict[str, tuple[int, ...]] = {
-        f"{MTP_PREFIX}.fc_embedding.weight": (hidden, hidden),
-        f"{MTP_PREFIX}.fc_hidden.weight": (hidden, hidden),
-        f"{MTP_PREFIX}.pre_fc_norm_embedding.weight": (hidden,),
-        f"{MTP_PREFIX}.pre_fc_norm_hidden.weight": (config.hc_hidden_size,),
-    }
-    shapes.update(
-        {
-            f"{MTP_PREFIX}.hyper_connection_mixer.{name}": shape
-            for name, shape in _hyper_shapes(config, False).items()
-        }
-    )
-    for index in range(config.mtp_num_hidden_layers):
-        prefix = f"{MTP_PREFIX}.layers.{index}"
-        for name, shape in _attn_shapes(config).items():
-            shapes[f"{prefix}.{name}"] = shape
-        shapes[f"{prefix}.mlp.gate.weight"] = (config.num_experts, hidden)
-        shared = config.shared_expert_intermediate_size
-        shapes[f"{prefix}.mlp.shared_expert.gate_proj.weight"] = (shared, hidden)
-        shapes[f"{prefix}.mlp.shared_expert.up_proj.weight"] = (shared, hidden)
-        shapes[f"{prefix}.mlp.shared_expert.down_proj.weight"] = (hidden, shared)
-        shapes[f"{prefix}.mlp.shared_expert_gate.weight"] = (1, hidden)
-        blocks = (FP8_BLOCK, FP8_BLOCK)
-        for expert in range(config.num_experts):
-            for name, shape in (
-                ("gate_proj", (inter, hidden)),
-                ("up_proj", (inter, hidden)),
-                ("down_proj", (hidden, inter)),
-            ):
-                shapes[f"{prefix}.mlp.experts.{expert}.{name}.weight"] = shape
-                shapes[f"{prefix}.mlp.experts.{expert}.{name}.weight_scale_inv"] = (
-                    -(-shape[0] // blocks[0]),
-                    -(-shape[1] // blocks[1]),
-                )
-        for name, shape in _hyper_shapes(config, True).items():
-            shapes[f"{prefix}.attn_hyper_connection.{name}"] = shape
-            shapes[f"{prefix}.mlp_hyper_connection.{name}"] = shape
-    return shapes

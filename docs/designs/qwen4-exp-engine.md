@@ -5,11 +5,20 @@ the engine: architecture port, weight loader, adapter, and cache integration.
 
 ## Scope
 
-mlxcache serves `nvidia/Qwen3.8-Flash-Next-NVFP4` end to end on one Apple
-Silicon machine: text and image input, prefill, generation, persistent KV
-checkpoints, delta resume, and MTP draft-based decoding. No dependency on any
-other repository: the weight reader, the architecture, the vision tower, the
-multi-token-prediction head and the n-gram embedding table all live here.
+mlxcache serves `nvidia/Qwen3.8-Flash-Next-NVFP4` text input end to end on one
+Apple Silicon machine: prefill, generation, persistent KV checkpoints, and
+delta resume. No dependency on any other repository: the weight reader, the
+architecture, and the n-gram embedding table all live here.
+
+Scope boundary: the checkpoint also bundles a multi-token-prediction head
+(`mtp.*`, 3,101 tensors) and a vision tower (`model.visual.*`, 333 tensors).
+Neither contributes cache state — `weight_shapes()` enumerates 74,926 text
+tensors and zero of either family — so neither is required to cache this model
+correctly, and neither is implemented on this branch. The cache composition
+(`make_cache()`) lives in the model, so a checkpoint that serves images
+composes its own cache here with no change to the daemon, the wire format, or
+the key. Adding either back is a feature decision with its own justification,
+not a caching prerequisite.
 
 Reference implementation: `transformers` `qwen4_exp` (Apache-2.0), read as the
 authority for forward semantics. MLX has no implementation; this port is
@@ -19,8 +28,8 @@ reference numerically where a comparison is possible.
 ## The checkpoint
 
 `config.json` is a `Qwen4ExpConfig` wrapper; the language model is under
-`text_config` (`Qwen4ExpTextConfig`, `model_type: qwen4_exp_text`), and the
-vision tower under `vision_config`.
+`text_config` (`Qwen4ExpTextConfig`, `model_type: qwen4_exp_text`). The
+wrapper's `vision_config` block is not read.
 
 Stored bytes, measured by `sidecar/probes/qwen4_inventory.py`: 132.6 GB.
 

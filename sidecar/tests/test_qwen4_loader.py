@@ -135,8 +135,9 @@ def _build_checkpoint(root: Path) -> dict[str, object]:
     truth["model.language_model.embed_tokens.weight"] = embedding
     truth[f"{prefix}.mlp.shared_expert.gate_proj.weight"] = shared
 
-    # FP8 expert weights with [8, 8]-blocked scale_inv, as the checkpoint's
-    # mtp experts use (block 128 on the real tensors; geometry scales down).
+    # FP8 expert weights with [8, 8]-blocked scale_inv. The loader dispatches
+    # dequantization on stored dtype, so this path must hold for any future
+    # fp8 expert family, not just the one the current checkpoint ships.
     # The payload is stored normalised so each block's amax hits the e4m3
     # maximum (448) and scale_inv carries the magnitude, which is what the real
     # blocks do -- measured amax 448.0 for every block under that layout.
@@ -151,7 +152,7 @@ def _build_checkpoint(root: Path) -> dict[str, object]:
             mx.repeat(scale_inv.astype(mx.float32), block_rows, axis=0), block_cols, axis=1
         )
         fp8 = mx.to_fp8(weight / wide).view(mx.uint8)
-        name = f"mtp.layers.0.mlp.experts.0.{proj}.weight"
+        name = f"model.language_model.layers.3.mlp.experts.0.{proj}.weight"
         out[name] = ("F8_E4M3", fp8.shape, _u8_bytes(fp8))
         out[name.replace(".weight", ".weight_scale_inv")] = (
             "BF16",
@@ -313,7 +314,7 @@ def test_get_slice_matches_full_tensor_rows(synthetic):
     for name in (
         "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
         "model.language_model.layers.0.mlp.experts.1.down_proj.weight",
-        "mtp.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.language_model.layers.3.mlp.experts.0.gate_proj.weight",
     ):
         full = loader.get(name)
         sliced = loader.get_slice(name, slice(3, 9))
@@ -449,7 +450,10 @@ def test_classify_names(synthetic):
     from mlxcache_qwen4.loader import classify
 
     assert classify("model.language_model.layers.0.mlp.experts.0.gate_proj.weight") == "expert"
-    assert classify("mtp.layers.0.mlp.experts.7.down_proj.weight_scale_inv") == "expert"
+    assert (
+        classify("model.language_model.layers.3.mlp.experts.7.down_proj.weight_scale_inv")
+        == "expert"
+    )
     assert (
         classify("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_5.weight")
         == "ple"
@@ -527,7 +531,7 @@ def test_fp8_block_scale_layout(synthetic):
 
     root, truth = synthetic
     loader = _loader(root)
-    name = "mtp.layers.0.mlp.experts.0.gate_proj.weight"
+    name = "model.language_model.layers.3.mlp.experts.0.gate_proj.weight"
     got = loader.get(name).astype(mx.float32)
     want = truth[name]
     rel = float(mx.sqrt(mx.mean((got - want) ** 2)) / mx.sqrt(mx.mean(want**2)))

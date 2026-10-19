@@ -39,19 +39,17 @@ unpack of the nibbles decoded as E2M1 times the expanded e4m3 group scale
 times ``weight_scale_2`` reproduces mlx's ``global_scale`` output to a
 relative error of 9.5e-4, so the two descriptions are the same weights.
 
-FP8 (``mtp.layers.N.mlp.experts.E.*`` and any ``*_scale_inv`` pair)::
+FP8 (any ``*_scale_inv`` pair)::
 
     out = mx.from_fp8(weight_bytes, float32) * expand(weight_scale_inv)
 
 The block layout was determined by measuring, for every (out, in) block, the
 largest FP8 magnitude inside it. With ``weight_scale_inv`` read as shaped
-(``[out/128, in/128]`` here) every block of every projection of mtp experts
-0 and 5 has amax exactly 448.0 -- the E4M3 maximum, i.e. each block is
-normalised to fill its range. The transposed reading yields uneven block
-amax (240.0..448.0 for the same tensors), so "read the scale as shaped and
-expand by ``out/s0`` rows and ``in/s1`` columns" is the correct layout.
-Sanity: mtp expert/shared mean|w| ratios are 1.77 / 1.54 / 1.27 for
-gate/up/down, again order 1.
+(``[out/128, in/128]`` here) every block of every projection has amax exactly
+448.0 -- the E4M3 maximum, i.e. each block is normalised to fill its range.
+The transposed reading yields uneven block amax (240.0..448.0 for the same
+tensors), so "read the scale as shaped and expand by ``out/s0`` rows and
+``in/s1`` columns" is the correct layout.
 
 PLE n-gram tables (``...ple_embedding.ngram_embedding.shard_{0..127}.weight``,
 F8_E4M3 ``[2500012, 160]``, 320001536 rows over 128 shards)::
@@ -67,11 +65,11 @@ costs 480 bytes rather than a 400 MB shard.
 
 Residency classes
 -----------------
-``resident`` -- non-expert weights (embed_tokens, lm_head, attention, MTP
-singletons, vision, PLE scalars): 9.4 GiB for the whole set, read on demand
-and kept decoded, one tensor at a time.
-``expert`` -- routed NVFP4 experts and FP8 MTP experts: decoded on demand,
-optionally cached in an LRU holding N experts per layer.
+``resident`` -- non-expert weights (embed_tokens, lm_head, attention,
+PLE scalars): 9.4 GiB for the whole set, read on demand and kept decoded,
+one tensor at a time.
+``expert`` -- routed NVFP4 experts: decoded on demand, optionally cached in
+an LRU holding N experts per layer.
 ``ple`` -- the 128 n-gram shard tables: serially row-addressed, cached by
 row range under a byte budget.
 ``stream`` -- a 2-D tensor larger than the resident ceiling: addressable
@@ -266,9 +264,9 @@ class CheckpointLoader:
         """
         if self.expert_resident_n == 0:
             return 0
-        # Keyed by (module prefix, expert index), not layer number alone: the MTP
-        # experts live at `mtp.layers.0.mlp.experts.N` and would otherwise be
-        # summed into text layer 0.
+        # Keyed by (module prefix, expert index), not layer number alone: two
+        # families can both have an expert 0, and a bare layer number would sum
+        # them into one budget.
         per_expert: dict[tuple[str, str], int] = {}
         for name in self._catalog.names():
             match = _EXPERT_RE.search(name)
@@ -485,7 +483,7 @@ class CheckpointLoader:
     ) -> tuple[mx.array | None, int]:
         """Per-expert global scale scalar and the bytes spent reading it."""
         layer = _LAYER_RE.search(name)
-        if proj is None or expert is None or layer is None or name.startswith("mtp."):
+        if proj is None or expert is None or layer is None:
             return None, 0
         table_name = (
             f"model.language_model.layers.{layer.group(1)}.mlp.switch_mlp.{proj}.global_scale"

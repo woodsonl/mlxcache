@@ -86,10 +86,6 @@ class Qwen4TextConfig:
     indexer_budget: int | None = 2048
     indexer_compress_ratio: int | None = 4
 
-    # MTP (multi-token prediction) head.
-    mtp_num_hidden_layers: int = 1
-    mtp_layer_types: list[str] = field(default_factory=lambda: [FULL])
-
     eos_token_id: int | list[int] | None = None
     bos_token_id: int | None = None
 
@@ -244,9 +240,7 @@ class Qwen4TextConfig:
             raise ValueError(f"unsupported model_type: {raw.get('model_type')!r}")
         rope = raw.get("rope_parameters") or {}
         partial = rope.get("partial_rotary_factor", raw.get("partial_rotary_factor", 1.0))
-        mtp = raw.get("mtp") or {}
         layer_types = raw.get("layer_types") or []
-        mtp_layers = mtp.get("layer_types") or [FULL] * int(raw.get("mtp_num_hidden_layers") or 1)
         return cls(
             vocab_size=int(raw["vocab_size"]),
             hidden_size=int(raw["hidden_size"]),
@@ -293,10 +287,6 @@ class Qwen4TextConfig:
             indexer_head_dim=_as_int(raw.get("indexer_head_dim"), None),
             indexer_budget=_as_int(raw.get("indexer_budget"), None),
             indexer_compress_ratio=_as_int(raw.get("indexer_compress_ratio"), None),
-            mtp_num_hidden_layers=int(
-                raw.get("mtp_num_hidden_layers") or mtp.get("num_hidden_layers") or 1
-            ),
-            mtp_layer_types=[_LAYER_TYPE_ALIASES.get(t, t) for t in mtp_layers],
             eos_token_id=raw.get("eos_token_id"),
             bos_token_id=raw.get("bos_token_id"),
         )

@@ -82,7 +82,7 @@ Measured checkpoint layout (132.6 GB total):
 132.6 GB total exactly.)
 
 Resident: the non-expert weights (linear attention, self attention,
-embeddings, `lm_head`, MTP head, vision tower), plus the decoded expert
+embeddings, `lm_head`), plus the decoded expert
 window and the decoded PLE rows the two knobs below bound. Streamed per
 token or per layer: expert weights (dequantized on use) and PLE rows (read
 through the shard manifest, one hash lookup per n-gram head, 24 lookups per
@@ -95,7 +95,7 @@ gated-delta-net linear-attention layers. Each layer routes to 512 experts
 top-10 plus a shared expert, carries hyper-connection residual streams, and
 the full-attention layers run an indexer ("QSA") that budgets which key
 blocks are attended. On top of the text stack sit a PLE n-gram embedding
-layer, a multi-token-prediction head, and a vision tower.
+layer. The bundled MTP head and vision tower are not loaded.
 
 Two consequences an operator sees:
 
