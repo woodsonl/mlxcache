@@ -338,6 +338,15 @@ uv run ruff check sidecar/ scripts/
 uv run ruff format --check sidecar/ scripts/
 ```
 
+Bench and QA harnesses live in `scripts/` on one shared core, `_harness.py`
+(spawn, readiness that cannot certify a server it did not start, teardown):
+`bench_workloads.py` is a plumbing check over the synthetic engine — its
+8-token "prefill" can never express prefix reuse, so its cache numbers must
+never be quoted as cache-benefit evidence; `bench_prefix.py` is the
+real-engine prefix benchmark (premise-guarded, see
+[docs/benchmarks.md](docs/benchmarks.md)); `bench_wrapper.py`/`qa_wrapper.py`
+drive the wrapper path's own gates; `replay_trace.py` scores captured traces.
+
 The real mlx-lm round-trip gate (needs a downloaded model) is opt-in:
 
 ```bash

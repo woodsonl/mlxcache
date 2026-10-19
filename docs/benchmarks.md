@@ -76,7 +76,7 @@ much text is shared. `bench_prefix.py` therefore runs W1 **both ways**:
 |---|---|---|
 | `W1` | fixed long prefix + N short changing questions, primed with one prefix-only request | best-case benefit for shared-prefix traffic |
 | `W1np` | the same traffic with **no** priming request | what an application gets without knowing the rule |
-| `W2` | shared prefix that diverges in its first few tokens | near-miss / "similar document" traffic |
+| `W2` | documents share a long opening, then diverge mid-document | near-miss / "similar document" traffic |
 | `W3` | distinct short prompts, 256-token answers | decode-bound traffic, where reuse cannot help |
 | `W4` | fixed prefix + k unrelated requests between repeats, under a tight entry cap | **does the benefit survive cache pressure?** |
 | `W5` | the captured trace of the above, scored with `scripts/replay_trace.py` | trace and `/stats` must agree |
@@ -111,13 +111,12 @@ uv run python scripts/bench_prefix.py --model /abs/path/to/snapshot \
 
 # the pressure sweep (fresh store and process per k, so it is the slow part)
 uv run python scripts/bench_prefix.py --arms pressure --k 0,1,2,4,8,16
-
-# arithmetic only, no model, no disk (runs in CI)
-uv run python scripts/bench_prefix.py --self-check
 ```
 
 Output is a markdown table plus a JSON artifact containing every per-request
-sample, the daemon `/stats` snapshot per leg, and the trace-replay cross-check.
+sample, the daemon `/stats` snapshot per leg, and the enforced trace/stats
+cross-check. The premise arithmetic itself is pinned by
+`sidecar/tests/test_bench_prefix.py` (what CI runs).
 
 ## Measured results
 
@@ -147,7 +146,7 @@ What the grid says:
 
 1. **Cross-restart reuse is real**: warm TTFT is 24–27× the cold leg (5.1–5.3 s → 0.19–0.22 s) with 99.97% of requested prefix tokens served after both processes were killed and restarted from disk. No in-process cache can do this tier at all.
 2. **TPOT is flat (~12–14 ms) cold vs warm everywhere.** Caching moves prefill, not decode; W3 exists to keep that measured rather than assumed.
-3. **Early divergence is never served**: W2's near-miss traffic gets exactly 0% cold, as the end-anchored rule requires.
+3. **Mid-document divergence is never served**: W2's near-miss traffic (a long shared opening that diverges before either document's end) gets exactly 0% cold, as the end-anchored rule requires.
 4. **Priming matters once**: W1's first question is served ~2,000 tokens because the prefix was published alone; W1np's first question gets 0. After each request publishes its own full-length key, both warm legs converge to 99.97%.
 
 ### Against a raw local engine (the honest baseline)
@@ -165,7 +164,7 @@ At a 2K-token prefix on this hardware, plain mlx_lm re-prefills the whole 3,260-
 
 ### Pressure (W4): does the benefit survive unrelated traffic?
 
-Store capped at 3 published entries, reaper every 1 s, probe = the prefix re-sent after k unrelated requests (declared reuse 3,259 of 3,259 tokens):
+Store capped at 3 published entries, reaper every 1 s, probe = the prefix re-sent after k unrelated requests (the row's `repeat_declared`/`repeat_served` artifact fields carry the exact values; `served` is always one below `declared` at the prime-anchored entry, since coverage excludes the anchoring token):
 
 | arm | k | evictions seen | probe verdict | probe served | probe TTFT (ms) |
 |---|---|---|---|---|---|
