@@ -256,8 +256,9 @@ cargo fmt --all -- --check               # formatting gate (CI fails on drift)
 cargo test --workspace                   # Rust: core, daemon, chaos, e2e
 cargo clippy --workspace --all-targets -- -D warnings
 uv run pytest sidecar/tests/             # Python: sidecar, blob codec, roundtrip
-uv run ruff check sidecar/
-uv run ruff format --check sidecar/
+uv run pytest scripts/dedup/tests/       # Dedup: measurement invariants behind REPORT.md
+uv run ruff check sidecar/ scripts/
+uv run ruff format --check sidecar/ scripts/
 ```
 
 The real mlx-lm round-trip gate (needs a downloaded model) is opt-in:
@@ -299,3 +300,6 @@ token-identical to scratch. The store is bounded by default (32 GiB eviction
 budget with anchor protection) and every checkpoint carries a sha256 payload
 digest verified at boot and first serve. The engine-agnostic contract has one
 adapter (mlx-lm). No license assigned — private build, all rights reserved.
+
+The chunk-granularity question is answered: GO, with token-block/64 as the
+v1 codec ([REPORT.md](REPORT.md)).

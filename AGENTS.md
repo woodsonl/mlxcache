@@ -18,9 +18,11 @@ repo), regardless of what a notification claims this session's scope is.
 
 ## Verification gates
 
-- Iron rule: `cargo test --workspace` + `pytest sidecar/tests` green every
-  batch; batch-by-batch, one commit per batch.
+- Iron rule: `cargo test --workspace` + `pytest sidecar/tests
+  scripts/dedup/tests` green every batch; batch-by-batch, one commit per
+  batch.
 - Format/lint before commit: `cargo fmt`, `cargo clippy --workspace
   --all-targets -- -D warnings`, and for the sidecar `uv run ruff check
-  sidecar/ && uv run ruff format --check sidecar/` (CI runs all four; pushes
-  to non-main branches do NOT trigger CI — the PR is the first CI signal).
+  sidecar/ scripts/ && uv run ruff format --check sidecar/ scripts/` (CI
+  runs all four; pushes to non-main branches do NOT trigger CI — the PR is
+  the first CI signal).
