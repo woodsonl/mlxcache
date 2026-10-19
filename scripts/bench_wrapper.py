@@ -31,7 +31,8 @@ resolved BEFORE launch so the bench and the server child agree on the store
 fingerprint; the 7B-4bit default needs ~4GB and Apple Silicon.
 
 This harness measures the WRAPPER path's disk tier. It is not the prefix-
-caching benchmark: see scripts/bench_prefix.py for declared-vs-served prefix
+caching benchmark: see scripts/bench_prefix.py (it lands with the
+prefix-benchmark unit of this change stack) for declared-vs-served prefix
 accounting and the cold/warm/pressure grid.
 
 Usage:
@@ -44,7 +45,9 @@ Env: MLXCACHE_BENCH_MODEL overrides the model default.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import shutil
 import sys
 import tempfile
 import time
@@ -52,7 +55,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _harness import DEFAULT_MODEL, REPO, WrapperServer, free_port, resolve_model  # noqa: E402 — path insert above
+from _harness import (  # noqa: E402 — path insert above
+    DEFAULT_MODEL,
+    REPO,
+    WrapperServer,
+    free_port,
+    resolve_model,
+)
 
 TURN1 = {
     "messages": [
@@ -125,10 +134,13 @@ def _fp_for(model: str):
     return default_fingerprint_for((model, None, None))
 
 
-def _gate_ok(results, skip_pct, observed_hits) -> tuple[bool, list[str]]:
+def _gate_ok(results, skip_pct, observed_hits, reuse_errors=None) -> tuple[bool, list[str]]:
     """The acceptance predicate. Returns (ok, reasons). A reusable blob
     is not reuse: the disk legs must have OBSERVED a disk hit, so a store
-    that is populated but never read cannot pass."""
+    that is populated but never read cannot pass. The hits are DELTAS across
+    each measured leg (the counters are process-cumulative and the warmup
+    probe can itself hit the disk tier), and a leg that logged reuse errors
+    fails even when its hit count is positive."""
     reasons = []
     bad = [r["leg"] for r in results if r["verdict"] != "token-identical"]
     if bad:
@@ -138,6 +150,9 @@ def _gate_ok(results, skip_pct, observed_hits) -> tuple[bool, list[str]]:
     reused = all(v is not None and v > 0 for v in observed_hits.values())
     if not reused:
         reasons.append(f"disk tier not observed serving (disk_hits={observed_hits})")
+    errored = {k: v for k, v in (reuse_errors or {}).items() if v}
+    if errored:
+        reasons.append(f"reuse errors on measured legs: {errored}")
     return (not reasons), reasons
 
 
@@ -149,12 +164,21 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     model = resolve_model(args.model)
+    if args.port == 0:
+        # A literal 0 would be passed to the child, which then binds a
+        # kernel-assigned port while we probe 127.0.0.1:0 until the 180s
+        # deadline; pick the port here instead.
+        args.port = free_port()
     TURN1["max_tokens"] = args.max_tokens
 
     print(f"model: {model}")
 
     results: list[dict] = []
     tmp = tempfile.mkdtemp(prefix="mlxcache-bench-")
+    # The store holds GB-scale checkpoints at real-model sizes; strand it in
+    # $TMPDIR on every run and the machine eventually fills the volume the
+    # harness itself needs. atexit covers the SystemExit failure paths too.
+    atexit.register(shutil.rmtree, tmp, True)
     store_dir = str(Path(tmp) / "store")
 
     # ---- one server serves turn 1 (cold + warm) AND the memory turn-2
@@ -178,30 +202,11 @@ def main() -> int:
     finally:
         srv.stop()
 
-    # ---- restart turn 2 (fresh process, SAME store): the request stream
-    # extends the persisted turn-1 stream, so the disk tier should cover the
-    # whole first exchange minus one position (§3.2). Compared against the
-    # MEMORY reference.
-    with Server(store_dir, model, args.port) as srv2:
-        srv2.wait_ready()
-        wall_re, text_re = srv2.chat(body2)
-        restart_stats = srv2.stats()
-        results.append(_leg_result("restart-turn2", wall_re, text_re, baseline2, restart_stats))
-
-    # ---- second process (another pair, SAME store): determinism ----------
-    with Server(store_dir, model, args.port) as srv3:
-        srv3.wait_ready()
-        wall_2nd, text_2nd = srv3.chat(body2)
-        second_stats = srv3.stats()
-        results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2, second_stats))
-
-    # ---- acceptance ------------------------------------------------------
-    # Prefill-skip, measured as WORK not wall: the restart/second legs'
-    # requests are full two-turn streams; a disk hit covers (matched-1)
-    # positions of the turn-1 prefix, so the prefill actually computed is
-    # the remainder. Coverage (how MUCH a blob holds) is read from the
-    # shared store; the disk_hits counter from /mlxcache/stats proves the
-    # server actually TOOK that blob rather than the memory twin.
+    # Snapshot the store's answer for body2 BEFORE any restart leg runs.
+    # Each later leg publishes its own full stream, and the deepest-match
+    # lookup against those self-published entries always returns ~100% —
+    # measuring the legs' own output instead of the turn-1 state they were
+    # supposed to resume from, so the skip gate could never fail.
     from mlxcache_store import Store as _Store
 
     st = _Store(store_dir, byte_budget=0)
@@ -223,9 +228,51 @@ def main() -> int:
         )
     covered = max(matched - 1, 0)
     skip_pct = round(100 * covered / max(len(tok) - 1, 1))
+
+    # ---- restart turn 2 (fresh process, SAME store): the request stream
+    # extends the persisted turn-1 stream, so the disk tier should cover the
+    # whole first exchange minus one position (§3.2). Compared against the
+    # MEMORY reference.
+    with Server(store_dir, model, args.port) as srv2:
+        srv2.wait_ready()
+        # disk_hits is process-CUMULATIVE and the warmup itself can hit the
+        # disk tier; gate on the DELTA across the measured request, or the
+        # warmup alone could satisfy a "store was read" gate.
+        pre = srv2.stats() or {}
+        wall_re, text_re = srv2.chat(body2)
+        post = srv2.stats() or {}
+        restart_stats = dict(
+            disk_hits=(post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0),
+            reuse_errors=(post.get("reuse_errors") or 0) - (pre.get("reuse_errors") or 0),
+        )
+        results.append(_leg_result("restart-turn2", wall_re, text_re, baseline2, restart_stats))
+
+    # ---- second process (another pair, SAME store): determinism ----------
+    with Server(store_dir, model, args.port) as srv3:
+        srv3.wait_ready()
+        pre = srv3.stats() or {}
+        wall_2nd, text_2nd = srv3.chat(body2)
+        post = srv3.stats() or {}
+        second_stats = dict(
+            disk_hits=(post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0),
+            reuse_errors=(post.get("reuse_errors") or 0) - (pre.get("reuse_errors") or 0),
+        )
+        results.append(_leg_result("second-turn2", wall_2nd, text_2nd, baseline2, second_stats))
+
+    # ---- acceptance ------------------------------------------------------
+    # Prefill-skip, measured as WORK not wall, from the PRE-LEG snapshot
+    # above: a disk hit covers (matched-1) positions of the turn-1 prefix,
+    # so the prefill actually computed is the remainder. The disk_hits
+    # DELTAS prove the restart legs actually took a blob from disk rather
+    # than re-prefilling (at temp 0 the two are token-identical, so the
+    # token verdict alone cannot).
     observed_hits = {
         "restart-turn2": (restart_stats or {}).get("disk_hits"),
         "second-turn2": (second_stats or {}).get("disk_hits"),
+    }
+    reuse_errors = {
+        "restart-turn2": (restart_stats or {}).get("reuse_errors"),
+        "second-turn2": (second_stats or {}).get("reuse_errors"),
     }
     for r in results:
         if r["leg"] in ("restart-turn2", "second-turn2"):
@@ -234,8 +281,9 @@ def main() -> int:
             r["reused"]["disk_covered"] = covered
     # A blob existing is not reuse. At temperature 0 a full prefill and a
     # disk resume are token-identical, so the token verdict cannot prove the
-    # disk tier served anything; the counter can. Require an observed hit.
-    ok, reasons = _gate_ok(results, skip_pct, observed_hits)
+    # disk tier served anything; the delta can. Require an observed hit and
+    # zero reuse errors on the measured legs.
+    ok, reasons = _gate_ok(results, skip_pct, observed_hits, reuse_errors)
 
     out_path = args.out or str(REPO / "bench" / f"wrapper-bench-{int(time.time())}.json")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)

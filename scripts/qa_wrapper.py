@@ -22,6 +22,8 @@ Env: MLXCACHE_BENCH_MODEL overrides the model default. Exit 0 = all pass.
 from __future__ import annotations
 
 import argparse
+import atexit
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -82,6 +84,7 @@ def main() -> int:
         args.port = free_port()
 
     tmp = tempfile.mkdtemp(prefix="mlxcache-qa-")
+    atexit.register(shutil.rmtree, tmp, True)
     store_dir = str(Path(tmp) / "store")
 
     chat_body = {
@@ -165,14 +168,16 @@ def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, 
         expect(chat1 is not None, "Q1 failed; dependent probe skipped")
         with Server(store_dir, model, port) as srv2:
             srv2.wait_ready()
+            # disk_hits is process-cumulative and the warmup probe can hit
+            # the disk tier by itself; only the DELTA across the measured
+            # request proves the grown conversation was disk-served.
+            pre = srv2.stats() or {}
             code, body = srv2.post("/v1/chat/completions", _grown_body(chat_body, chat1))
             expect(code == 200, f"status {code}")
             state["grown"] = body["choices"][0]["message"]["content"]
-            # The fresh process must have REUSED the persisted turn-1 stream,
-            # not merely re-prefilled it: the counter proves it took the disk
-            # path (at temp 0 the two are token-identical).
-            hits = srv2.stats().get("disk_hits") or 0
-            expect(hits > 0, f"restart served without a disk hit (disk_hits={hits})")
+            post = srv2.stats() or {}
+            hits = (post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0)
+            expect(hits > 0, f"restart served without a disk hit (delta disk_hits={hits})")
 
     @probe("Q5 disk-resume identity (second fresh process)")
     def _():
@@ -181,6 +186,7 @@ def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, 
         expect(grown_state is not None, "Q4 failed; dependent probe skipped")
         with Server(store_dir, model, port) as srv3:
             srv3.wait_ready()
+            pre = srv3.stats() or {}
             code, body = srv3.post("/v1/chat/completions", _grown_body(chat_body, chat1))
             expect(code == 200, f"status {code}")
             expect(
@@ -188,8 +194,9 @@ def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, 
                 f"second disk-resumed answer diverged:\n"
                 f" A={grown_state[:80]!r}\n B={body['choices'][0]['message']['content'][:80]!r}",
             )
-            hits = srv3.stats().get("disk_hits") or 0
-            expect(hits > 0, f"second process served without a disk hit (disk_hits={hits})")
+            post = srv3.stats() or {}
+            hits = (post.get("disk_hits") or 0) - (pre.get("disk_hits") or 0)
+            expect(hits > 0, f"second process served without a disk hit (delta disk_hits={hits})")
 
     @probe("Q7 store hygiene")
     def _():

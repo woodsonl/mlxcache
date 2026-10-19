@@ -22,7 +22,8 @@ count), so a regression in ANY layer — tokenize, route, prefill, publish,
 stream — shows up where the client feels it.
 
 For real-engine cache-benefit numbers (declared vs served prefix, cold/warm,
-pressure sweep) use scripts/bench_prefix.py.
+pressure sweep) use scripts/bench_prefix.py (it lands with the
+prefix-benchmark unit of this change stack).
 
 Usage:
     uv run python scripts/bench_workloads.py [--daemon URL] [--requests N]
@@ -45,6 +46,11 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _harness import free_port  # noqa: E402 — path insert above
 
 
 def http_json(url: str, payload: dict, timeout: float = 60.0) -> dict:
@@ -129,21 +135,34 @@ def tpot_ms(total_ms: float, ttft_ms: float, tokens: int) -> float:
 
 
 def report(name: str, ttfts: list[float], totals: list[float], token_counts: list[int]) -> dict:
-    tpots = [tpot_ms(t, ttft, n) for ttft, t, n in zip(ttfts, totals, token_counts, strict=True)]
+    if any(n < 1 for n in token_counts):
+        raise RuntimeError(
+            f"{name}: a request reported {min(token_counts)} generated tokens; "
+            "the token counting has drifted and every TPOT below would be fiction"
+        )
+    # TPOT needs at least one decoded token AFTER the first: a tokens==1
+    # sample has an empty post-TTFT window and dividing would fabricate a
+    # per-token number out of nothing.
+    tpots = [
+        tpot_ms(t, ttft, n)
+        for ttft, t, n in zip(ttfts, totals, token_counts, strict=True)
+        if n >= 2
+    ]
     row = {
         "workload": name,
         "n": len(ttfts),
         "ttft_p50_ms": round(pct(ttfts, 50), 2),
         "ttft_p95_ms": round(pct(ttfts, 95), 2) if len(ttfts) >= P95_MIN_N else None,
         "ttft_mean_ms": round(statistics.fmean(ttfts), 2),
-        "tpot_p50_ms": round(pct(tpots, 50), 2),
+        "tpot_p50_ms": round(pct(tpots, 50), 2) if tpots else None,
         "tpot_p95_ms": round(pct(tpots, 95), 2) if len(tpots) >= P95_MIN_N else None,
         "tokens_mean": round(statistics.fmean(token_counts), 1),
     }
-    p95 = f"  p95 {row['ttft_p95_ms']:>8.2f}ms" if row["ttft_p95_ms"] is not None else ""
+    ttft_p95 = f"  p95 {row['ttft_p95_ms']:>8.2f}ms" if row["ttft_p95_ms"] is not None else ""
+    tpot_p95 = f"  p95 {row['tpot_p95_ms']:>7.2f}ms/token" if row["tpot_p95_ms"] is not None else ""
     print(
-        f"  {name:<34} TTFT p50 {row['ttft_p50_ms']:>8.2f}ms{p95}"
-        f"   TPOT p50 {row['tpot_p50_ms']:>6.2f}ms"
+        f"  {name:<34} TTFT p50 {row['ttft_p50_ms']:>8.2f}ms{ttft_p95}"
+        f"   TPOT p50 {row['tpot_p50_ms']:>6.2f}ms{tpot_p95}"
         f"  (n={len(ttfts)}, tokens~{row['tokens_mean']})"
     )
     return row
@@ -166,14 +185,9 @@ def wait_healthy(url: str, deadline_s: float = 30.0) -> None:
 
 
 def _free_port() -> int:
-    """Pick an unused localhost port (hardcoding 8420/8421 collided with any
-    dev daemon/demo already running — and silently benchmarked the wrong
-    stack; review 2026-10-04)."""
-    import socket
-
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    # Kept as a thin alias so the call sites read locally; the logic lives in
+    # _harness so the port-picking rules cannot drift between harnesses.
+    return free_port()
 
 
 def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]:
@@ -220,7 +234,12 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--daemon", help="existing daemon base URL (skip auto-start)")
-    ap.add_argument("--requests", type=int, default=30, help="per-workload sample count")
+    ap.add_argument(
+        "--requests",
+        type=int,
+        default=P95_MIN_N,
+        help="per-workload sample count (default keeps p95 emittable)",
+    )
     ap.add_argument("--concurrency", type=int, default=8, help="concurrent workers")
     ap.add_argument("--grow-rounds", type=int, default=8, help="conversation growth rounds")
     ap.add_argument(
@@ -231,26 +250,40 @@ def main() -> int:
     )
     ap.add_argument("--json", help="write results to this file")
     args = ap.parse_args()
+    if args.requests < 1 or args.concurrency < 1 or args.grow_rounds < 1:
+        raise SystemExit(
+            "--requests, --concurrency and --grow-rounds must all be >= 1 "
+            f"(got {args.requests}/{args.concurrency}/{args.grow_rounds})"
+        )
 
     procs: list[subprocess.Popen] = []
     url = args.daemon
     blob_dir = args.blobs or tempfile.mkdtemp(prefix="mlxcache-bench-blobs-")
-    if url is None:
-        os.makedirs(blob_dir, exist_ok=True)
-        sidecar, daemon, port = start_stack(blob_dir)
-        procs += [sidecar, daemon]
-        url = f"http://127.0.0.1:{port}"
     try:
-        wait_healthy(url)
-        results = run_workloads(url, args)
+        if url is None:
+            os.makedirs(blob_dir, exist_ok=True)
+            sidecar, daemon, port = start_stack(blob_dir)
+            procs += [sidecar, daemon]
+            url = f"http://127.0.0.1:{port}"
+        try:
+            wait_healthy(url)
+            results = run_workloads(url, args)
+        finally:
+            for p in procs:
+                p.send_signal(signal.SIGTERM)
+            for p in procs:
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p.kill()
     finally:
-        for p in procs:
-            p.send_signal(signal.SIGTERM)
-        for p in procs:
-            try:
-                p.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                p.kill()
+        # The blob dir is GB-scale at real-model sizes; stranding it in $TMPDIR
+        # on every run is how a machine fills the volume the harness itself
+        # needs for temp logs.
+        if args.blobs is None:
+            import shutil
+
+            shutil.rmtree(blob_dir, ignore_errors=True)
 
     if args.json:
         with open(args.json, "w") as fh:
@@ -327,20 +360,30 @@ def run_workloads(url: str, args) -> list[dict]:
     # 4. Concurrent identical load: C workers fire the SAME uncached prompt at
     #    once; single-flight must coalesce them into one prefill.
     def worker(shared: dict, idx: int) -> None:
-        ttft, total, ntok = stream_chat(
-            url,
-            {
-                "model": "bench-model",
-                "messages": [{"role": "user", "content": f"concurrent burst {shared['burst']}"}],
-            },
-        )
+        try:
+            ttft, total, ntok = stream_chat(
+                url,
+                {
+                    "model": "bench-model",
+                    "messages": [
+                        {"role": "user", "content": f"concurrent burst {shared['burst']}"}
+                    ],
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — collected, re-raised after join
+            shared["errors"].append(f"worker {idx}: {exc!r}")
+            return
         shared["ttfts"].append(ttft)
         shared["totals"].append(total)
         shared["ntoks"].append(ntok)
 
     ttfts, totals, ntoks = [], [], []
-    for burst in range(max(1, args.requests // args.concurrency)):
-        shared = {"burst": burst, "ttfts": [], "totals": [], "ntoks": []}
+    # Ceiling division: floor() would quantize the sample count DOWN, and at
+    # requests=100/concurrency=8 the tail gate would go silent on exactly the
+    # contention workloads it exists for.
+    bursts = -(-args.requests // args.concurrency)
+    for burst in range(bursts):
+        shared = {"burst": burst, "ttfts": [], "totals": [], "ntoks": [], "errors": []}
         import threading
 
         threads = [
@@ -350,6 +393,14 @@ def run_workloads(url: str, args) -> list[dict]:
             t.start()
         for t in threads:
             t.join()
+        # A worker that dies in a thread would otherwise just shorten the
+        # aggregate — a server 500ing under contention would read as a
+        # slightly smaller n and a green run.
+        if shared["errors"]:
+            raise RuntimeError(
+                f"concurrent_identical lost {len(shared['errors'])} worker(s): "
+                f"{shared['errors'][0]}"
+            )
         ttfts += shared["ttfts"]
         totals += shared["totals"]
         ntoks += shared["ntoks"]
@@ -358,17 +409,21 @@ def run_workloads(url: str, args) -> list[dict]:
     # 5. Concurrent distinct load: C workers on DIFFERENT prompts (no
     #    coalescing possible; pure parallelism of the hot path).
     ttfts, totals, ntoks = [], [], []
-    for burst in range(max(1, args.requests // args.concurrency)):
-        shared = {"ttfts": [], "totals": [], "ntoks": []}
+    for burst in range(bursts):
+        shared = {"ttfts": [], "totals": [], "ntoks": [], "errors": []}
 
         def worker_distinct(i: int, burst: int = burst, shared: dict = shared) -> None:
-            ttft, total, ntok = stream_chat(
-                url,
-                {
-                    "model": "bench-model",
-                    "messages": [{"role": "user", "content": f"distinct burst {burst}-{i}"}],
-                },
-            )
+            try:
+                ttft, total, ntok = stream_chat(
+                    url,
+                    {
+                        "model": "bench-model",
+                        "messages": [{"role": "user", "content": f"distinct burst {burst}-{i}"}],
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 — collected, re-raised after join
+                shared["errors"].append(f"worker {i}: {exc!r}")
+                return
             shared["ttfts"].append(ttft)
             shared["totals"].append(total)
             shared["ntoks"].append(ntok)
@@ -380,6 +435,10 @@ def run_workloads(url: str, args) -> list[dict]:
             t.start()
         for t in threads:
             t.join()
+        if shared["errors"]:
+            raise RuntimeError(
+                f"concurrent_distinct lost {len(shared['errors'])} worker(s): {shared['errors'][0]}"
+            )
         ttfts += shared["ttfts"]
         totals += shared["totals"]
         ntoks += shared["ntoks"]

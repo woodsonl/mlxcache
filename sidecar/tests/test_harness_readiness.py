@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import tempfile
 import time
 import urllib.error
@@ -24,6 +25,11 @@ def _load(name: str):
     path = Path(__file__).resolve().parents[2] / "scripts" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec: the wrapper scripts import _harness through
+    # sys.path, and without this the file-located copy and the imported copy
+    # are two different module objects — a monkeypatch on `harness.X` would
+    # then "succeed" without touching the classes bench/qa actually use.
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -128,8 +134,11 @@ def test_bench_warmup_retries_then_succeeds(monkeypatch):
         srv.log_path.unlink(missing_ok=True)
 
 
-@pytest.mark.parametrize("mod", [qa, bench])
+@pytest.mark.parametrize("mod", [harness])
 def test_stop_unlinks_temp_log(mod):
+    # Parametrized over the SHARED implementation once: after the dedup,
+    # neither wrapper subclass overrides stop(), so per-subclass rows would
+    # replay the same inherited contract twice.
     srv = _server(mod.Server)
     log_path = srv.log_path
     srv.stop()
