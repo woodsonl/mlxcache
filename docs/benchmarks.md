@@ -120,34 +120,34 @@ cross-check. The premise arithmetic itself is pinned by
 
 ## Measured results
 
-Provenance — run 2026-10-19 on Apple M3 Max (Darwin 27.0.0), `mlx-community/Qwen2.5-7B-Instruct-4bit` (mlx 0.32.2, mlx_lm 0.31.3), concurrency 1, ~2,000-token shared prefix (~3,260-token serialized prompts), 6 varying requests per workload, premise guards green:
+Provenance — run 2026-10-19 on Apple M3 Max (Darwin 27.0.0), `mlx-community/Qwen2.5-7B-Instruct-4bit` (mlx 0.32.2, mlx_lm 0.31.3), concurrency 1, `--prefix-tokens 2000` **calibrated at runtime against the real tokenizer** (27 tokens per filler repeat → a measured ~1,975-token shared prefix; earlier runs divided by a guessed 16 and silently benchmarked a ~3,250-token prefix under a 2,000 knob), 6 varying requests per workload, all premise guards green including the enforced trace/`/stats` cross-checks:
 
 ```bash
 uv run python scripts/bench_prefix.py --workloads W1,W1np,W2,W3 --arms daemon,direct \
-  --questions 6 --prefix-tokens 2000 --json /tmp/prefix-grid2.json
+  --questions 6 --prefix-tokens 2000 --json /tmp/prefix-grid4.json
 uv run python scripts/bench_prefix.py --arms pressure --k 0,1,2,4,8,16 \
-  --prefix-tokens 2000 --json /tmp/prefix-pressure2.json
+  --prefix-tokens 2000 --json /tmp/prefix-pressure4.json
 ```
 
 ### Cross-restart reuse (the daemon's own cold vs warm)
 
 | workload | leg | n | TTFT p50 (ms) | TPOT p50 (ms) | served % of requested | verdicts |
 |---|---|---|---|---|---|---|
-| W1 (primed) | daemon/cold | 7 | 5,317.5 | 13.99 | 14.2 | 6 miss, 1 partial |
-| W1 (primed) | daemon/warm | 7 | 222.6 | 13.91 | 99.97 | 7 hit |
-| W1np (unprimed) | daemon/cold | 6 | 5,138.4 | 13.09 | 0.0 | 6 miss |
-| W1np (unprimed) | daemon/warm | 6 | 189.7 | 13.21 | 99.97 | 6 hit |
-| W2 near-miss | daemon/cold | 6 | 5,086.2 | 13.00 | 0.0 | 6 miss |
-| W2 near-miss | daemon/warm | 6 | 193.3 | 12.90 | 99.97 | 6 hit |
-| W3 decode-heavy | daemon/cold | 6 | 153.7 | 11.89 | 0.0 | 6 miss |
-| W3 decode-heavy | daemon/warm | 6 | 91.6 | 12.01 | 95.0 | 6 hit |
+| W1 (primed) | daemon/cold | 7 | 3,178.3 | 13.12 | 14.17 | 6 miss, 1 partial |
+| W1 (primed) | daemon/warm | 7 | 154.3 | 13.01 | 99.95 | 7 hit |
+| W1np (unprimed) | daemon/cold | 6 | 3,183.4 | 13.38 | 0.0 | 6 miss |
+| W1np (unprimed) | daemon/warm | 6 | 155.1 | 13.03 | 99.95 | 6 hit |
+| W2 near-miss | daemon/cold | 6 | 2,020.6 | 13.30 | 0.0 | 6 miss |
+| W2 near-miss | daemon/warm | 6 | 146.9 | 13.18 | 99.93 | 6 hit |
+| W3 decode-heavy | daemon/cold | 6 | 164.2 | 12.21 | 0.0 | 6 miss |
+| W3 decode-heavy | daemon/warm | 6 | 86.6 | 12.56 | 95.0 | 6 hit |
 
 What the grid says:
 
-1. **Cross-restart reuse is real**: warm TTFT is 24–27× the cold leg (5.1–5.3 s → 0.19–0.22 s) with 99.97% of requested prefix tokens served after both processes were killed and restarted from disk. No in-process cache can do this tier at all.
-2. **TPOT is flat (~12–14 ms) cold vs warm everywhere.** Caching moves prefill, not decode; W3 exists to keep that measured rather than assumed.
+1. **Cross-restart reuse is real**: warm TTFT is ~20× the cold leg (3.2 s → ~0.15 s) with 99.93–99.95% of requested prefix tokens served after both processes were killed and restarted from disk. No in-process cache can do this tier at all.
+2. **TPOT is flat (~12–13 ms) cold vs warm everywhere.** Caching moves prefill, not decode; W3 exists to keep that measured rather than assumed.
 3. **Mid-document divergence is never served**: W2's near-miss traffic (a long shared opening that diverges before either document's end) gets exactly 0% cold, as the end-anchored rule requires.
-4. **Priming matters once**: W1's first question is served ~2,000 tokens because the prefix was published alone; W1np's first question gets 0. After each request publishes its own full-length key, both warm legs converge to 99.97%.
+4. **Priming matters once**: W1's first question is served ~1,959 tokens because the prefix was published alone; W1np's first question gets 0. After each request publishes its own full-length key, both warm legs converge to ~99.95%.
 
 ### Against a raw local engine (the honest baseline)
 
@@ -155,27 +155,43 @@ The direct arm sends the daemon's exact serialization through `/v1/completions`,
 
 | leg | TTFT p50 (ms) |
 |---|---|
-| direct restart (cold prefill every time) | 154–172 |
-| direct inproc (mlx_lm LRU prompt cache) | 101 |
-| daemon cold (lookup + prefill + publish) | 5,318 |
-| daemon warm (blob load + KV adopt, cross-restart) | 223 |
+| direct inproc (mlx_lm LRU prompt cache) | 121 |
+| daemon warm (blob load + KV adopt, cross-restart) | 154 |
+| direct restart (cold prefill every time) | 189 |
+| daemon cold (lookup + prefill + publish) | 3,178 |
 
-At a 2K-token prefix on this hardware, plain mlx_lm re-prefills the whole 3,260-token prompt in ~155 ms. The daemon's warm path costs ~223 ms — **slower than re-prefilling** — and its cold path pays ~5.3 s, dominated by publishing a ~190 MB checkpoint (~58 KB/token, measured 56.7 MB at 972 tokens). The honest conclusion: at short prefixes on a fast local engine, prefix caching here buys restart-proof reuse, not latency. It pays when prefill is expensive (much longer contexts, a contended or remote engine, cold weights), and the benchmark exists to keep that claim tied to numbers.
+At a true ~2,000-token prefix on this hardware the ordering flips from the
+earlier (miscalibrated, ~3,250-token) run: the daemon's cross-restart warm
+path (~154 ms) is now **faster than plain mlx_lm re-prefilling the same
+bytes (~189 ms)**, and only the in-memory LRU cache of a live process stays
+ahead (~121 ms) — at the cost of dying with the process. The cold path
+still pays ~3.2 s, dominated by publishing a ~110 MB checkpoint (~57 MB per
+1,000 tokens at 7B-4bit). Honest conclusion: at 2K prefixes the cached path
+wins on latency AND survives restarts; the first request that publishes
+still pays the serialization cost, so short-lived processes that never
+repeat a prefix lose. The benchmark exists to keep that claim tied to
+numbers, and the earlier "re-prefill is faster" claim was an artifact of
+the miscalibrated prefix — a measured warning about measuring the workload
+you think you measured.
 
 ### Pressure (W4): does the benefit survive unrelated traffic?
 
-Store capped at 3 published entries, reaper every 1 s, probe = the prefix re-sent after k unrelated requests (the row's `repeat_declared`/`repeat_served` artifact fields carry the exact values; `served` is always one below `declared` at the prime-anchored entry, since coverage excludes the anchoring token):
+Store capped at 3 published entries, reaper every 1 s, probe = the prefix re-sent after k unrelated requests (quote the row's `repeat_declared`/`repeat_served` artifact fields for exact values; at this construction the prime-anchored probe serves its full declared LCP, while the extension-anchored arm serves seven below it once the extension anchors the chain):
 
 | arm | k | evictions seen | probe verdict | probe served | probe TTFT (ms) |
 |---|---|---|---|---|---|
-| p_alone | 0–2 | 0 | partial | 3,259 | 932–1,142 |
-| p_alone | 4 | 1 | miss | 0 | 5,004 |
-| p_alone | 8 | 6 | miss | 0 | 5,093 |
-| p_alone | 16 | 14 | miss | 0 | 6,517 |
-| p_extended | 0–2 | 0–1 | partial | 3,259 | 906–1,306 |
-| p_extended | 4 | 2 | miss | 0 | 5,154 |
-| p_extended | 8–16 | 6–14 | miss | 0 | 5,104–5,227 |
+| p_alone | 0 | 0 | partial | 1,959 of 1,959 declared | 766 |
+| p_alone | 1–2 | 0 | partial | 1,959 of 1,959 | 706–711 |
+| p_alone | 4 | 1 | miss | 0 of 1,959 | 3,097–3,122 |
+| p_alone | 8 | 6 | miss | 0 | 3,097 |
+| p_alone | 16 | 14 | miss | 0 | 3,160 |
+| p_extended | 0–1 | 0 | miss | 0 of 1,966 | 3,155–3,235 |
+| p_extended | 2 | 1 | partial | 1,959 of 1,966 | 897 |
+| p_extended | 4 | 2 | miss | 0 | 3,099 |
+| p_extended | 8 | 6 | miss | 0 | 3,063 |
+| p_extended | 16 | 15 | miss | 0 | 3,219 |
 
-- **p_alone**: the prefix is the longest entry, and the reaper scores biggest-first, so once the cap binds (k ≥ 4) the highest-value blob is the first to go. The benefit does not degrade gracefully; it collapses to a full cold prefill.
-- **p_extended**: publishing an extension makes the prefix an anchor and buys survival through k = 2 (the reaper takes the extension instead). At k ≥ 4 the chain breaks — evicting the extension un-anchors the prefix, and the next sweep takes the prefix too.
+- **p_alone**: the prefix is the longest entry, and the reaper scores biggest-first, so once the cap binds (k ≥ 4) the highest-value blob is the first to go. The benefit does not degrade gracefully; it collapses to a full cold prefill (~3.1 s vs ~0.7 s served).
+- **p_extended**: publishing an extension makes the prefix an anchor. It buys survival exactly once the reaper has run (k = 2: the extension is evicted, the anchored prefix survives and still serves 1,959 of 1,966). At k ≥ 4 the chain breaks — with the extension gone the prefix loses its anchor, and the next sweep takes the prefix too.
+- The k = 0/k = 1 p_extended probe misses are the shadowing rule, not eviction (0 evictions observed): the freshly published extension sits deeper on the greedy walk than the prefix-only entry, so the probe reads a miss until the first sweep removes the extension.
 - Net answer to "does the benefit hold under cache pressure": **not under a tight cap**. The reaper's own scoring order targets exactly the blob the workload cares about, and anchoring delays but does not prevent the loss.

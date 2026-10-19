@@ -400,15 +400,20 @@ both KV tiers, f16 and q8).
 
 Full numbers and caveats in the [design doc](docs/designs/mlx-kv-cache-daemon.md) (R1-5).
 
-Prefix-cache benchmark (Qwen2.5-7B-Instruct-4bit, ~2,000-token shared prefix,
-concurrency 1, premise-guarded): after a restart, the daemon serves 99.97% of
-requested prefix tokens and cuts TTFT 5.3 s → 0.22 s, with TPOT flat at ~13 ms
-— but a raw local `mlx_lm.server` re-prefills the same 3,260-token prompt in
-~0.15 s, faster than the cached path. At short prefixes on a fast local engine
-the cache buys restart-proof reuse, not latency. Under a 3-entry cap the
-reaper evicts the longest (highest-value) prefix first once pressure binds, and
-anchor chains delay but do not prevent it. Methodology, guards, and the full
-grid: [docs/benchmarks.md](docs/benchmarks.md).
+Prefix-cache benchmark (Qwen2.5-7B-Instruct-4bit, runtime-calibrated
+~1,975-token shared prefix, concurrency 1, premise-guarded with enforced
+trace//stats cross-checks): after a restart, the daemon serves 99.95% of
+requested prefix tokens and cuts TTFT 3.2 s → 0.15 s, with TPOT flat at
+~13 ms — and the cross-restart cached path (~154 ms) now beats a raw local
+`mlx_lm.server` re-prefilling the same bytes (~189 ms); only a live
+process's in-memory LRU stays ahead (~121 ms) and it dies with the process.
+The first request still pays ~3.2 s to publish a ~110 MB checkpoint. Under
+a 3-entry cap the reaper evicts the longest (highest-value) prefix first
+once pressure binds; anchor chains delay but do not prevent it. An earlier
+"re-prefill is faster" claim here was an artifact of a miscalibrated
+prefix (a guessed divisor benchmarked ~3,250 tokens under a 2,000-token
+knob). Methodology, guards, and the full grid:
+[docs/benchmarks.md](docs/benchmarks.md).
 
 ## Operating it
 
