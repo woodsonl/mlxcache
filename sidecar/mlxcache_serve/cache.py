@@ -29,6 +29,7 @@ import hashlib
 import io
 import logging
 import os
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,73 @@ def _default_load(payload: bytes) -> Any:
     return load_prompt_cache(blob)
 
 
+def _artifact_bytes(path: Path) -> bytes | None:
+    """Read a model artifact's bytes, refusing a symlink that escapes the model.
+
+    HF cache layouts symlink every snapshot file into a sibling ``blobs/``
+    directory (``snapshots/<rev>/tokenizer.json -> ../../blobs/<sha>``), so a
+    blanket ``O_NOFOLLOW`` hashed nothing for EVERY cached model — every
+    HF-cached model then fingerprinted as ``"missing"``, erasing tokenizer
+    identity for all of them (a tokenizer swap under the same model dir went
+    undetected, and all symlinked models aliased one sentinel). The two
+    engine paths hash different artifacts by design (the wrapper hashes
+    these file bytes; the daemon hashes the vocabulary), so this guard
+    restores identity pinning WITHIN each path, not agreement between them.
+
+    The guard's intent survives: a link is followed only when its target
+    resolves inside the model directory itself or inside a ``blobs/``
+    sibling of it — the model's own storage, which is the declared trust
+    boundary: an attacker with write access to that tree could already swap
+    blob contents or plant a regular file. Anything resolving elsewhere — a
+    link pointing at another model's artifact or at an arbitrary file — is
+    still refused. The final open uses ``O_NOFOLLOW`` so a swap of the FINAL
+    component between the check and the open fails closed; the opened
+    file's ``(st_dev, st_ino)`` is then reconciled against the checked
+    path's so an intermediate-directory swap mid-window is caught too
+    (usual inode-reuse caveat applies). A target that is a directory (a
+    corrupt pull can leave the link at ``blobs/`` itself) reads as missing,
+    not as an error. Swap DETECTION is restart-scoped: the fingerprint is
+    memoized for the process lifetime, so a tokenizer swapped under a live
+    server is caught on its next restart, not mid-run.
+    """
+    target = path
+    if path.is_symlink():
+        resolved = Path(os.path.realpath(path))
+        model_dir = Path(os.path.realpath(path.parent))
+        # HF cache: <hub>/models--org--name/{snapshots/<rev>,blobs/<sha>} with
+        # model_dir being the SNAPSHOT dir, so blobs/ sits two levels up —
+        # trusted ONLY in that shape; a plain local model may keep a blobs/
+        # sibling one level up. Anything resolving outside those — another
+        # model's artifact, an arbitrary file — is a forgery and stays
+        # refused.
+        allowed = [model_dir, model_dir.parent / "blobs"]
+        if model_dir.parent.name == "snapshots":
+            allowed.append(model_dir.parent.parent / "blobs")
+        if not any(resolved.is_relative_to(root) for root in allowed):
+            return None
+        target = resolved
+    try:
+        checked = os.stat(target)
+        if stat.S_ISDIR(checked.st_mode):
+            return None  # a directory is not an artifact (corrupt-pull shape)
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        # The context manager owns the fd from here (a manual close would
+        # double-close on a read error and leak on the mismatch return).
+        # O_NOFOLLOW only guards the final component, so an intermediate
+        # directory swapped for a symlink mid-window would otherwise be
+        # followed silently; the inode reconciliation catches it.
+        with os.fdopen(fd, "rb") as fh:
+            opened = os.fstat(fh.fileno())
+            if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
+                return None
+            return fh.read()
+    except OSError:
+        return None
+
+
 def fingerprint_for_model_dir(
     model_path: str | os.PathLike,
     kv_bits: int = 0,
@@ -74,18 +142,11 @@ def fingerprint_for_model_dir(
 
     ``model_id`` is the REALPATH of the model directory (stable across
     restarts and ~ vs absolute invocations). The tokenizer hash reads the
-    artifact bytes without following a symlink planted at tokenizer.json.
+    artifact bytes without following a symlink that escapes the model tree.
     """
     p = Path(model_path)
-    tokenizer = p / "tokenizer.json"
-    tokenizer_hash = "missing"
-    try:
-        fd = os.open(tokenizer, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        tokenizer_hash = "missing"
-    else:
-        with os.fdopen(fd, "rb") as fh:
-            tokenizer_hash = hashlib.sha256(fh.read()).hexdigest()
+    payload = _artifact_bytes(p / "tokenizer.json")
+    tokenizer_hash = hashlib.sha256(payload).hexdigest() if payload is not None else "missing"
     return Fingerprint(
         model_id=model_id_override or os.path.realpath(p),
         tokenizer_hash=tokenizer_hash,
