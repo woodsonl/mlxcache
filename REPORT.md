@@ -296,7 +296,7 @@ Ship **token-block/64** as the v1 codec:
 - 64 positions per block rather than 256: the measured cost of larger blocks is
   real and monotonic. `token-block/256` is worse in both tiers (6.84% vs 5.30% f16,
   7.01% vs 5.19% q8) and stores more total unique bytes (460.8 vs 422.3 MiB f16,
-  247.2 vs 222.8 MiB q8), because fewer, larger blocks mean coarser partial-block
+  247.2 vs 223.1 MiB q8), because fewer, larger blocks mean coarser partial-block
   churn. 1024 was never measured; the trend from 64 → 256 is the evidence, and the
   next step down (32) is untested.
 - Needs positions at chunk time, but not an adapter change: the blob header already
@@ -360,9 +360,11 @@ recapture additionally regenerated the eviction ladder under the faithful
 anchor model, the restore timings under the fixed bench, and the layout probe
 at full tensor coverage, as noted above. Script edits made after that
 regeneration (dead-branch removals, the cuts_by return drop, first_diff reuse
-in the probe) are output-neutral by inspection — each touches a path the
-tables never read — and the chunk-digest/offset contracts they sit on are
-pinned by tests.
+in the probe) are output-neutral: each is an identity (win_end ≡ the
+already-clamped stop; first_diff ≡ the replaced inline scan under the same
+prefix guard; cuts_by was discarded by every reader), and the contracts they
+sit on — chunk digests and offsets, the diff arithmetic feeding the probe's
+records — are pinned by tests.
 
 ## Falsifying workloads (what would overturn this)
 
