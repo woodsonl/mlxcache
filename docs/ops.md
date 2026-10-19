@@ -105,10 +105,16 @@ Two consequences an operator sees:
   identity carries a `cache_layout` signature: a payload of one composition
   is never served to an engine that would deserialize it as another.
 
-Changing `MLXCACHE_ENGINE` while the daemon runs is NOT picked up: the
-daemon resolves engine identity (engine id, cache layout, quantization tier)
-once per process and keys every blob by it. To serve a different engine,
-restart the daemon after restarting the sidecar.
+`MLXCACHE_ENGINE` is read when the sidecar starts; changing it on a running
+process does nothing. From there the daemon adopts the identity the sidecar
+reports (engine id, cache layout, quantization tier) on every request and
+keys every blob by it: restart the sidecar to serve a different engine and
+the daemon follows on the next request, with the old engine's blobs
+unreachable — never mis-served — because `engine_id` namespaces the key (a
+daemon restart is still needed to change `MLXCACHE_MODELS`, read at boot).
+The exception is `MLXCACHE_NATIVE_TOKENIZER`: that path verifies the
+identity once per process and caches the verdict, so with it set, restart
+the daemon after restarting the sidecar.
 
 ### Knobs
 

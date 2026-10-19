@@ -20,7 +20,7 @@ Endpoints (daemon -> sidecar protocol):
                    it must be captured here; a separate endpoint could not
                    rebuild it from tokens.
 
-Engine selection: MLXCACHE_ENGINE=synthetic (default, hermetic) or mlx-lm
+Engine selection: MLXCACHE_ENGINE=synthetic (default, hermetic), mlx-lm, or qwen4-exp
 (lazy import; requires a local model). The daemon is the only client; this
 server binds 127.0.0.1 by default.
 

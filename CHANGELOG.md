@@ -20,7 +20,7 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   resume and `engine_id` namespacing apply as-is. Residency accounting and
   troubleshooting are in `docs/ops.md`. Performance on the real checkpoint is
   recorded in the README's Measured section: boot 4.6 s, prefill 46.1 s at 256
-  tokens to 76.6 s at 8K, decode 2.0-2.3 s/token to 2K. Decode at 8K was
+  tokens to 76.6 s at 8K, decode 2.0-2.2 s/token to 2K. Decode at 8K was
   measured under 10 GB of swap and is flagged there as contaminated rather
   than quoted.
 - **Hybrid-architecture models verified on the R1-5 gate**: mlx-lm's

@@ -245,7 +245,9 @@ plus ≈58 KB/token. The 2 s resume budget holds: loading a checkpoint takes
 the next turn adds, not by the restore. A served conversation settles a real
 checkpoint and resumes from it (verified end to end over HTTP: prefill 14
 tokens → generate 10 → settle 119 MB covering 25 positions → next turn
-answers from the settled blob without re-prefilling the prompt).
+answers from the settled blob without re-prefilling the prompt). The design
+record (scope boundary, checkpoint inventory, batch contracts) is
+[`docs/designs/qwen4-exp-engine.md`](docs/designs/qwen4-exp-engine.md).
 
 The knob's useful range is narrow and documented in
 [`docs/ops.md`](docs/ops.md#qwen38-flash-next-residency-qwen4-exp): a decoded
