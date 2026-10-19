@@ -119,6 +119,55 @@ def test_store_never_cross_serves_cache_layouts(tmp_path):
     assert s.lookup("mlx-lm", DENSE, [5, 6, 7]) == (0, None)
 
 
+# --- non-text content identity (B2) -----------------------------------------
+# The image collision: a multimodal prompt renders its media as ORDINARY token
+# ids, so two different images at one prompt produce one token sequence and two
+# different KV states. Same fixture/golden values as the Rust twin
+# (blob_key_content_digest_golden in http.rs).
+IMAGE_A = Fingerprint(
+    "golden-model",
+    "golden-tok",
+    "f16",
+    1,
+    content_digest="b1946ac92492d2347c6235b4d2611184",
+)
+IMAGE_B = Fingerprint(
+    "golden-model",
+    "golden-tok",
+    "f16",
+    1,
+    content_digest="5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
+)
+GOLDEN_KEY_IMAGE_A = "831a3b8ca657914f65c4de75cf8a4a61"
+
+
+def test_content_digest_key_golden():
+    tokens = list(range(1, 9))
+    assert f"{blob_key(IMAGE_A, None, tokens):032x}" == GOLDEN_KEY_IMAGE_A
+    # An empty digest contributes ZERO bytes: text-only keys are unchanged.
+    assert f"{blob_key(FP_GOLDEN, None, tokens):032x}" == GOLDEN_KEY_8
+
+
+def test_content_digest_compatibility_rule():
+    text = Fingerprint("m", "t", "f16", 1)
+    image = Fingerprint("m", "t", "f16", 1, content_digest="abc")
+    assert identity_compatible(text, Fingerprint("m", "t", "f16", 1))
+    assert identity_compatible(image, image)
+    # Empty means "no non-text content", not "unknown": both directions miss.
+    assert not identity_compatible(text, image)
+    assert not identity_compatible(image, text)
+
+
+def test_store_never_cross_serves_images_at_the_same_tokens(tmp_path):
+    # Same model, same tokens, different pixels: the second lookup must not
+    # return the first image's blob. This is the whole point of the axis.
+    s = Store(tmp_path, byte_budget=0)
+    ref = s.put("mlx-lm", IMAGE_A, [7, 8, 9], b"image-a-kv")
+    assert s.lookup("mlx-lm", IMAGE_A, [7, 8, 9, 10]) == (3, ref)
+    assert s.lookup("mlx-lm", IMAGE_B, [7, 8, 9, 10]) == (0, None)
+    assert s.lookup("mlx-lm", FP_GOLDEN, [7, 8, 9, 10]) == (0, None)
+
+
 # --- store semantics --------------------------------------------------------
 
 

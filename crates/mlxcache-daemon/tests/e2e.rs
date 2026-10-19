@@ -2655,12 +2655,33 @@ async fn stalled_stream_is_cut_by_the_idle_budget_with_an_explicit_error() {
 
 /// Serve one prompt through a state and return the parsed response body.
 async fn post_prompt(state: Arc<AppState>, content: &str) -> serde_json::Value {
-    let body = serde_json::json!({
-        "model": "e2e-model",
-        "messages": [{"role": "user", "content": content}],
-        "stream": false,
-    })
-    .to_string();
+    post_body(
+        state,
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": [{"role": "user", "content": content}],
+            "stream": false,
+        }),
+    )
+    .await
+}
+
+/// Post a chat request with an already-built `messages` array, for
+/// multimodal content that cannot be expressed as a plain string.
+async fn post_messages(state: Arc<AppState>, messages: serde_json::Value) -> serde_json::Value {
+    post_body(
+        state,
+        serde_json::json!({
+            "model": "e2e-model",
+            "messages": messages,
+            "stream": false,
+        }),
+    )
+    .await
+}
+
+async fn post_body(state: Arc<AppState>, body: serde_json::Value) -> serde_json::Value {
+    let body = body.to_string();
     let res = router(state)
         .oneshot(
             axum::http::Request::builder()
@@ -2822,6 +2843,123 @@ async fn default_engine_identity_keeps_the_legacy_key_and_header() {
             mlxcache_daemon::http::blob_key(&unrecorded, None, &tokens)
         ),
         "an engine that reports a composition must not share a pre-B1 key"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn image_content_is_stamped_in_the_published_header() {
+    // The content digest must survive the whole path: request -> fingerprint
+    // -> blob_key -> header on disk. A digest computed but not folded would
+    // leave the image collision open, and one folded but not persisted would
+    // be lost on restart, when the index is rebuilt from headers alone (R1-4).
+    //
+    // Note what this does NOT claim: today the daemon serializes messages to
+    // JSON and tokenizes that, so an image request also differs in its TOKENS.
+    // The collision this axis closes becomes reachable when the encode path
+    // substitutes a fixed `<|image_pad|>` run for the media; the digest is
+    // computed from the messages, so it is already in place for that path.
+    let (url, mut child) = spawn_sidecar_with_setup(&[], "").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let image_messages = serde_json::json!([
+        {"role": "user", "content": [
+            {"type": "text", "text": "what is in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ]}
+    ]);
+    let res = post_messages(state.clone(), image_messages).await;
+    assert_eq!(res["mlxcache"]["verdict"], "miss");
+
+    let digests: Vec<String> = state
+        .persistence
+        .list_blobs()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            state
+                .persistence
+                .load(p)
+                .unwrap()
+                .0
+                .fingerprint
+                .content_digest
+        })
+        .collect();
+    assert_eq!(digests.len(), 2, "prefill prefix + settled checkpoint");
+    for d in &digests {
+        assert!(
+            !d.is_empty(),
+            "an image request must record its content identity"
+        );
+        assert_eq!(d.len(), 64, "sha256 hex");
+    }
+    assert_eq!(
+        digests[0], digests[1],
+        "both coverage nodes share one identity"
+    );
+
+    // The SAME image at a different prompt is the same content: the digest
+    // tracks pixels, not prose.
+    let other_text = serde_json::json!([
+        {"role": "user", "content": [
+            {"type": "text", "text": "describe it briefly"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ]}
+    ]);
+    let res = post_messages(state.clone(), other_text).await;
+    assert_eq!(
+        res["mlxcache"]["verdict"], "miss",
+        "different prompt tokens"
+    );
+    let after: Vec<String> = state
+        .persistence
+        .list_blobs()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            state
+                .persistence
+                .load(p)
+                .unwrap()
+                .0
+                .fingerprint
+                .content_digest
+        })
+        .collect();
+    let unique: std::collections::HashSet<_> = after.into_iter().collect();
+    assert_eq!(
+        unique.len(),
+        1,
+        "one image, one content identity: {unique:?}"
+    );
+
+    // A text-only request records nothing, so its header stays byte-identical
+    // to a pre-B2 one and its key is the legacy key.
+    let res = post_prompt(state.clone(), "plain text prompt").await;
+    assert_eq!(res["mlxcache"]["verdict"], "miss");
+    let text_digests: Vec<String> = state
+        .persistence
+        .list_blobs()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            state
+                .persistence
+                .load(p)
+                .unwrap()
+                .0
+                .fingerprint
+                .content_digest
+        })
+        .filter(|d| d.is_empty())
+        .collect();
+    assert!(
+        !text_digests.is_empty(),
+        "text-only publishes record no digest"
     );
 
     child.kill().expect("kill sidecar");

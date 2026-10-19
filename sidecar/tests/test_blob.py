@@ -205,6 +205,65 @@ def test_decode_rejects_non_string_cache_layout():
             raise AssertionError(f"non-string cache_layout {bad!r} must be rejected")
 
 
+def test_decode_accepts_and_omits_content_digest():
+    # B2 forward compatibility, by the same discipline as cache_layout: a
+    # daemon that records non-text content serializes one more field, and the
+    # reader must adopt it. An empty digest is "no non-text content" — exactly
+    # what a pre-B2 header says by saying nothing — so it must not be emitted.
+    rust_style = {
+        "fingerprint": {
+            "model_id": "Qwen/Qwen3.8-Flash-Next",
+            "tokenizer_hash": "1a2b3c4d5e6f7081",
+            "kv_dtype": "float16",
+            "kv_layout_version": 1,
+            "content_digest": "b1946ac92492d2347c6235b4d2611184",
+        },
+        "token_count": 4,
+        "tokens": [1, 2, 3, 4],
+        "format_version": 1,
+    }
+    header = json.dumps(rust_style).encode()
+    meta, _ = blob.decode(struct.pack("<I", len(header)) + header + b"KV")
+    assert meta.fingerprint.content_digest == "b1946ac92492d2347c6235b4d2611184"
+
+    encoded = blob.encode(_meta([1, 2]), b"kv")
+    (header_len,) = struct.unpack("<I", encoded[:4])
+    header = json.loads(encoded[4 : 4 + header_len])
+    assert "content_digest" not in header["fingerprint"]
+
+    recorded = _meta([1, 2])
+    recorded.fingerprint.content_digest = "abc123"
+    encoded = blob.encode(recorded, b"kv")
+    (header_len,) = struct.unpack("<I", encoded[:4])
+    header = json.loads(encoded[4 : 4 + header_len])
+    assert header["fingerprint"]["content_digest"] == "abc123"
+
+
+def test_decode_rejects_non_string_content_digest():
+    # Same poison-pill path as cache_layout: a non-str digest would raise on
+    # the fold's .encode() outside every guarded region.
+    for bad in (5, None, ["x"], {"a": 1}):
+        rust_style = {
+            "fingerprint": {
+                "model_id": "m",
+                "tokenizer_hash": "h",
+                "kv_dtype": "f16",
+                "kv_layout_version": 1,
+                "content_digest": bad,
+            },
+            "token_count": 2,
+            "tokens": [1, 2],
+            "format_version": 1,
+        }
+        header = json.dumps(rust_style).encode()
+        try:
+            blob.decode(struct.pack("<I", len(header)) + header + b"KV")
+        except blob.HeaderRejected as exc:
+            assert exc.kind == "header", bad
+        else:
+            raise AssertionError(f"non-string content_digest {bad!r} must be rejected")
+
+
 def test_decode_rejects_version_mismatch():
     meta = _meta([1])
     meta.format_version = 99

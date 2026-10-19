@@ -37,6 +37,7 @@ fn bench_blob_key(c: &mut Criterion) {
         kv_bits: 0,
         kv_group_size: 0,
         cache_layout: String::new(),
+        content_digest: String::new(),
     };
     let mut group = c.benchmark_group("blob_key");
     group.warm_up_time(std::time::Duration::from_millis(300));
