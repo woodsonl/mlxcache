@@ -111,7 +111,7 @@ def test_start_stack_spawns_prebuilt_daemon_not_cargo_run(monkeypatch, tmp_path)
 
     monkeypatch.setattr(bw.subprocess, "run", fake_run)
     monkeypatch.setattr(bw.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(bw, "_wait_listening", lambda addr, deadline_s=30.0: None)
+    monkeypatch.setattr(bw, "_wait_listening", lambda addr, deadline_s=30.0, proc=None: None)
 
     bw.start_stack(str(tmp_path))
 

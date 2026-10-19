@@ -238,9 +238,11 @@ class Server:
 
         urllib's line iteration over the response is buffered, so a `data:`
         record split across TCP reads is reassembled before we see it. The
-        socket timeout bounds one read, not the stream: a server dripping a
-        frame every few seconds would hold the connection open forever, so a
-        monotonic deadline caps the whole consumption.
+        socket timeout bounds one read, not the stream — so the socket's
+        timeout is reset to the REMAINING total budget before every read
+        and a server dripping a frame every few seconds can neither hold
+        the connection past the deadline nor block one read longer than
+        the budget allows. EOF (empty read) ends consumption cleanly.
         """
         req = urllib.request.Request(
             f"{self.base}{path}",
@@ -250,7 +252,23 @@ class Server:
         events = []
         deadline = time.monotonic() + timeout
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            for raw_line in r:
+            sock = getattr(getattr(r.fp, "raw", None), "_sock", None)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
+                if sock is not None:
+                    # Bound the NEXT blocking read by what is left of the
+                    # total budget, not by the original per-read timeout.
+                    sock.settimeout(max(0.05, remaining))
+                try:
+                    raw_line = r.readline()
+                except TimeoutError:
+                    # The remaining-budget read timed out: same verdict as
+                    # the deadline check, raised as the documented error.
+                    raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget") from None
+                if not raw_line:
+                    break  # EOF: the server closed the stream
                 if time.monotonic() > deadline:
                     raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
                 line = raw_line.decode().strip()

@@ -79,7 +79,21 @@ def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, fl
     ttft: float | None = None
     tokens = 0
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        for raw in resp:
+        sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
+            if sock is not None:
+                # Bound the NEXT blocking read by the remaining total
+                # budget, not by the original per-read timeout.
+                sock.settimeout(max(0.05, remaining))
+            try:
+                raw = resp.readline()
+            except TimeoutError:
+                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget") from None
+            if not raw:
+                break  # EOF: stream closed
             if time.monotonic() > deadline:
                 raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
             line = raw.decode(errors="replace").strip()
@@ -254,7 +268,7 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
         # workload request would die with an unattributable 5xx. The sidecar
         # boots slower than the daemon (uv discovery + interpreter +
         # imports), so prove it is LISTENING before the daemon exists.
-        _wait_listening(("127.0.0.1", sidecar_port), deadline_s=30.0)
+        _wait_listening(("127.0.0.1", sidecar_port), deadline_s=30.0, proc=sidecar)
         daemon_port = _free_port()
         daemon = subprocess.Popen(
             [
@@ -280,12 +294,28 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
     return sidecar, daemon, daemon_port
 
 
-def _wait_listening(addr: tuple[str, int], deadline_s: float) -> None:
-    """Block until something accepts TCP connections on addr."""
+def _wait_listening(
+    addr: tuple[str, int], deadline_s: float, proc: subprocess.Popen | None = None
+) -> None:
+    """Block until something accepts TCP connections on addr.
+
+    When the owning child is supplied, its liveness is checked before and
+    after every attempt: a child that dies mid-boot must fail with its exit
+    status, not burn the whole deadline on "nothing listened".
+    """
     import socket
+
+    def _child_dead() -> int | None:
+        if proc is None:
+            return None
+        rc = proc.poll()
+        return rc
 
     deadline = time.time() + deadline_s
     while time.time() < deadline:
+        rc = _child_dead()
+        if rc is not None:
+            raise RuntimeError(f"child exited (code {rc}) before listening on {addr[0]}:{addr[1]}")
         with socket.socket() as s:
             if s.connect_ex(addr) == 0:
                 return
