@@ -2,16 +2,25 @@
 
 Endpoints (daemon -> sidecar protocol):
 - POST /tokenize  {"prompt": str} -> {"tokens": [u32], "tokenizer_hash": str,
-                   "kv_dtype": str, "kv_bits": int, "kv_group_size": int}
+                   "kv_dtype": str, "kv_bits": int, "kv_group_size": int,
+                   "engine_id": str, "cache_layout": str}
 - POST /prefill   {"tokens": [u32], "ancestor_blob_path": str|null}
                    -> KV checkpoint payload (binary; EMPTY body = nothing
                    cacheable). 400 on bad input; 422 when a declared ancestor
                    is missing or unloadable (the daemon quarantines it and
                    retries from scratch).
 - POST /generate  {"tokens": [u32], "max_tokens": int, "blob_path": str|null,
-                   "stream": bool} -> NDJSON token stream
+                   "stream": bool, "settle_path": str|null} -> NDJSON token
+                   stream (or a JSON body when stream is false). `settle_path`
+                   asks the engine to persist the POST-GENERATION cache — the
+                   prompt plus the tokens it just produced — as a wire
+                   checkpoint at that path, and to report the outcome in the
+                   response (`settle`, on the JSON body and on the terminal
+                   done frame). The cache only exists inside this request, so
+                   it must be captured here; a separate endpoint could not
+                   rebuild it from tokens.
 
-Engine selection: MLXCACHE_ENGINE=synthetic (default, hermetic) or mlx-lm
+Engine selection: MLXCACHE_ENGINE=synthetic (default, hermetic), mlx-lm, or redacted-engine
 (lazy import; requires a local model). The daemon is the only client; this
 server binds 127.0.0.1 by default.
 
@@ -20,15 +29,18 @@ Run: uv run python -m mlxcache_sidecar.server
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import PurePath
 
 
 class CheckpointRejectedError(Exception):
@@ -198,6 +210,256 @@ def _payload_digest_ok(meta: object, payload: bytes) -> bool:
     return hashlib.sha256(payload).hexdigest() == expected.lower()
 
 
+# ---------------------------------------------------------------------------
+# Post-generation settling
+#
+# The KV for a request exists only inside the request that built it: /prefill
+# constructs it and returns, and /generate constructs or loads it and returns.
+# Nothing outside those calls can reconstruct it from token ids, which is why a
+# settled checkpoint has to be produced and handed out from INSIDE the generate
+# request instead of from a separate endpoint.
+#
+# A settle keeps the repository's coverage convention: a persisted cache covers
+# `meta.tokens[:-1]`, so the reader's `covered = len(meta.tokens) - 1` tells the
+# next turn exactly which positions are already resident. The cache an engine
+# holds at the end of generation may sit one position deeper than that (the
+# sampler feeds the last generated token to produce the token AFTER it, which
+# is then discarded), so coverage is MEASURED and trimmed to the convention
+# rather than assumed — an off-by-one here makes the next turn feed a token the
+# cache already holds, which degrades output without failing any structural
+# check.
+# ---------------------------------------------------------------------------
+
+# Generous but finite: settling is best-effort work on the request's critical
+# path, so it must never be unbounded. The token cap bounds positions (and the
+# payload that follows from them); the byte cap bounds a payload whose shape
+# does not follow the token count (wide KV heads, many layers).
+SETTLE_MAX_TOKENS_DEFAULT = 32768
+SETTLE_MAX_BYTES_DEFAULT = 2 * 1024 * 1024 * 1024
+
+
+def _settle_limits() -> tuple[int | None, int | None]:
+    """(max_tokens, max_bytes) for one settled checkpoint. A malformed value
+    falls back to the default rather than disabling settling silently.
+
+    An explicitly-set 0 means REFUSE EVERYTHING, not "no cap": `0` is the
+    natural "turn this off" for the two knobs that bound on-disk writes, so
+    treating it as falsy-disabled would invert the operator's intent. An
+    unset or unparsable variable keeps the default — a malformed value must
+    never leave the caps silently off."""
+
+    def read(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    return (
+        read("MLXCACHE_SETTLE_MAX_TOKENS", SETTLE_MAX_TOKENS_DEFAULT),
+        read("MLXCACHE_SETTLE_MAX_BYTES", SETTLE_MAX_BYTES_DEFAULT),
+    )
+
+
+def _settle_fingerprint(engine: object) -> object:
+    """The header fingerprint a settled checkpoint carries.
+
+    Identity is owned by the DAEMON (it is the side that keys and publishes),
+    so this header is not the authority for routing: it is what makes the file
+    a self-describing wire checkpoint the daemon can decode, cross-check
+    against the identity it already resolved for the request, and re-stamp
+    with its own metadata. Writing the engine's own identity keeps the two
+    comparable instead of forcing the daemon to trust an opaque blob.
+    """
+    from .blob import Fingerprint  # noqa: PLC0415
+
+    return Fingerprint(
+        model_id=str(getattr(engine, "model_id", "")),
+        tokenizer_hash=str(getattr(engine, "tokenizer_hash", "")),
+        kv_dtype=str(getattr(engine, "kv_dtype", "unknown")),
+        kv_layout_version=1,
+        kv_bits=int(getattr(engine, "kv_bits", 0) or 0),
+        kv_group_size=int(getattr(engine, "kv_group_size", 0) or 0),
+        cache_layout=str(getattr(engine, "cache_layout", "") or ""),
+    )
+
+
+def settle_checkpoint(
+    engine: object,
+    settle_path: str,
+    tokens: list[int],
+    payload: bytes,
+    *,
+    covered: int | None = None,
+) -> dict:
+    """Write one post-generation checkpoint (wire format) and report the outcome.
+
+    `tokens` is the FULL sequence the checkpoint's cache is described by
+    (prompt + generated); the cache itself covers `tokens[:-1]` by the
+    repository's convention. `covered` is the measured number of positions the
+    cache actually holds; the caller has already brought it to
+    `len(tokens) - 1` (or declines to settle), so this function only records
+    it.
+
+    Never raises. A settle is best-effort work: the model's answer is already
+    produced, and a failed settle (ENOSPC, a bad path, a refused write) must
+    not turn a successful completion into an error. The returned report says
+    what happened so the daemon can log the reason and so "wrote nothing" is
+    never mistaken for "wrote something".
+    """
+    max_tokens, max_bytes = _settle_limits()
+    if len(tokens) < 2:
+        # A prefix shorter than two tokens caches nothing (mirrors prefill and
+        # read_wire_checkpoint): publishing it would index a checkpoint that
+        # can never be resumed from.
+        return {"written": False, "tokens": len(tokens), "reason": "too_short"}
+    if max_tokens is not None and len(tokens) > max_tokens:
+        return {"written": False, "tokens": len(tokens), "reason": "token_cap"}
+    if not payload:
+        return {"written": False, "tokens": len(tokens), "reason": "empty_payload"}
+    if max_bytes is not None and len(payload) > max_bytes:
+        return {"written": False, "tokens": len(tokens), "reason": "size_cap"}
+
+    from .blob import CheckpointMeta, encode  # noqa: PLC0415
+
+    meta = CheckpointMeta(
+        fingerprint=_settle_fingerprint(engine),
+        token_count=len(tokens),
+        tokens=list(tokens),
+        # No payload digest here: the daemon stamps format_version 2 and the
+        # digest at its single publish choke point (publish_atomic), exactly as
+        # it does for a prefill payload. Duplicating that here would create a
+        # second, independently-maintained integrity contract.
+        engine_id=_engine_id_meta(engine),
+    )
+    wire = encode(meta, payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    # A unique sibling temp + os.replace keeps a concurrent reader (the daemon
+    # reading the staging file after this response) from ever seeing a torn
+    # write, without requiring the caller to coordinate a lock. mkstemp gives
+    # the uniqueness: a FIXED ".part" name would let two overlapping requests
+    # (a daemon retry racing an abandoned attempt) corrupt each other's temp.
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(settle_path) or ".",
+            prefix=os.path.basename(settle_path) + ".",
+            suffix=".part",
+        )
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(wire)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, settle_path)
+    except OSError as exc:
+        # Leave nothing behind: a stranded temp in the blob dir would be
+        # invisible to every reader and accumulate per request. mkstemp can
+        # itself fail (a read-only blob dir), in which case there is no temp.
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+        return {"written": False, "tokens": len(tokens), "reason": f"write_failed: {exc}"}
+    return {
+        "written": True,
+        "tokens": len(tokens),
+        "covered": len(tokens) - 1 if covered is None else covered,
+        "sha256": digest,
+        "bytes": len(wire),
+    }
+
+
+def _engine_id_meta(engine: object) -> str | None:
+    """`engine_id` for the header, using the same zero-byte default rule as the
+    daemon: the default engine records nothing so its header stays
+    byte-identical to a pre-namespacing one."""
+    engine_id = str(getattr(engine, "engine_id", "mlx-lm") or "mlx-lm")
+    return None if engine_id == "mlx-lm" else engine_id
+
+
+def _is_staging_shaped(path: str) -> bool:
+    """True when `path` is NAMED like the daemon's own settle staging path:
+    basename `.settle-<pid>-<seq>-<nanos>.staging`, no traversal components.
+    Anything else is not a path the daemon would ever send."""
+    import re
+
+    if re.fullmatch(r"\.settle-\d+-\d+-\d+\.staging", os.path.basename(path)) is None:
+        return False
+    return not any(part in ("..", ".") for part in PurePath(path).parts)
+
+
+def _staging_dir_matches(path: str) -> bool:
+    """True when `path`'s parent directory is the pinned staging directory.
+
+    The pin is the daemon's blob dir in real deployments. A mismatch means
+    misconfiguration (the daemon restarted against a new blob dir while the
+    old one still exists), not an attack: the caller never gets to write
+    anywhere either way, because the mismatch DEGRADES the settle rather
+    than the request -- generation has value, a best-effort settle does not.
+    """
+    parent = os.path.realpath(os.path.dirname(path) or ".")
+    with _SETTLE_DIR_LOCK:
+        pinned = _SETTLE_DIR_PIN[0]
+        # Re-pin only when the pinned directory is GONE: a live directory can
+        # never be displaced by another caller's path.
+        if pinned is not None and pinned != parent and not os.path.isdir(pinned):
+            pinned = None
+            _SETTLE_DIR_PIN[0] = None
+        if pinned is None:
+            _SETTLE_DIR_PIN[0] = parent
+            pinned = parent
+        return pinned == parent
+
+
+_SETTLE_DIR_LOCK = threading.Lock()
+_SETTLE_DIR_PIN: list[str | None] = [None]
+
+
+def _cache_positions(cache) -> int | None:
+    """How many positions a prompt cache actually holds, or None when the
+    composition cannot report it.
+
+    Measured, never assumed: the sampler's lookahead means a finished
+    generation can leave the cache exactly one position deeper than the
+    `tokens[:-1]` convention, and the amount differs with where the loop
+    stopped (token budget, EOS).
+    """
+    if cache is None:
+        return None
+    try:
+        entries = list(cache)
+    except TypeError:
+        return None
+    if not entries:
+        return None
+    sizes: list[int] = []
+    for entry in entries:
+        size = getattr(entry, "size", None)
+        if callable(size):
+            sizes.append(int(size()))
+        elif isinstance(getattr(entry, "offset", None), int):
+            sizes.append(int(entry.offset))
+        else:
+            return None
+    return max(sizes)
+
+
+def _trim_cache_to(cache, target: int) -> bool:
+    """Trim `cache` in place down to `target` positions. False when the
+    composition cannot be trimmed (recurrent/SSM hybrid state has no
+    per-position trim), or when trimming does not reach the target."""
+    from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache  # noqa: PLC0415
+
+    current = _cache_positions(cache)
+    if current is None or current <= target:
+        return current == target
+    if not can_trim_prompt_cache(cache):
+        return False
+    trim_prompt_cache(cache, current - target)
+    return _cache_positions(cache) == target
+
+
 def read_wire_checkpoint(
     blob_path: str, tokens: list[int] | None = None, check_safetensors: bool = True
 ) -> tuple[object | None, bytes, bool]:
@@ -314,6 +576,22 @@ class SyntheticEngine:
     """Hermetic engine: deterministic tokens + KV bytes, no MLX dependency."""
 
     name = "synthetic"
+    # Engine identity and cache composition are part of the reported identity
+    # (connector protocol §2/§4), so a future engine must set both:
+    #
+    # - `engine_id` namespaces the store key domain. It is "mlx-lm" — NOT
+    #   "synthetic" — deliberately: this engine stands in for mlx-lm in
+    #   hermetic tests, and a checkpoint minted by a test run must be
+    #   indistinguishable (byte-for-byte fingerprints, hence keys) from one
+    #   minted by the real engine. A distinct id would re-key every hermetic
+    #   e2e blob and hide exactly the cross-binding drift those tests exist to
+    #   catch.
+    # - `cache_layout` signs the payload's SHAPE. The synthetic engine has no
+    #   real cache, so it reports a fixed constant standing in for a dense KV
+    #   stack: the composition nothing may be cross-served with, and stable
+    #   across processes because it is a literal.
+    engine_id = "mlx-lm"
+    cache_layout = "synthetic-dense-kv"
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
@@ -459,11 +737,17 @@ class SyntheticEngine:
         # can assert the delta path ran and how much it saved.
         self.last_prefill_tokens = len(tokens)
         self.last_prefill_delta_tokens = max(len(tokens) - 1 - covered, 0)
-        payload = b"".join(
+        # Raw payload only; the daemon writes the checkpoint header.
+        return self._kv_bytes(tokens)
+
+    @staticmethod
+    def _kv_bytes(tokens: list[int]) -> bytes:
+        """The synthetic KV payload for a token sequence: a pure function of
+        (token id, position), which is what makes this engine's scratch
+        prefill, delta prefill, and settled checkpoint byte-identical."""
+        return b"".join(
             ((t * 31 + i) & 0xFFFFFFFF).to_bytes(4, "little") * 256 for i, t in enumerate(tokens)
         )
-        # Raw payload only; the daemon writes the checkpoint header.
-        return payload
 
     def generate(self, tokens: list[int], max_tokens: int) -> list[int]:
         # Deterministic continuation: token ids derived from context length.
@@ -472,7 +756,60 @@ class SyntheticEngine:
         base = len(tokens)
         return [(base + i) % 2**31 for i in range(max_tokens)]
 
-    def generate_with_text(self, tokens: list[int], max_tokens: int, blob_path: str | None = None):
+    def settle(
+        self, prompt_tokens: list[int], generated: list[int], cache, settle_path: str
+    ) -> dict:
+        """Persist the synthetic KV for prompt+generated.
+
+        The synthetic KV is a pure function of (token id, position), so the
+        settled payload is byte-identical to what a scratch prefill of the same
+        sequence returns — this engine CAN honor a settle honestly, and doing so
+        is what lets the hermetic e2e prove the daemon's settle→resume routing.
+        It is not a fabricated checkpoint: the bytes are exactly the KV this
+        engine would compute for those tokens.
+
+        The documented no-op rule still binds this engine where it cannot
+        produce a real settle: with no generated tokens, fewer than two total
+        tokens, or a payload over the caps, it writes NOTHING and says so
+        (settle_checkpoint enforces those, and the reason is reported).
+        """
+        del cache  # this engine persists no state object, only the token-ordered KV
+        total = list(prompt_tokens) + list(generated)
+        if not generated:
+            return {"written": False, "tokens": len(total), "reason": "no_generated_tokens"}
+        report = settle_checkpoint(self, settle_path, total, self._kv_bytes(total))
+        # Test knob (same family as MLXCACHE_GENERATE_FAIL): let a e2e spawn
+        # an engine that lies about its digest, or omits it, so the daemon's
+        # publish-time guards are exercised over the real HTTP path.
+        lie = os.environ.get("MLXCACHE_SETTLE_LIE", "")
+        if lie and report.get("written"):
+            if lie == "omit":
+                report.pop("sha256", None)
+            elif lie == "bad":
+                report["sha256"] = "0" * 64
+        return report
+
+    def generate_collect(
+        self,
+        tokens: list[int],
+        max_tokens: int,
+        blob_path: str | None = None,
+        settle_path: str | None = None,
+    ):
+        """(token_ids, text, cache, settle_report) — the collecting entry the
+        handler uses when a settle was requested."""
+        out, text = self.generate_with_text(tokens, max_tokens, blob_path)
+        settle = None
+        if settle_path is not None:
+            settle = self.settle(tokens, out, None, settle_path)
+        return out, text, None, settle
+
+    def generate_with_text(
+        self,
+        tokens: list[int],
+        max_tokens: int,
+        blob_path: str | None = None,
+    ):
         """(token_ids, text) — mirrors the stream path's pieces exactly, so
         streaming and non-streaming clients see the same detokenization."""
         if blob_path:
@@ -521,12 +858,23 @@ class MlxLmEngine:
     """
 
     name = "mlx-lm"
+    # The default engine's key domain: zero fold bytes (protocol §4).
+    engine_id = "mlx-lm"
 
     def __init__(self, model_id: str) -> None:
         from mlx_lm import load  # noqa: PLC0415 — lazy, only when selected
 
         self.model_id = model_id
         self.model, self.tokenizer = load(model_id)
+        self._adopt_model()
+
+    def _adopt_model(self) -> None:
+        """Everything that follows loading a model, independent of HOW it was
+        loaded. A second engine that builds its model some other way (a
+        streaming loader over an architecture mlx-lm cannot construct) calls
+        this same method, so the identity fields and boot guards have exactly
+        one implementation and cannot drift apart from the load path."""
+        self._materialize_weights()
         # Hash the vocabulary, not the model name: R1-2 pins the tokenizer
         # artifact, and two different tokenizers can share a name_or_path-free
         # identity. The vocab is deterministic and artifact-derived.
@@ -541,6 +889,14 @@ class MlxLmEngine:
         if self.kv_bits and not self.kv_group_size:
             # A group size is mandatory with quantization; 64 is the proven one.
             self.kv_group_size = 64
+        # One cache construction serves BOTH boot checks below. It allocates
+        # no arrays (state fills on the first forward), so probing every model
+        # — quantized or not — is free. Composition must be signed for EVERY
+        # model: an empty (unknown) layout would let this engine serve blobs
+        # whose payload shape it cannot verify.
+        probe = self._prompt_cache_probe()
+        self.cache_layout = self._cache_layout_of(probe)
+        self._assert_quantization_supported(probe)
         self.prefill_count = 0
         # Metal allocator hygiene: MLX pools freed GPU buffers by size-class
         # indefinitely (set_cache_limit defaults high). A day of mixed-leg
@@ -563,6 +919,80 @@ class MlxLmEngine:
         self._eos_ids = getattr(self.tokenizer, "_eos_token_ids", None) or {
             self.tokenizer.eos_token_id
         }
+
+    def _materialize_weights(self) -> None:
+        """Evaluate every model parameter on the boot thread.
+
+        MLX defers array construction, and a lazy graph built on one thread
+        cannot be evaluated on another: doing so raises
+        `RuntimeError: There is no Stream(gpu, 0) in current thread`. The engine
+        is built on the thread that calls `serve()`, while
+        `ThreadingHTTPServer` dispatches each request on a worker thread, so a
+        model whose weights are still unevaluated when the first request arrives
+        fails on the very first forward pass — a 500 on `/prefill`, before any
+        token is produced.
+
+        `parameters()` is a lazy view, so this is one `mx.eval` over the whole
+        weight tree, on the thread that owns it. It costs the load's own I/O,
+        which the loader is already streaming at boot; it does not hold a second
+        copy. Engines whose model is not an MLX module (the synthetic engine, a
+        third-party adapter) are skipped.
+        """
+        parameters = getattr(self.model, "parameters", None)
+        if parameters is None:
+            return
+        try:
+            import mlx.core as mx  # noqa: PLC0415
+        except ImportError:
+            return
+        tree = parameters()
+        if tree:
+            mx.eval(tree)
+
+    def _prompt_cache_probe(self):
+        """One freshly constructed prompt cache for this model, shared by the
+        boot checks. Construction allocates no arrays (states fill on the
+        first forward), so this is cheap and side-effect free."""
+        from mlx_lm.models.cache import make_prompt_cache  # noqa: PLC0415
+
+        return make_prompt_cache(self.model)
+
+    @staticmethod
+    def _cache_layout_of(cache) -> str:
+        """The cache-composition signature: the ORDERED tuple of cache-entry
+        class names, hashed. A dense model yields one class repeated per
+        layer; a hybrid model yields CacheList/ArraysCache entries carrying
+        linear-attention or SSM state. Two architectures can agree on model
+        id, tokenizer, dtype and quantization tier while their payloads have
+        different shapes, so composition must be part of the identity.
+
+        The signature is a digest, not the raw tuple: it is folded into every
+        key and stamped in every header, and a short stable hex string keeps
+        both cheap. Truncated to 16 hex chars (64 bits) — collisions between
+        two real cache compositions are not a realistic concern and, unlike
+        the key fold, this value only ever needs to separate architectures
+        that differ structurally."""
+        names = ",".join(type(c).__name__ for c in cache)
+        return hashlib.sha256(names.encode()).hexdigest()[:16]
+
+    def _assert_quantization_supported(self, cache) -> None:
+        """Boot-time guard for the T12 q8 tier: parity is proven for dense
+        attention stacks only. Hybrid caches (CacheList/ArraysCache entries
+        carrying linear-attention / SSM / GDN state) have no ``to_quantized``,
+        so _quantize_cache would crash on the first prefill; refuse at boot
+        with the fix in the message instead."""
+        if not self.kv_bits:
+            return
+        from mlx_lm.models.cache import KVCache  # noqa: PLC0415
+
+        if not all(type(c) is KVCache for c in cache):
+            raise ValueError(
+                "MLXCACHE_KV_BITS is set but this model's prompt cache is not "
+                "a dense KV stack (a hybrid architecture: linear attention, "
+                "SSM, or GDN layers). The q8 tier is parity-proven for dense "
+                "models only; hybrid checkpoints persist their state "
+                "unquantized. Restart with MLXCACHE_KV_BITS=0."
+            )
 
     def _kv_dtype(self) -> str:
         """The KV/compute dtype this model will cache in (bf16 vs f16 changes the
@@ -737,21 +1167,113 @@ class MlxLmEngine:
         """
         return self._generate_with_cache(tokens, max_tokens, cache=None)
 
-    def generate_with_text(self, tokens: list[int], max_tokens: int, blob_path: str | None = None):
+    def _new_cache(self):
+        """A fresh prompt cache owned by the caller, so generation mutates it in
+        place and it survives the call.
+
+        Passing None to mlx-lm makes IT construct the cache internally, which
+        leaves nothing to settle: the post-generation KV would be unreachable
+        from the request that produced it, and settling would be impossible
+        without replaying generation.
+        """
+        from mlx_lm.models.cache import make_prompt_cache  # noqa: PLC0415
+
+        return make_prompt_cache(self.model)
+
+    def settle(
+        self, prompt_tokens: list[int], generated: list[int], cache, settle_path: str
+    ) -> dict:
+        """Persist the POST-GENERATION cache (prompt + generated) as a wire
+        checkpoint, so the next turn resumes with only its own new tokens.
+
+        Coverage is measured and reconciled, never assumed. mlx-lm's sampler
+        feeds the most recent token to predict the NEXT one, and the final
+        prediction is discarded, so the cache at the end of generation can hold
+        one position MORE than the `tokens[:-1]` convention. Two directions,
+        both handled:
+
+        - Deeper than the convention: trim the surplus position(s). If the
+          composition cannot be trimmed (recurrent/SSM hybrid state has no
+          per-position trim), do NOT settle — a covered count one too deep
+          makes the next turn re-feed a token the cache already holds, which
+          degrades output silently instead of failing.
+        - Shallower than the convention (immediate EOS, a prompt-only run):
+          REFUSE. The earlier behavior shortened the recorded prefix and wrote
+          the file, but the daemon requires the settled sequence to equal
+          request+generated exactly (publish_settled_blob discards anything
+          else), so a shortened settle was dead work that still reported
+          `written: true` — a report nothing downstream ever acted on.
+        """
+        from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
+
+        total = list(prompt_tokens) + list(generated)
+        if not generated:
+            return {"written": False, "tokens": len(total), "reason": "no_generated_tokens"}
+        if cache is None:
+            return {"written": False, "tokens": len(total), "reason": "no_cache"}
+        if len(total) < 2:
+            return {"written": False, "tokens": len(total), "reason": "too_short"}
+        # Same tier as prefill persists: the header's fingerprint pins
+        # kv_bits/kv_group_size, so a settled blob must hold the same shape of
+        # state as a prefilled one for the two to be interchangeable.
+        cache = self._quantize_cache(cache)
+        positions = _cache_positions(cache)
+        if positions is None:
+            return {"written": False, "tokens": len(total), "reason": "unmeasurable_cache"}
+        target = len(total) - 1
+        if positions > target:
+            if not _trim_cache_to(cache, target):
+                return {"written": False, "tokens": len(total), "reason": "untrimmable_cache"}
+            # `covered` must describe the state as persisted, not as first
+            # measured: the trim above is what makes them differ.
+            positions = _cache_positions(cache)
+            if positions is None or positions != target:
+                return {"written": False, "tokens": len(total), "reason": "untrimmable_cache"}
+        elif positions < target:
+            return {"written": False, "tokens": len(total), "reason": "shallow_cache"}
+        buf = io.BytesIO()
+        save_prompt_cache(buf, cache)
+        payload = buf.getvalue()
+        return settle_checkpoint(self, settle_path, total, payload, covered=positions)
+
+    def generate_with_text(
+        self,
+        tokens: list[int],
+        max_tokens: int,
+        blob_path: str | None = None,
+    ):
         """(token_ids, detokenized_text) for non-streaming callers.
 
         Collects from the same streaming decode path so token-for-token (and
         character-for-character) it matches what a streaming client sees; the
         plain `generate` below discards text for callers that only want ids.
         """
+        out, text, _cache, _settle = self.generate_collect(tokens, max_tokens, blob_path, None)
+        return out, text
+
+    def generate_collect(
+        self,
+        tokens: list[int],
+        max_tokens: int,
+        blob_path: str | None = None,
+        settle_path: str | None = None,
+    ):
+        """(token_ids, text, cache, settle_report) for the non-streaming leg.
+
+        The cache is returned rather than discarded so a settle can persist the
+        post-generation KV: it exists only inside this call, so the request
+        that built it is the only place it can be captured.
+        """
         if max_tokens <= 0:
-            return [], ""
+            return [], "", None, None
         cache = None
         prompt = tokens
         if blob_path:
             cache, prompt = self._load_cache_delta(tokens, blob_path)
             if cache is None:
                 prompt = tokens  # unexpectable cache: scratch
+        if cache is None:
+            cache = self._new_cache()
         out: list[int] = []
         pieces: list[str] = []
         for token, text in self._stream_with_cache(prompt, cache):
@@ -759,7 +1281,22 @@ class MlxLmEngine:
             pieces.append(text)
             if len(out) >= max_tokens:
                 break
-        return out, "".join(pieces)
+        settle = None
+        if settle_path is not None:
+            # Never raises, mirroring _settle_stream: generation already
+            # succeeded, and a failed settle (an import, an untrimmable cache
+            # composition, a quantize step) must not turn the completed
+            # request into a 500. The report carries the reason instead.
+            try:
+                settle = self.settle(tokens, out, cache, settle_path)
+            except Exception as exc:  # noqa: BLE001 — a settle is best-effort
+                traceback.print_exc()
+                settle = {
+                    "written": False,
+                    "tokens": len(tokens) + len(out),
+                    "reason": f"settle_failed: {exc}",
+                }
+        return out, "".join(pieces), cache, settle
 
     def stream(self, tokens: list[int], blob_path: str | None):
         """Yield (token_id, text) for this request, resuming from `blob_path`
@@ -771,13 +1308,22 @@ class MlxLmEngine:
         """Load the checkpoint (may raise for a corrupt blob) and return
         (prompt, cache). Done before headers are sent so a load failure is a
         clean 422, not a truncated stream. First-token decode happens later, in
-        stream_prepared, so a decode error does not look like blob corruption."""
+        stream_prepared, so a decode error does not look like blob corruption.
+
+        A cache is ALWAYS returned (constructed here when there is no blob to
+        adopt): generation mutates it in place, and the settled checkpoint is
+        captured from exactly that object after the last token. Letting mlx-lm
+        build a throwaway internal cache would make the post-generation KV
+        unreachable from the request that produced it.
+        """
         cache = None
         prompt = tokens
         if blob_path:
             cache, prompt = self._load_cache_delta(tokens, blob_path)
             if cache is None:
                 prompt = tokens  # unexpectable cache: scratch
+        if cache is None:
+            cache = self._new_cache()
         return prompt, cache
 
     def stream_prepared(self, prompt, cache):
@@ -793,14 +1339,86 @@ class MlxLmEngine:
         yield from self.stream_with_cache(prompt, cache)
 
     def stream_with_cache(self, tokens, cache):
-        """Yield (token_id, text_piece) per decode step from mlx-lm."""
-        import mlx.core as mx  # noqa: PLC0415
-        from mlx_lm import stream_generate  # noqa: PLC0415
+        """Yield (token_id, text_piece) per decode step.
 
-        for resp in stream_generate(
-            self.model, self.tokenizer, prompt=mx.array(tokens), prompt_cache=cache
-        ):
-            yield resp.token, resp.text
+        Two loops, chosen by what the cache can do, because they differ by
+        exactly the position `settle` has to reconcile.
+
+        `mlx_lm.stream_generate` runs one forward per token PLUS one: the token
+        it yielded last is fed back before the budget check, so after N tokens
+        the cache holds N+1 positions. `settle` trims that surplus back to the
+        `tokens[:-1]` convention, which is fine for a KV cache —
+        `KVCache.trim` drops positions.
+
+        A hybrid cache cannot. This architecture's GDN layers accumulate
+        recurrent state with no position axis, so `is_trimmable()` is False and
+        the surplus is unfixable after the fact: `settle` refuses every
+        checkpoint, and without a checkpoint every turn re-prefills from
+        scratch. For those caches the loop below forwards only when the consumer
+        asks for another token, so the last forward is the one that produced the
+        last yielded token and the cache lands on the convention exactly. That
+        also saves one forward per request.
+
+        Token choice is identical either way: `stream_generate`'s default
+        sampler is argmax over the log-probabilities, which is argmax over the
+        logits.
+        """
+        from mlx_lm.models.cache import can_trim_prompt_cache  # noqa: PLC0415
+
+        if can_trim_prompt_cache(cache):
+            import mlx.core as mx  # noqa: PLC0415
+            from mlx_lm import stream_generate  # noqa: PLC0415
+
+            for resp in stream_generate(
+                self.model, self.tokenizer, prompt=mx.array(tokens), prompt_cache=cache
+            ):
+                yield resp.token, resp.text
+            return
+        yield from self._stream_untrimmable(tokens, cache)
+
+    def _stream_untrimmable(self, tokens, cache):
+        """Decode loop that ends on the cache convention, for caches without trim.
+
+        The prompt is fed up to but excluding its last token; that tail is the
+        first input to the loop, so its output predicts the first generated token
+        with the whole prompt already resident.
+        """
+        import mlx.core as mx  # noqa: PLC0415
+        from mlx_lm.tokenizer_utils import TokenizerWrapper  # noqa: PLC0415
+
+        if not tokens:
+            raise ValueError("stream_with_cache needs at least one prompt token")
+        tokenizer = self.tokenizer
+        if not isinstance(tokenizer, TokenizerWrapper):
+            tokenizer = TokenizerWrapper(tokenizer)
+        eos = set(getattr(tokenizer, "eos_token_ids", ()) or ())
+        detokenizer = tokenizer.detokenizer
+
+        if len(tokens) > 1:
+            self.model(mx.array([tokens[:-1]]), cache=cache)
+        pending = tokens[-1]
+        while True:
+            logits = self.model(mx.array([[pending]]), cache=cache)
+            token = int(mx.argmax(logits[0, -1]).item())
+            if token in eos:
+                # Not yielded: `stream_generate` ends before emitting EOS, so
+                # yielding it would change the token sequence callers see.
+                #
+                # The cache is one position DEEPER than the `tokens[:-1]`
+                # convention here, not on it: the forward that discovered the
+                # EOS is the one that consumed the last yielded token, so the
+                # cache now covers the whole `prompt + generated` sequence. A
+                # trimmable cache drops that surplus; this one cannot, so
+                # `settle` refuses the checkpoint rather than record a coverage
+                # count the cache does not hold. The answer is unaffected; the
+                # cost is that an EOS-terminated reply on a hybrid engine
+                # publishes no checkpoint. A token-budget stop, which is the
+                # path the settle tests drive, lands exactly on the convention.
+                detokenizer.finalize()
+                return
+            detokenizer.add_token(token)
+            yield token, detokenizer.last_segment
+            pending = token
 
     def _generate_with_cache(self, tokens: list[int], max_tokens: int, cache) -> list[int]:
         """Collect a bounded generation from the streaming path, so the
@@ -863,8 +1481,25 @@ class MlxLmEngine:
 
 
 def make_engine(model_id: str) -> SyntheticEngine | MlxLmEngine:
-    if os.environ.get("MLXCACHE_ENGINE", "synthetic") == "mlx-lm":
+    """Select the engine from `MLXCACHE_ENGINE`.
+
+    An unknown value is a hard error, never a silent fallback: falling back to
+    the synthetic engine would answer real requests with its deterministic
+    toy tokens while every health check still passed.
+    """
+    engine = os.environ.get("MLXCACHE_ENGINE", "synthetic")
+    if engine == "mlx-lm":
         return MlxLmEngine(model_id)
+    if engine == "redacted-engine":
+        # Imported here, not at module scope: this adapter pulls in the
+        # architecture and loader modules, which the other engines never need.
+        from .engine_redacted import RedactedEngineEngine  # noqa: PLC0415
+
+        return RedactedEngineEngine(model_id)
+    if engine != "synthetic":
+        raise ValueError(
+            f"unknown MLXCACHE_ENGINE={engine!r}; expected 'synthetic', 'mlx-lm', or 'redacted-engine'"
+        )
     return SyntheticEngine(model_id)
 
 
@@ -946,7 +1581,47 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError) as exc:
             raise Handler._BadRequestError("malformed JSON body") from exc
 
-    def _stream_ndjson(self, tokens: list, blob_path: str | None, max_tokens: int) -> None:
+    def _settle_stream(
+        self,
+        prompt_tokens: list,
+        generated: list,
+        cache,
+        settle_path: str | None,
+    ) -> dict | None:
+        """Settle the post-generation cache on the streaming leg, BEFORE the
+        done frame is emitted so the terminal frame can report the outcome.
+
+        Returns None when the client did not ask to settle (no field at all,
+        distinct from "asked and nothing was written"). Never raises: a settle
+        failure must not corrupt a stream whose tokens are already delivered —
+        the engine reports the reason and the frame carries it.
+        """
+        if settle_path is None:
+            return None
+        settle = getattr(self.engine, "settle", None)
+        if settle is None:
+            # An engine that does not implement settling writes NOTHING. It
+            # must not be assumed to have written: the daemon publishes what
+            # the report describes, never what the request asked for.
+            return {"written": False, "tokens": len(prompt_tokens) + len(generated)}
+        try:
+            return settle(prompt_tokens, generated, cache, settle_path)
+        except Exception as exc:  # noqa: BLE001 — a settle is best-effort
+            traceback.print_exc()
+            return {
+                "written": False,
+                "tokens": len(prompt_tokens) + len(generated),
+                "reason": f"settle_failed: {exc}",
+            }
+
+    def _stream_ndjson(
+        self,
+        tokens: list,
+        blob_path: str | None,
+        max_tokens: int,
+        settle_path: str | None = None,
+        settle_refusal: bool = False,
+    ) -> None:
         """Stream generation as newline-delimited JSON: one line per token,
         then a final done line. Framed by connection close (HTTP/1.0-style)
         so reqwest reads until EOF — no hand-rolled chunked encoding."""
@@ -977,6 +1652,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         n = 0
+        generated: list[int] = []
         try:
             gen = self.engine.stream_prepared(prompt, cache)
             while n < max_tokens:
@@ -986,8 +1662,25 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write((json.dumps({"token": token, "text": text}) + "\n").encode())
                 self.wfile.flush()
+                generated.append(token)
                 n += 1
-            self.wfile.write((json.dumps({"done": True, "tokens": n}) + "\n").encode())
+            # Settle BEFORE the done frame: the terminal frame must carry the
+            # outcome, and a client that stops reading at `done` must not miss
+            # it. The cache object here is the one generation just mutated.
+            done = {"done": True, "tokens": n}
+            settle = self._settle_stream(tokens, generated, cache, settle_path)
+            if settle_refusal:
+                # The staging pin refused this request's path: report the
+                # refusal rather than an absent settle, so the daemon logs a
+                # reason instead of wondering whether one was requested.
+                settle = {
+                    "written": False,
+                    "tokens": len(tokens) + len(generated),
+                    "reason": "staging_path_refused",
+                }
+            if settle is not None:
+                done["settle"] = settle
+            self.wfile.write((json.dumps(done) + "\n").encode())
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             # Client went away mid-stream (R1-4 semantics): stop cleanly.
@@ -1023,6 +1716,13 @@ class Handler(BaseHTTPRequestHandler):
                         "kv_dtype": getattr(self.engine, "kv_dtype", "unknown"),
                         "kv_bits": getattr(self.engine, "kv_bits", 0),
                         "kv_group_size": getattr(self.engine, "kv_group_size", 0),
+                        # Connector protocol §2/§4 identity: the engine that
+                        # owns this key domain and the signature of the cache
+                        # composition it persists. Both are fingerprinted by
+                        # the daemon; an engine that omits them defaults to
+                        # the mlx-lm domain and an unknown composition.
+                        "engine_id": getattr(self.engine, "engine_id", "mlx-lm"),
+                        "cache_layout": getattr(self.engine, "cache_layout", ""),
                     },
                 )
             elif self.path == "/prefill":
@@ -1078,30 +1778,99 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     self._json(400, {"error": "max_tokens must be a non-negative integer"})
                     return
+                # An optional filesystem path the engine writes the settled
+                # checkpoint to. Validated before any generation work starts: a
+                # bad type here must be a clean 400, and an empty-string path
+                # would silently mean "settle somewhere unusable".
+                #
+                # The path is ALSO confined to the daemon's staging naming
+                # convention (`.settle-<pid>-<seq>-<nanos>.staging`, generated
+                # by the daemon inside its own blob dir). This server is an
+                # unauthenticated loopback HTTP server: without the confinement
+                # any local process could hand it an arbitrary path and make
+                # the engine create or clobber a file there. The daemon is the
+                # only intended caller and always sends a convention-named
+                # path, so anything else is refused rather than written.
+                settle_path = req.get("settle_path")
+                settle_refused = False
+                if settle_path is not None and (
+                    not isinstance(settle_path, str)
+                    or not settle_path
+                    or not _is_staging_shaped(settle_path)
+                ):
+                    # Not a path the daemon would ever send: refuse the request.
+                    self._json(400, {"error": "settle_path must be a daemon staging path"})
+                    return
+                if settle_path is not None and not _staging_dir_matches(settle_path):
+                    # A staging-shaped path in a directory other than the
+                    # pinned one. Nothing is written either way, so degrade
+                    # the best-effort settle instead of failing the whole
+                    # (already-completable) generation -- a daemon restarted
+                    # against a new blob dir must not 502 every request
+                    # until the sidecar restarts.
+                    settle_refused = True
+                    settle_path = None
+
                 if req.get("stream"):
-                    self._stream_ndjson(tokens, req.get("blob_path"), max_tokens)
+                    self._stream_ndjson(
+                        tokens,
+                        req.get("blob_path"),
+                        max_tokens,
+                        settle_path,
+                        settle_refusal=settle_refused,
+                    )
                 else:
                     blob_path = req.get("blob_path")
-                    gen = getattr(self.engine, "generate_with_text", None)
-                    if gen is not None:
-                        out, text = gen(tokens, max_tokens, blob_path)
-                    elif hasattr(self.engine, "stream"):
-                        # Contract-conforming engine without generate_with_text:
-                        # collect from its stream so non-stream clients still
-                        # get detokenized text (api-contract review: falling
-                        # through to empty choices[].content is a silent
-                        # compatibility trap for third-party adapters).
-                        out, pieces = [], []
-                        for i, (tok, piece) in enumerate(self.engine.stream(tokens, blob_path)):
-                            out.append(tok)
-                            pieces.append(piece)
-                            if i + 1 >= max_tokens:
-                                break
-                        text = "".join(pieces)
+                    settle: dict | None = None
+                    collect = getattr(self.engine, "generate_collect", None)
+                    if collect is not None:
+                        # The only path that can settle: it returns the cache
+                        # generation mutated. Engines without it fall through to
+                        # the contract-level entries below, which have nowhere to
+                        # surface post-generation KV.
+                        out, text, _cache, settle = collect(
+                            tokens, max_tokens, blob_path, settle_path
+                        )
                     else:
-                        out = self.engine.generate(tokens, max_tokens)
-                        text = ""
-                    self._json(200, {"tokens": out, "text": text})
+                        gen = getattr(self.engine, "generate_with_text", None)
+                        if gen is not None:
+                            out, text = gen(tokens, max_tokens, blob_path)
+                        elif hasattr(self.engine, "stream"):
+                            # Contract-conforming engine without generate_with_text:
+                            # collect from its stream so non-stream clients still
+                            # get detokenized text (api-contract review: falling
+                            # through to empty choices[].content is a silent
+                            # compatibility trap for third-party adapters).
+                            out, pieces = [], []
+                            for i, (tok, piece) in enumerate(self.engine.stream(tokens, blob_path)):
+                                out.append(tok)
+                                pieces.append(piece)
+                                if i + 1 >= max_tokens:
+                                    break
+                            text = "".join(pieces)
+                        else:
+                            out = self.engine.generate(tokens, max_tokens)
+                            text = ""
+                        if settle_path is not None:
+                            # An engine with no collecting entry cannot hand out
+                            # the cache it just used: report that nothing was
+                            # written rather than pretending it settled.
+                            settle = {
+                                "written": False,
+                                "tokens": len(tokens) + len(out),
+                                "reason": "engine_cannot_settle",
+                            }
+                    if settle_refused:
+                        settle = {
+                            "written": False,
+                            "tokens": len(tokens) + len(out),
+                            "reason": "staging_path_refused",
+                        }
+                    body: dict = {"tokens": out, "text": text}
+                    if settle is not None:
+                        body["settle"] = settle
+                    self._json(200, body)
+
             else:
                 self._json(404, {"error": f"unknown path {self.path}"})
         except Handler._BadRequestError as exc:

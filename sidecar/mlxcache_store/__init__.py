@@ -10,17 +10,26 @@ sidecar/tests/test_conformance.py.
 """
 
 from .errors import CorruptCache, Refused, Unavailable
-from .fingerprint import Fingerprint, blob_key
+from .fingerprint import (
+    DEFAULT_ENGINE,
+    Fingerprint,
+    blob_key,
+    cache_layout_compatible,
+    identity_compatible,
+)
 from .store import DEFAULT_ANCHOR_WINDOW_S, DEFAULT_BUDGET, Granularity, Store
 
 __all__ = [
     "CorruptCache",
     "DEFAULT_ANCHOR_WINDOW_S",
     "DEFAULT_BUDGET",
+    "DEFAULT_ENGINE",
     "Refused",
     "Unavailable",
     "Fingerprint",
     "blob_key",
+    "cache_layout_compatible",
+    "identity_compatible",
     "Granularity",
     "Store",
 ]

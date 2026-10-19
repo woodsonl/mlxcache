@@ -41,6 +41,33 @@ impl Persistence {
     pub fn new(blob_dir: impl Into<PathBuf>) -> Result<Self, PersistError> {
         let dir = blob_dir.into();
         fs::create_dir_all(&dir)?;
+        // Reap settle staging leftovers before anything indexes the store: a
+        // daemon that died between the sidecar's temp write and its rename
+        // strands `.settle-*.staging` files (and their `.part` temps), which
+        // list_blobs' `.ckpt` filter hides from every later sweep — each one
+        // up to the settle byte cap, invisible, forever. Anything matching the
+        // daemon's own staging naming convention is by construction not a
+        // published blob and belongs to a request that no longer exists.
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(".settle-")
+                && (name.ends_with(".staging") || name.ends_with(".part"))
+            {
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => tracing::warn!(
+                        path = %entry.path().display(),
+                        "reaped stale settle staging file at boot"
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "could not reap stale settle staging file"
+                    ),
+                }
+            }
+        }
         Ok(Self { blob_dir: dir })
     }
 
@@ -346,6 +373,25 @@ mod tests {
         p.publish_atomic(0x2, 1, meta(2), b"b").unwrap();
         fs::write(dir.path().join("stray.txt"), b"nope").unwrap();
         assert_eq!(p.list_blobs().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stale_settle_staging_files_are_reaped_at_boot() {
+        // A daemon that died between the sidecar's temp write and its rename
+        // strands staging files list_blobs can never see (its filter is
+        // `.ckpt`). Each is up to the settle byte cap, so construction must
+        // reap them; ordinary files and published blobs stay untouched.
+        let dir = tmpdir();
+        fs::write(dir.path().join(".settle-1-1-1.staging"), b"orphan").unwrap();
+        fs::write(dir.path().join(".settle-1-1-1.staging.ABC.part"), b"orphan").unwrap();
+        fs::write(dir.path().join("unrelated.txt"), b"keep").unwrap();
+        let p = Persistence::new(dir.path()).unwrap();
+        p.publish_atomic(0x1, 1, meta(1), b"a").unwrap();
+
+        assert!(!dir.path().join(".settle-1-1-1.staging").exists());
+        assert!(!dir.path().join(".settle-1-1-1.staging.ABC.part").exists());
+        assert!(dir.path().join("unrelated.txt").exists());
+        assert_eq!(p.list_blobs().unwrap().len(), 1);
     }
 
     #[test]

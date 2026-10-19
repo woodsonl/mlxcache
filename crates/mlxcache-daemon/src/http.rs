@@ -434,6 +434,8 @@ async fn chat_completions(
                         kv_dtype: r.kv_dtype,
                         kv_bits: r.kv_bits,
                         kv_group_size: r.kv_group_size,
+                        engine_id: r.engine_id,
+                        cache_layout: r.cache_layout,
                     },
                     r.tokens,
                 ),
@@ -475,8 +477,12 @@ async fn chat_completions(
 
     // Route + classify (R1-1 fingerprint check inside classify). The identity
     // comes from the adapter (R1-2): a constant here would let checkpoints
-    // from different tokenizers/dtypes/quantization share a fingerprint and
-    // be served wrongly.
+    // from different tokenizers/dtypes/quantization/cache-compositions share a
+    // fingerprint and be served wrongly. `engine_id` stays out of the
+    // fingerprint struct and rides its own argument to `blob_key` (and its own
+    // header field) — it namespaces a key DOMAIN, it is not a property of the
+    // model.
+    let engine_id = identity.engine_id.clone();
     let fingerprint = ModelFingerprint {
         model_id: req.model.clone(),
         tokenizer_hash: identity.tokenizer_hash,
@@ -484,6 +490,7 @@ async fn chat_completions(
         kv_layout_version: 1,
         kv_bits: identity.kv_bits,
         kv_group_size: identity.kv_group_size,
+        cache_layout: identity.cache_layout,
     };
     let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
     // The token-only prefix hash for the request log line. The blob filename
@@ -503,6 +510,11 @@ async fn chat_completions(
             "adapter_unavailable",
         ));
     };
+    // Settle staging path for BOTH legs (one per request, inside blob_dir).
+    // Created BEFORE the branch so the stream leg can pass it through and clean
+    // it up after the terminal frame.
+    let settle_path = settle_staging_path(&state.persistence.blob_dir);
+    let settle_arg = settle_path.to_string_lossy().into_owned();
     if outcome.decision.verdict != CacheVerdict::Hit {
         match state.singleflight.enter(&tokens).await {
             mlxcache_core::singleflight::Role::Leader(lead) => {
@@ -548,6 +560,7 @@ async fn chat_completions(
                             lead,
                             &mut outcome,
                             &fingerprint,
+                            &engine_id,
                             &tokens,
                             blob,
                         )
@@ -587,6 +600,7 @@ async fn chat_completions(
                                         lead,
                                         &mut outcome,
                                         &fingerprint,
+                                        &engine_id,
                                         &tokens,
                                         blob,
                                     )
@@ -662,7 +676,7 @@ async fn chat_completions(
     // so replay re-sends byte-equivalent requests. Serialization happens ONLY
     // when capture is on.
     let trace_ctx = state.trace.is_some().then(|| TraceCtx {
-        model_hash: (blob_key(&fingerprint, None, &[]) >> 64) as u64,
+        model_hash: (blob_key(&fingerprint, Some(engine_id.as_str()), &[]) >> 64) as u64,
         model: req.model.clone(),
         messages: serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null),
     });
@@ -700,6 +714,10 @@ async fn chat_completions(
                 model: req.model.clone(),
                 completion_id,
                 started,
+                fingerprint,
+                engine_id,
+                settle_arg: settle_path.to_string_lossy().into_owned(),
+                settle_path,
             },
             outcome,
             blob_arg,
@@ -707,8 +725,19 @@ async fn chat_completions(
         .await;
     }
 
+    // Non-streaming from here on: this call's scope owns the staging file, so a
+    // destructor covers every early return (a failed generate, a refused
+    // scratch retry) without a cleanup line at each one.
+    let staging = SettleStaging::new(settle_path);
+
     // Generate: full context tokens, continuation from the request length.
     // The adapter opens the blob directly, so it needs the absolute path.
+    // Settle sink (B6): the post-generation cache is persisted HERE, inside the
+    // generate request, because it exists nowhere else — the sidecar builds it
+    // during generation and discards it on return, so no later request could
+    // reconstruct it from tokens. The engine writes a wire checkpoint to this
+    // staging path and reports the outcome; the daemon then publishes it through
+    // the same integrity path as a prefill payload.
     // True when this request leaned on a blob but ended up not using its KV
     // (rejected OR a transient failure). The response and aggregate must then
     // report a scratch run: no prior KV was reused. Quarantine is a separate
@@ -717,8 +746,11 @@ async fn chat_completions(
     // `generated` = token ids, `generated_text` = the sidecar's detokenized
     // completion (same pieces the streaming path emits, so both legs agree
     // character-for-character).
-    let (generated, generated_text) = match client.generate(&tokens, max_tokens, blob_arg).await {
-        Ok(t) => t,
+    let (generated, generated_text, settle_report) = match client
+        .generate(&tokens, max_tokens, blob_arg, Some(&settle_arg))
+        .await
+    {
+        Ok(t) => (t.tokens, t.text, t.settle),
         Err(e) => {
             // If this request leaned on a blob and the request failed, retry
             // from scratch. A checkpoint the adapter explicitly rejected (422)
@@ -748,13 +780,16 @@ async fn chat_completions(
                         "blob run failed with a non-rejection error; retrying from scratch without quarantine (effective prefill_from=0)"
                     );
                 }
-                match client.generate(&tokens, max_tokens, None).await {
+                match client
+                    .generate(&tokens, max_tokens, None, Some(&settle_arg))
+                    .await
+                {
                     Ok(t) => {
                         // Correct the aggregate only after the scratch retry
                         // succeeds: the covered KV counted at record() was never
                         // in hand. A 502 must not be counted as a served miss.
                         state.stats.correct_retire(&outcome.decision);
-                        t
+                        (t.tokens, t.text, t.settle)
                     }
                     Err(e2) => {
                         emit_failed_trace(&state, &trace_ctx, &outcome, blob_unused, tokens.len());
@@ -769,6 +804,26 @@ async fn chat_completions(
             }
         }
     };
+
+    // Publish the settled checkpoint (best-effort; never affects the response).
+    // The staging file is removed on EVERY path, so nothing accumulates in the
+    // blob dir — including when the engine reported `written: false`.
+    let mut settled = settle_report;
+    if settled.as_ref().is_some_and(|r| r.written) {
+        staging
+            .publish(
+                &state,
+                &fingerprint,
+                &engine_id,
+                &tokens,
+                &generated,
+                settled.as_ref().and_then(|r| r.sha256.as_deref()),
+            )
+            .await;
+    } else if let Some(reason) = settled.as_ref().and_then(|r| r.reason.as_deref()) {
+        // Not an error: the engine declined (too short, over a cap, no KV).
+        tracing::debug!(reason, "engine declined to settle this completion");
+    }
 
     // RT#7: emit after the generate leg settles. A blob that was rejected
     // (or failed transiently) and scratch-retried is a miss in /stats (the
@@ -786,7 +841,17 @@ async fn chat_completions(
     // mandatory in stock SDK parsers — extras like `mlxcache` are allowed,
     // missing-required is not). The response is ADDITIVE: the raw fields
     // (`generated_tokens`, `mlxcache`, `status`) stay for existing consumers.
-    let body = serde_json::json!({
+    //
+    // STATS RULE for a settled blob: the checkpoint this request just produced
+    // is NOT reported as cached for THIS request. `tokens_cached` and
+    // `prefill_from` keep the outcome.decision values the route produced (0 on
+    // a fresh prefill, matched-1 on a partial), because the request that
+    // generated the KV never REUSED it — the settle only makes it available to a
+    // LATER request, which will report the reuse itself when it resumes. Claiming
+    // the settled tokens here would double-count them: once at production, again
+    // at the resume that actually benefits. Same conservative rule as a fresh
+    // prefill publish.
+    let mut body = serde_json::json!({
         "id": completion_id,
         "object": "chat.completion",
         "created": created,
@@ -833,6 +898,18 @@ async fn chat_completions(
         "generated_tokens": generated,
         "status": "ok",
     });
+    // The settle outcome, reported rather than guessed: `written` is what the
+    // engine actually did, `tokens` the coverage it recorded, `sha256` the
+    // payload digest. Additive and optional — an older client, or a response
+    // whose request did not settle, simply has no such field.
+    if let Some(report) = settled.take() {
+        body["settle"] = serde_json::json!({
+            "written": report.written,
+            "tokens": report.tokens,
+            "sha256": report.sha256,
+            "reason": report.reason,
+        });
+    }
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
@@ -859,6 +936,7 @@ async fn publish_leader_blob(
     lead: mlxcache_core::singleflight::Leadership,
     outcome: &mut crate::orchestrator::RouteOutcome,
     fingerprint: &ModelFingerprint,
+    engine_id: &str,
     tokens: &[u32],
     blob: Vec<u8>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -870,10 +948,10 @@ async fn publish_leader_blob(
         // publish_atomic stamps the current version + payload digest (D1).
         format_version: 1,
         payload_sha256: None,
-        engine_id: None,
+        engine_id: mlxcache_core::contract::engine_id_meta(engine_id),
         granularity: None,
     };
-    let key = blob_key(fingerprint, None, tokens);
+    let key = blob_key(fingerprint, Some(engine_id), tokens);
     // Refuse before writing if the generation floor is unknown (a failed
     // startup scan): writing first would leak an unindexed file on every
     // request. Serve from scratch.
@@ -988,6 +1066,302 @@ async fn publish_leader_blob(
     Ok(())
 }
 
+/// Publish a checkpoint the engine SETTLED after generation (prompt +
+/// generated tokens), best-effort and per-request.
+///
+/// Not single-flight: the settle covers a sequence only this request knows (its
+/// own completion), so there is nothing to coalesce. It is the same integrity
+/// path as the prefill publish — the engine writes a WIRE checkpoint, the daemon
+/// re-derives the payload digest from the file it is about to publish and
+/// `publish_atomic` stamps format_version 2 plus its own digest — so a settled
+/// blob is byte-verifiable by `read_wire_checkpoint` exactly like a prefilled
+/// one.
+///
+/// Every failure is invisible to the client: the completion is already
+/// produced. A refusal, a missing file, a digest mismatch, an index rejection,
+/// or ENOSPC logs and returns; nothing is quarantined (no existing entry is at
+/// fault) and no 5xx is raised.
+async fn publish_settled_blob(
+    state: &Arc<AppState>,
+    fingerprint: &ModelFingerprint,
+    engine_id: &str,
+    request_tokens: &[u32],
+    generated: &[u32],
+    settle_path: &std::path::Path,
+    reported_sha256: Option<&str>,
+) {
+    // Same gate as the prefill publish: a daemon whose startup scan failed has
+    // an unknown generation floor, so writing would leak an unindexed file.
+    if !state.orchestrator.can_publish() {
+        tracing::debug!("not settling: startup recovery incomplete");
+        return;
+    }
+    let mut total: Vec<u32> = Vec::with_capacity(request_tokens.len() + generated.len());
+    total.extend_from_slice(request_tokens);
+    total.extend_from_slice(generated);
+    // A settled prefix shorter than two tokens caches nothing (the same floor
+    // every other publish applies); the index would refuse it anyway.
+    if total.len() < 2 {
+        tracing::debug!("not settling: fewer than two tokens");
+        return;
+    }
+    // Read + verify the engine's file before it can become a store entry. This
+    // is the trust boundary the daemon owns: the blob was produced by another
+    // process, so its header and payload are untrusted until checked here. The
+    // sidecar's own digest is not consulted as truth — the payload is hashed
+    // locally and publish_atomic stamps THAT digest.
+    let persistence = state.persistence.clone();
+    let path = settle_path.to_path_buf();
+    let loaded = tokio::task::spawn_blocking(move || persistence.load(&path))
+        .await
+        .unwrap_or_else(|join| {
+            tracing::error!(error = %join, "settled checkpoint read task panicked");
+            Err(crate::persistence::PersistError::Io(std::io::Error::other(
+                "settled checkpoint read task panicked",
+            )))
+        });
+    let (meta, payload) = match loaded {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "settle discarded: checkpoint unreadable or corrupt");
+            return;
+        }
+    };
+    // Cross-check the payload the engine claimed against the payload on disk.
+    // A mismatch means the file is not the one this request produced (a stale
+    // staging file, a concurrent writer, a torn write) and publishing it would
+    // key a blob whose bytes belong to another sequence.
+    //
+    // The digest is REQUIRED when the engine reports written:true. Skipping
+    // the check for an engine that omits the field would publish exactly the
+    // unverified writes the check exists to catch; both bundled engines always
+    // report it, so an absent digest is treated as a declined settle.
+    let Some(reported) = reported_sha256 else {
+        tracing::warn!("settle discarded: engine reported no payload digest");
+        return;
+    };
+    {
+        use sha2::Digest;
+        let actual = format!("{:x}", sha2::Sha256::digest(&payload));
+        if !actual.eq_ignore_ascii_case(reported) {
+            tracing::warn!(
+                reported,
+                actual = %actual,
+                "settle discarded: payload digest does not match the engine report"
+            );
+            return;
+        }
+    }
+    // The header must describe EXACTLY the sequence this request settled, or the
+    // blob would key a prefix it does not cover. Both the recorded prefix and
+    // the identity the daemon resolved for this request are checked.
+    if meta.tokens != total {
+        tracing::warn!(
+            header_tokens = meta.tokens.len(),
+            request_tokens = total.len(),
+            "settle discarded: header prefix does not match the settled sequence"
+        );
+        return;
+    }
+    // Compare the identity fields the ADAPTER owns, not `model_id`: the sidecar's
+    // engine is configured with its own model name, and the daemon's served name
+    // for that engine may differ. The published metadata is rebuilt from the
+    // daemon's fingerprint below, so a differing model_id here is not a
+    // cross-serving risk — the fields that decide whether the PAYLOAD is
+    // interpretable (tokenizer, dtype, quantization tier, cache composition)
+    // are the ones that must agree.
+    let same_shape = meta.fingerprint.tokenizer_hash == fingerprint.tokenizer_hash
+        && meta.fingerprint.kv_dtype == fingerprint.kv_dtype
+        && meta.fingerprint.kv_bits == fingerprint.kv_bits
+        && meta.fingerprint.kv_group_size == fingerprint.kv_group_size
+        && meta.fingerprint.kv_layout_version == fingerprint.kv_layout_version
+        && meta.fingerprint.cache_layout == fingerprint.cache_layout;
+    if !same_shape {
+        tracing::warn!("settle discarded: header identity does not match the request");
+        return;
+    }
+    if mlxcache_core::contract::engine_id_meta(engine_id)
+        .as_deref()
+        .unwrap_or(mlxcache_core::contract::DEFAULT_ENGINE)
+        != meta
+            .engine_id
+            .as_deref()
+            .unwrap_or(mlxcache_core::contract::DEFAULT_ENGINE)
+    {
+        tracing::warn!("settle discarded: header engine id does not match the request");
+        return;
+    }
+    // Reuse the request's already-resolved identity for the key AND for the
+    // published metadata: rebuilding identity from the header would let a blob
+    // name a key domain the request never resolved, and the index looks entries
+    // up by the request's fingerprint.
+    let key = blob_key(fingerprint, Some(engine_id), &total);
+    let generation = state.orchestrator.reserve_generation();
+    let blob_name = format!("{:032x}-{:016x}.ckpt", key, generation);
+    let published_meta = mlxcache_core::contract::CheckpointMeta {
+        fingerprint: fingerprint.clone(),
+        token_count: total.len() as u64,
+        tokens: total.clone(),
+        // publish_atomic stamps the current version + payload digest (D1).
+        format_version: 1,
+        payload_sha256: None,
+        engine_id: mlxcache_core::contract::engine_id_meta(engine_id),
+        granularity: None,
+    };
+    let meta_for_write = published_meta.clone();
+    let persistence = state.persistence.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        persistence.publish_atomic(key, generation, meta_for_write, &payload)
+    })
+    .await
+    .unwrap_or_else(|join| {
+        tracing::error!(error = %join, "settled checkpoint publish task panicked");
+        Err(crate::persistence::PersistError::Io(std::io::Error::other(
+            "settled checkpoint publish task panicked",
+        )))
+    });
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "settled checkpoint write failed; completion is unaffected");
+        return;
+    }
+    if !state.orchestrator.publish_checkpoint(
+        &state.persistence,
+        &total,
+        published_meta,
+        blob_name.clone(),
+        generation,
+    ) {
+        // The index refused it: remove the now-unindexed file so it cannot leak
+        // (the boot scan would otherwise re-index a blob the live daemon
+        // declined).
+        if let Err(e) = state.persistence.remove(&blob_name) {
+            tracing::warn!(error = %e, "could not remove unindexed settled blob");
+        }
+        return;
+    }
+    tracing::debug!(
+        blob = %blob_name,
+        tokens = total.len(),
+        "settled checkpoint published"
+    );
+}
+
+/// Remove a settle staging file, logging (never propagating) a failure.
+///
+/// Called on EVERY path — success, refusal, error — so nothing accumulates in
+/// the blob dir. Idempotent: a missing file is the normal success case.
+fn discard_settle_staging(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "could not remove settle staging file"
+        ),
+    }
+    // The sidecar writes through a uniquely-named `<staging>.<rand>.part`
+    // sibling before the rename. A crash between create and rename strands
+    // it, list_blobs ignores the suffix, and no scan would ever reap it —
+    // so the same guard removes any leftover part files for this staging
+    // path. NotFound is the ordinary case.
+    let dir = path.parent().map(std::path::Path::to_path_buf);
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| format!("{n}."));
+    if let (Some(dir), Some(stem)) = (dir, stem) {
+        let leftovers = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&stem) && n.ends_with(".part"))
+            })
+            .map(|e| e.path());
+        for leftover in leftovers {
+            match std::fs::remove_file(&leftover) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    path = %leftover.display(),
+                    error = %e,
+                    "could not remove settle staging temp file"
+                ),
+            }
+        }
+    }
+}
+
+/// RAII cleanup for one request's settle staging file.
+///
+/// The staging file must never outlive the request that asked for it, including
+/// when the client disconnects mid-stream (the stream future is DROPPED at an
+/// arbitrary await point, so no cleanup line after the loop would run). Tying
+/// removal to a destructor makes every exit path — success, failure, refusal,
+/// panic-free early return, client disconnect — remove it exactly once.
+struct SettleStaging {
+    path: std::path::PathBuf,
+}
+
+impl SettleStaging {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Publishes what the engine settled, then (via Drop) removes the staging
+    /// file. Runs at most once per request.
+    async fn publish(
+        &self,
+        state: &Arc<AppState>,
+        fingerprint: &ModelFingerprint,
+        engine_id: &str,
+        request_tokens: &[u32],
+        generated: &[u32],
+        reported_sha256: Option<&str>,
+    ) {
+        publish_settled_blob(
+            state,
+            fingerprint,
+            engine_id,
+            request_tokens,
+            generated,
+            &self.path,
+            reported_sha256,
+        )
+        .await;
+    }
+}
+
+impl Drop for SettleStaging {
+    fn drop(&mut self) {
+        discard_settle_staging(&self.path);
+    }
+}
+
+/// A unique staging path for one request's settle inside the blob dir.
+///
+/// Inside `blob_dir` so the publish rename stays on one filesystem (a rename
+/// across devices fails), unique per request so concurrent settles cannot
+/// collide, and OUTSIDE the `.ckpt` namespace so a staging file is never
+/// picked up as a published blob (list_blobs filters on the extension).
+fn settle_staging_path(blob_dir: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    blob_dir.join(format!(
+        ".settle-{}-{}-{}.staging",
+        std::process::id(),
+        seq,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
 /// Adapter-reported cache identity (R1-1/R1-2): everything the fingerprint
 /// pins that the sidecar owns. The native-tokenize path adopts it wholesale
 /// after the parity probe so fingerprints stay byte-identical to the
@@ -998,6 +1372,14 @@ struct Identity {
     kv_dtype: String,
     kv_bits: u8,
     kv_group_size: u32,
+    /// The engine that will prefill/serve this request (connector protocol §4).
+    /// Namespaces the key domain: a non-default engine folds its id first, and
+    /// the default engine contributes zero bytes.
+    engine_id: String,
+    /// The engine's cache-composition signature. Folded into the fingerprint
+    /// (and hence the key and the header) so a payload of one shape is never
+    /// served to an engine that would deserialize it as another.
+    cache_layout: String,
 }
 
 /// T13 identity resolution: prove the native tokenizer IS the engine's, once,
@@ -1095,6 +1477,8 @@ async fn resolve_native_identity(
                 kv_dtype: reference.kv_dtype,
                 kv_bits: reference.kv_bits,
                 kv_group_size: reference.kv_group_size,
+                engine_id: reference.engine_id,
+                cache_layout: reference.cache_layout,
             });
         }
     }
@@ -1138,7 +1522,17 @@ pub fn prefix_hash(tokens: &[u32]) -> u128 {
 /// — short of a 128-bit fold collision (birthday scale ~2⁻⁶⁴, accepted
 /// residual risk in the D1 register): the lookup-time fingerprint check
 /// reads the INDEX entry, not the file, so a collision would NOT be caught
-/// downstream. Public for the B1 criterion bench.
+/// downstream.
+///
+/// Full order (connector protocol §4): `engine_chunks? ‖ SEP ‖
+/// fingerprint_chunks ‖ SEP ‖ tokens`, where the fingerprint chunks are
+/// `model_id ‖ tokenizer_hash ‖ kv_dtype ‖ kv_layout_version ‖ kv_bits ‖
+/// kv_group_size ‖ cache_layout?`. Two fields are folded ONLY when
+/// non-default, contributing ZERO bytes otherwise — the engine id when it is
+/// the default engine, and the cache layout when it is empty (composition
+/// unrecorded). That zero-byte rule is what keeps every pre-existing store's
+/// keys byte-identical; it is pinned by the golden-key tests on both sides.
+/// Public for the B1 criterion bench.
 pub fn blob_key(
     fingerprint: &mlxcache_core::contract::ModelFingerprint,
     engine_id: Option<&str>,
@@ -1164,6 +1558,15 @@ pub fn blob_key(
     // file), ping-ponging the two tiers on every alternating request.
     put(&mut f, &fingerprint.kv_bits.to_string());
     put(&mut f, &fingerprint.kv_group_size.to_string());
+    // Cache composition: folded only when recorded. An empty layout means the
+    // blob predates composition tracking (or the engine cannot report one),
+    // and contributes ZERO bytes so those keys are unchanged — the same
+    // rule as the default engine id. A non-empty layout is length-prefixed
+    // like every other field, so no layout string can be re-split across a
+    // field boundary to alias another composition.
+    if !fingerprint.cache_layout.is_empty() {
+        put(&mut f, &fingerprint.cache_layout);
+    }
     // Fold the fingerprint into the token hash: hash the fingerprint bytes into
     // both lanes first, then continue with the tokens.
     let fp_bytes: Vec<u32> = f
@@ -1265,7 +1668,21 @@ impl ChunkFramer {
     /// `[DONE]`; a token line becomes an OpenAI delta chunk carrying the
     /// sidecar's text piece (plus the raw `token` id as an extra field for
     /// existing consumers); a non-JSON line is a protocol violation.
-    pub fn push_line(&self, frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>, raw: &[u8]) {
+    ///
+    /// Reports what the caller needs OUTSIDE the frames, without re-scanning
+    /// the line: the produced token id (the settle key covers prompt +
+    /// generated ids, and the done frame carries only a count) and, on the done
+    /// line, the optional `settle` report. `done` stays the LAST protocol line
+    /// and [DONE] stays the last SSE frame.
+    ///
+    /// The allocation contract is unchanged: a token line costs its one frame
+    /// buffer, and a done line without a settle is parsed NO further than the
+    /// done marker (the `settle` key is tested before any JSON tree is built).
+    pub fn push_line(
+        &self,
+        frames: &mut Vec<Result<bytes::Bytes, std::io::Error>>,
+        raw: &[u8],
+    ) -> LineOutcome {
         /// A done marker may carry any NON-NULL JSON value (`true`, `1`, …):
         /// `Option<IgnoredAny>` maps a literal `null` to `None`, so presence
         /// of the key with a null value would NOT terminate the stream. Our
@@ -1286,11 +1703,11 @@ impl ChunkFramer {
                 frames.push(Err(std::io::Error::other(
                     "sidecar emitted a non-UTF-8 stream line",
                 )));
-                return;
+                return LineOutcome::default();
             }
         };
         if line.is_empty() {
-            return;
+            return LineOutcome::default();
         }
         match serde_json::from_str::<SidecarStreamFrame>(line) {
             Ok(f) if f.done.is_some() => {
@@ -1307,20 +1724,56 @@ impl ChunkFramer {
                         _ => "stop",
                     }
                 };
+                // The settle report is lifted verbatim (its shape is the
+                // engine's, not ours). Guarded by a cheap key test so a done
+                // line WITHOUT a settle costs no JSON tree — the allocation
+                // gate pins the done frame to its single buffer.
+                let settle = if line.contains("\"settle\"") {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .ok()
+                        .and_then(|v| v.get("settle").cloned())
+                        .filter(|v| !v.is_null())
+                } else {
+                    None
+                };
                 const SSE: &[u8] = b"data: ";
                 const OPEN: &[u8] = b"\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"";
-                const TAIL: &[u8] = b"\"}]}\n\n";
+                const TAIL: &[u8] = b"\"}]";
+                const CLOSE: &[u8] = b"}\n\n";
+                // The settle outcome rides ON the terminal chunk as a top-level
+                // extra (SDKs ignore extras): a separate frame would land after
+                // the finish chunk and no longer describe the stream's end.
+                let settle_frag = settle.as_ref().map(|s| format!(",\"settle\":{s}"));
+                let extra_len = settle_frag.as_ref().map_or(0, |s| s.len());
+                // Capacity must be EXACT: len == capacity keeps Bytes::from on
+                // its zero-alloc fast path, and a short count forces a realloc
+                // plus the Shared box (two extra allocations per done frame —
+                // the alloc gate exists to pin exactly this).
                 let mut frame = Vec::with_capacity(
-                    SSE.len() + self.head.len() + OPEN.len() + finish.len() + TAIL.len(),
+                    SSE.len()
+                        + self.head.len()
+                        + OPEN.len()
+                        + finish.len()
+                        + TAIL.len()
+                        + CLOSE.len()
+                        + extra_len,
                 );
                 frame.extend_from_slice(SSE);
                 frame.extend_from_slice(self.head.as_bytes());
                 frame.extend_from_slice(OPEN);
                 frame.extend_from_slice(finish.as_bytes());
                 frame.extend_from_slice(TAIL);
+                if let Some(frag) = &settle_frag {
+                    frame.extend_from_slice(frag.as_bytes());
+                }
+                frame.extend_from_slice(CLOSE);
                 debug_assert_eq!(frame.len(), frame.capacity());
                 frames.push(Ok(bytes::Bytes::from(frame)));
                 frames.push(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")));
+                LineOutcome {
+                    token: None,
+                    settle,
+                }
             }
             Ok(_) => {
                 // Token chunk. The sidecar's line is `{"token": <id>,
@@ -1336,7 +1789,7 @@ impl ChunkFramer {
                         frames.push(Err(std::io::Error::other(
                             "sidecar token line lacks a text string",
                         )));
-                        return;
+                        return LineOutcome::default();
                     }
                 };
                 let token = match scan_json_number_value(line, "\"token\"") {
@@ -1347,7 +1800,7 @@ impl ChunkFramer {
                         frames.push(Err(std::io::Error::other(
                             "sidecar token line lacks a plain u32 token id",
                         )));
-                        return;
+                        return LineOutcome::default();
                     }
                 };
                 const SSE: &[u8] = b"data: ";
@@ -1372,10 +1825,19 @@ impl ChunkFramer {
                 frame.extend_from_slice(TAIL);
                 debug_assert_eq!(frame.len(), frame.capacity());
                 frames.push(Ok(bytes::Bytes::from(frame)));
+                // The id was already parsed for the frame; reuse it instead of
+                // scanning the line again on the hot path.
+                LineOutcome {
+                    token: token.parse::<u32>().ok(),
+                    settle: None,
+                }
             }
-            Err(_) => frames.push(Err(std::io::Error::other(
-                "sidecar emitted a non-JSON stream line",
-            ))),
+            Err(_) => {
+                frames.push(Err(std::io::Error::other(
+                    "sidecar emitted a non-JSON stream line",
+                )));
+                LineOutcome::default()
+            }
         }
     }
 
@@ -1392,6 +1854,18 @@ impl ChunkFramer {
             mlxcache_json.as_bytes(),
         )));
     }
+}
+
+/// What one sidecar stream line contributed beyond its SSE frames.
+///
+/// Returned by [`ChunkFramer::push_line`] so the stream loop can key a settled
+/// checkpoint without re-scanning the line it just framed.
+#[derive(Debug, Default)]
+pub struct LineOutcome {
+    /// The produced token id, on a token line.
+    pub token: Option<u32>,
+    /// The engine's settle report, on a done line that carried one.
+    pub settle: Option<serde_json::Value>,
 }
 
 /// Unix seconds, once per request (shared by the JSON and stream envelopes).
@@ -1570,6 +2044,15 @@ struct StreamReq {
     model: String,
     completion_id: String,
     started: std::time::Instant,
+    /// Resolved identity for this request, reused (never rebuilt) to name the
+    /// settled checkpoint's key domain.
+    fingerprint: ModelFingerprint,
+    engine_id: String,
+    /// Where the engine writes its settled checkpoint. Owned here so the
+    /// staging guard can remove it however the stream ends.
+    settle_path: std::path::PathBuf,
+    /// The same path as the adapter sees it.
+    settle_arg: String,
 }
 
 async fn stream_response(
@@ -1593,7 +2076,7 @@ async fn stream_response(
     // report a miss. Quarantine stays conditional on an explicit rejection.
     let blob_unused = std::cell::Cell::new(false);
     let upstream = match client
-        .generate_stream(&req.tokens, req.max_tokens, blob_arg)
+        .generate_stream(&req.tokens, req.max_tokens, blob_arg, Some(&req.settle_arg))
         .await
     {
         Ok(u) => u,
@@ -1625,7 +2108,7 @@ async fn stream_response(
             prefill_from = 0;
             blob_unused.set(true);
             let upstream = match client
-                .generate_stream(&req.tokens, req.max_tokens, None)
+                .generate_stream(&req.tokens, req.max_tokens, None, Some(&req.settle_arg))
                 .await
             {
                 Ok(u) => u,
@@ -1745,7 +2228,37 @@ async fn stream_response(
         /// with an explicit error (the sidecar stalling must not wedge a
         /// client forever now that streams carry no total timeout).
         idle: std::time::Duration,
+        /// Token ids this stream produced, in order. The settled checkpoint
+        /// covers request tokens + these, and the blob key needs the ids —
+        /// the done frame only reports a COUNT.
+        generated: Vec<u32>,
+        /// Everything the settle publication needs, absent when this stream
+        /// was not asked to settle.
+        settle: Option<StreamSettle>,
+        /// The engine's settle report from the done line, if it sent one.
+        settle_report: Option<serde_json::Value>,
+        /// Set once the settle has been published (or declined), so the
+        /// publication runs exactly once.
+        settle_done: bool,
     }
+
+    struct StreamSettle {
+        /// Removes the staging file on EVERY exit — including a client
+        /// disconnect, which drops this stream before any cleanup line runs.
+        guard: SettleStaging,
+        state: Arc<AppState>,
+        request_tokens: Vec<u32>,
+        fingerprint: mlxcache_core::contract::ModelFingerprint,
+        engine_id: String,
+    }
+
+    let stream_settle = StreamSettle {
+        guard: SettleStaging::new(req.settle_path.clone()),
+        state: state.clone(),
+        request_tokens: req.tokens.clone(),
+        fingerprint: req.fingerprint.clone(),
+        engine_id: req.engine_id.clone(),
+    };
     let state = StreamState {
         framer,
         upstream: Box::pin(upstream.bytes_stream()),
@@ -1755,6 +2268,10 @@ async fn stream_response(
         started: req.started,
         ttft_ms: None,
         idle: client.stream_idle_timeout(),
+        generated: Vec::new(),
+        settle: Some(stream_settle),
+        settle_report: None,
+        settle_done: false,
     };
     let body_stream = futures_util::stream::unfold(state, |mut st| async move {
         use futures_util::StreamExt;
@@ -1815,7 +2332,12 @@ async fn stream_response(
                     }
                     while let Some(pos) = st.buf.iter().position(|b| *b == b'\n') {
                         let line = st.buf.split_to(pos + 1);
-                        st.framer.push_line(&mut frames, &line);
+                        let outcome = st.framer.push_line(&mut frames, &line);
+                        // The settle key covers prompt + these ids; the done
+                        // frame reports only a count. Option<u32> iterates 0 or
+                        // 1 times, so extend consumes it directly.
+                        st.generated.extend(outcome.token);
+                        st.settle_report = st.settle_report.take().or(outcome.settle);
                         let last_done = frames.last().is_some_and(|f| {
                             f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
                         });
@@ -1860,7 +2382,9 @@ async fn stream_response(
                     // does not read a silent truncation as a completed answer.
                     if !st.buf.is_empty() {
                         let line = std::mem::take(&mut st.buf);
-                        st.framer.push_line(&mut frames, &line);
+                        let outcome = st.framer.push_line(&mut frames, &line);
+                        st.generated.extend(outcome.token);
+                        st.settle_report = st.settle_report.take().or(outcome.settle);
                         if frames.last().is_some_and(|f| {
                             f.as_ref().is_ok_and(|b| b.starts_with(b"data: [DONE]"))
                         }) {
@@ -1888,6 +2412,37 @@ async fn stream_response(
                     }
                     st.done = true;
                     break;
+                }
+            }
+        }
+        // Publish the settled checkpoint once the stream has terminated, BEFORE
+        // handing out the last frames: the publication is best-effort and never
+        // changes what was streamed, but it must not outlive the request either.
+        // The staging guard removes the file on drop whatever happens here.
+        if st.terminated && !st.settle_done {
+            st.settle_done = true;
+            if let Some(settle) = &st.settle {
+                let wrote = st
+                    .settle_report
+                    .as_ref()
+                    .and_then(|r| r.get("written"))
+                    .and_then(|w| w.as_bool())
+                    .unwrap_or(false);
+                if wrote {
+                    settle
+                        .guard
+                        .publish(
+                            &settle.state,
+                            &settle.fingerprint,
+                            &settle.engine_id,
+                            &settle.request_tokens,
+                            &st.generated,
+                            st.settle_report
+                                .as_ref()
+                                .and_then(|r| r.get("sha256"))
+                                .and_then(|v| v.as_str()),
+                        )
+                        .await;
                 }
             }
         }
@@ -2222,6 +2777,7 @@ mod tests {
             kv_layout_version: 1,
             kv_bits: 0,
             kv_group_size: 0,
+            cache_layout: String::new(),
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "model-b".into(),
@@ -2230,6 +2786,7 @@ mod tests {
             kv_layout_version: 1,
             kv_bits: 0,
             kv_group_size: 0,
+            cache_layout: String::new(),
         };
         assert_ne!(blob_key(&a, None, &tokens), blob_key(&b, None, &tokens));
         // Tokenizer-only difference must also separate.
@@ -2240,6 +2797,7 @@ mod tests {
             kv_layout_version: 1,
             kv_bits: 0,
             kv_group_size: 0,
+            cache_layout: String::new(),
         };
         assert_ne!(blob_key(&a, None, &tokens), blob_key(&c, None, &tokens));
         // Deterministic and distinct from the bare token hash.
@@ -2248,6 +2806,68 @@ mod tests {
             blob_key(&a, None, &[10, 20, 30])
         );
         assert_ne!(blob_key(&a, None, &tokens), prefix_hash(&tokens));
+    }
+
+    #[test]
+    fn blob_key_cache_layout_and_engine_goldens() {
+        // Connector protocol §4. Cache composition is folded ONLY when
+        // recorded, and the constants below are shared verbatim with
+        // sidecar/tests/test_store.py — same fixtures, same expected keys,
+        // which is what makes the two folds provably one definition.
+        let with_layout = |layout: &str| mlxcache_core::contract::ModelFingerprint {
+            model_id: "golden-model".into(),
+            tokenizer_hash: "golden-tok".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
+            cache_layout: layout.into(),
+        };
+        let tokens: Vec<u32> = (1..=8).collect();
+        let dense = with_layout("KV-KV");
+        let hybrid = with_layout("CacheList-ArraysCache-KV");
+
+        // (a) An empty layout contributes ZERO bytes: the legacy key stands.
+        assert_eq!(
+            format!("{:032x}", blob_key(&with_layout(""), None, &tokens)),
+            "2786690f2948dec17c5498a6267fc101",
+            "empty layout must not re-key an existing store"
+        );
+        // (b) Two compositions of the same model are different keys.
+        assert_eq!(
+            format!("{:032x}", blob_key(&dense, None, &tokens)),
+            "e21b343efc207f88a45df7f9530fbe62"
+        );
+        assert_eq!(
+            format!("{:032x}", blob_key(&hybrid, None, &tokens)),
+            "c42837b2930d326f652585408b9b20eb"
+        );
+        // (c) The same layout under a different engine id is a different key:
+        // composition and engine domain are independent axes.
+        assert_eq!(
+            format!("{:032x}", blob_key(&dense, Some("llama-cpp"), &tokens)),
+            "01d9e1aadc1b180c8d8580d70683df4e"
+        );
+        assert_ne!(
+            blob_key(&dense, Some("llama-cpp"), &tokens),
+            blob_key(&dense, None, &tokens)
+        );
+        // The layout is the LAST fingerprint field: it must not alias a
+        // fingerprint whose LAST OTHER field is stretched to swallow it.
+        let stretched = mlxcache_core::contract::ModelFingerprint {
+            model_id: "golden-model".into(),
+            tokenizer_hash: "golden-tok".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
+            cache_layout: format!("{}6:KV-KV", "0"),
+        };
+        assert_ne!(
+            blob_key(&dense, None, &tokens),
+            blob_key(&stretched, None, &tokens),
+            "length prefixes must keep the layout field unambiguous"
+        );
     }
 
     #[test]
@@ -2264,6 +2884,7 @@ mod tests {
             kv_layout_version: 1,
             kv_bits: 0,
             kv_group_size: 0,
+            cache_layout: String::new(),
         };
         let tokens: Vec<u32> = (1..=8).collect();
         assert_eq!(
@@ -2312,6 +2933,7 @@ mod tests {
             kv_layout_version: 1,
             kv_bits: 0,
             kv_group_size: 0,
+            cache_layout: String::new(),
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "m".into(),
@@ -2320,6 +2942,7 @@ mod tests {
             kv_layout_version: 1,
             kv_bits: 0,
             kv_group_size: 0,
+            cache_layout: String::new(),
         };
         assert_ne!(blob_key(&a, None, &tokens), blob_key(&b, None, &tokens));
     }
