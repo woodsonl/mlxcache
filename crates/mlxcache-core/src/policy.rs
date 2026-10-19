@@ -17,6 +17,42 @@ pub enum CacheVerdict {
     Partial,
 }
 
+/// Cache-composition compatibility (the B1 identity rule).
+///
+/// `cache_layout` is a signature of the ordered tuple of cache-entry classes
+/// the engine builds for a model — the SHAPE of the payload. `""` means
+/// "composition unknown", the value every pre-B1 blob carries (and the value
+/// any engine that does not report one would carry).
+///
+/// The rule: an entry is compatible only with a request reporting the SAME
+/// layout string. Consequences are both deliberate:
+///
+/// - a request with a KNOWN (non-empty) layout is never served an
+///   unknown-layout entry: nothing proves that entry's payload has the shape
+///   the request's engine will deserialize, and a dense KV stack loaded as a
+///   hybrid model's recurrent state is silent wrong output, not an error;
+/// - an unknown-layout request may still be served an unknown-layout entry,
+///   so a store written before layouts were recorded keeps working until the
+///   current engine rewrites its blobs (legacy-to-legacy only — the moment
+///   either side knows its composition, the comparison is exact).
+pub fn cache_layout_compatible(entry_layout: &str, request_layout: &str) -> bool {
+    entry_layout == request_layout
+}
+
+/// The single identity relation every matching site uses (R1-1): the
+/// fingerprint fields AND the cache-composition rule above. Field-by-field on
+/// purpose — the composition rule is a named decision, not an accident of
+/// `PartialEq` on the struct, so it cannot be dropped by adding a field.
+pub fn identity_compatible(entry: &ModelFingerprint, request: &ModelFingerprint) -> bool {
+    entry.model_id == request.model_id
+        && entry.tokenizer_hash == request.tokenizer_hash
+        && entry.kv_dtype == request.kv_dtype
+        && entry.kv_layout_version == request.kv_layout_version
+        && entry.kv_bits == request.kv_bits
+        && entry.kv_group_size == request.kv_group_size
+        && cache_layout_compatible(&entry.cache_layout, &request.cache_layout)
+}
+
 /// Classification of a lookup against the index + fingerprint rules (R1-1).
 ///
 /// A match of fewer than 2 tokens is treated as a miss: a checkpoint caches KV
@@ -33,7 +69,7 @@ pub fn classify(
     match matched_tokens {
         Some(n) if n < 2 => CacheVerdict::Miss,
         Some(n) => {
-            if matched_fingerprint != Some(request_fingerprint) {
+            if !matched_fingerprint.is_some_and(|m| identity_compatible(m, request_fingerprint)) {
                 return CacheVerdict::Miss;
             }
             if n == request_tokens {
@@ -132,6 +168,67 @@ mod tests {
         let a = fp("m1");
         let b = fp("m2");
         assert_eq!(classify(Some(5), 5, Some(&a), &b), CacheVerdict::Miss);
+    }
+
+    fn fp_with_layout(layout: &str) -> ModelFingerprint {
+        ModelFingerprint {
+            cache_layout: layout.into(),
+            ..fp("m")
+        }
+    }
+
+    #[test]
+    fn known_layout_never_served_an_unknown_layout_blob() {
+        // The legacy rule: a request that KNOWS its cache composition can
+        // never prove an unrecorded (pre-B1) blob has that composition, and
+        // a payload of the wrong shape is silent wrong output. Miss.
+        let legacy = fp_with_layout("");
+        let request = fp_with_layout("KV-KV");
+        assert_eq!(
+            classify(Some(5), 5, Some(&legacy), &request),
+            CacheVerdict::Miss
+        );
+        assert_eq!(
+            classify(Some(3), 5, Some(&legacy), &request),
+            CacheVerdict::Miss
+        );
+    }
+
+    #[test]
+    fn unknown_layout_request_may_use_an_unknown_layout_blob() {
+        // Legacy-to-legacy: an engine that reports no composition keeps
+        // serving the store written before compositions were recorded, so an
+        // upgrade does not invalidate an entire cache directory at once.
+        let legacy = fp_with_layout("");
+        let request = fp_with_layout("");
+        assert_eq!(
+            classify(Some(5), 5, Some(&legacy), &request),
+            CacheVerdict::Hit
+        );
+        assert_eq!(
+            classify(Some(3), 5, Some(&legacy), &request),
+            CacheVerdict::Partial
+        );
+    }
+
+    #[test]
+    fn differing_layouts_never_cross_serve() {
+        // The reason B1 exists: a dense-transformer blob and a hybrid-model
+        // blob of the same model/tokenizer/tier are different payload shapes.
+        let dense = fp_with_layout("KV-KV");
+        let hybrid = fp_with_layout("CacheList-ArraysCache-KV");
+        assert_eq!(
+            classify(Some(5), 5, Some(&dense), &hybrid),
+            CacheVerdict::Miss
+        );
+        assert_eq!(
+            classify(Some(5), 5, Some(&hybrid), &dense),
+            CacheVerdict::Miss
+        );
+        assert_eq!(
+            classify(Some(5), 5, Some(&dense), &dense),
+            CacheVerdict::Hit
+        );
     }
 
     #[test]

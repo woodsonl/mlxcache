@@ -150,7 +150,7 @@ Criteria 1-2 hold only if the adapter round-trip benchmark (Next Steps #3) demon
 
 ## Success Criteria
 
-- **(gated on adapter round-trip benchmark, R1-6)** A coding agent session (e.g. Claude Code pointing at local mlx-lm through the daemon) resumes warm across daemon restart: TTFT for the resumed turn < 2s at 50K+ cached prefix tokens.
+- **(gated on adapter round-trip benchmark, R1-6)** A coding agent session (pointing at local mlx-lm through the daemon) resumes warm across daemon restart: TTFT for the resumed turn < 2s at 50K+ cached prefix tokens.
 - **(gated on adapter round-trip benchmark, R1-6)** Two different processes (agent + chat app) sharing the same model get shared prefix hits: second process's TTFT for the shared prefix < 10% of cold prefill.
 - Cross-process + cross-restart hit-rate ≥ 80% of tokens on a real 1-day agent workload trace — assumes adapter-based reuse works (see the "Success-criteria gating" section); if the mlx-lm adapter proves too lossy, v1 target drops to the proxy-layer ceiling (~60-80%) and 80% becomes the stretch goal.
 - End-to-end value (the actual goal, premise 5): p95 turn latency and total prefill compute measurably lower than same workload without the daemon (A/B on captured traces, all requests counted including warming traffic).

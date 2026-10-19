@@ -35,6 +35,14 @@ class Fingerprint:
     # preserve what it recognizes.
     kv_bits: int = 0
     kv_group_size: int = 0
+    # Cache COMPOSITION signature: the ordered tuple of cache-entry class
+    # names the engine builds for this model (`""` = composition unknown,
+    # which is what every pre-B1 blob carries). Same forward-compat rule as
+    # the two fields above: defaulted so an older reader/writer pairs with a
+    # newer one, and `""` contributes zero fold bytes so existing keys are
+    # byte-identical. Never served across a differing value — see
+    # `mlxcache_store.cache_layout_compatible`.
+    cache_layout: str = ""
 
 
 def _known_fields(data: dict) -> dict:
@@ -65,7 +73,14 @@ def encode(meta: CheckpointMeta, payload: bytes) -> bytes:
     # None-valued fields are OMITTED, matching the Rust writer's
     # skip_serializing_if (byte-exactness across bindings, protocol §2:
     # absent means default). asdict alone would emit `"engine_id": null`.
+    # An EMPTY fingerprint.cache_layout is omitted for the same reason: it is
+    # the "composition unknown" default, exactly what a pre-B1 header says by
+    # saying nothing, so the two forms stay byte-identical on the wire.
     raw = {k: v for k, v in asdict(meta).items() if v is not None}
+    fp = dict(raw.get("fingerprint") or {})
+    if not fp.get("cache_layout"):
+        fp.pop("cache_layout", None)
+    raw["fingerprint"] = fp
     header = json.dumps(raw, separators=(",", ":")).encode()
     return struct.pack("<I", len(header)) + header + payload
 
@@ -89,7 +104,8 @@ def decode_header(header: bytes) -> CheckpointMeta:
     and a KeyError/TypeError/RecursionError escape would poison-brick
     every reader (§6). Validated: container types, tokens as a u32 list
     (bools are not ints), granularity in {0,1}, string engine_id /
-    payload_sha256, int token_count (advisory) and format_version."""
+    payload_sha256 / fingerprint.cache_layout, int token_count (advisory)
+    and format_version."""
     try:
         raw = json.loads(header)
     except RecursionError as exc:
@@ -118,6 +134,7 @@ def decode_header(header: bytes) -> CheckpointMeta:
         or type(fp.kv_layout_version) is not int
         or type(fp.kv_bits) is not int
         or type(fp.kv_group_size) is not int
+        or not isinstance(fp.cache_layout, str)
     ):
         # The dataclass does not enforce types; a non-str field would
         # explode later in the fold (.encode()) outside every guarded

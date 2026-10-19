@@ -8,6 +8,19 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The engine that owns the default key domain (connector protocol §4).
+/// It contributes ZERO fold bytes, so every pre-namespacing key is
+/// byte-identical to the current one.
+pub const DEFAULT_ENGINE: &str = "mlx-lm";
+
+/// The `CheckpointMeta::engine_id` value that records `engine`: `None` for the
+/// default engine. Same zero-byte rule as the key fold, applied to the header:
+/// a blob from the default engine is byte-identical to a pre-namespacing blob,
+/// and every reader already resolves an absent engine_id to the default.
+pub fn engine_id_meta(engine: &str) -> Option<String> {
+    (engine != DEFAULT_ENGINE).then(|| engine.to_string())
+}
+
 /// Fingerprint pinned in every checkpoint's metadata. Any mismatch is a miss (R1-1).
 ///
 /// `kv_bits`/`kv_group_size` pin the KV quantization config (T12): an 8-bit
@@ -33,6 +46,29 @@ pub struct ModelFingerprint {
     /// with different group sizes are different formats, not variants.
     #[serde(default)]
     pub kv_group_size: u32,
+    /// Signature of the model's CACHE COMPOSITION: the ordered tuple of cache
+    /// entry class names the engine builds for this model (dense KV stack,
+    /// CacheList of linear-attention state, ArraysCache of SSM state, ...).
+    ///
+    /// Distinct architectures can share a model id, tokenizer, dtype and
+    /// quantization tier while their payloads are shaped differently — a
+    /// dense stack's tensors cannot be loaded as a hybrid model's recurrent
+    /// state, and the mismatch is not detectable from the bytes. Pinning the
+    /// composition in the fingerprint makes cross-architecture serving
+    /// impossible by construction instead of by payload inspection.
+    ///
+    /// `#[serde(default)]` because pre-B1 blobs have no such field: they read
+    /// as `""`, the "composition unknown" value (see `crate::policy` for the
+    /// serve rule). An empty layout contributes ZERO fold bytes, so every
+    /// existing store keeps byte-identical keys.
+    ///
+    /// `skip_serializing_if` for the same reason: an empty layout means
+    /// "unrecorded", and a header that says nothing about composition is the
+    /// pre-B1 header byte-for-byte. Emitting `"cache_layout":""` would make
+    /// every publish differ from the pinned cross-language wire golden while
+    /// carrying no information.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_layout: String,
 }
 
 /// Metadata header for a checkpoint blob. Stored alongside the KV tensors.

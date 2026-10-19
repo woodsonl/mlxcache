@@ -16,6 +16,7 @@ import types
 
 import pytest
 from mlxcache_sidecar import blob, server
+from mlxcache_sidecar.server import MlxLmEngine
 
 
 class FakeCache:
@@ -91,9 +92,7 @@ def _install_fake_mlx(monkeypatch, on_load=None):
 
 
 def _engine(model=None):
-    from mlxcache_sidecar.server import MlxLmEngine
-
-    eng = MlxLmEngine.__new__(MlxLmEngine)
+    eng = server.MlxLmEngine.__new__(server.MlxLmEngine)
     eng.model_id = "fake"
     eng.model = model if model is not None else types.SimpleNamespace()
     eng.tokenizer_hash = "h"
@@ -839,6 +838,116 @@ def test_quantize_cache_skips_already_quantized_delta_ancestor(monkeypatch):
     assert eng._quantize_cache([marker]) == [marker]
 
 
+def test_quantization_guard_refuses_hybrid_cache(monkeypatch):
+    # Boot-time guard: a hybrid prompt cache (mixed CacheList/ArraysCache
+    # entries — linear attention, SSM, GDN layers) has no to_quantized, so
+    # the q8 tier must refuse the model at boot instead of crashing on the
+    # first prefill.
+    _install_fake_mlx(monkeypatch)
+    import sys
+
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    kv_cls = type("KVCache", (), {})
+    cache_mod.KVCache = kv_cls
+
+    eng = _engine()
+    eng.kv_bits = 8
+    eng.kv_group_size = 64
+    with pytest.raises(ValueError, match="MLXCACHE_KV_BITS"):
+        eng._assert_quantization_supported([kv_cls(), object()])  # mixed stack
+
+
+def test_quantization_guard_allows_dense_cache_and_skips_f16(monkeypatch):
+    # A dense stack (every entry exactly KVCache) passes the guard; with
+    # kv_bits=0 the guard itself does not reject anything, because hybrid
+    # models run fine on the f16 tier — which is how mlx-lm's class-generic
+    # save/load_prompt_cache persists their state.
+    #
+    # The cache PROBE, however, is unconditional now: its other consumer is
+    # the cache_layout signature, and a model whose composition is unrecorded
+    # could be served a payload of the wrong shape. See
+    # test_cache_layout_is_signed_for_every_model.
+    _install_fake_mlx(monkeypatch)
+    import sys
+
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    kv_cls = type("KVCache", (), {})
+    cache_mod.KVCache = kv_cls
+
+    eng = _engine()
+    eng.kv_bits = 8
+    eng.kv_group_size = 64
+    eng._assert_quantization_supported([kv_cls(), kv_cls()])  # dense: no raise
+
+    eng.kv_bits = 0
+    eng._assert_quantization_supported([object(), object()])  # f16: no raise
+
+
+def test_cache_layout_is_signed_for_every_model(monkeypatch):
+    # The composition signature must exist for EVERY model, quantized or not:
+    # it is what stops a dense-transformer payload from being handed to a
+    # hybrid model whose cache entries are a different shape entirely. It is
+    # the digest of the ORDERED class-name tuple, so layer order counts.
+    _install_fake_mlx(monkeypatch)
+    import sys
+
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    kv_cls = type("KVCache", (), {})
+    list_cls = type("CacheList", (), {})
+    arrays_cls = type("ArraysCache", (), {})
+    cache_mod.KVCache = kv_cls
+
+    dense = server.MlxLmEngine._cache_layout_of([kv_cls(), kv_cls()])
+    hybrid = server.MlxLmEngine._cache_layout_of(
+        [list_cls(), arrays_cls(), kv_cls(), list_cls(), arrays_cls()]
+    )
+    assert dense and hybrid and dense != hybrid
+    assert len(dense) == 16 and len(hybrid) == 16
+    # Deterministic and order-sensitive.
+    assert server.MlxLmEngine._cache_layout_of([kv_cls(), kv_cls()]) == dense
+    assert server.MlxLmEngine._cache_layout_of([list_cls(), arrays_cls()]) != (
+        server.MlxLmEngine._cache_layout_of([arrays_cls(), list_cls()])
+    )
+    # Composing one entry type differently is a different composition, not a
+    # different length of the same one.
+    assert server.MlxLmEngine._cache_layout_of([kv_cls()]) != server.MlxLmEngine._cache_layout_of(
+        [kv_cls(), kv_cls()]
+    )
+
+
+def test_init_probes_cache_layout_and_quantization_together(monkeypatch):
+    # __init__ constructs the prompt cache ONCE and feeds both boot checks:
+    # the layout signature (always) and the q8 guard (only when quantizing).
+    # A second construction would double the probe cost on every boot.
+    _install_fake_mlx(monkeypatch)
+    import sys
+
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    kv_cls = type("KVCache", (), {})
+    cache_mod.KVCache = kv_cls
+    probed = []
+    cache_mod.make_prompt_cache = lambda model: probed.append(1) or [kv_cls(), kv_cls()]
+
+    class FakeTokenizer:
+        eos_token_id = 0
+        name_or_path = "fake-model"
+
+        def get_vocab(self):
+            return {"a": 0, "b": 1}
+
+    sys.modules["mlx_lm"].load = lambda model_id: (
+        types.SimpleNamespace(),
+        FakeTokenizer(),
+    )
+    monkeypatch.delenv("MLXCACHE_KV_BITS", raising=False)
+    monkeypatch.delenv("MLXCACHE_KV_GROUP_SIZE", raising=False)
+
+    eng = server.MlxLmEngine("fake-model")
+    assert probed == [1], "exactly one cache construction at boot"
+    assert eng.engine_id == "mlx-lm", "the real engine owns the default domain"
+    assert eng.cache_layout == server.MlxLmEngine._cache_layout_of([kv_cls(), kv_cls()])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 
@@ -942,3 +1051,133 @@ def test_engine_id_and_granularity_round_trip():
     m3, _ = blob.decode(blob.encode(legacy, b"kv"))
     assert m3.engine_id is None, "absent engine_id reads as the default"
     assert m3.granularity is None, "absent granularity reads as ANY_PREFIX"
+
+
+# --- settle reconciliation (B6 negative paths) --------------------------------
+
+
+class _DepthCache:
+    """A prompt-cache stand-in whose entries report a chosen depth."""
+
+    def __init__(self, depth: int) -> None:
+        self.depth = depth
+
+    def __iter__(self):
+        entry = types.SimpleNamespace(size=lambda: self.depth)
+        return iter([entry])
+
+
+def _settle_engine(monkeypatch, depth: int, trim_to: int | None = None, trimmable=True):
+    _install_fake_mlx(monkeypatch)
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    monkeypatch.setattr(cache_mod, "can_trim_prompt_cache", lambda cache: trimmable, raising=False)
+    monkeypatch.setattr(
+        cache_mod,
+        "trim_prompt_cache",
+        lambda cache, n: setattr(cache, "depth", trim_to if trim_to is not None else cache.depth),
+        raising=False,
+    )
+    # settle serializes through save_prompt_cache; emit placeholder payload
+    # bytes so the write path is real (the caps test reads the byte length).
+    monkeypatch.setattr(cache_mod, "save_prompt_cache", lambda fh, cache: fh.write(b"p" * 64))
+    engine = _engine()
+    engine.cache_layout = ""
+    engine.engine_id = "mlx-lm"
+    return engine, _DepthCache(depth)
+
+
+def test_settle_trims_deeper_cache_and_reports_post_trim_depth(monkeypatch, tmp_path):
+    # Generation left the cache one position deeper than the tokens[:-1]
+    # convention: settle must trim to target and report the depth it PERSISTED,
+    # not the depth it first measured.
+    engine, cache = _settle_engine(monkeypatch, depth=9, trim_to=7)
+    path = tmp_path / ".settle-1-1-1.staging"
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report["written"] is True, report
+    assert report["covered"] == 7, "covered must describe the state as persisted"
+    assert path.exists()
+
+
+def test_settle_refuses_untrimmable_deeper_cache(monkeypatch, tmp_path):
+    engine, cache = _settle_engine(monkeypatch, depth=9, trimmable=False)
+    path = tmp_path / ".settle-1-1-1.staging"
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report == {"written": False, "tokens": 8, "reason": "untrimmable_cache"}
+    assert not path.exists()
+
+
+def test_settle_refuses_shallower_cache_instead_of_shortening(monkeypatch, tmp_path):
+    # The daemon requires the settled sequence to equal request+generated
+    # exactly, so a shortened file was always discarded downstream: writing it
+    # was dead work reporting written:true. Refuse instead.
+    engine, cache = _settle_engine(monkeypatch, depth=3)
+    path = tmp_path / ".settle-1-1-1.staging"
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report == {"written": False, "tokens": 8, "reason": "shallow_cache"}
+    assert not path.exists(), "a settle the daemon will discard must not be written"
+
+
+def test_settle_cap_of_zero_refuses_rather_than_disables(monkeypatch, tmp_path):
+    # 0 is the natural "turn settling off"; treating it as falsy-disabled did
+    # the opposite of the operator's intent.
+    engine, cache = _settle_engine(monkeypatch, depth=7)
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_TOKENS", "0")
+    path = tmp_path / ".settle-1-1-1.staging"
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report["reason"] == "token_cap"
+    assert report["written"] is False
+
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_TOKENS", "")
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_BYTES", "0")
+    report = engine.settle([1, 2, 3, 4, 5], [6, 7, 8], cache, str(path))
+    assert report["reason"] == "size_cap"
+    assert report["written"] is False
+    assert not path.exists()
+
+
+def test_settle_caps_default_when_env_unset_or_malformed(monkeypatch):
+    # The caps bound on-disk writes; an unset or unparsable variable must
+    # keep the default, never silently disable them (a first version of the
+    # 0-refuses fix did exactly that).
+    from mlxcache_sidecar.server import (
+        SETTLE_MAX_BYTES_DEFAULT,
+        SETTLE_MAX_TOKENS_DEFAULT,
+        _settle_limits,
+    )
+
+    for name in ("MLXCACHE_SETTLE_MAX_TOKENS", "MLXCACHE_SETTLE_MAX_BYTES"):
+        monkeypatch.delenv(name, raising=False)
+    assert _settle_limits() == (SETTLE_MAX_TOKENS_DEFAULT, SETTLE_MAX_BYTES_DEFAULT)
+
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_TOKENS", "not-a-number")
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_BYTES", "")
+    assert _settle_limits() == (SETTLE_MAX_TOKENS_DEFAULT, SETTLE_MAX_BYTES_DEFAULT)
+
+
+def test_generate_collect_reports_a_settling_failure_instead_of_raising(monkeypatch, tmp_path):
+    # Regression: the collecting leg called engine.settle unguarded, so an
+    # exception in pre-settle work turned a completed generation into a 500.
+    # Remove the guard and this test fails with the raised RuntimeError.
+    _install_fake_mlx(monkeypatch)
+    cache_mod = sys.modules["mlx_lm.models.cache"]
+    monkeypatch.setattr(cache_mod, "can_trim_prompt_cache", lambda cache: True, raising=False)
+    monkeypatch.setattr(cache_mod, "trim_prompt_cache", lambda cache, n: None, raising=False)
+    engine = _engine()
+    engine.cache_layout = ""
+    engine.engine_id = "mlx-lm"
+    # One scripted token: the test targets the settle guard, not generation.
+    monkeypatch.setattr(
+        MlxLmEngine, "stream_with_cache", lambda self, tokens, cache: iter([(7, "x")])
+    )
+
+    def _boom(self, prompt, generated, cache, path):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(MlxLmEngine, "settle", _boom)
+    tokens = [1, 2, 3]
+    out, text, _cache, settle = engine.generate_collect(
+        tokens, 1, None, str(tmp_path / ".settle-1-1-1.staging")
+    )
+    assert len(out) >= 1, "generation itself must complete"
+    assert settle["written"] is False
+    assert settle["reason"].startswith("settle_failed")

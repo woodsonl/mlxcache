@@ -12,7 +12,7 @@ Source of truth: docs/designs/mlx-kv-cache-daemon.md (eng review decisions R1-R7
 | **adapter** | A per-engine implementation of the contract (Rust native for the owner engine; Python sidecar for mlx-lm). |
 | **checkpoint** | A serialized KV blob for one token prefix, plus its metadata header. |
 | **prefix** | A token-ID sequence identifying a checkpoint. |
-| **fingerprint** | The ModelFingerprint struct pinning model identity, tokenizer, dtype, layout. |
+| **fingerprint** | The ModelFingerprint struct pinning model identity, tokenizer, dtype, KV layout, quantization tier, and cache composition. |
 | **sidecar** | The Python mlx-lm compatibility adapter process. Never the hot-path default. |
 | **daemon** | The mlxcache Rust binary orchestrating proxy, policy, index, adapters. |
 
@@ -61,7 +61,8 @@ CheckpointBlob = {
   tensors: safetensors frame (kv dtype/layout per fingerprint),
 }
 CheckpointMeta = {
-  fingerprint: { model_id, tokenizer_hash, kv_dtype, kv_layout_version },
+  fingerprint: { model_id, tokenizer_hash, kv_dtype, kv_layout_version,
+                 kv_bits, kv_group_size, cache_layout },
   token_count: u64,
   tokens: [u32],         // the token-ID prefix this blob covers; makes the blob
                          // self-describing so the index is rebuildable after a

@@ -35,20 +35,36 @@ JSON header fields `[CURRENT, plus B0.2 additions marked]`:
 
 | field | type | notes |
 |---|---|---|
-| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size` `[CURRENT]` |
+| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size`, `cache_layout` `[CURRENT]` |
 | `token_count` | u64 | cross-checked against `len(tokens)` at read `[CURRENT]` |
 | `tokens` | [u32] | the exact token-ID prefix this entry is keyed by `[CURRENT]` |
 | `format_version` | u32 | see §5 `[CURRENT]` |
 | `payload_sha256` | hex string | sha256 of the payload bytes `[CURRENT]` |
-| `engine_id` | string? | e.g. `"mlx-lm"`, `"llama-cpp"`; absent ⇒ `"mlx-lm"` `[B0.2]` |
-| `granularity` | u8? | 0 = `ANY_PREFIX` (default), 1 = `WHOLE_CONTEXT` `[B0.2]` |
+| `engine_id` | string? | e.g. `"mlx-lm"`, `"llama-cpp"`, `"qwen4-exp"`; absent ⇒ `"mlx-lm"` `[CURRENT]` |
+| `granularity` | u8? | 0 = `ANY_PREFIX` (default), 1 = `WHOLE_CONTEXT` `[CURRENT]` |
+
+`fingerprint.cache_layout` is a short, stable signature of the model's
+**cache composition**: the ordered tuple of cache-entry class names the
+engine builds for it (a dense KV stack, a `CacheList` of linear-attention
+state, an `ArraysCache` of SSM state, …), joined and hashed. Two
+architectures can agree on model id, tokenizer, dtype and quantization tier
+while their payloads have mutually unloadable shapes, so composition is
+part of the identity that gates serving. A writer that cannot report a
+composition MUST omit the field (it is never emitted empty); a reader
+resolves an absent field to `""`, which means **composition unrecorded**
+and is served only legacy-to-legacy (§3.3). An engine that reports no
+`engine_id` is the default engine; writers MUST NOT name the default
+engine explicitly, so default-engine headers stay byte-identical to
+pre-namespacing ones.
 
 **Unknown fields**: readers MUST ignore header fields they do not
 recognize; an unknown field is never corruption. `engine_id` and
 `granularity` are additions WITHIN `format_version` 2, which writers MUST
-still emit. (Precedent: the T12 incident — strict parsing quarantined
-every healthy ancestor when a newer daemon added a field.) `[CURRENT:
-blob.py _known_fields strips unknowns; Rust serde ignores unknown fields]`
+still emit; `cache_layout` is an addition to the fingerprint object
+(defaulted, omitted when empty). (Precedent: the T12 incident — strict
+parsing quarantined every healthy ancestor when a newer daemon added a
+field.) `[CURRENT: blob.py _known_fields strips unknowns; Rust serde
+ignores unknown fields]`
 
 ## 3. Operations (L1)
 
@@ -93,7 +109,22 @@ gone raises `Unavailable(io)`.
   granularity. `ANY_PREFIX` entries match any request whose token stream
   extends the entry's `tokens` `[CURRENT in daemon index]`;
   `WHOLE_CONTEXT` entries match only when the request's FULL token
-  stream equals the entry's `tokens` `[B0.2]`.
+  stream equals the entry's `tokens` `[CURRENT]`.
+- **Cache composition** `[CURRENT]`: an entry matches only when its
+  `fingerprint.cache_layout` equals the caller's. `""` means composition
+  unrecorded, and the two consequences are deliberate:
+  - a request reporting a NON-EMPTY layout is NEVER served an
+    unrecorded-layout entry — nothing proves that payload has the shape the
+    caller's engine will deserialize, and deserializing the wrong shape is
+    silent wrong output, not an error;
+  - a request reporting `""` may be served a `""` entry, so a store written
+    before compositions were recorded stays usable until the current engine
+    rewrites its blobs (legacy-to-legacy only: the moment either side knows
+    its composition, the comparison is exact).
+
+  This is not a compatibility grace period to be relaxed later: an engine
+  that reports no composition asserts it cannot prove compatibility, and
+  exact equality is the only safe reading of that assertion.
 - **End-anchored rule** `[CURRENT in daemon]`: a request whose stream
   equals the entry's `tokens` through `len-1` but DIVERGES at the final
   token still matches — the payload covers exactly `0..matched_len-1`,
@@ -141,18 +172,42 @@ The fold is **normative by reference and by construction**:
   fingerprint fields → u32-LE chunks → `0xFFFFFFFF` domain separator →
   token stream → dual-lane FNV-1a (lane seeds `0xcbf29ce484222325` /
   `0x9e3779b97f4a7c15`, primes `0x100000001b3` / `0x880355f21e6d1965`).
-- **B0.2 extension**: a non-default `engine_id` is length-prefixed (same
+- **Engine namespacing**: a non-default `engine_id` is length-prefixed (same
   `:field` scheme as fingerprint fields) and folded BEFORE all fingerprint
-  fields, **closed by its own `0xFFFFFFFF` domain separator**. Full order:
-  `engine_chunks? ‖ SEP ‖ fingerprint_chunks ‖ SEP ‖ tokens`. The DEFAULT
-  engine (`"mlx-lm"`) contributes ZERO bytes (no chunks, no separator) —
-  keys of engine-less and default-engine entries are byte-identical to the
-  current fold, so existing stores keep their keys.
+  fields, **closed by its own `0xFFFFFFFF` domain separator**. The DEFAULT
+  engine (`"mlx-lm"`, and an absent id) contributes ZERO bytes (no chunks,
+  no separator) — keys of engine-less and default-engine entries are
+  byte-identical to the engine-less fold, so existing stores keep their
+  keys.
+- **Cache composition** `[CURRENT]`: a NON-EMPTY
+  `fingerprint.cache_layout` is one more length-prefixed field, folded
+  AFTER `kv_group_size` and before the closing domain separator. An EMPTY
+  layout contributes ZERO bytes, on the same rule as the default engine id:
+  every blob whose composition is unrecorded keeps its previous key.
+
+Full order, with `?` marking the two fields that fold only when
+non-default:
+
+```
+engine_chunks? ‖ SEP ‖ model_id ‖ tokenizer_hash ‖ kv_dtype
+                       ‖ kv_layout_version ‖ kv_bits ‖ kv_group_size
+                       ‖ cache_layout?          ‖ SEP ‖ tokens
+```
+
+Every field is length-prefixed, so no field's bytes can be re-split across
+a boundary to alias another identity — including a `cache_layout` crafted
+to look like "previous field plus this one".
 
 Cross-engine `lookup` returns `matched_len = 0` by construction (the
-fingerprint check in §3.3 additionally re-verifies identity).
+fingerprint check in §3.3 additionally re-verifies identity). `engine_id` is
+a key domain, not a hint: because it folds ahead of the fingerprint behind its
+own separator, two engines can never produce the same key for the same model
+and tokens, so a blob written by one engine is unreachable to the other
+regardless of how closely their fingerprints otherwise agree.
 
-Engine registry (maintained here): `"mlx-lm"`, `"llama-cpp"` (reserved).
+Engine registry (maintained here): `"mlx-lm"` (the default),
+`"qwen4-exp"` (the self-contained Qwen3.8-Flash-Next NVFP4 engine, which
+reports `engine_id = "qwen4-exp"`), `"llama-cpp"` (reserved).
 
 ## 5. Versioning
 
@@ -168,6 +223,11 @@ Engine registry (maintained here): `"mlx-lm"`, `"llama-cpp"` (reserved).
 Writers declare KV layout via `fingerprint.kv_layout_version`; readers
 MUST refuse to serve an entry whose fingerprint differs from the caller's
 (primary enforcement is §4 keying; implementations re-check).
+
+`kv_layout_version` describes the PAYLOAD layout (how the bytes are
+framed), not the cache composition. Adding composition to the identity is
+therefore not a reason to bump it: the field lives in the fingerprint,
+which every read already compares.
 
 ## 6. Trust boundary
 

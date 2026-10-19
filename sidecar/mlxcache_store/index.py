@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 
-from .fingerprint import Fingerprint
+from .fingerprint import Fingerprint, identity_compatible
 
 ANY_PREFIX = 0
 WHOLE_CONTEXT = 1
@@ -239,7 +239,7 @@ class PrefixIndex:
         fingerprint: Fingerprint,
         tokens: list[int],
     ) -> bool:
-        if e.engine_id != engine_id or e.fingerprint != fingerprint:
+        if e.engine_id != engine_id or not identity_compatible(e.fingerprint, fingerprint):
             return False  # cross-engine/fingerprint: structurally no match
         if e.granularity == Granularity.WHOLE_CONTEXT:
             return len(e.tokens) == len(tokens) and e.tokens == tuple(tokens)

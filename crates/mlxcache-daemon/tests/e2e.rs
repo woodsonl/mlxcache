@@ -72,8 +72,11 @@ async fn unusable_blob_is_quarantined_and_served_from_scratch() {
     assert_eq!(res.status(), 200);
     assert_eq!(state.orchestrator.quarantined_count(), 0);
 
-    // Delete the blob out from under the index (simulate a disk fault).
-    let blob_path = state.persistence.list_blobs().unwrap().pop().unwrap();
+    // Delete the blob out from under the index (simulate a disk fault). Naming
+    // it by coverage matters: this request also settled a longer checkpoint, and
+    // deleting that one would leave the 8-token prefix serving request 2 without
+    // ever touching a missing file.
+    let blob_path = blob_with_coverage(&state, 8);
     std::fs::remove_file(&blob_path).unwrap();
 
     // Request 2: hit points at a missing blob → adapter errors → daemon must
@@ -153,34 +156,57 @@ async fn eviction_reaper_unlinks_and_stats_and_next_request_misses() {
         }
     };
 
-    // Request 1: miss → publish.
+    // Request 1: miss → publish the prefill prefix, and (after generation) the
+    // settled checkpoint covering prompt + generated.
     let res = post(body.clone()).await;
     assert_eq!(res.status(), 200);
     assert_eq!(
         state.orchestrator.published_count(),
-        1,
-        "checkpoint published"
+        2,
+        "the prefill prefix and the settled checkpoint are both published"
     );
-    let blob = state.persistence.list_blobs().unwrap().pop().unwrap();
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8, 72],
+        "prefill prefix + settled checkpoint: {:?}",
+        blob_coverages(&state)
+    );
+    let prefix = blob_with_coverage(&state, 8);
+    let settled = blob_with_coverage(&state, 72);
 
-    // Reaper pass: cap 0 + window 0 → the just-published entry is NOT recency-
-    // protected (window 0) and has no published extension → evicted. Goes
-    // through AppState::evict_pass — the same single path the background
-    // reaper uses — so the /stats counter is exercised here too.
+    // Reaper passes with cap 0 + window 0. The settled checkpoint extends the
+    // 8-token prefix, so the index marks that prefix an ANCHOR (a live chain's
+    // base) and the policy never evicts an anchor — the first pass reaps the
+    // settled blob and leaves the prefix; only the pass after that (no longer
+    // extended by anything) reaps the prefix. Goes through AppState::evict_pass
+    // — the same single path the background reaper uses — so the /stats counter
+    // is exercised here too.
     let evicted = state.evict_pass(0, 0, std::time::Duration::ZERO);
-    assert_eq!(evicted, 1, "the single published entry must be reaped");
-    assert_eq!(state.orchestrator.published_count(), 0);
+    assert_eq!(
+        evicted, 1,
+        "the settled checkpoint is evicted; the anchored prefix survives"
+    );
     assert!(
-        !blob.exists(),
+        !settled.exists(),
         "evicted blob file must be unlinked, or the next restart resurrects it"
     );
+    assert!(prefix.exists(), "an anchor must survive a reaper pass");
+    assert_eq!(state.orchestrator.published_count(), 1);
+
+    let evicted = state.evict_pass(0, 0, std::time::Duration::ZERO);
+    assert_eq!(evicted, 1, "the now-unanchored prefix must be reaped");
+    assert_eq!(state.orchestrator.published_count(), 0);
+    assert!(!prefix.exists(), "the prefix file must be unlinked");
 
     // /stats reflects the eviction.
     let res = get_stats().await;
     assert_eq!(res.status(), 200);
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["evictions"], 1, "/stats must report the eviction");
+    assert_eq!(
+        v["evictions"], 2,
+        "/stats must report both reaper passes' evictions"
+    );
     assert_eq!(v["checkpoints_published"], 0);
 
     // Request 2: identical prompt → clean miss from scratch (no 502, no
@@ -272,10 +298,10 @@ async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
 }
 
 #[tokio::test]
-async fn one_token_prompt_serves_and_publishes_no_blob() {
+async fn one_token_prompt_serves_and_publishes_no_prefill_blob() {
     // A one-token prompt caches nothing (empty adapter payload). The daemon must
-    // serve it from scratch, publish no checkpoint, and never report a phantom
-    // hit on the repeat request.
+    // serve it from scratch, publish no PREFILL checkpoint, and never report a
+    // phantom hit on the repeat request.
     let (sidecar_url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_ONE", "1")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
@@ -304,12 +330,16 @@ async fn one_token_prompt_serves_and_publishes_no_blob() {
         assert_eq!(v["mlxcache"]["verdict"], "miss", "nothing was cached");
         assert!(!v["generated_tokens"].as_array().unwrap().is_empty());
     }
+    // No PREFILL checkpoint (a one-token prompt caches nothing), but generation
+    // itself built KV for prompt + generated, so exactly one settled checkpoint
+    // exists — and it can never serve this one-token prompt, whose lookup cannot
+    // match a 65-token key.
     assert_eq!(
-        state.persistence.list_blobs().unwrap().len(),
-        0,
-        "a one-token prompt must publish no blob"
+        blob_coverages(&state),
+        vec![65],
+        "only the settled checkpoint may exist; the prefill published nothing"
     );
-    assert_eq!(state.orchestrator.published_count(), 0);
+    assert_eq!(state.orchestrator.published_count(), 1);
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
@@ -409,12 +439,14 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
         Some(1),
         "N={N} one-token requests must coalesce to 1 prefill; got {stats}"
     );
+    // The prefill publishes nothing; the settled checkpoint (prompt + generated)
+    // is the only blob, and a 1-token lookup cannot match its 65-token key.
     assert_eq!(
-        state.persistence.list_blobs().unwrap().len(),
-        0,
-        "no checkpoint may be published for a one-token prompt"
+        blob_coverages(&state),
+        vec![65],
+        "no PREFILL checkpoint may exist"
     );
-    assert_eq!(state.orchestrator.published_count(), 0);
+    assert_eq!(state.orchestrator.published_count(), 1);
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
@@ -468,7 +500,9 @@ async fn stream_leg_traces_the_settled_verdict() {
     .await;
     assert_eq!(res.status(), 200);
 
-    let blob = state.persistence.list_blobs().unwrap().pop().unwrap();
+    // The 8-token prefill prefix is what the grown request matches (the settled
+    // 72-token blob is longer than the whole request, so it is not a candidate).
+    let blob = blob_with_coverage(&state, 8);
     std::fs::write(&blob, b"JUNK").unwrap();
 
     let res = post(
@@ -681,9 +715,11 @@ async fn stream_chunks_decode_with_stock_openai_sdk_shape() {
 }
 
 #[tokio::test]
-async fn one_token_streaming_serves_and_publishes_no_blob() {
-    // The streaming path for the no-publish case: a one-token prompt must stream
-    // a 200 SSE with a miss verdict and publish nothing.
+async fn one_token_streaming_serves_and_publishes_no_prefill_blob() {
+    // The streaming path for the no-prefill-publish case: a one-token prompt
+    // must stream a 200 SSE with a miss verdict and publish no prefill
+    // checkpoint. The post-generation settle still publishes its own (prompt +
+    // generated), on this leg too.
     let (sidecar_url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_TOKENIZE_ONE", "1")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&sidecar_url, &blobs);
@@ -713,10 +749,12 @@ async fn one_token_streaming_serves_and_publishes_no_blob() {
         text.trim_end().ends_with("data: [DONE]"),
         "SSE tail: {text}"
     );
+    // The stream leg publishes the same way the JSON leg does: no prefill
+    // checkpoint, exactly one settled one.
     assert_eq!(
-        state.persistence.list_blobs().unwrap().len(),
-        0,
-        "no checkpoint may be published for a one-token prompt"
+        blob_coverages(&state),
+        vec![65],
+        "no PREFILL checkpoint may exist; the settle still publishes"
     );
 
     child.kill().expect("kill sidecar");
@@ -769,8 +807,14 @@ async fn end_to_end_miss_then_hit() {
         "a cold miss cached nothing from a prior request"
     );
 
-    // Blob must be on disk now.
-    assert_eq!(state.persistence.list_blobs().unwrap().len(), 1);
+    // Blob must be on disk now: the 8-token prefill prefix, plus the settled
+    // checkpoint covering prompt + generated.
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8, 72],
+        "{:?}",
+        blob_coverages(&state)
+    );
 
     // Request 2: same prompt → hit (index lookup finds the published prefix)
     let res = make_app()
@@ -871,6 +915,15 @@ impl std::ops::DerefMut for SidecarHandle {
 }
 
 async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> (String, SidecarHandle) {
+    spawn_sidecar_with_setup(env, "").await
+}
+
+/// Spawn a sidecar whose engine gets extra setup statement(s) appended to the
+/// boot script (after `make_engine`, before the server starts) — each one
+/// semicolon-terminated, since the script is a single Python line. Lets a test
+/// present an engine with a different identity/composition without adding a
+/// second engine implementation.
+async fn spawn_sidecar_with_setup(env: &[(&str, &str)], setup: &str) -> (String, SidecarHandle) {
     // The health probe needs its own deadline: `reqwest::get` is a bare
     // client with NO timeout, so under a loaded machine (parallel e2e
     // spawns) a half-open connect hangs the poll forever and the test
@@ -892,6 +945,7 @@ async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> (String, SidecarHandle)
         "import sys; sys.path.insert(0, {root:?}); \
          from mlxcache_sidecar import server; \
          server.Handler.engine = server.make_engine('e2e-model'); \
+         {setup} \
          srv = server.BurstServer(('127.0.0.1', 0), server.Handler); \
          print('PORT=%d' % srv.server_address[1], flush=True); \
          srv.serve_forever()",
@@ -1047,15 +1101,25 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".ckpt"))
         .collect();
-    // The index holds one entry per token prefix. Both models tokenize the same
-    // prompt, so the second publish replaces the first at that node and reclaims
-    // its immutable file — exactly one blob survives, with no generation leak.
     // The evicted model is a fingerprint miss (recomputed), never an error.
+    // The index holds one entry per token prefix. Both models tokenize the same
+    // prompt, so the second publish replaces the first at each of those nodes
+    // and reclaims its immutable file: one blob per coverage node survives (the
+    // prefill prefix and the settled checkpoint), and no generation leaks —
+    // four publications, two files whose entries belong to the serving model.
     assert_eq!(
         ckpts.len(),
-        1,
-        "the superseded generation must be reclaimed: {ckpts:?}"
+        2,
+        "exactly one blob per coverage node, no superseded generation: {ckpts:?}"
     );
+    assert_eq!(blob_coverages(&state), vec![8, 72], "{ckpts:?}");
+    for path in state.persistence.list_blobs().unwrap() {
+        let (meta, _) = state.persistence.load(&path).unwrap();
+        assert_eq!(
+            meta.fingerprint.model_id, "model-b",
+            "the surviving entry at each node is the one that last published it"
+        );
+    }
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
@@ -1226,9 +1290,13 @@ async fn q8_and_f16_blobs_never_share_a_file() {
     // 1) q8 run: miss → publish.
     let res = post(state_q8.clone(), body.clone()).await;
     assert_eq!(res.status(), 200);
-    assert_eq!(state_q8.orchestrator.published_count(), 1, "q8 published");
+    assert_eq!(
+        state_q8.orchestrator.published_count(),
+        2,
+        "q8 publishes its prefill prefix and its settled checkpoint"
+    );
     let q8_blobs = blob_names();
-    assert_eq!(q8_blobs.len(), 1);
+    assert_eq!(q8_blobs.len(), 2, "{q8_blobs:?}");
 
     // 2) same prompt through the f16 sidecar: the tier is a DIFFERENT
     //    fingerprint (kv_bits 0 vs 8 in /tokenize → blob_key fold) → the q8
@@ -1239,14 +1307,14 @@ async fn q8_and_f16_blobs_never_share_a_file() {
     assert_eq!(res.status(), 200);
     assert_eq!(
         state_f16.orchestrator.published_count(),
-        1,
-        "the f16 tier must publish its own checkpoint, not serve the q8 one"
+        2,
+        "the f16 tier must publish its own checkpoints, not serve the q8 ones"
     );
     let both = blob_names();
     assert_eq!(
         both.len(),
-        2,
-        "two tiers = two blob files; a shared name would overwrite the other tier: {both:?}"
+        4,
+        "two tiers x two coverage nodes = four blob files; a shared name would overwrite the other tier: {both:?}"
     );
     assert!(
         q8_blobs.iter().all(|b| both.contains(b)),
@@ -1399,8 +1467,15 @@ async fn concurrent_identical_requests_share_one_prefill() {
         "unexpected verdicts: {verdicts:?}"
     );
 
-    // One blob on disk, not N.
-    assert_eq!(state.persistence.list_blobs().unwrap().len(), 1);
+    // One blob per coverage node, not N: the leader's prefill prefix and the
+    // settled checkpoint (each follower's settle lands on the same node and
+    // replaces the previous publication).
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8, 72],
+        "N identical requests must not leave N checkpoints: {:?}",
+        blob_coverages(&state)
+    );
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
@@ -1779,7 +1854,11 @@ async fn partial_hit_delta_prefills_only_the_delta() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["mlxcache"]["verdict"], "miss");
-    assert_eq!(state.persistence.list_blobs().unwrap().len(), 1);
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8, 72],
+        "request 1 publishes its prefill prefix and its settled checkpoint"
+    );
 
     // Request 2: the SAME conversation grown by 8 more tokens. Longest match is
     // the ancestor (8 tokens) → partial → delta prefill.
@@ -1807,8 +1886,14 @@ async fn partial_hit_delta_prefills_only_the_delta() {
         v["mlxcache"]["tokens_cached"], 7,
         "tokens_cached must equal prefill_from (the single covered-KV definition): {v}"
     );
-    // Both the ancestor (8-token) and the new (16-token) checkpoint exist.
-    assert_eq!(state.persistence.list_blobs().unwrap().len(), 2);
+    // Both the ancestor (8-token) and the new (16-token) prefill checkpoints
+    // exist, each with its own settled extension (72 and 80 tokens).
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8, 16, 72, 80],
+        "{:?}",
+        blob_coverages(&state)
+    );
 
     // The sidecar's phase accounting proves the delta path ran: the second
     // prefill covered a 16-token prompt but only processed the 8-step delta
@@ -1901,7 +1986,11 @@ async fn transient_prefill_failure_keeps_ancestor_and_recovers() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["mlxcache"]["verdict"], "miss");
-    assert_eq!(state.persistence.list_blobs().unwrap().len(), 1);
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8, 72],
+        "request 1 publishes its prefill prefix and its settled checkpoint"
+    );
 
     // Request 2: grown prompt → partial → delta prefill is call #2 → 500.
     // The 502 envelope must carry the adapter_error kind (a genuine adapter
@@ -1934,9 +2023,9 @@ async fn transient_prefill_failure_keeps_ancestor_and_recovers() {
         "the induced failure must be surfaced verbatim: {v}"
     );
     assert_eq!(
-        state.persistence.list_blobs().unwrap().len(),
-        1,
-        "no quarantine and no new publish: the ancestor stays exactly as-is"
+        blob_coverages(&state),
+        vec![8, 72],
+        "no quarantine and no new publish: the store stays exactly as-is"
     );
 
     // Request 3: identical to request 2 — prefill call #3 succeeds now, so
@@ -1959,9 +2048,9 @@ async fn transient_prefill_failure_keeps_ancestor_and_recovers() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["mlxcache"]["verdict"], "partial", "recovered: {v}");
     assert_eq!(
-        state.persistence.list_blobs().unwrap().len(),
-        2,
-        "ancestor + the recovered delta checkpoint"
+        blob_coverages(&state),
+        vec![8, 16, 72, 80],
+        "ancestor + the recovered delta checkpoint, each with its settled extension"
     );
 
     child.kill().expect("kill sidecar");
@@ -2098,12 +2187,19 @@ async fn multi_turn_end_divergent_serves_t22() {
         v["mlxcache"]["prefill_from"], 8,
         "turn-1's 8 tokens of covered KV reused (matched 9 - 1): {v}"
     );
-    // Turn 2 did NOT republish: it served from turn-1's blob (no new
-    // publication on the hit path).
+    // Turn 1 published its prefill prefix AND its settled checkpoint. Turn 2 is
+    // a HIT: it publishes no PREFILL checkpoint (nothing was prefilled), and the
+    // only new blob is its own settled one — the KV it just produced, which a
+    // later turn can resume from. So: 2 from turn 1, plus turn 2's settle.
     assert_eq!(
         state.persistence.list_blobs().unwrap().len(),
-        1,
-        "a hit must not publish a second checkpoint"
+        3,
+        "a hit publishes no prefill checkpoint; the settle is a separate publication"
+    );
+    assert_eq!(
+        state.orchestrator.published_count(),
+        3,
+        "turn 1: prefix + settle; turn 2: settle only"
     );
 
     // Replay turn 2: the same hit, byte-identical routing.
@@ -2172,8 +2268,11 @@ async fn corrupt_ancestor_quarantines_and_prefills_from_scratch() {
     .await;
     assert_eq!(res.status(), 200);
 
-    // Corrupt the ancestor in place: a truncation the wire decoder rejects.
-    let ancestor = state.persistence.list_blobs().unwrap().pop().unwrap();
+    // Corrupt the ancestor in place: a truncation the wire decoder rejects. The
+    // request below matches the 8-token PREFILL prefix — the settled checkpoint
+    // is far longer than the whole request, so it is not a candidate and
+    // damaging it would prove nothing.
+    let ancestor = blob_with_coverage(&state, 8);
     std::fs::write(&ancestor, b"JUNK").unwrap();
 
     // A different extension of the same base: its longest match IS the
@@ -2486,4 +2585,356 @@ async fn stalled_stream_is_cut_by_the_idle_budget_with_an_explicit_error() {
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
+}
+
+/// Serve one prompt through a state and return the parsed response body.
+async fn post_prompt(state: Arc<AppState>, content: &str) -> serde_json::Value {
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": content}],
+        "stream": false,
+    })
+    .to_string();
+    let res = router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Token coverage of every published checkpoint, sorted.
+///
+/// A request that generates publishes TWO kinds of checkpoint: the prefill
+/// prefix (the prompt, published by the leader) and the SETTLED one (prompt +
+/// generated, published best-effort after generation). Asserting on coverage —
+/// the token count each blob's header records — names the publication a test
+/// means; asserting on a bare file count would conflate them, and asserting on
+/// filenames would depend on directory order.
+fn blob_coverages(state: &Arc<AppState>) -> Vec<usize> {
+    let mut out: Vec<usize> = state
+        .persistence
+        .list_blobs()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            state
+                .persistence
+                .load(p)
+                .expect("published blob must load")
+                .0
+                .tokens
+                .len()
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// The published blob whose header records `coverage` tokens.
+///
+/// Tests that damage or inspect ONE checkpoint must name it by coverage: with a
+/// settled checkpoint alongside the prefill prefix, `pop()` picks whichever
+/// file the directory happens to list last.
+fn blob_with_coverage(state: &Arc<AppState>, coverage: usize) -> std::path::PathBuf {
+    let paths = state.persistence.list_blobs().unwrap();
+    let found: Vec<std::path::PathBuf> = paths
+        .into_iter()
+        .filter(|p| {
+            state
+                .persistence
+                .load(p)
+                .map(|(m, _)| m.tokens.len() == coverage)
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one blob covering {coverage} tokens"
+    );
+    found.into_iter().next().unwrap()
+}
+
+/// The .ckpt filenames present in a store directory.
+fn blob_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".ckpt"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn default_engine_identity_keeps_the_legacy_key_and_header() {
+    // The wiring proof for §4's zero-byte rule, on the REAL tokenize path: a
+    // request served through the sidecar (which reports engine_id and
+    // cache_layout) records a blob whose filename recomputes from the identity
+    // the blob itself carries — with the engine id folded as the DEFAULT
+    // (zero bytes) and the composition folded as a normal field.
+    let (sidecar_url, mut child) = spawn_sidecar().await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&sidecar_url, &blobs);
+    let body = post_prompt(state.clone(), "identity parity").await;
+    assert_eq!(body["mlxcache"]["verdict"], "miss");
+
+    // One request publishes two checkpoints (prefill prefix + settled); the
+    // prefix's filename is the one whose key the sidecar identity recomputes.
+    let prefix = blob_with_coverage(&state, 8);
+    let prefix_name = prefix.file_name().unwrap().to_string_lossy().into_owned();
+    let names = blob_names(blobs.path());
+    assert_eq!(names.len(), 2, "{names:?}");
+    let key_hex = prefix_name.split('-').next().unwrap().to_string();
+
+    // The sidecar reports the default engine domain and a real composition.
+    let tokenized: serde_json::Value = reqwest::Client::new()
+        .post(format!("{sidecar_url}/tokenize"))
+        .json(&serde_json::json!({"prompt": "x"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tokenized["engine_id"], "mlx-lm");
+
+    // Read the header the daemon wrote: composition recorded, engine id absent
+    // (the default is never named, exactly like a pre-namespacing blob).
+    let path = blobs.path().join(&names[0]);
+    let bytes = std::fs::read(&path).unwrap();
+    let header_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let header: serde_json::Value = serde_json::from_slice(&bytes[4..4 + header_len]).unwrap();
+    assert!(
+        header.get("engine_id").is_none(),
+        "the default engine must not be named in the header: {header}"
+    );
+    let fingerprint: mlxcache_core::contract::ModelFingerprint =
+        serde_json::from_value(header["fingerprint"].clone()).unwrap();
+    assert_eq!(
+        fingerprint.cache_layout,
+        tokenized["cache_layout"].as_str().unwrap(),
+        "the published header records the engine's composition"
+    );
+    assert!(!fingerprint.cache_layout.is_empty());
+    let tokens: Vec<u32> = serde_json::from_value(header["tokens"].clone()).unwrap();
+
+    // The filename is exactly the fold of the recorded identity.
+    assert_eq!(
+        key_hex,
+        format!(
+            "{:032x}",
+            mlxcache_daemon::http::blob_key(&fingerprint, Some("mlx-lm"), &tokens)
+        ),
+        "published key must recompute from the recorded identity"
+    );
+    // And the default engine id contributed ZERO bytes: naming it explicitly
+    // is byte-identical to leaving it absent.
+    assert_eq!(
+        mlxcache_daemon::http::blob_key(&fingerprint, Some("mlx-lm"), &tokens),
+        mlxcache_daemon::http::blob_key(&fingerprint, None, &tokens)
+    );
+    // The composition, by contrast, IS folded: dropping it re-keys the blob.
+    let mut unrecorded = fingerprint.clone();
+    unrecorded.cache_layout = String::new();
+    assert_ne!(
+        key_hex,
+        format!(
+            "{:032x}",
+            mlxcache_daemon::http::blob_key(&unrecorded, None, &tokens)
+        ),
+        "an engine that reports a composition must not share a pre-B1 key"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_different_cache_layout_never_serves_the_other_blob() {
+    // The reason B1 exists: two engines that agree on model id, tokenizer,
+    // dtype and quantization but build different cache compositions must not
+    // share a checkpoint. Proven end to end: the second engine reports a
+    // different layout, so it misses (publishes its own blob) instead of being
+    // handed a payload shape it would deserialize wrongly.
+    let (a_url, mut a_child) = spawn_sidecar_with_setup(&[], "").await;
+    let (b_url, mut b_child) = spawn_sidecar_with_setup(
+        &[],
+        "server.Handler.engine.cache_layout = 'CacheList-ArraysCache-KV';",
+    )
+    .await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state_a = app_state(&a_url, &blobs);
+    let state_b = app_state(&b_url, &blobs);
+    let content = "same tokens, different composition";
+
+    let first = post_prompt(state_a.clone(), content).await;
+    assert_eq!(first["mlxcache"]["verdict"], "miss");
+    assert_eq!(state_a.orchestrator.published_count(), 2);
+    let after_a = blob_names(blobs.path());
+    assert_eq!(
+        after_a.len(),
+        2,
+        "one composition publishes a prefill prefix and a settled checkpoint: {after_a:?}"
+    );
+
+    // A second request from the SAME engine is a hit: the composition pin did
+    // not break ordinary reuse.
+    let again = post_prompt(state_a.clone(), content).await;
+    assert_eq!(again["mlxcache"]["verdict"], "hit");
+
+    // The other composition: miss, and its own (different) key.
+    let second = post_prompt(state_b.clone(), content).await;
+    assert_eq!(
+        second["mlxcache"]["verdict"], "miss",
+        "a different cache composition must never be served the dense blob"
+    );
+    assert_eq!(
+        state_b.orchestrator.published_count(),
+        2,
+        "the second composition publishes its own prefix and its own settled checkpoint"
+    );
+    let after_b = blob_names(blobs.path());
+    assert_eq!(
+        after_b.len(),
+        4,
+        "two compositions x two coverage nodes = four files; a shared key would \
+         overwrite another composition's checkpoint: {after_b:?}"
+    );
+    // Each composition owns exactly one key domain: no file holds the other's
+    // fingerprint.
+    let mut fps: Vec<String> = state_a
+        .persistence
+        .list_blobs()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            state_a
+                .persistence
+                .load(p)
+                .unwrap()
+                .0
+                .fingerprint
+                .cache_layout
+        })
+        .collect();
+    fps.sort();
+    fps.dedup();
+    assert_eq!(fps.len(), 2, "both compositions present, distinct: {fps:?}");
+
+    // And the second engine now hits ITS blob, not the first one's.
+    let b_again = post_prompt(state_b, content).await;
+    assert_eq!(b_again["mlxcache"]["verdict"], "hit");
+
+    a_child.kill().expect("kill sidecar");
+    a_child.wait().expect("reap sidecar");
+    b_child.kill().expect("kill sidecar");
+    b_child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn legacy_unrecorded_layout_is_never_served_to_a_composition_aware_request() {
+    // The serving rule for pre-B1 blobs, end to end. An engine that reports NO
+    // composition (= a legacy engine, or one that cannot report it) may reuse
+    // the legacy blob; the moment an engine KNOWS its composition, the same on
+    // -disk blob is unreachable — it cannot prove the payload has that shape.
+    let (legacy_url, mut legacy_child) =
+        spawn_sidecar_with_setup(&[], "server.Handler.engine.cache_layout = '';").await;
+    let (modern_url, mut modern_child) = spawn_sidecar_with_setup(&[], "").await;
+    let blobs = tempfile::tempdir().unwrap();
+    let content = "legacy versus composition-aware";
+
+    let legacy = app_state(&legacy_url, &blobs);
+    assert_eq!(
+        post_prompt(legacy.clone(), content).await["mlxcache"]["verdict"],
+        "miss"
+    );
+    // Legacy-to-legacy keeps working: the same engine reuses its own blob.
+    assert_eq!(
+        post_prompt(legacy.clone(), content).await["mlxcache"]["verdict"],
+        "hit"
+    );
+
+    let modern = app_state(&modern_url, &blobs);
+    let modern_first = post_prompt(modern.clone(), content).await;
+    assert_eq!(
+        modern_first["mlxcache"]["verdict"], "miss",
+        "a known composition must not adopt an unrecorded-layout blob"
+    );
+    // It publishes its own blob, and then it hits that one.
+    assert_eq!(
+        post_prompt(modern, content).await["mlxcache"]["verdict"],
+        "hit"
+    );
+
+    legacy_child.kill().expect("kill sidecar");
+    legacy_child.wait().expect("reap sidecar");
+    modern_child.kill().expect("kill sidecar");
+    modern_child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_settle_report_omitting_the_digest_is_discarded() {
+    // The engine's report is the only integrity claim about the staged file.
+    // An engine that reports written:true with no digest used to publish
+    // unverified; the daemon now treats the omission as a declined settle.
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "omit")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "settle without a digest").await;
+    assert_eq!(res["status"], "ok", "generation itself must not fail");
+    assert_eq!(
+        blob_coverages(&state).len(),
+        1,
+        "only the prefill prefix; a digestless settle publishes nothing"
+    );
+    assert!(
+        !staging_files(blobs.path()),
+        "no staging file or temp may survive"
+    );
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_settle_report_with_a_wrong_digest_is_discarded() {
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "bad")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "settle with a wrong digest").await;
+    assert_eq!(res["status"], "ok");
+    assert_eq!(
+        blob_coverages(&state).len(),
+        1,
+        "a digest mismatch means the file is not this request's product"
+    );
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+/// Any `.settle-*` staging or `.part` temp left in the blob dir: the RAII
+/// guard plus the boot sweep should make this identically false.
+fn staging_files(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(".settle-"))
+        })
 }
