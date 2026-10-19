@@ -17,6 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import chunk_sim  # noqa: E402
 from chunk_sim import token_block_chunks  # noqa: E402
 
 HEADS = 4
@@ -107,3 +108,28 @@ def test_indivisible_head_size_fails_loudly():
     bad = {"kv": {"begin": 0, "end": tensors["kv"]["end"] + 4, "shape": (1, HEADS, 8, UNIT)}}
     with pytest.raises(SystemExit, match="not divisible"):
         token_block_chunks(payload, bad, 8, 4)
+
+
+def test_simulate_counts_new_bytes_against_cumulative_store(tmp_path, monkeypatch):
+    """VALUE: simulate() produces G1's new-bytes-per-turn number. Catches the
+    accounting regressions that would silently move the committed gate line:
+    updating the store before counting (new_bytes collapses to 0 and G1 looks
+    perfect), counting against only the previous turn (re-inflates), or
+    letting turn 1 into the mean's denominator. The chunker is injected, so
+    this pins accounting semantics, not any chunker's behavior."""
+    payloads = {
+        "t1.ckpt": ({"token_count": 5}, b"AAAA"),
+        "t2.ckpt": ({"token_count": 9}, b"AAAABBBB"),
+    }
+    monkeypatch.setattr(chunk_sim, "load_blob", lambda p: payloads[p.name])
+    turns = [(1, tmp_path / "t1.ckpt"), (2, tmp_path / "t2.ckpt")]
+    table = {
+        b"AAAA": [(4, 4, "d1"), (8, 4, "d2")],
+        b"AAAABBBB": [(4, 4, "d1"), (8, 4, "d2"), (12, 4, "d3")],
+    }
+    r = chunk_sim.simulate(turns, "cfg", lambda payload, meta: table[payload])
+    assert r["turns"][0]["new_bytes"] == 8
+    assert r["turns"][1]["new_bytes"] == 4  # only d3 is new vs the CUMULATIVE store
+    assert r["turns"][1]["new_frac"] == 0.5
+    assert r["mean_new_frac_turns2plus"] == 0.5  # mean excludes turn 1 entirely
+    assert r["store_unique_bytes"] == 12

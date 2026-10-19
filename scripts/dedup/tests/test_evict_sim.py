@@ -255,3 +255,36 @@ def test_restore_bytes_only_count_after_first_eviction():
     assert r.evictions > 0 and c.evictions > 0  # the reaper really ran
     assert r.restore_bytes and c.restore_bytes
     assert c.restore_bytes < r.restore_bytes
+
+
+def test_enforce_evicts_largest_first_per_policy():
+    """VALUE: the two stores' eviction ORDER is the policy the sim exists to
+    measure — WholeStore mirrors store.py §7 (token_count DESC); ChunkStore
+    proposes biggest-unique-tail first (only unique bytes reclaim space). A
+    silent sort-key change (ascending, or plain entry size) would attribute a
+    different policy's numbers to the design evidence while every existing
+    invariant still holds, so the evicted SET is pinned directly."""
+    # WholeStore: token_count DESC — the biggest-token entry dies first
+    w = WholeStore()
+    ws = []
+    for k, tok in enumerate((1000, 2000, 3000)):
+        e = Entry(convo="A", turn=k + 1, tokens=tok, size=100, chunks={}, parent=None)
+        ws.append(e)
+        w.publish(e, tick=k)
+    r = w.enforce(250, tick=99, window=0)
+    assert r["evicted"] == 1
+    assert not ws[2].live and ws[0].live and ws[1].live
+
+    # ChunkStore: biggest unique tail first — e3 owns the most unique bytes
+    # (40) despite the smallest total size, so it is evicted before the fat
+    # shared holders; the doubly-referenced chunk must survive
+    c = ChunkStore()
+    e1 = Entry("B", 1, tokens=10, size=220, chunks={"s": 200, "u1": 20}, parent=None)
+    e2 = Entry("B", 2, tokens=20, size=210, chunks={"s": 200, "u2": 10}, parent=None)
+    e3 = Entry("B", 3, tokens=30, size=40, chunks={"u3": 40}, parent=None)
+    for k, e in enumerate((e1, e2, e3)):
+        c.publish(e, tick=k)
+    r = c.enforce(250, tick=99, window=0)  # disk 270 B, budget 250: one eviction
+    assert r["evicted"] == 1
+    assert not e3.live and e1.live and e2.live
+    assert c.ref["s"] == 2 and c.chunks_on_disk["s"] == 200

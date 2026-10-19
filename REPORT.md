@@ -233,7 +233,7 @@ Three findings, in the order they matter:
 
 | Tier | Whole re-stored | Chunk re-stored (cdc) | Chunk re-stored (**tb**) | Ratio (tb) |
 |---|---|---|---|---|
-| f16 | 2,494.8 MiB | 40.0 MiB | **18.0 MiB** | **139×** |
+| f16 | 2,494.8 MiB | 40.0 MiB | **18.0 MiB** | **138×** |
 | q8 | 1,327.9 MiB | 73.1 MiB | **10.5 MiB** | **127×** |
 
 An earlier revision printed 7,178.5 / 92.7 MiB here; those numbers were

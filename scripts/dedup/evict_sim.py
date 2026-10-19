@@ -47,7 +47,8 @@ tests nothing):
   S3 evict-then-re-request — run the chain under a binding budget, then
      re-request it (aged, so the anchors from pass one have expired):
      republish cost is full bytes (whole) vs the chunks whose refcount hit
-     zero (chunk; measured ~1-6% of whole-blob republish at the x1 budget).
+     zero (chunk; measured 0.8-5.5% of whole-blob republish at the x1
+     budget across codecs and tiers).
 
 Every row records the absolute budget, whether the store ever reached it
 (``binding``), and the anchor-window regime it ran under. Invariants are
