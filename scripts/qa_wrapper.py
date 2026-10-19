@@ -28,10 +28,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import _harness  # noqa: E402 — path insert above
-from _harness import DEFAULT_MODEL, REPO, WrapperServer, free_port  # noqa: E402
+from _harness import (  # noqa: E402 — path insert above
+    DEFAULT_MODEL,
+    REPO,
+    WrapperServer,
+    free_port,
+    resolve_model,
+)
 
-_resolve_model = _harness.resolve_model
 RESULTS: list[tuple[str, str, str]] = []
 
 
@@ -72,7 +76,7 @@ def main() -> int:
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--port", type=int, default=0)
     args = ap.parse_args()
-    model = _resolve_model(args.model)
+    model = resolve_model(args.model)
 
     if args.port == 0:
         args.port = free_port()

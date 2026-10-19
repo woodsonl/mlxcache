@@ -52,11 +52,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import _harness  # noqa: E402 — path insert above
-from _harness import DEFAULT_MODEL, REPO, WrapperServer  # noqa: E402
-
-_resolve_model = _harness.resolve_model
-_free_port = _harness.free_port
+from _harness import DEFAULT_MODEL, REPO, WrapperServer, free_port, resolve_model  # noqa: E402 — path insert above
 
 TURN1 = {
     "messages": [
@@ -148,11 +144,11 @@ def _gate_ok(results, skip_pct, observed_hits) -> tuple[bool, list[str]]:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=DEFAULT_MODEL)
-    ap.add_argument("--port", type=int, default=_free_port())
+    ap.add_argument("--port", type=int, default=free_port())
     ap.add_argument("--max-tokens", type=int, default=24)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    model = _resolve_model(args.model)
+    model = resolve_model(args.model)
     TURN1["max_tokens"] = args.max_tokens
 
     print(f"model: {model}")

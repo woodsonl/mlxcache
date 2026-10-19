@@ -285,7 +285,7 @@ class WrapperServer(Server):
             "max_tokens": 1,
             "temperature": 0.0,
         }
-        if getattr(self, "warmup", "chat") == "post":
+        if self.warmup == "post":
             code, payload = self.post("/v1/chat/completions", body, timeout=timeout)
             if code != 200:
                 raise RuntimeError(f"warmup HTTP {code}: {str(payload)[:120]}")

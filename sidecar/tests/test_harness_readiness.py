@@ -148,14 +148,14 @@ def test_resolve_model_abs_and_hfid_agree():
         pytest.skip("no cached Qwen2.5-7B snapshot")
     absolute = os.path.realpath(absolute)
     for mod in (bench, qa):
-        assert os.path.realpath(mod._resolve_model(absolute)) == absolute
-        assert os.path.realpath(mod._resolve_model(hfid)) == absolute
+        assert os.path.realpath(mod.resolve_model(absolute)) == absolute
+        assert os.path.realpath(mod.resolve_model(hfid)) == absolute
 
 
 def test_resolve_model_rejects_uncached_id():
     for mod in (bench, qa):
         with pytest.raises(SystemExit):
-            mod._resolve_model("definitely/not-a-cached-model-xyz")
+            mod.resolve_model("definitely/not-a-cached-model-xyz")
 
 
 def _leg(verdict):
