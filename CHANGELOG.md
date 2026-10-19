@@ -2,6 +2,28 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.1.6 — 2026-10-19
+
+### Fixed
+
+- **The sidecar fingerprints HF-cached models again**: every snapshot
+  file in an HF cache is a symlink into a sibling `blobs/` directory, so
+  the fingerprinter's blanket `O_NOFOLLOW` hashed nothing and every
+  cached model read as `"missing"` — erasing tokenizer-identity pinning
+  within each engine path. `_artifact_bytes` now follows a link only when
+  its target resolves inside the model directory or its own `blobs/`
+  storage (the two-level root trusted only in the real HF
+  `snapshots/<rev>` shape); a link to another model's artifact or an
+  arbitrary file is still refused. The opened file's `(st_dev, st_ino)`
+  is reconciled against the checked path so an intermediate-directory
+  swap mid-window fails closed, a directory artifact (a corrupt pull
+  leaving the link at `blobs/` itself) reads as missing instead of
+  raising, and the fd is owned end-to-end by its context manager (the
+  mismatch path leaked it; a read error double-closed into an escaping
+  EBADF). Swap detection is restart-scoped: the fingerprint is memoized
+  per process. Seven tests pin the follow/refuse/missing corpus,
+  including the corrupt-pull directory shape and the in-model link.
+
 ## 0.1.5 — 2026-10-19
 
 ### Fixed

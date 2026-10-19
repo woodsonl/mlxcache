@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "mlxcache-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "criterion",
  "serde",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "mlxcache-daemon"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
