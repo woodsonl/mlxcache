@@ -298,24 +298,23 @@ impl SidecarClient {
         settle_path: Option<&str>,
     ) -> Result<GenerateOutcome, SidecarError> {
         let url = format!("{}/generate", self.config.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .json(&serde_json::json!({
-                "tokens": tokens,
-                "max_tokens": max_tokens,
-                "blob_path": blob_path,
-                // Absent (not null) when the daemon is not settling: an older
-                // sidecar must not even see the key, and a null would ask it to
-                // settle at an unusable path.
-                "settle_path": settle_path,
-            }))
-            .send()
-            .await
-            .map_err(|e| SidecarError::Unreachable {
+        // Absent (not null) when the daemon is not settling: an older
+        // sidecar must not even see the key, and a null would ask it to
+        // settle at an unusable path.
+        let mut body = serde_json::json!({
+            "tokens": tokens,
+            "max_tokens": max_tokens,
+            "blob_path": blob_path,
+        });
+        if let Some(p) = settle_path {
+            body["settle_path"] = serde_json::json!(p);
+        }
+        let resp = self.http.post(&url).json(&body).send().await.map_err(|e| {
+            SidecarError::Unreachable {
                 url: url.clone(),
                 source: e,
-            })?;
+            }
+        })?;
         let status = resp.status();
         if !status.is_success() {
             return Err(classify_http_error(resp).await);
@@ -358,19 +357,19 @@ impl SidecarClient {
     ) -> Result<reqwest::Response, SidecarError> {
         let url = format!("{}/generate", self.config.base_url);
         let open = self.stream_open;
-        let fut = async {
-            self.stream_http
-                .post(&url)
-                .json(&serde_json::json!({
-                    "tokens": tokens,
-                    "max_tokens": max_tokens,
-                    "blob_path": blob_path,
-                    "stream": true,
-                    "settle_path": settle_path,
-                }))
-                .send()
-                .await
-        };
+        let mut body = serde_json::json!({
+            "tokens": tokens,
+            "max_tokens": max_tokens,
+            "blob_path": blob_path,
+            "stream": true,
+        });
+        // Absent (not null) unless the daemon is settling, matching the
+        // non-streaming generate above.
+        if let Some(p) = settle_path {
+            body["settle_path"] = serde_json::json!(p);
+        }
+        let body = body;
+        let fut = async { self.stream_http.post(&url).json(&body).send().await };
         let resp = match tokio::time::timeout(open, fut).await {
             // Elapsed before headers: the sidecar wedged opening the stream.
             Err(_elapsed) => {

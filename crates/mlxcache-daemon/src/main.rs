@@ -20,8 +20,11 @@ async fn main() -> Result<()> {
     let served_models: Vec<String> = std::env::var("MLXCACHE_MODELS")
         .unwrap_or_else(|_| String::new())
         .split(',')
+        // Trim BEFORE filtering: a whitespace-only entry is empty once
+        // trimmed and must not slip past the guard as a phantom model.
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(|s| s.trim().to_string())
+        .map(|s| s.to_string())
         .collect();
     // Treat an empty MLXCACHE_SIDECAR_URL as unset: an empty value would build
     // a client with malformed relative URLs. Common launchd misconfiguration.

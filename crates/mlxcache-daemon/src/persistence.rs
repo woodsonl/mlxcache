@@ -250,7 +250,7 @@ impl Persistence {
     /// Load a blob: parse header, return (meta, payload). Corruption or version
     /// mismatch returns Corrupt — the caller quarantines (R1-1).
     pub fn load(&self, blob_path: &Path) -> Result<(CheckpointMeta, Vec<u8>), PersistError> {
-        let bytes = fs::read(blob_path)?;
+        let mut bytes = fs::read(blob_path)?;
         if bytes.len() < 4 {
             return Err(PersistError::Corrupt {
                 reason: "truncated header length".into(),
@@ -296,7 +296,12 @@ impl Persistence {
                 })
             }
         }
-        Ok((meta, bytes[4 + header_len..].to_vec()))
+        // Strip the header in place instead of copying the payload into a
+        // second allocation: KV blobs are tens-to-hundreds of MB, and the
+        // copy doubled peak memory per load for no benefit.
+        let payload_start = 4 + header_len;
+        bytes.drain(..payload_start);
+        Ok((meta, bytes))
     }
 
     /// Delete a published blob file on retirement (R1-1). Best-effort: a missing

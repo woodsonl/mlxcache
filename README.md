@@ -19,7 +19,7 @@ client ──HTTP──▶ mlxcache daemon ──▶ sidecar (mlx-lm) ──▶ 
 
 - The **daemon** (Rust) owns the cache: it hashes token prefixes, routes hits,
   collapses concurrent identical prefills into one, and persists KV checkpoints
-  atomically (`write temp → rename`). Zero Python on the hot path.
+  atomically (`write temp → sync → rename`). Zero Python on the hot path.
 - The **sidecar** (Python, `mlx-lm`) is the compatibility adapter. It tokenizes,
   runs prefill, captures KV as safetensors, and streams generation. The daemon
   talks to it over local HTTP.
