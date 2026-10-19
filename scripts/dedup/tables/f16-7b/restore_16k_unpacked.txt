@@ -1,0 +1,6 @@
+blob: turn-08  payload=426,300,650B  tokens=7435
+chunks: 21162  scope=head  avg-target=16KiB  workers=8  inline=5,354B
+plain   {'min_s': 0.2066, 'median_s': 0.2384, 'p90_s': 0.3072}
+chunked {'min_s': 0.8954, 'median_s': 0.9883, 'p90_s': 1.1056}  (0.40 GiB/s)
+median delta: +749.9 ms  (+1.889 s/GiB)
+chunk-store bytes on disk (this blob): 426,295,296B

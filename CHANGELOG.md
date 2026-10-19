@@ -2,6 +2,55 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.1.7 — 2026-10-19
+
+### Added
+
+- **The chunk-granularity question is answered with primary evidence, and
+  the answer is GO**: content-defined chunk dedup belongs in the blob
+  store, with token-block/64 as the v1 codec (CDC/head/16 KiB as the
+  fallback for adapters that cannot report position boundaries). The
+  decision record, the pre-registered gates and every table that backs
+  them live in `REPORT.md`, `docs/designs/mlx-kv-cache-daemon.md` and
+  `scripts/dedup/`, measured on the real daemon and real mlx-lm sidecar,
+  f16 and 8-bit KV tiers, 8-turn conversation over the pinned T22 corpus.
+  Nothing in the daemon or sidecar runtime changes in this release; this
+  ships the evidence and its tooling.
+- **`scripts/dedup/` carries the full measurement pipeline**: capture
+  harness (grow + single modes, per-turn manifest checkpointing), blob
+  forensics (per-KV-head identity probes), CDC vs token-block chunker
+  simulation (vectorized gear hash verified against the naive reference
+  on every run), restore bench (packed and unpacked layouts), eviction
+  simulation under the daemon's real anchor model (structural + recency),
+  and the round-trip probe that isolated where KV byte identity actually
+  breaks. Every committed table regenerates from a checked-in script.
+- **CI runs the 52 dedup invariants** (`uv run pytest scripts/dedup/tests/`)
+  after the python job's dev-group sync; numpy is now a pinned dev
+  dependency (it previously entered the lock only via the mlx extra, so
+  the step was a false green until fixed).
+
+### Fixed
+
+- **Eviction evidence now measures the real policy**: the simulation
+  mirrors sidecar `store.py` §7 (non-anchors evicted token_count
+  descending, over-budget holds by anchors) and `index.py`'s recency
+  anchor window (`MLXCACHE_EVICT_ANCHOR_WINDOW_S`, default 900 s). An
+  earlier revision omitted the recency term, read artificially aggressive
+  eviction as policy evidence, and double-counted republished entries in
+  the S3 scenario (an evicted entry re-entered the store ledger twice);
+  both are fixed with regression tests, and all eviction tables were
+  regenerated from a fresh capture. The adopted codec now has its own
+  evidence arm: after the background reaper cascades and the chain is
+  re-requested, the whole-blob store re-stores 2,494.8 MiB (f16) where
+  the token-block chunk store re-stores 18.0 MiB.
+
+### Removed
+
+- Dead flexibility found during review: an unreachable eviction-ordering
+  switch, a never-measured restore scope flag, an unused optional
+  parameter, a dead cut-map return value, and an unreachable branch in
+  `first_diff`.
+
 ## 0.1.6 — 2026-10-19
 
 ### Fixed

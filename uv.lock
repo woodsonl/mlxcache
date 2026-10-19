@@ -319,7 +319,7 @@ wheels = [
 
 [[package]]
 name = "mlxcache-sidecar"
-version = "0.1.6"
+version = "0.1.7"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -330,6 +330,7 @@ mlx = [
 [package.dev-dependencies]
 dev = [
     { name = "httpx" },
+    { name = "numpy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -342,6 +343,7 @@ provides-extras = ["mlx"]
 [package.metadata.requires-dev]
 dev = [
     { name = "httpx", specifier = "==0.28.1" },
+    { name = "numpy", specifier = "==2.5.3" },
     { name = "pytest", specifier = "==9.1.1" },
     { name = "pytest-asyncio", specifier = "==1.4.0" },
     { name = "ruff", specifier = "==0.16.9" },
