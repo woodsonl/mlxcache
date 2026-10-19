@@ -1208,6 +1208,13 @@ async fn publish_settled_blob(
         );
         return;
     }
+    // content_digest is deliberately ABSENT here, and that is a property of
+    // the handshake, not an omission: the staging header is written by the
+    // sidecar (server.py :: _settle_fingerprint), which never sees the
+    // messages and cannot know the digest. Comparing it would discard every
+    // settle from a request carrying media. The bytes-belong-to-this-request
+    // guarantee is carried by the payload-sha256 cross-check above.
+    //
     // Compare the identity fields the ADAPTER owns, not `model_id`: the sidecar's
     // engine is configured with its own model name, and the daemon's served name
     // for that engine may differ. The published metadata is rebuilt from the
@@ -1675,28 +1682,61 @@ pub fn content_digest(messages: &[Message]) -> String {
     }
 
     fn is_text_part(part: &serde_json::Value) -> bool {
+        // A bare string inside a parts array is text, same as the top-level
+        // string form of `content` — hashing it would needlessly split the
+        // cache between two encodings of the same prompt.
+        if part.is_string() {
+            return true;
+        }
         matches!(
             part.get("type").and_then(|t| t.as_str()),
             Some("text") | Some("input_text")
         )
     }
 
-    let mut payload = String::new();
+    // One part at a time, each canonical encoding fed to the hasher behind
+    // its own length prefix — the same discipline blob_key's `put` uses.
+    // Without the prefix the concatenation is re-splittable across part and
+    // message boundaries (parts `[1, 23]` and `[12, 3]` both hash "123"):
+    // a canonicalization collision between different media payloads, the
+    // exact class this axis exists to prevent. Hashing incrementally also
+    // never materializes a second full copy of an already-buffered request
+    // body (multi-MB base64 data URLs are the normal case, not an attack).
+    let mut hasher = Sha256::new();
+    let mut hashed_any = false;
+    let mut encoded = String::new();
+    let mut hash_part = |hasher: &mut sha2::Sha256, encoded: &mut String| {
+        hasher.update(encoded.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(encoded.as_bytes());
+        encoded.clear();
+    };
     for message in messages {
-        if let serde_json::Value::Array(parts) = &message.content {
-            for part in parts {
-                if is_text_part(part) {
-                    continue;
+        match &message.content {
+            serde_json::Value::Array(parts) => {
+                for part in parts {
+                    if is_text_part(part) {
+                        continue;
+                    }
+                    canonical(part, &mut encoded);
+                    hash_part(&mut hasher, &mut encoded);
+                    hashed_any = true;
                 }
-                canonical(part, &mut payload);
+            }
+            // A non-string, non-null scalar or object `content` (out-of-spec
+            // for the Chat shape, but not impossible) is ONE non-text part:
+            // hashing it as text would under-claim the media it carries.
+            serde_json::Value::Null | serde_json::Value::String(_) => {}
+            other => {
+                canonical(other, &mut encoded);
+                hash_part(&mut hasher, &mut encoded);
+                hashed_any = true;
             }
         }
     }
-    if payload.is_empty() {
+    if !hashed_any {
         return String::new();
     }
-    let mut hasher = Sha256::new();
-    hasher.update(payload.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -3300,6 +3340,74 @@ mod tests {
         }];
         assert!(!content_digest(&audio).is_empty());
         assert_ne!(content_digest(&audio), a);
+
+        // The concatenation is length-prefixed: a number split across parts
+        // (or across messages) must not reassemble into another payload's
+        // bytes. Before the prefix, parts [1, 23] and [12, 3] both hashed
+        // "123" — a canonicalization collision between different media.
+        let split_a = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([1, 23]),
+        }];
+        let split_b = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([12, 3]),
+        }];
+        assert_ne!(
+            content_digest(&split_a),
+            content_digest(&split_b),
+            "part boundaries must be unambiguous"
+        );
+        let cross_message_a = vec![
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([1]),
+            },
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([23]),
+            },
+        ];
+        let cross_message_b = vec![
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([12]),
+            },
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([3]),
+            },
+        ];
+        assert_ne!(
+            content_digest(&cross_message_a),
+            content_digest(&cross_message_b)
+        );
+        // Same parts across different message splits hash identically: the
+        // prefix delimits parts, it does not conflate the same media arranged
+        // as one message or two.
+        assert_eq!(content_digest(&split_a), content_digest(&cross_message_a));
+
+        // A bare string inside a parts array is TEXT (same as the top-level
+        // string form), so this prompt stays on the legacy text-only key.
+        let string_in_parts = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!(["describe this", {"type": "image_url", "image_url": {"url": "u"}}]),
+        }];
+        assert_eq!(
+            content_digest(&string_in_parts),
+            content_digest(&vec![Message {
+                role: "user".into(),
+                content: serde_json::json!([{"type": "image_url", "image_url": {"url": "u"}}]),
+            }]),
+            "bare strings in parts are text and contribute nothing"
+        );
+
+        // Out-of-spec object `content` is one non-text part, not silent text.
+        let object_content = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!({"type": "image_url", "image_url": {"url": "u"}}),
+        }];
+        assert!(!content_digest(&object_content).is_empty());
     }
 
     #[test]
