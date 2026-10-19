@@ -1077,8 +1077,6 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                         evicted = now
                         break
                     time.sleep(0.5)
-                after_stats = stack.stats()
-                published_after = after_stats["checkpoints_published"]
                 # An expired wait is not a pressure result: if the store holds
                 # more than the cap, the reaper never bound and the row would
                 # measure an un-evicted cache while reading green. The noise
@@ -1096,6 +1094,14 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                         "PREMISE VIOLATION (harness/daemon bug, pressure):\n  "
                         + "\n  ".join(problems)
                     )
+                # Refresh AFTER the premise checks and immediately before the
+                # decision: the reaper removes entries one at a time and
+                # records the count only when its pass returns, so an earlier
+                # read can observe published > cap while evicted still holds
+                # a stale zero from the wait loop.
+                after_stats = stack.stats()
+                evicted = _harness.stats_delta(before_stats, after_stats, "evictions")
+                published_after = after_stats["checkpoints_published"]
                 if evicted == 0 and published_after > cap:
                     row = summarize(
                         wl["name"], f"daemon/pressure_cap{cap}_evict_wait_timeout", noise
