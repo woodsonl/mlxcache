@@ -65,6 +65,17 @@ jobs:
       # rather than being left to a manual invocation.
       - name: Test (dedup analysis invariants)
         run: uv run pytest scripts/dedup/tests/ -v
+      - name: Hermetic engine tests (mlx extra)
+        # The qwen4-exp engine tests skip under the dev group alone, because
+        # mlx is an optional extra -- without this step a PR could pass CI
+        # while every engine test silently skipped, which is exactly how a
+        # collection-order bug (numpy imported ahead of its guard) survived
+        # unmerged work: local venvs carried the extra, CI never did.
+        run: |
+          uv sync --group dev --extra mlx --locked
+          uv run pytest sidecar/tests -v
+        env:
+          MLXCACHE_BENCH_REAL: "0"
 
   # The real mlx-lm round-trip is the product's core claim (resumed generation ==
   # scratch generation). It needs a ~500MB model download + load, so it runs on a

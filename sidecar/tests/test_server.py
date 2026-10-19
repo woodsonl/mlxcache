@@ -469,6 +469,7 @@ def _untrimmable_loop_engine(script, eos_token):
     check and its `eos_token_ids`/`detokenizer` use are the contract), with the
     HF work stubbed out.
     """
+    pytest.importorskip("mlx_lm")
     import mlx.core as mx
     from mlx_lm.tokenizer_utils import TokenizerWrapper
 

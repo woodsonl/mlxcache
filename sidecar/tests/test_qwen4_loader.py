@@ -22,10 +22,12 @@ import json
 import struct
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 pytest.importorskip("mlx.core")
+pytest.importorskip("numpy")
+
+import numpy as np  # noqa: E402
 
 CHECKPOINT = Path("/Users/lance/models/Qwen3.8-Flash-Next-NVFP4-mlxstream")
 
