@@ -565,18 +565,29 @@ def test_generate_rejects_settle_path_outside_the_staging_convention(
     # is accepted.
     # Pin the daemon's directory first so every target is judged against it.
     _reset_staging_pin(monkeypatch, directory=tmp_path)
-    targets = [
+    # Not paths the daemon would ever send: refused at the door.
+    for bad in (
         str(tmp_path / "ordinary.ckpt"),
         str(tmp_path / ".settle-1-1-1.staging/../../escape"),
-        "/etc/.settle-1-1-1.staging",
-    ]
-    for bad in targets:
+        str(tmp_path / "settle"),
+        5,
+        [],
+    ):
         res = httpx.post(
             f"{sidecar_url}/generate",
             json={"tokens": [1, 2, 3], "max_tokens": 1, "settle_path": bad},
         )
         assert res.status_code == 400, bad
         assert "staging" in res.json()["error"]
+
+    # Staging-shaped but in a foreign directory: DEGRADED to a refused settle,
+    # not a failed request (see the foreign-directory test below).
+    res = httpx.post(
+        f"{sidecar_url}/generate",
+        json={"tokens": [1, 2, 3], "max_tokens": 1, "settle_path": "/etc/.settle-1-1-1.staging"},
+    )
+    assert res.status_code == 200
+    assert res.json()["settle"]["reason"] == "staging_path_refused"
 
 
 def test_generate_rejects_a_staging_shaped_path_in_a_foreign_directory(
@@ -604,5 +615,10 @@ def test_generate_rejects_a_staging_shaped_path_in_a_foreign_directory(
             "settle_path": str(other / ".settle-2-2-2.staging"),
         },
     )
-    assert res.status_code == 400, "a pinned daemon must not be redirected to another directory"
+    # Degraded, not fatal: a daemon restarted against a new blob dir must
+    # still get its generation. The settle reports the refusal by name and
+    # nothing is written outside the pinned directory.
+    assert res.status_code == 200, res.text
+    assert res.json()["settle"]["reason"] == "staging_path_refused"
+    assert res.json()["settle"]["written"] is False
     assert not (other / ".settle-2-2-2.staging").exists()

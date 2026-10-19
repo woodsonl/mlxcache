@@ -609,3 +609,34 @@ def test_weight_table_matches_real_checkpoint():
 
     assert not missing, f"{len(missing)} names absent from the checkpoint: {missing[:5]}"
     assert not mismatched, f"shape mismatches: {mismatched[:5]}"
+
+
+def test_qsa_multi_tile_selection_matches_single_tile(bundle, monkeypatch):
+    """The pooled-block hoist must not change selection.
+
+    _pool is computed once per batch element for the deepest prefix and each
+    query tile slices its own prefix; this test pins that a forward over a
+    sequence LONGER than INDEXER_QUERY_TILE (so the tile loop actually runs
+    and slices) produces byte-identical logits to the same forward with the
+    tile raised above the sequence length (one tile, blocks == blocks_all).
+    The tiny fixture's sequences are 5-10 tokens, so without this test the
+    multi-tile path only ever ran against the 132.6 GB checkpoint.
+    """
+    import mlx.core as mx
+    import mlxcache_qwen4.model as model_mod
+
+    config = bundle["config"]
+    model = bundle["model"]
+    ids = mx.array([list(range(2, 2 + 80))])
+
+    out_multi = model(ids, cache=model.make_cache())
+    mx.eval(out_multi)
+
+    monkeypatch.setattr(model_mod, "INDEXER_QUERY_TILE", 256)
+    out_single = model(ids, cache=model.make_cache())
+    mx.eval(out_single)
+
+    assert out_multi.shape == (1, 80, config.vocab_size)
+    assert mx.array_equal(out_multi, out_single), (
+        "hoisted per-tile selection must equal the single-tile computation"
+    )

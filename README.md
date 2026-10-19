@@ -320,8 +320,8 @@ Sidecar:
 | `MLXCACHE_Q4_EXPERT_RESIDENT_N` | `0` | `qwen4-exp` only: decoded experts per layer kept in an LRU. Larger = faster steady-state decode, more RAM |
 | `MLXCACHE_Q4_PLE_CACHE_MB` | `512` | `qwen4-exp` only: byte budget for decoded PLE n-gram rows (rows are cached, never the 51.2 GB table) |
 | `MLXCACHE_METAL_CACHE_MB` | `1024` | MLX allocator cache limit; freed buffers beyond it return to the OS instead of pooling |
-| `MLXCACHE_SETTLE_MAX_TOKENS` | (unset) | cap on a settled checkpoint's token count; an explicit `0` refuses every settle rather than disabling the cap |
-| `MLXCACHE_SETTLE_MAX_BYTES` | (unset) | cap on a settled checkpoint's payload bytes; an explicit `0` refuses every settle rather than disabling the cap |
+| `MLXCACHE_SETTLE_MAX_TOKENS` | `32768` (unset) | cap on a settled checkpoint's token count; an explicit `0` refuses every settle rather than disabling the cap |
+| `MLXCACHE_SETTLE_MAX_BYTES` | `2 GiB` (unset) | cap on a settled checkpoint's payload bytes; an explicit `0` refuses every settle rather than disabling the cap |
 
 ## Building and testing
 

@@ -202,6 +202,6 @@ Sidecar (compatibility adapter):
 | MLXCACHE_Q4_EXPERT_RESIDENT_N | 0 | `qwen4-exp`: decoded experts per layer kept in an LRU |
 | MLXCACHE_Q4_PLE_CACHE_MB | 512 | `qwen4-exp`: byte budget for decoded PLE n-gram rows |
 | MLXCACHE_METAL_CACHE_MB | 1024 | MLX allocator cache limit in MB; 0 keeps the library default |
-| MLXCACHE_SETTLE_MAX_TOKENS | (unset) | cap on a settled checkpoint's token count. An explicitly set `0` REFUSES every settle (reason `token_cap`); unset keeps the default |
-| MLXCACHE_SETTLE_MAX_BYTES | (unset) | cap on a settled checkpoint's payload bytes. An explicitly set `0` REFUSES every settle (reason `size_cap`); unset keeps the default |
+| MLXCACHE_SETTLE_MAX_TOKENS | 32768 (unset) | cap on a settled checkpoint's token count. An explicitly set `0` REFUSES every settle (reason `token_cap`); unset keeps the default |
+| MLXCACHE_SETTLE_MAX_BYTES | 2 GiB (unset) | cap on a settled checkpoint's payload bytes. An explicitly set `0` REFUSES every settle (reason `size_cap`); unset keeps the default |
 | MLXCACHE_BENCH_REAL | (unset) | set to 1 for the real mlx-lm benchmark (needs a local model) |

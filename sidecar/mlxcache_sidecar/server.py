@@ -378,6 +378,40 @@ def _engine_id_meta(engine: object) -> str | None:
     return None if engine_id == "mlx-lm" else engine_id
 
 
+def _is_staging_shaped(path: str) -> bool:
+    """True when `path` is NAMED like the daemon's own settle staging path:
+    basename `.settle-<pid>-<seq>-<nanos>.staging`, no traversal components.
+    Anything else is not a path the daemon would ever send."""
+    import re
+
+    if re.fullmatch(r"\.settle-\d+-\d+-\d+\.staging", os.path.basename(path)) is None:
+        return False
+    return not any(part in ("..", ".") for part in PurePath(path).parts)
+
+
+def _staging_dir_matches(path: str) -> bool:
+    """True when `path`'s parent directory is the pinned staging directory.
+
+    The pin is the daemon's blob dir in real deployments. A mismatch means
+    misconfiguration (the daemon restarted against a new blob dir while the
+    old one still exists), not an attack: the caller never gets to write
+    anywhere either way, because the mismatch DEGRADES the settle rather
+    than the request -- generation has value, a best-effort settle does not.
+    """
+    parent = os.path.realpath(os.path.dirname(path) or ".")
+    with _SETTLE_DIR_LOCK:
+        pinned = _SETTLE_DIR_PIN[0]
+        # Re-pin only when the pinned directory is GONE: a live directory can
+        # never be displaced by another caller's path.
+        if pinned is not None and pinned != parent and not os.path.isdir(pinned):
+            pinned = None
+            _SETTLE_DIR_PIN[0] = None
+        if pinned is None:
+            _SETTLE_DIR_PIN[0] = parent
+            pinned = parent
+        return pinned == parent
+
+
 def _is_daemon_staging_path(path: str) -> bool:
     """True when `path` is shaped like the daemon's own settle staging path.
 
@@ -392,28 +426,7 @@ def _is_daemon_staging_path(path: str) -> bool:
     directory of their own; even the pre-pin window only allows creating a
     hidden, oddly-shaped name, never clobbering a chosen file.
     """
-    import re
-
-    if re.fullmatch(r"\.settle-\d+-\d+-\d+\.staging", os.path.basename(path)) is None:
-        return False
-    parts = PurePath(path).parts
-    if any(part in ("..", ".") for part in parts):
-        return False
-    parent = os.path.realpath(os.path.dirname(path) or ".")
-    with _SETTLE_DIR_LOCK:
-        pinned = _SETTLE_DIR_PIN[0]
-        # A pinned directory that no longer exists means the daemon restarted
-        # against a different blob dir (the e2e suite does exactly this with
-        # tempdirs): re-pin rather than 400 every generate forever. The pin
-        # only ever changes when the old target is GONE, so a live daemon's
-        # directory can never be displaced by an attacker's.
-        if pinned is not None and pinned != parent and not os.path.isdir(pinned):
-            pinned = None
-            _SETTLE_DIR_PIN[0] = None
-        if pinned is None:
-            _SETTLE_DIR_PIN[0] = parent
-            pinned = parent
-        return pinned == parent
+    return _is_staging_shaped(path) and _staging_dir_matches(path)
 
 
 _SETTLE_DIR_LOCK = threading.Lock()
@@ -1287,7 +1300,19 @@ class MlxLmEngine:
                 break
         settle = None
         if settle_path is not None:
-            settle = self.settle(tokens, out, cache, settle_path)
+            # Never raises, mirroring _settle_stream: generation already
+            # succeeded, and a failed settle (an import, an untrimmable cache
+            # composition, a quantize step) must not turn the completed
+            # request into a 500. The report carries the reason instead.
+            try:
+                settle = self.settle(tokens, out, cache, settle_path)
+            except Exception as exc:  # noqa: BLE001 — a settle is best-effort
+                traceback.print_exc()
+                settle = {
+                    "written": False,
+                    "tokens": len(tokens) + len(out),
+                    "reason": f"settle_failed: {exc}",
+                }
         return out, "".join(pieces), cache, settle
 
     def stream(self, tokens: list[int], blob_path: str | None):
@@ -1612,6 +1637,7 @@ class Handler(BaseHTTPRequestHandler):
         blob_path: str | None,
         max_tokens: int,
         settle_path: str | None = None,
+        settle_refusal: bool = False,
     ) -> None:
         """Stream generation as newline-delimited JSON: one line per token,
         then a final done line. Framed by connection close (HTTP/1.0-style)
@@ -1660,6 +1686,15 @@ class Handler(BaseHTTPRequestHandler):
             # it. The cache object here is the one generation just mutated.
             done = {"done": True, "tokens": n}
             settle = self._settle_stream(tokens, generated, cache, settle_path)
+            if settle_refusal:
+                # The staging pin refused this request's path: report the
+                # refusal rather than an absent settle, so the daemon logs a
+                # reason instead of wondering whether one was requested.
+                settle = {
+                    "written": False,
+                    "tokens": len(tokens) + len(generated),
+                    "reason": "staging_path_refused",
+                }
             if settle is not None:
                 done["settle"] = settle
             self.wfile.write((json.dumps(done) + "\n").encode())
@@ -1774,16 +1809,33 @@ class Handler(BaseHTTPRequestHandler):
                 # only intended caller and always sends a convention-named
                 # path, so anything else is refused rather than written.
                 settle_path = req.get("settle_path")
+                settle_refused = False
                 if settle_path is not None and (
                     not isinstance(settle_path, str)
                     or not settle_path
-                    or not _is_daemon_staging_path(settle_path)
+                    or not _is_staging_shaped(settle_path)
                 ):
+                    # Not a path the daemon would ever send: refuse the request.
                     self._json(400, {"error": "settle_path must be a daemon staging path"})
                     return
+                if settle_path is not None and not _staging_dir_matches(settle_path):
+                    # A staging-shaped path in a directory other than the
+                    # pinned one. Nothing is written either way, so degrade
+                    # the best-effort settle instead of failing the whole
+                    # (already-completable) generation -- a daemon restarted
+                    # against a new blob dir must not 502 every request
+                    # until the sidecar restarts.
+                    settle_refused = True
+                    settle_path = None
 
                 if req.get("stream"):
-                    self._stream_ndjson(tokens, req.get("blob_path"), max_tokens, settle_path)
+                    self._stream_ndjson(
+                        tokens,
+                        req.get("blob_path"),
+                        max_tokens,
+                        settle_path,
+                        settle_refusal=settle_refused,
+                    )
                 else:
                     blob_path = req.get("blob_path")
                     settle: dict | None = None
@@ -1825,6 +1877,12 @@ class Handler(BaseHTTPRequestHandler):
                                 "tokens": len(tokens) + len(out),
                                 "reason": "engine_cannot_settle",
                             }
+                    if settle_refused:
+                        settle = {
+                            "written": False,
+                            "tokens": len(tokens) + len(out),
+                            "reason": "staging_path_refused",
+                        }
                     body: dict = {"tokens": out, "text": text}
                     if settle is not None:
                         body["settle"] = settle
