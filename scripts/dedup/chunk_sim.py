@@ -194,7 +194,7 @@ def chunk_stream(
         chunk = data[start:end]
         out.append((end, end - start, hashlib.sha256(chunk).hexdigest()))
         start = end
-    return out, cuts  # type: ignore[return-value]
+    return out, cuts
 
 
 def blob_chunk_sets(
