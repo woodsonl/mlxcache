@@ -120,7 +120,7 @@ instability, it is the shift at each head's append point.
    (5.6% → 8.5% f16) and 256 KiB fails outright. The post's snapshot layout did not
    have per-head growth.
 2. **Whole-file chunking (a direct port of that approach) is the weakest arm** —
-   8.6% of new bytes at 16 KiB f16 and 13.4% at q8, versus 5.3% for token blocks.
+   6.6% of new bytes at 16 KiB f16 and 13.4% at q8, versus 5.3% for token blocks.
    The technique transfers; the *scope* does not.
 
 Why token-block/64 wins: block identity is digest over the concatenation of each
@@ -245,7 +245,7 @@ fixed with a regression test during pre-landing review.
   identical hit rate. The adopted codec is the better of the two arms in both
   tiers, so the eviction evidence is measured on the codec the decision ships,
   not a stand-in.
-- Invariants asserted in `scripts/dedup/tests/` (30 tests, green, collected by
+- Invariants asserted in `scripts/dedup/tests/` (48 tests, green, collected by
   CI): a chunk leaves disk only at refcount 0; anchored entries are never
   evicted; the budget holds after EVERY sweep with candidates; recency
   anchoring holds recent entries inside a window and expires them after; a
@@ -295,8 +295,8 @@ Ship **token-block/64** as the v1 codec:
   construction rather than dependent on a resynchronization argument.
 - 64 positions per block rather than 256: the measured cost of larger blocks is
   real and monotonic. `token-block/256` is worse in both tiers (6.84% vs 5.30% f16,
-  7.01% vs 5.19% q8) and stores more total unique bytes (483.2 vs 442.8 MB f16,
-  259.2 vs 233.9 MB q8), because fewer, larger blocks mean coarser partial-block
+  7.01% vs 5.19% q8) and stores more total unique bytes (460.8 vs 422.3 MiB f16,
+  247.2 vs 222.8 MiB q8), because fewer, larger blocks mean coarser partial-block
   churn. 1024 was never measured; the trend from 64 → 256 is the evidence, and the
   next step down (32) is untested.
 - Needs positions at chunk time, but not an adapter change: the blob header already
@@ -358,7 +358,11 @@ refactors made during pre-landing review (blocked gear gather, shared
 mask/envelope helpers) are proven output-identical, not assumed. The third
 recapture additionally regenerated the eviction ladder under the faithful
 anchor model, the restore timings under the fixed bench, and the layout probe
-at full tensor coverage, as noted above.
+at full tensor coverage, as noted above. Script edits made after that
+regeneration (dead-branch removals, the cuts_by return drop, first_diff reuse
+in the probe) are output-neutral by inspection — each touches a path the
+tables never read — and the chunk-digest/offset contracts they sit on are
+pinned by tests.
 
 ## Falsifying workloads (what would overturn this)
 

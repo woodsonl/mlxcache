@@ -28,7 +28,6 @@ import io
 import json
 from pathlib import Path
 
-import mlx.core as mx
 from blob_forensics import first_diff, parse_safetensors
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -53,6 +52,9 @@ def load_cache(payload: bytes):
 
 
 def feed(model, cache, tokens: list[int]):
+    import mlx.core as mx  # deferred: mlx is an optional extra, and the
+    # hermetic helpers in this module must stay importable without it
+
     inp = mx.array(tokens)[None]
     logits = model(inp, cache=cache)
     mx.eval([c.state for c in cache], logits)

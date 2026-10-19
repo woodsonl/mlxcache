@@ -234,6 +234,7 @@ def blob_chunk_sets(
 # One definition so the eviction arm always chunks with the codec the decision
 # adopts, even if that default changes.
 TOKEN_BLOCK = 64
+DEFAULT_TOKEN_BLOCKS = f"{TOKEN_BLOCK},256"
 
 
 def token_block_chunks(payload: bytes, tensors: dict, positions: int, block: int):
@@ -258,6 +259,14 @@ def token_block_chunks(payload: bytes, tensors: dict, positions: int, block: int
                 base = t["begin"] + h * hsz
                 parts.append(payload[base + b * unit : base + (b + n) * unit])
             digest = hashlib.sha256(b"".join(parts)).hexdigest()
+            # CAUTION — this tuple mimics the CDC shape but the contract
+            # differs: `end` is the payload offset just past this block's
+            # LAST head slice (a real position), while the digest covers the
+            # per-head concatenation, NOT the contiguous span [end-size, end)
+            # (a block's bytes are not contiguous in the on-disk layout). Any
+            # consumer that verifies sha256(payload[end-size:end]) against
+            # this digest is wrong by construction; a future physical codec
+            # re-materializes the contiguous layout at save time.
             chunks.append((t["begin"] + n_heads * (b + n) * unit, n * nbytes // positions, digest))
     return chunks
 
@@ -338,7 +347,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("grow_dir", type=Path)
     ap.add_argument("--avg-kib", default="16,64,256")
-    ap.add_argument("--token-blocks", default="64,256")
+    ap.add_argument("--token-blocks", default=DEFAULT_TOKEN_BLOCKS)
     ap.add_argument("--scopes", default="head,tensor,file")
     ap.add_argument("--json", type=Path)
     # The vectorized gear hash shipped a real boundary bug once; verification
@@ -352,9 +361,10 @@ def main() -> int:
         for kib in (int(x) for x in args.avg_kib.split(",")):
             avg = kib * 1024
             # the sample must hold enough natural cuts to make the equality
-            # meaningful: at avg=256 KiB a fixed 2 MiB sample has a handful,
-            # and at 1024 KiB nearly none, so scale with the target size
-            sample = load_blob(turns[0][1])[1][: max(2 << 20, 32 * avg)]
+            # meaningful (at avg=256 KiB a fixed 2 MiB sample has a handful,
+            # and at 1024 KiB nearly none) AND cross at least one gather
+            # block, so every default invocation self-checks the carry path
+            sample = load_blob(turns[0][1])[1][: max(2 << 20, 32 * avg, _GATHER_BLOCK + 64)]
             verify_vectorized(sample, mask_bits_for(avg), *cdc_envelope(avg))
         print(
             "CDC verifier: vectorized == naive "

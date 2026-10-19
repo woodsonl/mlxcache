@@ -1,14 +1,21 @@
 {
   "dependencies": {
-    "scripts/dedup/blob_forensics.py": ["scripts/dedup/tests/test_blob_forensics.py"],
+    "scripts/dedup/blob_forensics.py": [
+      "scripts/dedup/tests/test_blob_forensics.py",
+      "scripts/dedup/tests/test_table_helpers.py"
+    ],
     "scripts/dedup/chunk_sim.py": [
       "scripts/dedup/tests/test_chunk_sim.py",
-      "scripts/dedup/tests/test_chunk_sim_cdc.py"
+      "scripts/dedup/tests/test_chunk_sim_cdc.py",
+      "scripts/dedup/tests/test_table_helpers.py"
     ],
     "scripts/dedup/evict_sim.py": ["scripts/dedup/tests/test_evict_sim.py"],
     "scripts/dedup/capture_chain.py": ["scripts/dedup/tests/test_capture_chain.py"],
-    "scripts/dedup/restore_bench.py": ["scripts/dedup/tests/test_restore_bench.py"],
-    "scripts/dedup/roundtrip_probe.py": [],
+    "scripts/dedup/restore_bench.py": [
+      "scripts/dedup/tests/test_restore_bench.py",
+      "scripts/dedup/tests/test_table_helpers.py"
+    ],
+    "scripts/dedup/roundtrip_probe.py": ["scripts/dedup/tests/test_roundtrip_probe.py"],
     ".github/workflows/ci.yml": ["scripts/dedup/tests/test_chunk_sim_cdc.py"],
     "uv.lock": ["scripts/dedup/tests/test_chunk_sim_cdc.py"],
     ".gitignore": [],
