@@ -20,7 +20,9 @@ from __future__ import annotations
 import http.server
 import importlib.util
 import json
+import os
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -214,21 +216,21 @@ def test_w1np_has_no_prime_request():
         assert r["messages"][1]["role"] == "user"
 
 
-def test_w2_diverges_in_the_first_tokens_not_the_tail():
-    """A near miss must differ EARLY. A tail-only difference is a legitimate
-    hit under the end-anchored serve rule, so a late divergence would make the
-    workload measure a cache win and report it as a near miss."""
-    prefix = bench.filler_text(200)
+def test_w2_shares_a_long_region_but_diverges_before_the_end():
+    """A near miss must share a LONG region yet diverge well before either
+    document's end: a tail-only difference is a legitimate hit under the
+    end-anchored serve rule, while zero sharing (the old shape) measures
+    disjoint traffic and calls it a near miss. Half the prefix shared,
+    divergence mid-document — the shape the docs' 'similar text, different
+    document' claim describes."""
+    prefix = bench.filler_text(200, 26)
     wl = bench.build_w2(prefix, 2)
     a = wl["requests"][0]["messages"][0]["content"]
     b = wl["requests"][1]["messages"][0]["content"]
-    common = 0
-    for x, y in zip(a, b, strict=False):
-        if x != y:
-            break
-        common += 1
-    assert common < 40, f"near-miss shares {common} leading characters"
     assert a != b
+    common = len(os.path.commonprefix([a, b]))
+    assert common > len(a) // 3, f"near-miss shares only {common} of {len(a)} chars"
+    assert common < len(a) - 40, "divergence must come before the document end"
 
 
 def test_w3_is_decode_bound():
@@ -311,17 +313,20 @@ def test_join_trace_refuses_a_short_capture(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_synthetic_engine_is_refused(monkeypatch):
-    """The synthetic tokenizer hashes a whole prompt into 8 tokens, so it can
-    never show a long shared prefix. Letting it run under this banner would
-    produce a confident, meaningless number."""
+def test_unknown_workload_and_arm_ids_are_refused(monkeypatch):
+    """A typo like --workloads W5 (a cross-check, not a workload) or --arms
+    bench must fail loudly: the old membership checks silently ran nothing and
+    wrote an empty, green-looking artifact."""
     monkeypatch.setattr(
         bench,
         "resolve_model",
-        lambda _m: pytest.fail("must refuse --engine synthetic before resolving a model"),
+        lambda _m: pytest.fail("validation must run before resolving a model"),
     )
-    monkeypatch.setattr("sys.argv", ["bench_prefix.py", "--engine", "synthetic"])
-    with pytest.raises(SystemExit, match="cannot express prefix reuse"):
+    monkeypatch.setattr("sys.argv", ["bench_prefix.py", "--workloads", "W5"])
+    with pytest.raises(SystemExit, match=r"unknown workload\(s\) \['W5'\]"):
+        bench.main()
+    monkeypatch.setattr("sys.argv", ["bench_prefix.py", "--arms", "bench"])
+    with pytest.raises(SystemExit, match="bench"):
         bench.main()
 
 
@@ -465,3 +470,227 @@ def test_pressure_flow_joins_the_trace_before_checking_premises(tmp_path):
     ]
     bench.join_trace(samples, str(trace), 0)
     assert bench.check_premises(samples) == []
+
+
+# ---------------------------------------------------------------------------
+# Gate findings: run_leg, meta merge, exact-count join, served-required
+# ---------------------------------------------------------------------------
+
+
+def test_run_leg_declares_against_the_threaded_corpus():
+    """run_leg produces every number the benchmark claims; its declared-LCP
+    computation over a corpus threaded across legs is the denominator of the
+    headline 'served 99.97% of declared' figure, so the corpus must grow in
+    order and declared must be the max over corpus AND earlier in-leg
+    requests."""
+    base, srv = _sse_base([{"token": "a"}])
+
+    class Stub:
+        pass
+
+    Stub.base = base
+    Stub.completion_request = lambda self, messages, max_tokens: (
+        "/v1/chat/completions",
+        {"stream": True},
+    )
+    try:
+        corpus = [[1, 2, 3]]  # a cold leg's streams
+        wl = {
+            "max_tokens": 1,
+            "requests": [
+                {"label": "a", "messages": [{"role": "user", "content": "x"}]},
+                {"label": "b", "messages": [{"role": "user", "content": "y"}]},
+            ],
+        }
+        toks = {"x": [1, 2, 3, 9], "y": [1, 2, 8]}
+        samples = bench.run_leg(Stub(), wl, lambda m: toks[m[0]["content"]], corpus=corpus)
+        assert samples[0]["declared_lcp"] == 3  # vs the cold-leg stream
+        assert samples[1]["declared_lcp"] == 2  # max over corpus and in-leg
+        assert corpus == [[1, 2, 3], [1, 2, 3, 9], [1, 2, 8]]
+    finally:
+        srv.shutdown()
+
+
+def test_post_stream_merges_leading_verdict_and_trailing_timing_extras():
+    """The daemon emits TWO mlxcache extras per stream; a last-write-wins
+    regression would erase the verdict and report every request as n/a with
+    premises green (None-skip)."""
+    base, srv = _sse_base(
+        [
+            {"mlxcache": {"verdict": "partial", "prefill_from": 100}},
+            {"token": "a"},
+            {"mlxcache": {"ttft_ms": 5.0, "tokens_total": 101}},
+        ]
+    )
+    try:
+        timing, meta = bench._post_stream(base, "/v1/chat/completions", {}, 10)
+        assert timing["tokens"] == 1
+        assert meta == {
+            "verdict": "partial",
+            "prefill_from": 100,
+            "ttft_ms": 5.0,
+            "tokens_total": 101,
+        }
+    finally:
+        srv.shutdown()
+
+
+def test_post_stream_cross_checks_the_server_usage_count():
+    """Where the server reports usage.completion_tokens, it must equal the
+    client's frame count or the token accounting has drifted."""
+    base, srv = _sse_base(
+        [
+            {"choices": [{"delta": {"content": "He"}}]},
+            {"choices": [{"delta": {"content": "llo"}}]},
+            {"usage": {"completion_tokens": 3}},
+        ]
+    )
+    try:
+        with pytest.raises(RuntimeError, match="token accounting has drifted"):
+            bench._post_stream(base, "/v1/chat/completions", {}, 10)
+    finally:
+        srv.shutdown()
+
+
+def test_join_trace_refuses_an_overlength_capture(tmp_path):
+    """An extra record would shift every later sample onto its predecessor's
+    record (positional join): the count must match EXACTLY, not merely be at
+    least as long."""
+    trace = tmp_path / "t.jsonl"
+    rec = {"n_tokens": 5, "matched_tokens": 0, "verdict": "miss"}
+    trace.write_text(json.dumps(rec) + "\n" + json.dumps(rec) + "\n")
+    samples = [
+        {"label": "a", "prompt_tokens": 5, "declared_lcp": 0, "served": 0},
+    ]
+    with pytest.raises(RuntimeError, match="2 records for 1"):
+        bench.join_trace(samples, str(trace), 0, timeout_s=0.2)
+
+
+def test_join_trace_short_capture_is_fast(tmp_path):
+    """Thread the timeout so the short-capture refusal does not burn the
+    20s default on every CI run."""
+    import time as _time
+
+    trace = tmp_path / "t.jsonl"
+    trace.write_text(json.dumps({"n_tokens": 5, "verdict": "miss", "matched_tokens": 0}) + "\n")
+    samples = [
+        {"label": "a", "prompt_tokens": 5, "declared_lcp": 0, "served": 0},
+    ] * 2
+    t0 = _time.monotonic()
+    with pytest.raises(RuntimeError, match="1 records for 2"):
+        bench.join_trace(samples, str(trace), 0, timeout_s=0.2)
+    assert _time.monotonic() - t0 < 5
+
+
+def test_trace_joined_sample_missing_served_meta_is_a_violation():
+    """A daemon-leg sample that lost its meta extras would read as a
+    premise-green 0% reuse — the confident-zero failure the disk preflight
+    exists to refuse."""
+    joined_no_meta = {
+        "label": "a",
+        "prompt_tokens": 10,
+        "declared_lcp": 5,
+        "trace_n_tokens": 10,
+    }
+    problems = bench.check_premises([joined_no_meta])
+    assert any("lost its served meta" in p for p in problems)
+
+
+def test_served_without_held_is_a_violation():
+    bad = {"label": "a", "prompt_tokens": 10, "declared_lcp": 5, "served": 3}
+    assert any("no held value" in p for p in bench.check_premises([bad]))
+
+
+def test_direct_arm_samples_without_meta_pass_relaxed_premises():
+    """The direct arm's samples carry no instrumentation: no trace_n_tokens,
+    no served — the relaxation exists for exactly this shape."""
+    plain = {"label": "a", "prompt_tokens": 10, "declared_lcp": 0, "served": None}
+    assert bench.check_premises([plain], strict_serialization=False) == []
+    assert bench.check_premises([plain]) == []
+
+
+def test_summarize_reports_na_when_no_request_was_instrumented():
+    """An uninstrumented leg (direct baseline) is NOT a measured zero: the
+    reuse rates must be None, not 0.0, or the table invites a false
+    daemon-vs-baseline reuse comparison."""
+    plain = [
+        {
+            "label": "a",
+            "prompt_tokens": 100,
+            "declared_lcp": 90,
+            "ttft_ms": 100.0,
+            "total_ms": 200.0,
+            "tokens_out": 10,
+            "tpot_ms": 10.0,
+            "verdict": None,
+            "served": None,
+        }
+    ]
+    row = bench.summarize("W1", "direct/restart1", plain)
+    assert row["reuse_pct_of_requested"] is None
+    assert row["served_pct_of_declared"] is None
+    assert row["n_instrumented"] == 0
+
+
+def test_score_trace_flags_a_served_disagreement(tmp_path):
+    """The W5 cross-check's booleans must actually distinguish: a trace whose
+    reuse totals differ from the bodies' must carry served_matches_samples
+    False (the caller aborts on it)."""
+    trace = tmp_path / "t.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "n_tokens": 10,
+                "matched_tokens": 0,
+                "verdict": "miss",
+                "prefill_from": 0,
+                "messages": [{"role": "user", "content": "q"}],
+            }
+        )
+        + "\n"
+    )
+    samples = [{"label": "q", "prompt_tokens": 10, "served": 5}]  # bodies say 5 reused
+    scored = bench.score_trace(str(trace), samples, offset=0)
+    assert scored["samples_served"] == 5
+    assert scored["served_matches_samples"] is False
+    assert scored["tokens_total_matches_samples"] is True
+
+
+def test_filler_text_calibrates_and_is_deterministic():
+    assert bench.filler_text(16, 16) == bench._FILLER
+    assert bench.filler_text(8, 16) == bench._FILLER  # floor of one repeat
+    assert bench.filler_text(32, 16) == bench._FILLER * 2
+    assert bench.filler_text(200, 26) == bench.filler_text(200, 26)
+    with pytest.raises(ValueError, match="tokens_per_repeat"):
+        bench.filler_text(100, 0)
+
+
+def test_post_stream_enforces_its_total_deadline():
+    """A stream dripping frames faster than the socket timeout but never
+    ending must be stopped by the monotonic total deadline."""
+    import http.server
+    import threading
+
+    class _Drip(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            for _ in range(200):
+                self.wfile.write(b'data: {"token": "a"}\n\n')
+                self.wfile.flush()
+                time.sleep(0.02)
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Drip)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with pytest.raises(RuntimeError, match="total budget"):
+            bench._post_stream(f"http://127.0.0.1:{srv.server_port}", "/x", {}, timeout=0.3)
+    finally:
+        srv.shutdown()

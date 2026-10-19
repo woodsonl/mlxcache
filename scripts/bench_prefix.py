@@ -66,16 +66,12 @@ Usage
   # smoke: one workload, few requests
   uv run python scripts/bench_prefix.py --workloads W1 --questions 2 --k 0
 
-  # arithmetic/wiring only, no model (CI): synthetic engine
-  uv run python scripts/bench_prefix.py --engine synthetic --self-check
-
 The model must already be on disk. This harness never downloads one.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import shutil
@@ -90,18 +86,34 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _harness  # noqa: E402 — path insert above
+import replay_trace  # noqa: E402 — path insert above
 from _harness import REPO, free_port, resolve_model  # noqa: E402
 
 P95_MIN_N = 100
+# W5 is not a selectable workload: it is the per-leg trace/stats cross-check
+# run automatically inside the daemon arm.
+KNOWN_WORKLOADS = {"W1", "W1np", "W2", "W3", "W4"}
+KNOWN_ARMS = {"daemon", "direct", "pressure"}
+# Named budgets: a slow stack tunes a constant instead of copying a loop
+# (the _harness rule). Model loads dominate readiness; requests stream well
+# inside these, and a deadline exists so a drip can never pin a leg open.
+MODEL_LOAD_TIMEOUT_S = 600.0
+REQUEST_TIMEOUT_S = 900.0
+TRACE_WAIT_S = 20.0
+EVICT_WAIT_S = 25.0
 
 # Filler that tokenizes to roughly one token per four characters. Repeated to
 # build a long, boring, real-tokenizer prefix. Nothing here is special-cased by
 # the engine; it is ordinary prose because the benchmark must not exploit the
-# synthetic tokenizer's sentence hashing.
+# synthetic tokenizer's sentence hashing. The repeat count is CALIBRATED at
+# runtime against the real tokenizer (measure_filler_tokens), so --prefix-tokens
+# means tokens, not repeats-of-guess; W2 splices on _FILLER_OPENING, keeping the
+# near-miss shape tied to this constant instead of a magic literal.
 _FILLER = (
     "The retention policy for a shared cache depends on the working set of the "
     "caller and on how much of the prefix survives between requests. "
 )
+_FILLER_OPENING = "The retention"
 
 
 def serialize_messages(messages: list[dict]) -> str:
@@ -139,15 +151,27 @@ def tpot_ms(total_ms: float, ttft_ms: float, tokens: int) -> float:
     return (total_ms - ttft_ms) / max(tokens - 1, 1)
 
 
-def filler_text(approx_tokens: int) -> str:
-    """Deterministic prose filler of roughly `approx_tokens` tokens.
+def filler_text(approx_tokens: int, tokens_per_repeat: int) -> str:
+    """Deterministic prose filler of approximately `approx_tokens` tokens.
 
-    Approximate on purpose: the real count is measured through the real
-    tokenizer and reported. Trimming to an exact count would require the
-    tokenizer at workload-build time in both arms, which changes the text the
-    direct arm sees and makes the two arms measure different prompts.
+    `tokens_per_repeat` is MEASURED for this model by the caller (one encode of
+    _FILLER); a guessed divisor here is exactly how the first run shipped a
+    3,243-token prefix under a --prefix-tokens 2000 knob. The real count is
+    measured through the real tokenizer anyway and reported; calibration makes
+    the knob mean what it says.
     """
-    return _FILLER * max(1, approx_tokens // 16)
+    if tokens_per_repeat < 1:
+        raise ValueError(f"tokens_per_repeat must be >= 1, got {tokens_per_repeat}")
+    repeats = max(1, -(-approx_tokens // tokens_per_repeat))
+    return _FILLER * repeats
+
+
+def measure_filler_tokens(model: str) -> int:
+    """One tokenizer encode of _FILLER, for runtime prefix calibration."""
+    from mlx_lm.utils import load_tokenizer  # noqa: PLC0415 — heavy import, once
+
+    tok = load_tokenizer(model)
+    return len(tok.encode(_FILLER))
 
 
 def check_disk_headroom(store_parent: str, min_free_bytes: int) -> list[str]:
@@ -176,15 +200,18 @@ def check_disk_headroom(store_parent: str, min_free_bytes: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def build_w1(prefix: str, questions: int, name: str) -> dict:
-    """Fixed prefix + short changing question, primed with the prefix itself.
+def build_w1(prefix: str, questions: int, name: str, primed: bool = True) -> dict:
+    """Fixed prefix + short changing question, optionally primed with the
+    prefix alone.
 
     The priming request's stream ends exactly one token past the shared region
     (`"}]` closes the JSON array), which is the boundary the index's child rule
     can serve. Without it, every question diverges mid-key and is a miss — that
     is W1np, not a bug in this construction.
     """
-    reqs = [{"label": f"{name}:prime", "messages": [{"role": "system", "content": prefix}]}]
+    reqs = []
+    if primed:
+        reqs.append({"label": f"{name}:prime", "messages": [{"role": "system", "content": prefix}]})
     for i in range(questions):
         reqs.append(
             {
@@ -199,28 +226,24 @@ def build_w1(prefix: str, questions: int, name: str) -> dict:
 
 
 def build_w1_unprimed(prefix: str, questions: int) -> dict:
-    reqs = []
-    for i in range(questions):
-        reqs.append(
-            {
-                "label": f"W1np:q{i}",
-                "messages": [
-                    {"role": "system", "content": prefix},
-                    {"role": "user", "content": f"Question {i}: answer in one short paragraph."},
-                ],
-            }
-        )
-    return {"name": "W1np_shared_prefix_unprimed", "requests": reqs, "max_tokens": 32}
+    return build_w1(prefix, questions, "W1np_shared_prefix_unprimed", primed=False)
 
 
 def build_w2(prefix: str, questions: int) -> dict:
-    """Near miss: the shared region diverges in its FIRST tokens.
+    """Near miss: documents share a long opening, then diverge EARLY relative
+    to each document's own length.
 
     A tail-only difference would be a legitimate hit under the end-anchored
-    rule, so the divergence has to be early for this workload to mean
-    "similar text, different document" rather than "same prefix".
+    rule, so the divergence must come well before the end for this workload to
+    mean "similar text, different document" rather than "same prefix". The
+    shared region is long (most of the filler) and the splice hangs off
+    _FILLER_OPENING, not a magic literal.
     """
-    other = "Instead of " + prefix[len("The retention") :]
+    shared = prefix[: max(1, len(prefix) // 2)]
+    other = (
+        shared + "A different cache eviction strategy applies when the working set "
+        "outgrows the resident set. "
+    )
     reqs = []
     for i in range(questions):
         body = prefix if i % 2 == 0 else other
@@ -336,7 +359,10 @@ def _post_stream(base: str, path: str, body: dict, timeout: float) -> tuple[dict
     daemon's leading chunk carries the cache verdict as an extra and
     OpenAI-style servers open with a role-only chunk, so stamping on the
     first frame of any kind would fold the cache decision into TTFT and hide
-    exactly the difference being measured.
+    exactly the difference being measured. The whole consumption runs under a
+    MONOTONIC TOTAL deadline: the socket timeout bounds one read only, and a
+    server dripping a frame every few seconds would otherwise pin a leg open
+    forever.
     """
     payload = dict(body, stream=True)
     req = urllib.request.Request(
@@ -345,11 +371,15 @@ def _post_stream(base: str, path: str, body: dict, timeout: float) -> tuple[dict
         headers={"Content-Type": "application/json"},
     )
     t0 = time.perf_counter()
+    deadline = time.monotonic() + timeout
     ttft: float | None = None
     tokens = 0
     meta: dict | None = None
+    usage: dict | None = None
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
             line = raw.decode(errors="replace").strip()
             if not line.startswith("data: "):
                 continue
@@ -367,6 +397,12 @@ def _post_stream(base: str, path: str, body: dict, timeout: float) -> tuple[dict
                 # verdict and report every request as "n/a".
                 meta = {**(meta or {}), **frame["mlxcache"]}
                 continue
+            if "usage" in frame:
+                # OpenAI-style servers can end with a usage frame when asked
+                # (stream_options.include_usage); the server-side completion
+                # count is the cross-check for the client's frame count.
+                usage = frame["usage"]
+                continue
             if "error" in frame:
                 raise RuntimeError(f"stream error frame: {frame['error']}")
             if _generated_text(frame):
@@ -376,6 +412,12 @@ def _post_stream(base: str, path: str, body: dict, timeout: float) -> tuple[dict
     total = (time.perf_counter() - t0) * 1000
     if ttft is None:
         raise RuntimeError("stream closed before any token frame")
+    server_count = (usage or {}).get("completion_tokens")
+    if server_count is not None and server_count != tokens:
+        raise RuntimeError(
+            f"server counted {server_count} completion tokens, "
+            f"client counted {tokens} frames — token accounting has drifted"
+        )
     return {"ttft_ms": ttft, "total_ms": total, "tokens": tokens}, meta
 
 
@@ -401,27 +443,22 @@ def _stats(base: str) -> dict:
         return json.loads(r.read())
 
 
-def _wait_stats(base: str, timeout_s: float) -> None:
-    """The daemon has no serving readiness gate: /stats answering 200 means the
-    router is wired. The sidecar's model load is proven separately by a real
-    request, because a bound port is not a loaded model."""
-    deadline = time.time() + timeout_s
-    last = None
-    while time.time() < deadline:
-        try:
-            _stats(base)
-            return
-        except urllib.error.HTTPError:
-            return
-        except Exception as exc:  # noqa: BLE001 — not up yet
-            last = repr(exc)
-            time.sleep(0.3)
-    raise RuntimeError(f"daemon never answered /stats ({last})")
-
-
 # ---------------------------------------------------------------------------
 # Stacks
 # ---------------------------------------------------------------------------
+
+
+class _DaemonServer(_harness.Server):
+    """The daemon side of a DaemonStack, on the shared readiness loop.
+
+    The daemon exposes no /health; a 2xx /stats read proves the router is
+    wired. Inheriting Server.wait_ready keeps the exit-fast poll, the
+    bounded retry, the log tail on failure and the POST-PROBE liveness
+    re-check (a stale listener on a recycled port cannot be certified).
+    """
+
+    def _warmup(self, timeout: float) -> None:
+        _stats(self.base)
 
 
 class DaemonStack:
@@ -439,15 +476,27 @@ class DaemonStack:
         env = dict(os.environ)
         env.pop("MLXCACHE_ENGINE", None)
         env.pop("MLXCACHE_TOKENIZE_GROW", None)  # synthetic-engine-only knob
-        sidecar_env = dict(env, MLXCACHE_ENGINE="mlx-lm", PYTHONUNBUFFERED="1")
+        # The model and port reach the child via ENV, never interpolated into
+        # executable source: the safety of `python -c` must not hang on a
+        # repr() round-trip of an operator-controlled string.
+        sidecar_env = dict(
+            env,
+            MLXCACHE_ENGINE="mlx-lm",
+            PYTHONUNBUFFERED="1",
+            MLXCACHE_BENCH_SIDECAR_DIR=str(REPO / "sidecar"),
+            MLXCACHE_BENCH_ENGINE_MODEL=model,
+            MLXCACHE_BENCH_SIDECAR_PORT=str(self.sidecar_port),
+        )
         self.sidecar = _harness.Server(
             [
                 str(REPO / ".venv/bin/python"),
                 "-c",
-                "import sys; sys.path.insert(0, 'sidecar'); "
+                "import os, sys; sys.path.insert(0, os.environ['MLXCACHE_BENCH_SIDECAR_DIR']); "
                 "from mlxcache_sidecar import server; "
-                f"server.Handler.engine = server.make_engine({model!r}); "
-                f"server.BurstServer(('127.0.0.1', {self.sidecar_port}), "
+                "server.Handler.engine = server.make_engine("
+                "os.environ['MLXCACHE_BENCH_ENGINE_MODEL']); "
+                "server.BurstServer(('127.0.0.1', "
+                "int(os.environ['MLXCACHE_BENCH_SIDECAR_PORT'])), "
                 "server.Handler).serve_forever()",
             ],
             cwd=REPO,
@@ -467,7 +516,7 @@ class DaemonStack:
         daemon_env.update(env_extra or {})
         self.daemon = self._spawn_daemon(daemon_env)
 
-    def _spawn_daemon(self, env: dict) -> _harness.Server:
+    def _spawn_daemon(self, env: dict) -> _DaemonServer:
         binary = REPO / "target/release/mlxcache-daemon"
         argv = (
             [str(binary)]
@@ -481,11 +530,10 @@ class DaemonStack:
                 "--",
             ]
         )
-        return _harness.Server(
+        return _DaemonServer(
             argv,
             cwd=REPO,
             env=env,
-            port=self.port,
             base=self.base,
             log_prefix="mlxcache-bench-daemon-",
         )
@@ -504,7 +552,7 @@ class DaemonStack:
             body["max_tokens"] = max_tokens
         return "/v1/chat/completions", body
 
-    def wait_ready(self, timeout_s: float = 600.0) -> None:
+    def wait_ready(self, timeout_s: float = MODEL_LOAD_TIMEOUT_S) -> None:
         """Wait for BOTH processes to serve, not just for the daemon's router.
 
         The daemon's /stats answers as soon as axum is up, while the sidecar
@@ -513,7 +561,7 @@ class DaemonStack:
         races a multi-second model load and surfaces as a 503
         `adapter_unavailable` on the first real request.
         """
-        _wait_stats(self.base, timeout_s)
+        self.daemon.wait_ready(timeout_s)
         self.sidecar.wait_ready(timeout_s)
 
     def stats(self) -> dict:
@@ -524,19 +572,21 @@ class DaemonStack:
         self.sidecar.stop()
 
 
-class DirectStack:
+class DirectStack(_harness.Server):
     """Plain mlx_lm.server: in-memory LRUPromptCache, nothing survives a restart.
 
     This is the cross-process baseline. It is not crippled: its in-process
     repeat leg measures its own prompt cache, which is what a caller gets
-    without mlxcache.
+    without mlxcache. Readiness rides the shared Server loop (exit-fast
+    poll, bounded retry, post-probe liveness) with a REAL COMPLETION as the
+    probe: mlx_lm.server binds its port before the weights are loaded, so a
+    port check would race the model.
     """
 
-    def __init__(self, model: str, prompt_cache_size: int | None = None):
+    def __init__(self, model: str):
         self.model = model
         self._tok = None
-        self.port = free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
+        port = free_port()
         argv = [
             str(REPO / ".venv/bin/python"),
             "-m",
@@ -545,15 +595,20 @@ class DirectStack:
             "--model",
             model,
             "--port",
-            str(self.port),
+            str(port),
             "--log-level",
             "ERROR",
         ]
-        if prompt_cache_size is not None:
-            argv += ["--prompt-cache-size", str(prompt_cache_size)]
-        self.proc = _harness.Server(
-            argv, cwd=REPO, port=self.port, base=self.base, log_prefix="mlxcache-bench-direct-"
+        super().__init__(
+            argv,
+            cwd=REPO,
+            base=f"http://127.0.0.1:{port}",
+            log_prefix="mlxcache-bench-direct-",
         )
+
+    def _warmup(self, timeout: float) -> None:
+        path, body = self.completion_request([{"role": "user", "content": "hi"}], 1)
+        _post_json(self.base, path, body, timeout)
 
     def tokenize(self, messages: list[dict]) -> list[int]:
         """Encode the same serialized string the daemon tokenizes, so a
@@ -574,32 +629,18 @@ class DirectStack:
         JSON prompts ran to the 256-token cap where the templated ones
         stopped at ~55 by EOS) and therefore TTFT are not comparable. The
         raw /v1/completions endpoint with the identical string is the honest
-        baseline: the same bytes the daemon's engine consumes.
+        baseline: the same bytes the daemon's engine consumes. The usage
+        frame is requested so the server's own completion count cross-checks
+        the client's frame count.
         """
-        body = {"model": self.model, "prompt": serialize_messages(messages)}
+        body = {
+            "model": self.model,
+            "prompt": serialize_messages(messages),
+            "stream_options": {"include_usage": True},
+        }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         return "/v1/completions", body
-
-    def wait_ready(self, timeout_s: float = 600.0) -> None:
-        """A real completion, not /health: mlx_lm.server binds its port before
-        the weights are loaded, so a port check would race the model."""
-        deadline = time.time() + timeout_s
-        last = None
-        while time.time() < deadline:
-            try:
-                path, body = self.completion_request([{"role": "user", "content": "hi"}], 1)
-                _post_json(self.base, path, body, 120)
-                return
-            except Exception as exc:  # noqa: BLE001 — still loading
-                last = repr(exc)
-                if self.proc.proc.poll() is not None:
-                    raise RuntimeError(f"direct server exited:\n{self.proc._log_tail()}") from exc
-                time.sleep(1.0)
-        raise RuntimeError(f"direct server never served ({last})")
-
-    def stop(self) -> None:
-        self.proc.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +674,7 @@ def run_leg(
         declared = max((lcp_len(prev, tokens) for prev in seen), default=0)
         seen.append(tokens)
         path, body = stack.completion_request(req["messages"], workload["max_tokens"])
-        timing, meta = _post_stream(stack.base, path, body, timeout=900)
+        timing, meta = _post_stream(stack.base, path, body, timeout=REQUEST_TIMEOUT_S)
         sample = {
             "label": req["label"],
             "prompt_tokens": len(tokens),
@@ -645,9 +686,6 @@ def run_leg(
             "tpot_ms": round(tpot_ms(timing["total_ms"], timing["ttft_ms"], timing["tokens"]), 2),
             "verdict": (meta or {}).get("verdict"),
             "served": (meta or {}).get("prefill_from"),
-            "daemon_tokens_total": (meta or {}).get("tokens_total"),
-            "daemon_ttft_ms": (meta or {}).get("ttft_ms"),
-            "lookup_ms": (meta or {}).get("lookup_ms"),
         }
         samples.append(sample)
     return samples
@@ -670,7 +708,9 @@ def _await_trace_records(path: str, want: int, timeout_s: float = 20.0) -> list[
     return records
 
 
-def join_trace(samples: list[dict], trace_path: str, base_n: int) -> None:
+def join_trace(
+    samples: list[dict], trace_path: str, base_n: int, timeout_s: float = TRACE_WAIT_S
+) -> None:
     """Attach trace-side accounting and enforce the premises.
 
     The trace writer is asynchronous (bounded channel drained by a thread), so
@@ -683,19 +723,29 @@ def join_trace(samples: list[dict], trace_path: str, base_n: int) -> None:
       1. serialization parity — the trace's n_tokens must equal the count the
          sidecar gives for OUR serialization of the same messages. A mismatch
          means the daemon tokenizes a different string and every declared
-         prefix in this run is fiction.
+         prefix in this run is fiction. (Enforced on token COUNT: the trace
+         carries no token ids, so count parity is the strongest check the
+         recorded data supports — two different equal-length serializations
+         would slip past it, which is the documented limit, not a promise of
+         byte identity.)
       2. served == held — `prefill_from` must equal `matched_tokens - 1`.
       3. served <= declared — the daemon cannot serve reuse the traffic never
          offered.
+
+    The record count must match EXACTLY: a longer capture would silently
+    shift every later sample onto its predecessor's record (positional join),
+    which is precisely the plausible-numbers failure this function exists to
+    prevent.
     """
-    records = _await_trace_records(trace_path, base_n + len(samples))[base_n:]
-    if len(records) < len(samples):
+    records = _await_trace_records(trace_path, base_n + len(samples), timeout_s)[base_n:]
+    if len(records) != len(samples):
         raise RuntimeError(
             f"{trace_path}: trace has {len(records)} records for {len(samples)} "
-            f"requests after offset {base_n} (capture lag or a dropped write); "
-            "the accounting cannot be joined"
+            f"requests after offset {base_n} (capture lag, a dropped write, or "
+            "an extra record that would shift the positional join); the "
+            "accounting cannot be joined"
         )
-    for sample, rec in zip(samples, records, strict=False):
+    for sample, rec in zip(samples, records, strict=True):
         sample["trace_n_tokens"] = rec["n_tokens"]
         sample["trace_matched"] = rec["matched_tokens"]
         sample["trace_verdict"] = rec["verdict"]
@@ -715,9 +765,21 @@ def _read_trace(path: str) -> list[dict]:
 
 def check_premises(samples: list[dict], strict_serialization: bool = True) -> list[str]:
     """Return premise violations. A violation is a bug in the harness or the
-    daemon's accounting, never a benchmark result — the caller aborts."""
+    daemon's accounting, never a benchmark result — the caller aborts.
+
+    A sample that was joined to a trace (has trace_n_tokens) must carry a
+    served verdict: losing the meta extras would otherwise read as a
+    premise-green 0% reuse — the exact confident-zero failure the disk
+    preflight exists to refuse. served=None is legal only where no
+    instrumentation exists (the direct arm's samples are never joined).
+    """
     problems = []
     for s in samples:
+        if "trace_n_tokens" in s and s.get("served") is None:
+            problems.append(
+                f"{s['label']}: trace-joined sample lost its served meta "
+                "(lost meta reads as a confident 0% reuse)"
+            )
         if (
             strict_serialization
             and "trace_n_tokens" in s
@@ -727,9 +789,11 @@ def check_premises(samples: list[dict], strict_serialization: bool = True) -> li
                 f"{s['label']}: trace tokenized {s['trace_n_tokens']} tokens, "
                 f"harness declared {s['prompt_tokens']} (serialization drift)"
             )
-        if s["served"] is not None and s["held"] is not None and s["served"] != s["held"]:
+        if s.get("served") is not None and s.get("held") is None:
+            problems.append(f"{s['label']}: served {s['served']} with no held value (unjoined)")
+        if s.get("served") is not None and s.get("held") is not None and s["served"] != s["held"]:
             problems.append(f"{s['label']}: served {s['served']} != held {s['held']}")
-        if s["served"] is not None and s["served"] > s["declared_lcp"]:
+        if s.get("served") is not None and s["served"] > s["declared_lcp"]:
             problems.append(
                 f"{s['label']}: served {s['served']} > declared {s['declared_lcp']} "
                 "(reuse invented)"
@@ -745,24 +809,33 @@ def summarize(name: str, leg: str, samples: list[dict]) -> dict:
     req_tokens = sum(s["prompt_tokens"] for s in samples)
     served = sum(s["served"] or 0 for s in samples)
     declared = sum(s["declared_lcp"] for s in samples)
+    instrumented = [s for s in samples if s.get("served") is not None]
     verdicts: dict[str, int] = {}
     for s in samples:
         v = s["verdict"] or "n/a"
         verdicts[v] = verdicts.get(v, 0) + 1
+    # Reuse rates are None when no request carried served data: an
+    # uninstrumented leg (the direct baseline) is NOT a measured zero, and
+    # printing 0.0 for it invites a false daemon-vs-baseline reuse compare.
+    any_served = bool(instrumented)
     return {
         "workload": name,
         "leg": leg,
         "n": len(samples),
+        "n_instrumented": len(instrumented),
         "ttft_p50_ms": pct(ttfts, 50),
         "ttft_p95_ms": pct(ttfts, 95) if len(ttfts) >= P95_MIN_N else None,
         "ttft_mean_ms": round(statistics.fmean(ttfts), 1) if ttfts else None,
         "tpot_p50_ms": pct(tpots, 50),
-        "tokens_per_s": None,
         "prompt_tokens": req_tokens,
         "declared_prefix_tokens": declared,
         "served_prefix_tokens": served,
-        "reuse_pct_of_requested": round(100 * served / req_tokens, 2) if req_tokens else 0.0,
-        "served_pct_of_declared": round(100 * served / declared, 2) if declared else None,
+        "reuse_pct_of_requested": (
+            round(100 * served / req_tokens, 2) if any_served and req_tokens else None
+        ),
+        "served_pct_of_declared": (
+            round(100 * served / declared, 2) if any_served and declared else None
+        ),
         "verdicts": verdicts,
     }
 
@@ -807,18 +880,29 @@ def run_daemon_arm(model: str, args, prefix: str) -> tuple[list[dict], dict[str,
                 # correct_retire rewrites the stats. Cold means a new store AND
                 # a new process.
                 #
-                # One trace file PER (workload, leg): TraceWriter truncates on
-                # start ("a trace is a session's story"), so reusing a path
-                # would wipe earlier records.
+                # One trace file PER (workload, leg), created with mkstemp:
+                # TraceWriter truncates on start ("a trace is a session's
+                # story"), so reusing a path would wipe earlier records — and a
+                # PREDICTABLE path under a shared TMPDIR is a symlink a local
+                # attacker can pre-plant for a truncation.
                 key = f"{wl['name']}/{leg}"
-                trace_path = str(
-                    Path(store).parent / f"trace-{wl['name']}-{leg}-{int(time.time())}.jsonl"
+                trace_fd, trace_path = tempfile.mkstemp(
+                    prefix=f"trace-{wl['name']}-{leg}-", suffix=".jsonl"
                 )
+                os.close(trace_fd)
                 trace_paths[key] = trace_path
                 stack = DaemonStack(model, store, env_extra={"MLXCACHE_TRACE": trace_path})
                 try:
                     stack.wait_ready()
-                    _post_json(stack.base, "/v1/chat/completions", hello, 900)
+                    # /stats baselines taken around the leg feed the W5
+                    # cross-check below; the hello warmup's traffic is excluded
+                    # by snapshotting after it settles.
+                    _post_json(
+                        stack.base,
+                        "/v1/chat/completions",
+                        hello,
+                        REQUEST_TIMEOUT_S,
+                    )
                     # The warmth request must be ON DISK before the baseline is
                     # taken, or every sample joins its predecessor's record. It
                     # is the first request this daemon serves, so exactly one
@@ -826,23 +910,46 @@ def run_daemon_arm(model: str, args, prefix: str) -> tuple[list[dict], dict[str,
                     base_n = len(_await_trace_records(trace_path, 1))
                     if base_n != 1:
                         raise SystemExit(f"{trace_path}: expected 1 warmup record, found {base_n}")
+                    pre_stats = stack.stats()
                     samples = run_leg(stack, wl, _tokenize_for_daemon(stack), corpus=corpus)
                     join_trace(samples, trace_path, base_n)
                     problems = check_premises(samples)
+                    post_stats = stack.stats()
+                    stats_delta = _harness.stats_delta(pre_stats, post_stats, "requests")
+                    row = summarize(wl["name"], f"daemon/{leg}", samples)
+                    row["samples"] = samples
+                    # W5: the trace slice for THIS leg must score identically to
+                    # the per-response accounting above, and both must agree
+                    # with the /stats request counter delta. A gap means one of
+                    # the three views of the same requests is lying — abort,
+                    # never print the leg.
+                    scored = score_trace(trace_path, samples, offset=base_n)
+                    row["trace_replay"] = scored
                     if problems:
                         raise SystemExit(
                             "PREMISE VIOLATION (harness/daemon bug):\n  " + "\n  ".join(problems)
                         )
-                    row = summarize(wl["name"], f"daemon/{leg}", samples)
-                    row["samples"] = samples
-                    # W5: the trace slice for THIS leg must score identically to
-                    # the per-response accounting above. A gap means the trace
-                    # and the response body disagree about the same request.
-                    row["trace_replay"] = score_trace(trace_path, samples, offset=base_n)
+                    if (
+                        scored is None
+                        or scored.get("error")
+                        or not (
+                            scored.get("tokens_total_matches_samples")
+                            and scored.get("served_matches_samples")
+                        )
+                    ):
+                        raise SystemExit(
+                            f"TRACE DISAGREEMENT for {wl['name']}/{leg}: {scored} — "
+                            "the trace and the response bodies are different "
+                            "views of the same requests; the leg cannot be trusted"
+                        )
+                    if stats_delta != len(samples):
+                        raise SystemExit(
+                            f"/STATS DISAGREEMENT for {wl['name']}/{leg}: counter "
+                            f"delta {stats_delta} != {len(samples)} requests — "
+                            "the stats view and the responses disagree"
+                        )
                     rows.append(row)
-                    rows.append(
-                        {"workload": "_stats", "leg": f"daemon/{leg}", "stats": stack.stats()}
-                    )
+                    rows.append({"workload": "_stats", "leg": f"daemon/{leg}", "stats": post_stats})
                 finally:
                     stack.stop()
         finally:
@@ -867,17 +974,33 @@ def run_direct_arm(model: str, args, prefix: str) -> list[dict]:
     The traffic is the daemon's own serialization, sent through
     /v1/completions (DirectStack.completion_request): the daemon never applies
     a chat template, so a templated baseline would answer a different prompt.
+    Only W1 and W3 have baseline analogues; the arm runs the intersection of
+    --workloads with those, so `--workloads W1np` does not silently benchmark
+    traffic the daemon arm never ran.
     """
     rows: list[dict] = []
-    workloads = [build_w1(prefix, args.questions, "W1")]
+    workloads = []
+    if "W1" in args.workloads:
+        workloads.append(build_w1(prefix, args.questions, "W1"))
     if "W3" in args.workloads:
         workloads.append(build_w3(args.questions))
+    if not workloads:
+        return rows
     for wl in workloads:
         for leg in ("restart1", "restart2"):
             stack = DirectStack(model)
             try:
                 stack.wait_ready()
                 samples = run_leg(stack, wl, stack.tokenize)
+                # The baseline gets the premise treatment too, minus the
+                # serialization check (it has no trace to join): a served
+                # value above declared, or a lost meta, is as fictional here
+                # as on the daemon arm.
+                problems = check_premises(samples, strict_serialization=False)
+                if problems:
+                    raise SystemExit(
+                        "PREMISE VIOLATION (harness bug, direct arm):\n  " + "\n  ".join(problems)
+                    )
                 rows.append(summarize(wl["name"], f"direct/{leg}", samples))
                 if leg == "restart1":
                     inproc = run_leg(stack, wl, stack.tokenize)
@@ -895,7 +1018,7 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
         for k in args.k:
             wl = build_w4(prefix, k, arm)
             store = tempfile.mkdtemp(prefix=f"mlxcache-w4-{arm}-{k}-")
-            trace_fd, trace_path = tempfile.mkstemp(prefix=f"trace-w4-{arm}-{k}-")
+            trace_fd, trace_path = tempfile.mkstemp(prefix=f"trace-w4-{arm}-{k}-", suffix=".jsonl")
             os.close(trace_fd)
             stack = DaemonStack(
                 model,
@@ -924,7 +1047,7 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                 # ~2s after boot at a 1s interval. Probing without this wait
                 # would measure the pre-eviction cache and label it pressure.
                 evicted = 0
-                deadline = time.time() + 25
+                deadline = time.time() + EVICT_WAIT_S
                 while time.time() < deadline:
                     now = stack.stats().get("evictions", 0)
                     if now > before:
@@ -933,6 +1056,27 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                     time.sleep(0.5)
                 after_stats = stack.stats()
                 published_after = after_stats.get("checkpoints_published")
+                # An expired wait is not a pressure result: if the store holds
+                # more than the cap, the reaper never bound and the row would
+                # measure an un-evicted cache while reading green. Per-arm disk
+                # headroom re-check: the sweep writes ~k checkpoints of ~190 MB
+                # at real sizes and the one-shot preflight cannot see a disk
+                # filling mid-sweep.
+                headroom = check_disk_headroom(tempfile.gettempdir(), args.min_free_gb * 1e9)
+                if headroom:
+                    raise SystemExit("PREFLIGHT (mid-sweep): " + "; ".join(headroom))
+                if evicted == 0 and (published_after or 0) > cap:
+                    row = summarize(
+                        wl["name"], f"daemon/pressure_cap{cap}_evict_wait_timeout", noise
+                    )
+                    row["evictions_observed"] = 0
+                    row["published_before_probe"] = published_after
+                    row["repeat_verdict"] = None
+                    row["repeat_served"] = None
+                    row["repeat_declared"] = None
+                    row["repeat_ttft_ms"] = None
+                    rows.append(row)
+                    continue
                 probe = run_leg(
                     stack,
                     wl,
@@ -971,19 +1115,16 @@ def score_trace(trace_path: str, samples: list[dict], offset: int = 0) -> dict |
 
     The trace and the per-response body are two views of one run, so their
     token totals and reuse totals must agree. A gap means one of them is
-    lying, and the leg's numbers in this report cannot be trusted.
+    lying, and the leg's numbers in this report cannot be trusted — the
+    caller treats any disagreement (or a missing/error result) as a premise
+    violation and aborts.
     """
     if not samples or not Path(trace_path).is_file():
         return None
-    spec = importlib.util.spec_from_file_location(
-        "replay_trace", Path(__file__).resolve().parent / "replay_trace.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    records = mod.read_trace(trace_path)[offset : offset + len(samples)]
+    records = replay_trace.read_trace(trace_path)[offset : offset + len(samples)]
     if len(records) != len(samples):
         return {"error": f"trace had {len(records)} records for {len(samples)} requests"}
-    scored = mod.score_records(records, "leg trace")
+    scored = replay_trace.score_records(records, "leg trace")
     scored["samples_tokens_total"] = sum(s["prompt_tokens"] for s in samples)
     scored["samples_served"] = sum(s["served"] or 0 for s in samples)
     scored["tokens_total_matches_samples"] = (
@@ -1019,11 +1160,7 @@ def main() -> int:
     ap.add_argument("--prefix-tokens", type=int, default=2000, help="approx shared-prefix size")
     ap.add_argument("--k", default="0,1,2,4,8,16", help="W4 noise counts (comma separated)")
     ap.add_argument("--arms", default="daemon,direct", help="daemon,direct,pressure")
-    ap.add_argument("--engine", default="real", choices=["real", "synthetic"])
     ap.add_argument("--json", default=None, help="write the full artifact here")
-    ap.add_argument(
-        "--self-check", action="store_true", help="exit after the premise arithmetic tests"
-    )
     ap.add_argument(
         "--min-free-gb",
         type=float,
@@ -1038,20 +1175,24 @@ def main() -> int:
     args.arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     args.k = [int(x) for x in str(args.k).split(",") if str(x).strip()]
 
-    if args.self_check:
-        return _self_check()
-
-    if args.engine == "synthetic":
+    unknown_w = [w for w in args.workloads if w not in KNOWN_WORKLOADS]
+    unknown_a = [a for a in args.arms if a not in KNOWN_ARMS]
+    if unknown_w or unknown_a:
         raise SystemExit(
-            "the synthetic engine hashes whole prompts into 8 tokens and cannot "
-            "express prefix reuse; use scripts/bench_workloads.py for plumbing, "
-            "or --self-check for the arithmetic"
+            f"unknown workload(s) {unknown_w} / arm(s) {unknown_a}; "
+            f"workloads: {sorted(KNOWN_WORKLOADS)}, arms: {sorted(KNOWN_ARMS)}"
         )
+    if set(args.workloads) & {"W1np", "W2"} and "direct" in args.arms:
+        print("note: W1np/W2 have no direct-baseline analogue; direct arm runs W1/W3 only")
 
     model = resolve_model(args.model)
-    prefix = filler_text(args.prefix_tokens)
+    tokens_per_repeat = measure_filler_tokens(model)
+    prefix = filler_text(args.prefix_tokens, tokens_per_repeat)
     print(f"model:  {model}")
-    print(f"prefix: ~{args.prefix_tokens} tokens requested")
+    print(
+        f"prefix: ~{args.prefix_tokens} tokens requested "
+        f"(calibrated: {tokens_per_repeat} tokens/filler-repeat)"
+    )
     print(f"grid:   workloads={args.workloads} arms={args.arms} n={args.questions} k={args.k}\n")
 
     # Refuse a run whose checkpoints cannot fit: a failed publish is silently
@@ -1090,49 +1231,6 @@ def main() -> int:
     for leg, path in traces.items():
         print(f"trace[{leg}]: {path}")
         print(f"  score: scripts/replay_trace.py --trace {path} --summary-only")
-    return 0
-
-
-def _self_check() -> int:
-    """Arithmetic and premise guards, no model. Runs in CI."""
-    failures = []
-    if lcp_len([1, 2, 3], [1, 2, 9]) != 2:
-        failures.append("lcp_len basic")
-    if lcp_len([], [1]) != 0:
-        failures.append("lcp_len empty")
-    if tpot_ms(1100.0, 100.0, 11) != 100.0:
-        failures.append("tpot_ms divisor")
-    # A 1-token completion must not divide by zero or go negative.
-    if tpot_ms(1100.0, 100.0, 1) != 1000.0:
-        failures.append("tpot_ms single token")
-    good = [
-        {
-            "label": "a",
-            "prompt_tokens": 10,
-            "served": 9,
-            "held": 9,
-            "declared_lcp": 9,
-            "trace_n_tokens": 10,
-        }
-    ]
-    if check_premises(good):
-        failures.append("premises reject a valid sample")
-    bad_served = [dict(good[0], served=11)]
-    if not check_premises(bad_served):
-        failures.append("premises accept served > declared")
-    bad_held = [dict(good[0], held=8)]
-    if not check_premises(bad_held):
-        failures.append("premises accept served != held")
-    bad_ser = [dict(good[0], trace_n_tokens=11)]
-    if not check_premises(bad_ser):
-        failures.append("premises accept serialization drift")
-    ser = serialize_messages([{"role": "user", "content": 'a "b"'}])
-    if ser != '[{"role":"user","content":"a \\"b\\""}]':
-        failures.append(f"serde serialization mismatch: {ser}")
-    if failures:
-        print("SELF-CHECK FAILED: " + "; ".join(failures))
-        return 1
-    print("self-check: ok")
     return 0
 
 
