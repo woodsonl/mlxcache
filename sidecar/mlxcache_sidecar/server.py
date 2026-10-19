@@ -412,23 +412,6 @@ def _staging_dir_matches(path: str) -> bool:
         return pinned == parent
 
 
-def _is_daemon_staging_path(path: str) -> bool:
-    """True when `path` is shaped like the daemon's own settle staging path.
-
-    The daemon generates `.settle-<pid>-<seq>-<nanos>.staging` inside its blob
-    dir (crates/mlxcache-daemon/src/http.rs :: settle_staging_path) and passes
-    the absolute path. This server is an unauthenticated loopback HTTP server,
-    so the confinement is: the BASENAME must match the daemon's exact staging
-    shape, no component may traverse (`..`), and the parent directory is PINNED
-    to the one the first accepted settle used — in real deployments that is the
-    daemon's blob dir, and after the pin nothing outside it can be targeted.
-    An attacker who loses the race to the daemon's first settle cannot pick a
-    directory of their own; even the pre-pin window only allows creating a
-    hidden, oddly-shaped name, never clobbering a chosen file.
-    """
-    return _is_staging_shaped(path) and _staging_dir_matches(path)
-
-
 _SETTLE_DIR_LOCK = threading.Lock()
 _SETTLE_DIR_PIN: list[str | None] = [None]
 
