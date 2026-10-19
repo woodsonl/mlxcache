@@ -61,6 +61,7 @@ from _harness import (  # noqa: E402 — path insert above
     WrapperServer,
     free_port,
     resolve_model,
+    stats_delta,
 )
 
 TURN1 = {
@@ -212,13 +213,7 @@ def main() -> int:
     # the disk_hits DELTA below.
     from mlxcache_store import Store as _Store
 
-    def _delta(pre: dict, post: dict, key: str) -> int:
-        # `or 0` coercion would report "0 hits" when the counter is actually
-        # MISSING from /mlxcache/stats — the opposite of what a gate wants
-        # to hear. Fail loudly instead.
-        if pre.get(key) is None or post.get(key) is None:
-            raise RuntimeError(f"/mlxcache/stats did not report {key!r}: cannot gate on it")
-        return post[key] - pre[key]
+    _delta = stats_delta
 
     st = _Store(store_dir, byte_budget=0)
     tok = _mlxcache_tokenize(model, body2)
@@ -278,12 +273,12 @@ def main() -> int:
     # than re-prefilling (at temp 0 the two are token-identical, so the
     # token verdict alone cannot).
     observed_hits = {
-        "restart-turn2": (restart_stats or {}).get("disk_hits"),
-        "second-turn2": (second_stats or {}).get("disk_hits"),
+        "restart-turn2": restart_stats["disk_hits"],
+        "second-turn2": second_stats["disk_hits"],
     }
     reuse_errors = {
-        "restart-turn2": (restart_stats or {}).get("reuse_errors"),
-        "second-turn2": (second_stats or {}).get("reuse_errors"),
+        "restart-turn2": restart_stats["reuse_errors"],
+        "second-turn2": second_stats["reuse_errors"],
     }
     for r in results:
         if r["leg"] in ("restart-turn2", "second-turn2"):

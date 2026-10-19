@@ -36,6 +36,7 @@ The daemon and sidecar are started automatically if --daemon is not given
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import signal
@@ -43,6 +44,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -50,18 +52,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _harness import free_port  # noqa: E402 — path insert above
-
-
-def http_json(url: str, payload: dict, timeout: float = 60.0) -> dict:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+from _harness import KILL_WAIT_S, TERM_WAIT_S, free_port  # noqa: E402 — path insert above
 
 
 def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, float, int]:
@@ -72,7 +63,9 @@ def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, fl
     stamp waits for a frame that is none of those (and not [DONE]) — stamping
     on the first `data:` line of any kind would overstate TTFT by the cache
     decision time. The per-frame loop reads the raw SSE byte stream like a
-    real client.
+    real client, under a MONOTONIC TOTAL deadline: the socket timeout bounds
+    one read only, so a server dripping a frame every few seconds would
+    otherwise hold this consumer open forever.
     """
     body = dict(body, stream=True)
     req = urllib.request.Request(
@@ -82,10 +75,13 @@ def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, fl
         method="POST",
     )
     t0 = time.perf_counter()
+    deadline = time.monotonic() + timeout
     ttft: float | None = None
     tokens = 0
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
             line = raw.decode(errors="replace").strip()
             if not line.startswith("data: "):
                 continue
@@ -169,11 +165,17 @@ def report(name: str, ttfts: list[float], totals: list[float], token_counts: lis
     return row
 
 
-def wait_healthy(url: str, deadline_s: float = 30.0) -> None:
+def wait_healthy(url: str, daemon: subprocess.Popen, deadline_s: float = 30.0) -> None:
     # The daemon exposes no /health; a 404 from /stats proves the listener is
     # accepting and routing (any response but connection-refused works).
+    # Liveness is checked every iteration too: a daemon that exits at startup
+    # (bad env, bind failure after the free_port TOCTOU) must fail FAST with
+    # its exit status, not burn the whole deadline on "not healthy".
     deadline = time.time() + deadline_s
     while time.time() < deadline:
+        rc = daemon.poll()
+        if rc is not None:
+            raise RuntimeError(f"daemon exited during startup (code {rc}) at {url}")
         try:
             with urllib.request.urlopen(f"{url}/stats", timeout=1) as r:
                 if r.status == 200:
@@ -192,9 +194,22 @@ def _free_port() -> int:
 
 
 def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]:
-    """Start sidecar (uv, synthetic engine) + daemon (release build)."""
+    """Start sidecar (uv, synthetic engine) + daemon (release build).
+
+    The daemon binary is BUILT to completion before ANY spawn: `cargo run
+    --release` would fold a cold build (minutes on a fresh checkout) into
+    the daemon's 30s readiness window, and the harness would fail as "not
+    healthy" while the compiler was still running. Building first also
+    keeps partial-failure cleanup simple: once a child exists, every later
+    failure path SIGTERMs it before re-raising, so a failed stack never
+    strands a process holding a port."""
     sidecar_port = _free_port()
     env = dict(os.environ, MLXCACHE_TOKENIZE_GROW="growing conversation seed")
+    subprocess.run(
+        ["uv", "run", "cargo", "build", "--release", "-p", "mlxcache-daemon"],
+        check=True,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
     sidecar = subprocess.Popen(
         [
             "uv",
@@ -210,27 +225,26 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
         env=env,
     )
     daemon_port = _free_port()
-    # Build to completion BEFORE spawning: `cargo run --release` folds a
-    # cold build (minutes on a fresh checkout) into the daemon's 30s
-    # readiness window, and the harness then fails as "not healthy" while
-    # the compiler is still running. The build output stays visible so a
-    # cold machine shows progress instead of silence.
-    subprocess.run(
-        ["uv", "run", "cargo", "build", "--release", "-p", "mlxcache-daemon"],
-        check=True,
-    )
-    daemon = subprocess.Popen(
-        [
-            str(Path(__file__).resolve().parents[1] / "target" / "release" / "mlxcache-daemon"),
-        ],
-        env=dict(
-            env,
-            MLXCACHE_MODELS="bench-model",
-            MLXCACHE_SIDECAR_URL=f"http://127.0.0.1:{sidecar_port}",
-            MLXCACHE_BLOBS=blob_dir,
-            MLXCACHE_ADDR=f"127.0.0.1:{daemon_port}",
-        ),
-    )
+    try:
+        daemon = subprocess.Popen(
+            [
+                str(Path(__file__).resolve().parents[1] / "target" / "release" / "mlxcache-daemon"),
+            ],
+            env=dict(
+                env,
+                MLXCACHE_MODELS="bench-model",
+                MLXCACHE_SIDECAR_URL=f"http://127.0.0.1:{sidecar_port}",
+                MLXCACHE_BLOBS=blob_dir,
+                MLXCACHE_ADDR=f"127.0.0.1:{daemon_port}",
+            ),
+        )
+    except BaseException:
+        sidecar.send_signal(signal.SIGTERM)
+        try:
+            sidecar.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            sidecar.kill()
+        raise
     return sidecar, daemon, daemon_port
 
 
@@ -262,23 +276,30 @@ def main() -> int:
     procs: list[subprocess.Popen] = []
     url = args.daemon
     blob_dir = args.blobs or tempfile.mkdtemp(prefix="mlxcache-bench-blobs-")
+    daemon_proc: subprocess.Popen | None = None
     try:
         if url is None:
             os.makedirs(blob_dir, exist_ok=True)
             sidecar, daemon, port = start_stack(blob_dir)
+            daemon_proc = daemon
             procs += [sidecar, daemon]
             url = f"http://127.0.0.1:{port}"
         try:
-            wait_healthy(url)
+            wait_healthy(url, daemon_proc)
             results = run_workloads(url, args)
         finally:
             for p in procs:
                 p.send_signal(signal.SIGTERM)
             for p in procs:
                 try:
-                    p.wait(timeout=10)
+                    p.wait(timeout=TERM_WAIT_S)
                 except subprocess.TimeoutExpired:
                     p.kill()
+                    # A killed child still needs reaping, and a reaped child
+                    # is not guaranteed: mirroring the shared Server.stop()
+                    # contract instead of leaving a weaker local copy.
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        p.wait(timeout=KILL_WAIT_S)
     finally:
         # The blob dir is GB-scale at real-model sizes; stranding it in $TMPDIR
         # on every run is how a machine fills the volume the harness itself
@@ -388,7 +409,6 @@ def run_workloads(url: str, args) -> list[dict]:
     bursts = -(-args.requests // args.concurrency)
     for burst in range(bursts):
         shared = {"burst": burst, "ttfts": [], "totals": [], "ntoks": [], "errors": []}
-        import threading
 
         threads = [
             threading.Thread(target=worker, args=(shared, i)) for i in range(args.concurrency)

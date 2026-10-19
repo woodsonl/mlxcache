@@ -96,6 +96,19 @@ def resolve_model(raw: str) -> str:
     )
 
 
+def stats_delta(pre: dict, post: dict, key: str) -> int:
+    """Delta of a /mlxcache/stats counter across a measured request.
+
+    Both wrappers gate reuse on this. `or 0` coercion would read a MISSING
+    counter as "zero hits" — the opposite of what a gate wants to hear when
+    the stats endpoint stops reporting a key — so a missing counter fails
+    loudly instead.
+    """
+    if pre.get(key) is None or post.get(key) is None:
+        raise RuntimeError(f"/mlxcache/stats did not report {key!r}: cannot gate on it")
+    return post[key] - pre[key]
+
+
 class Server:
     """One localhost server child: spawn, readiness-probe, kill, reap, unlink.
 

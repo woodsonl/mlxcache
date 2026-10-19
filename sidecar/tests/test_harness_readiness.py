@@ -77,6 +77,8 @@ class _ExitDuringWarmupProc(_FakeProc):
 class _StubbornProc:
     """Ignores SIGTERM until killed; models the stop() escalation path."""
 
+    pid = 4252
+
     def __init__(self):
         self.killed = False
 
@@ -176,12 +178,11 @@ def test_bench_warmup_retries_then_succeeds(monkeypatch):
         srv.log_path.unlink(missing_ok=True)
 
 
-@pytest.mark.parametrize("mod", [harness])
-def test_stop_unlinks_temp_log(mod):
-    # Parametrized over the SHARED implementation once: after the dedup,
-    # neither wrapper subclass overrides stop(), so per-subclass rows would
-    # replay the same inherited contract twice.
-    srv = _server(mod.Server)
+def test_stop_unlinks_temp_log():
+    # The shared implementation directly: after the dedup, neither wrapper
+    # subclass overrides stop(), so per-subclass rows would replay the same
+    # inherited contract twice.
+    srv = _server(harness.Server)
     log_path = srv.log_path
     srv.stop()
     assert not log_path.exists()
@@ -348,3 +349,193 @@ def test_gate_fails_on_divergence_or_low_skip():
 
     ok, reasons = bench._gate_ok([_leg("token-identical")], 50, {"restart-turn2": 1})
     assert not ok and any("50% < 90%" in r for r in reasons)
+
+
+def test_gate_fails_on_reuse_errors():
+    """A measured leg that logged reuse errors must fail the gate even when
+    its disk_hits delta is positive.
+
+    Value: protects=_gate_ok treats any reuse_errors delta > 0 on a measured
+    leg as a failure; fails_when=_gate_ok ignores the reuse_errors argument
+    (legs with reuse errors pass while hitting the disk); why_new=no other
+    test passes reuse_errors — the existing gate tests cover divergence,
+    low skip and missing disk hits, so deleting this branch stays green;
+    seam=none (pure function, real _gate_ok); no_claim=none beyond protects.
+    """
+    results = [_leg("token-identical") for _ in range(5)]
+    ok, reasons = bench._gate_ok(
+        results,
+        93,
+        {"restart-turn2": 1, "second-turn2": 1},
+        {"restart-turn2": 2, "second-turn2": 0},
+    )
+    assert not ok
+    assert any("reuse errors on measured legs" in r for r in reasons)
+
+    # Control: the same clean legs with no reuse errors still pass.
+    ok, _ = bench._gate_ok(results, 93, {"restart-turn2": 1, "second-turn2": 1})
+    assert ok
+
+
+def test_warmup_mode_typo_fails_before_spawn(monkeypatch):
+    """Value: protects=WrapperServer rejects an unknown warmup mode with a
+    ValueError BEFORE spawning the child; fails_when=validation runs after
+    super().__init__ (a typo'd mode leaks the spawned process and its log) or
+    is absent (silently selects the chat probe); why_new=the wiring test pins
+    the two valid modes, not the rejection; seam=none; no_claim=none beyond
+    protects."""
+    spawned = []
+
+    def no_spawn(*_a, **_k):
+        spawned.append(1)
+        raise AssertionError("constructor must not spawn on an invalid mode")
+
+    monkeypatch.setattr(harness.subprocess, "Popen", no_spawn)
+    with pytest.raises(ValueError, match="warmup mode"):
+        harness.WrapperServer("store", "model", 1234, warmup="Chat")
+    assert spawned == []
+
+
+def test_delta_fails_loudly_on_a_missing_counter():
+    """Value: protects=stats_delta (shared via _harness and re-exported by
+    both wrappers) raises when /mlxcache/stats omits a counter instead of
+    coercing it to zero; fails_when=the `or 0` coercion returns (a missing
+    disk_hits reads as 'no hits' and can pass a gate on a half-broken stats
+    endpoint); why_new=no test covers stats_delta; seam=none; no_claim=none
+    beyond protects."""
+    with pytest.raises(RuntimeError, match="did not report 'disk_hits'"):
+        qa._delta({}, {"reuse_errors": 0}, "disk_hits")
+    with pytest.raises(RuntimeError, match="did not report 'disk_hits'"):
+        qa._delta({"disk_hits": 1}, {}, "disk_hits")
+    assert qa._delta({"disk_hits": 2}, {"disk_hits": 5}, "disk_hits") == 3
+    assert qa._delta is harness.stats_delta
+    assert bench.stats_delta is harness.stats_delta
+
+
+def test_warmup_prompt_is_unique_per_child(monkeypatch):
+    """Value: protects=each spawned server's warmup probe prompt embeds its
+    OWN child pid (a constant prompt is published by the first server and
+    disk-hit by every later one during warmup, corrupting cumulative
+    disk_hits counters before any measured request); fails_when=the prompt
+    reverts to a constant string; why_new=the wiring test pins mode/base/
+    argv but not the prompt body; seam=none; no_claim=none beyond protects."""
+    bodies = []
+
+    class _P:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def poll(self):
+            return 0
+
+        def send_signal(self, _sig):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    for pid in (111, 222):
+
+        def fake_popen(*a, _pid=pid, **k):
+            return _P(_pid)
+
+        monkeypatch.setattr(harness.subprocess, "Popen", fake_popen)
+        srv = harness.WrapperServer("store", "model", 1, warmup="post")
+        monkeypatch.setattr(
+            srv, "post", lambda path, body, timeout=600: bodies.append(body) or (200, {})
+        )
+        monkeypatch.setattr(srv, "health_ok", lambda timeout: None)
+        srv._warmup(5.0)
+        srv.stop()
+    assert "111" in bodies[0]["messages"][0]["content"]
+    assert "222" in bodies[1]["messages"][0]["content"]
+    assert bodies[0]["messages"][0]["content"] != bodies[1]["messages"][0]["content"]
+
+
+def test_stop_warns_when_child_survives_sigkill(capsys):
+    """Value: protects=stop() prints a warning when the child survives
+    SIGKILL instead of returning silently; fails_when=the survived-branch
+    warning is dropped (a leaked process goes unreported while its log is
+    unlinked); why_new=the escalation test's child dies on kill, so the
+    survivor branch is never reached; seam=none; no_claim=none beyond
+    protects."""
+
+    class _UnkillableProc(_StubbornProc):
+        def kill(self):
+            self.killed = True  # but poll() below keeps reporting "alive"
+
+        def poll(self):
+            return None
+
+    srv = _server(harness.Server)
+    srv.proc = _UnkillableProc()
+    log_path = srv.log_path
+    srv.stop()
+    err = capsys.readouterr().err
+    assert "survived SIGKILL" in err
+    assert not log_path.exists()  # the leak warning must not skip cleanup
+
+
+def test_health_ok_requires_200(monkeypatch):
+    """Value: protects=health_ok raises on a non-200 status instead of
+    treating any response as healthy; fails_when=the status check is removed
+    (a 5xx listener reads as ready); why_new=only the 200 path was ever
+    faked; seam=none; no_claim=none beyond protects."""
+
+    class _Fake500:
+        status = 500
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    srv = _server(harness.Server)
+    monkeypatch.setattr(harness.urllib.request, "urlopen", lambda *a, **k: _Fake500())
+    try:
+        with pytest.raises(RuntimeError, match="health 500"):
+            srv.health_ok(1.0)
+    finally:
+        srv.log_fh.close()
+        srv.log_path.unlink(missing_ok=True)
+
+
+def test_stream_enforces_its_total_deadline():
+    """Value: protects=Server.stream raises when the SSE stream exceeds its
+    total budget even though no single read times out (a server dripping one
+    frame per few seconds would hang the harness forever); fails_when=the
+    monotonic deadline check is removed (only the per-read socket timeout
+    remains); why_new=no test reaches the deadline branch; seam=none (local
+    HTTP server, real stream path); no_claim=none beyond protects."""
+    import http.server
+    import threading
+
+    class _DripHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            # Frames arrive FASTER than the socket timeout but the stream
+            # never ends: only the monotonic total-deadline check can stop
+            # consumption (a per-read timeout would never fire).
+            for _ in range(100):
+                self.wfile.write(b'data: {"token": "a"}\n\n')
+                self.wfile.flush()
+                time.sleep(0.05)
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _DripHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = harness.Server.__new__(harness.Server)
+    client.base = f"http://127.0.0.1:{srv.server_port}"
+    try:
+        with pytest.raises(RuntimeError, match="total budget"):
+            client.stream("/v1/chat/completions", {}, timeout=0.3)
+    finally:
+        srv.shutdown()

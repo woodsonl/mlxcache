@@ -36,6 +36,7 @@ from _harness import (  # noqa: E402 — path insert above
     WrapperServer,
     free_port,
     resolve_model,
+    stats_delta,
 )
 
 RESULTS: list[tuple[str, str, str]] = []
@@ -122,12 +123,7 @@ def _grown_body(chat_body: dict, chat1: str) -> dict:
     }
 
 
-def _delta(pre: dict, post: dict, key: str) -> int:
-    # `or 0` coercion reads a MISSING counter as "zero hits" — the opposite
-    # of what a gate wants. Fail loudly instead.
-    if pre.get(key) is None or post.get(key) is None:
-        raise RuntimeError(f"/mlxcache/stats did not report {key!r}: cannot gate on it")
-    return post[key] - pre[key]
+_delta = stats_delta
 
 
 def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, port):
@@ -186,6 +182,11 @@ def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, 
             post = srv2.stats() or {}
             hits = _delta(pre, post, "disk_hits")
             expect(hits > 0, f"restart served without a disk hit (delta disk_hits={hits})")
+            errors = _delta(pre, post, "reuse_errors")
+            expect(
+                errors == 0,
+                f"restart leg logged reuse errors (delta reuse_errors={errors})",
+            )
 
     @probe("Q5 disk-resume identity (second fresh process)")
     def _():
@@ -205,6 +206,11 @@ def _run_suite(srv, state, chat_body, stream_body, comp_body, store_dir, model, 
             post = srv3.stats() or {}
             hits = _delta(pre, post, "disk_hits")
             expect(hits > 0, f"second process served without a disk hit (delta disk_hits={hits})")
+            errors = _delta(pre, post, "reuse_errors")
+            expect(
+                errors == 0,
+                f"second process logged reuse errors (delta reuse_errors={errors})",
+            )
 
     @probe("Q7 store hygiene")
     def _():
