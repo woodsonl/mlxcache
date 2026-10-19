@@ -295,8 +295,14 @@ class ShardCatalog:
     def _handle_for(self, shard: str) -> int:
         cached = self._handles.get(shard)
         if cached is None:
-            cached = os.open(self.root / shard, os.O_RDONLY)
-            self._handles[shard] = cached
+            fd = os.open(self.root / shard, os.O_RDONLY)
+            # setdefault is atomic under the GIL: when two worker threads race
+            # the open, the loser closes its own fd instead of leaking the one
+            # the winner registered.
+            existing = self._handles.setdefault(shard, fd)
+            if existing != fd:
+                os.close(fd)
+            cached = existing
         return cached
 
     def array(self, entry: TensorEntry) -> mx.array:

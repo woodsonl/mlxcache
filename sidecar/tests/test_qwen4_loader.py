@@ -743,11 +743,14 @@ def test_lru_stores_evaluated_values_safe_across_threads(synthetic):
     def consumer():
         try:
             for _ in range(64):
-                keys = list(lru._items)
-                for k in keys:
+                # Snapshot under the lock: iterating a dict that concurrent
+                # puts are mutating raises on its own and would test nothing.
+                with lru._lock:
+                    snapshot = [(k, v[0]) for k, v in lru._items.items()]
+                for _, value in snapshot:
                     # Evaluating another thread's cached graph on THIS thread
                     # is the crash the eval-before-store rule prevents.
-                    mx.eval(lru._items[k][0])
+                    mx.eval(value)
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 

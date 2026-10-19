@@ -1132,3 +1132,22 @@ def test_settle_cap_of_zero_refuses_rather_than_disables(monkeypatch, tmp_path):
     assert report["reason"] == "size_cap"
     assert report["written"] is False
     assert not path.exists()
+
+
+def test_settle_caps_default_when_env_unset_or_malformed(monkeypatch):
+    # The caps bound on-disk writes; an unset or unparsable variable must
+    # keep the default, never silently disable them (a first version of the
+    # 0-refuses fix did exactly that).
+    from mlxcache_sidecar.server import (
+        SETTLE_MAX_BYTES_DEFAULT,
+        SETTLE_MAX_TOKENS_DEFAULT,
+        _settle_limits,
+    )
+
+    for name in ("MLXCACHE_SETTLE_MAX_TOKENS", "MLXCACHE_SETTLE_MAX_BYTES"):
+        monkeypatch.delenv(name, raising=False)
+    assert _settle_limits() == (SETTLE_MAX_TOKENS_DEFAULT, SETTLE_MAX_BYTES_DEFAULT)
+
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_TOKENS", "not-a-number")
+    monkeypatch.setenv("MLXCACHE_SETTLE_MAX_BYTES", "")
+    assert _settle_limits() == (SETTLE_MAX_TOKENS_DEFAULT, SETTLE_MAX_BYTES_DEFAULT)

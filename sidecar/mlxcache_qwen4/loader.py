@@ -647,6 +647,10 @@ class CheckpointLoader:
             return cached
         scale_entry = self._catalog.entry(prefix + ".weight_scale")
         value = self._catalog.array(scale_entry).astype(mx.float32)
+        # Evaluated before caching: this dict is read from every worker
+        # thread, and a lazy graph built on one thread cannot be evaluated on
+        # another (the same rule _ByteLRU.put enforces).
+        mx.eval(value)
         # One 4-byte scalar per PLE layer, decoded once for the loader's life:
         # re-reading it on every row-cache miss added a catalog lookup, a file
         # read, and a host-to-device copy to each new n-gram run.

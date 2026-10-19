@@ -244,17 +244,18 @@ def _settle_limits() -> tuple[int | None, int | None]:
 
     An explicitly-set 0 means REFUSE EVERYTHING, not "no cap": `0` is the
     natural "turn this off" for the two knobs that bound on-disk writes, so
-    treating it as falsy-disabled would invert the operator's intent. Only an
-    unset (or unparsable) variable keeps the default."""
+    treating it as falsy-disabled would invert the operator's intent. An
+    unset or unparsable variable keeps the default — a malformed value must
+    never leave the caps silently off."""
 
-    def read(name: str, default: int) -> int | None:
+    def read(name: str, default: int) -> int:
         raw = os.environ.get(name)
         if raw is None or raw == "":
-            return None
+            return default
         try:
             return int(raw)
         except ValueError:
-            return None
+            return default
 
     return (
         read("MLXCACHE_SETTLE_MAX_TOKENS", SETTLE_MAX_TOKENS_DEFAULT),
@@ -400,9 +401,19 @@ def _is_daemon_staging_path(path: str) -> bool:
         return False
     parent = os.path.realpath(os.path.dirname(path) or ".")
     with _SETTLE_DIR_LOCK:
-        if _SETTLE_DIR_PIN[0] is None:
+        pinned = _SETTLE_DIR_PIN[0]
+        # A pinned directory that no longer exists means the daemon restarted
+        # against a different blob dir (the e2e suite does exactly this with
+        # tempdirs): re-pin rather than 400 every generate forever. The pin
+        # only ever changes when the old target is GONE, so a live daemon's
+        # directory can never be displaced by an attacker's.
+        if pinned is not None and pinned != parent and not os.path.isdir(pinned):
+            pinned = None
+            _SETTLE_DIR_PIN[0] = None
+        if pinned is None:
             _SETTLE_DIR_PIN[0] = parent
-        return _SETTLE_DIR_PIN[0] == parent
+            pinned = parent
+        return pinned == parent
 
 
 _SETTLE_DIR_LOCK = threading.Lock()
