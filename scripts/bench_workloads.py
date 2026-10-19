@@ -318,6 +318,15 @@ def _wait_listening(
             raise RuntimeError(f"child exited (code {rc}) before listening on {addr[0]}:{addr[1]}")
         with socket.socket() as s:
             if s.connect_ex(addr) == 0:
+                # Re-check AFTER a successful probe, outside the socket
+                # context: the child can die between accepting the probe
+                # and our return, and a listener that is not OUR child is
+                # exactly the wrong-stack trap the harness exists to avoid.
+                rc = _child_dead()
+                if rc is not None:
+                    raise RuntimeError(
+                        f"child exited (code {rc}) right after listening on {addr[0]}:{addr[1]}"
+                    )
                 return
         time.sleep(0.1)
     raise RuntimeError(f"nothing listened on {addr[0]}:{addr[1]} within {deadline_s}s")
