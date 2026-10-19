@@ -74,8 +74,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -522,7 +524,13 @@ class DaemonStack:
             RUST_LOG=os.environ.get("RUST_LOG", "warn"),
         )
         daemon_env.update(env_extra or {})
-        self.daemon = self._spawn_daemon(daemon_env)
+        try:
+            self.daemon = self._spawn_daemon(daemon_env)
+        except BaseException:
+            # The sidecar is already running; a daemon that failed to spawn
+            # must not strand it holding a port.
+            self.sidecar.stop()
+            raise
 
     def _spawn_daemon(self, env: dict) -> _DaemonServer:
         binary = REPO / "target/release/mlxcache-daemon"
@@ -1055,8 +1063,8 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                 # ~2s after boot at a 1s interval. Probing without this wait
                 # would measure the pre-eviction cache and label it pressure.
                 evicted = 0
-                before_stats = stack.stats()
-                if "evictions" not in before_stats or "checkpoints_published" not in before_stats:
+                noise_stats = stack.stats()
+                if "evictions" not in noise_stats or "checkpoints_published" not in noise_stats:
                     raise SystemExit(
                         "/stats did not report evictions/checkpoints_published: "
                         "a missing counter would reconcile as zero and route "
@@ -1176,6 +1184,26 @@ def print_table(rows: list[dict]) -> None:
         )
 
 
+def _chip_identity() -> str:
+    """Best-effort chip name for artifact provenance; empty when unknown."""
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001 — provenance must never fail a run
+        return ""
+
+
+def _daemon_spawn_mode() -> str:
+    """How the daemon child was spawned: prebuilt binary path or cargo run."""
+    binary = REPO / "target/release/mlxcache-daemon"
+    return str(binary) if binary.is_file() else "cargo run --release"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1250,6 +1278,28 @@ def main() -> int:
 
     artifact = {
         "model": model,
+        "provenance": {
+            "argv": sys.argv,
+            "source_revision": subprocess.run(
+                ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=REPO
+            ).stdout.strip()
+            or "unknown",
+            "source_dirty": bool(
+                subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    cwd=REPO,
+                ).stdout.strip()
+            ),
+            "machine": platform.machine(),
+            "system": platform.platform(),
+            "chip": _chip_identity(),
+            "daemon": _daemon_spawn_mode(),
+            "correctness": "premise guards enforced (serialization parity, "
+            "served==held, served<=declared, W5 trace+stats agreement; any "
+            "violation aborts before this artifact is written)",
+        },
         "prefix_tokens_requested": args.prefix_tokens,
         "questions": args.questions,
         "k": args.k,

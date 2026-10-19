@@ -81,8 +81,12 @@ much text is shared. `bench_prefix.py` therefore runs W1 **both ways**:
 | `W4` | fixed prefix + k unrelated requests between repeats, under a tight entry cap | **does the benefit survive cache pressure?** |
 | `W5` | the captured trace of the above, scored with `scripts/replay_trace.py` | trace and `/stats` must agree |
 
-Model, hardware, concurrency (1), input length and output cap are held constant
-across workloads. Every workload runs twice: **cold** (empty store, fresh
+Model, hardware, concurrency (1) and output cap are held constant across
+workloads; input length is held constant only WITHIN each workload's own
+cold/warm comparison — W1, W1np and W2 share the same ~1,975-token prefix
+while W3 deliberately uses short distinct prompts (decode-bound by design),
+so cross-workload rows are not input-length-controlled and are not
+comparable as such. Every workload runs twice: **cold** (empty store, fresh
 process) and **warm** (fresh process over the same store) — the cross-restart
 tier, which is what a persistent cache is for.
 
