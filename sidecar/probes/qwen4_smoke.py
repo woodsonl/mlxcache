@@ -71,9 +71,12 @@ def main() -> int:
     print(f"resident after  {engine.loader.stats()}", flush=True)
 
     # The resume claim: serialize the cache and continue from the reloaded copy.
+    # The name must carry the `.safetensors` extension: `load_prompt_cache`
+    # dispatches on the file name, not on the payload, so a BufferIO named
+    # otherwise fails to reload even though the bytes are valid.
     t0 = time.perf_counter()
     buffer = io.BytesIO()
-    buffer.name = "smoke.ckpt"
+    buffer.name = "smoke.safetensors"
     save_prompt_cache(buffer, cache)
     save = time.perf_counter() - t0
     payload = buffer.getvalue()
