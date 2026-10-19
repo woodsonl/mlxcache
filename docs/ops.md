@@ -105,6 +105,11 @@ Two consequences an operator sees:
   identity carries a `cache_layout` signature: a payload of one composition
   is never served to an engine that would deserialize it as another.
 
+Changing `MLXCACHE_ENGINE` while the daemon runs is NOT picked up: the
+daemon resolves engine identity (engine id, cache layout, quantization tier)
+once per process and keys every blob by it. To serve a different engine,
+restart the daemon after restarting the sidecar.
+
 ### Knobs
 
 | Variable | Default | Effect |
@@ -197,4 +202,6 @@ Sidecar (compatibility adapter):
 | MLXCACHE_Q4_EXPERT_RESIDENT_N | 0 | `qwen4-exp`: decoded experts per layer kept in an LRU |
 | MLXCACHE_Q4_PLE_CACHE_MB | 512 | `qwen4-exp`: byte budget for decoded PLE n-gram rows |
 | MLXCACHE_METAL_CACHE_MB | 1024 | MLX allocator cache limit in MB; 0 keeps the library default |
+| MLXCACHE_SETTLE_MAX_TOKENS | (unset) | cap on a settled checkpoint's token count. An explicitly set `0` REFUSES every settle (reason `token_cap`); unset keeps the default |
+| MLXCACHE_SETTLE_MAX_BYTES | (unset) | cap on a settled checkpoint's payload bytes. An explicitly set `0` REFUSES every settle (reason `size_cap`); unset keeps the default |
 | MLXCACHE_BENCH_REAL | (unset) | set to 1 for the real mlx-lm benchmark (needs a local model) |

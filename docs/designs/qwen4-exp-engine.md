@@ -1,7 +1,8 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) engine
 
-Status: in progress. This doc is the contract between the batches that build
-the engine: architecture port, weight loader, adapter, and cache integration.
+Status: implemented. The batches below (B2-B7) are built and measured; this
+doc is the design record and the boundary statement for what is not loaded
+(the bundled MTP head and vision tower).
 
 ## Scope
 
