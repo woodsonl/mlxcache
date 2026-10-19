@@ -111,6 +111,7 @@ def test_start_stack_spawns_prebuilt_daemon_not_cargo_run(monkeypatch, tmp_path)
 
     monkeypatch.setattr(bw.subprocess, "run", fake_run)
     monkeypatch.setattr(bw.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(bw, "_wait_listening", lambda addr, deadline_s=30.0: None)
 
     bw.start_stack(str(tmp_path))
 
@@ -121,6 +122,39 @@ def test_start_stack_spawns_prebuilt_daemon_not_cargo_run(monkeypatch, tmp_path)
     daemon_argv = events[-1][1]
     assert "cargo" not in daemon_argv
     assert str(daemon_argv[0]).endswith("target/release/mlxcache-daemon")
+
+
+def test_wait_healthy_rechecks_liveness_after_a_successful_probe():
+    """Regression: the probe can be answered by whatever now owns an explicit
+    port while our child died during it — the same window
+    _harness.Server.wait_ready closes with its post-probe poll."""
+
+    class _DiedDuringProbe:
+        def __init__(self):
+            self.probed = False
+
+        def poll(self):
+            return 17 if self.probed else None
+
+    daemon = _DiedDuringProbe()
+
+    class _Ok:
+        status = 200
+
+        def __enter__(self):
+            daemon.probed = True
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(bw.urllib.request, "urlopen", lambda *a, **k: _Ok())
+    try:
+        with pytest.raises(RuntimeError, match="exited during its readiness probe"):
+            bw.wait_healthy("http://127.0.0.1:1", daemon, deadline_s=2.0)
+    finally:
+        monkey.undo()
 
 
 def test_main_cleans_own_blob_dir_but_not_a_given_one(monkeypatch, tmp_path):

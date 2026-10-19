@@ -183,12 +183,22 @@ def wait_healthy(
                 raise RuntimeError(f"daemon exited during startup (code {rc}) at {url}")
         try:
             with urllib.request.urlopen(f"{url}/stats", timeout=1) as r:
-                if r.status == 200:
-                    return
+                routed = r.status == 200
         except urllib.error.HTTPError:
-            return  # routed response: daemon is up
+            routed = True  # routed response: daemon is up
         except Exception:  # noqa: BLE001 — not up yet
             time.sleep(0.2)
+            continue
+        # Post-probe liveness, OUTSIDE the retry's except (a raise inside it
+        # is swallowed into the retry loop) — the same window
+        # Server.wait_ready closes: a probe can be answered by whatever now
+        # owns an explicit port while our child died during it.
+        if daemon is not None:
+            rc = daemon.poll()
+            if rc is not None:
+                raise RuntimeError(f"daemon exited during its readiness probe (code {rc}) at {url}")
+        if routed:
+            return
     raise RuntimeError(f"daemon did not become healthy at {url}")
 
 
@@ -208,28 +218,43 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
     keeps partial-failure cleanup simple: once a child exists, every later
     failure path SIGTERMs it before re-raising, so a failed stack never
     strands a process holding a port."""
-    sidecar_port = _free_port()
-    env = dict(os.environ, MLXCACHE_TOKENIZE_GROW="growing conversation seed")
+    repo = str(Path(__file__).resolve().parents[1])
     subprocess.run(
         ["uv", "run", "cargo", "build", "--release", "-p", "mlxcache-daemon"],
         check=True,
-        cwd=str(Path(__file__).resolve().parents[1]),
+        cwd=repo,
     )
+    # The port is picked AFTER the build, immediately before its bind: a
+    # port picked earlier has its TOCTOU window widened from milliseconds to
+    # the length of the build. Same rule for both children.
+    sidecar_port = _free_port()
+    env = dict(os.environ, MLXCACHE_TOKENIZE_GROW="growing conversation seed")
     sidecar = subprocess.Popen(
         [
             "uv",
             "run",
             "python",
             "-c",
-            "import sys; sys.path.insert(0, 'sidecar'); "
+            # Absolute sidecar path + cwd=repo: invoked from another
+            # directory, `uv run` would resolve the wrong project and a
+            # relative 'sidecar' would not exist.
+            "import sys; sys.path.insert(0, "
+            f"{repo + '/sidecar'!r}); "
             "from mlxcache_sidecar import server; "
             "server.Handler.engine = server.make_engine('bench-model'); "
             f"server.BurstServer(('127.0.0.1', {sidecar_port}), "
             "server.Handler).serve_forever()",
         ],
         env=env,
+        cwd=repo,
     )
     try:
+        # Daemon-green is not stack-green: the daemon serves /stats locally,
+        # so a not-yet-listening sidecar hides behind it and the first
+        # workload request would die with an unattributable 5xx. The sidecar
+        # boots slower than the daemon (uv discovery + interpreter +
+        # imports), so prove it is LISTENING before the daemon exists.
+        _wait_listening(("127.0.0.1", sidecar_port), deadline_s=30.0)
         daemon_port = _free_port()
         daemon = subprocess.Popen(
             [
@@ -253,6 +278,19 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
                 sidecar.wait(timeout=KILL_WAIT_S)
         raise
     return sidecar, daemon, daemon_port
+
+
+def _wait_listening(addr: tuple[str, int], deadline_s: float) -> None:
+    """Block until something accepts TCP connections on addr."""
+    import socket
+
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        with socket.socket() as s:
+            if s.connect_ex(addr) == 0:
+                return
+        time.sleep(0.1)
+    raise RuntimeError(f"nothing listened on {addr[0]}:{addr[1]} within {deadline_s}s")
 
 
 def main() -> int:
