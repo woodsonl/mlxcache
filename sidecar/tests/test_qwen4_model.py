@@ -296,6 +296,76 @@ def test_hyper_streams_are_tiled_not_interleaved(bundle):
         )
 
 
+def test_expert_major_routing_matches_token_major_accumulation(bundle):
+    """Grouping assignments by expert must not change the MoE arithmetic.
+
+    The block visits each routed expert once and applies it to every token that
+    selected it, because a routed expert is read and dequantized on demand and a
+    token-major walk re-reads the same expert once per token. Grouping is only
+    a scheduling change, so the result has to match the reference's per-token
+    weighted sum: same experts, same weights, same totals.
+
+    Tokens deliberately outnumber experts and `top_k` exceeds one, so experts
+    repeat across slots and tokens across experts — the cases where a grouping
+    bug (a dropped assignment, a double-counted one, a mispaired weight) would
+    show up. The comparison is against an independent token-major evaluation of
+    the same math, not against the block's own output.
+    """
+    import mlx.core as mx
+    from mlxcache_qwen4.model import _act, _linear
+
+    config, model = bundle["config"], bundle["model"]
+    block = model.layers[0].mlp
+    mx.random.seed(11)
+    x = mx.random.normal((2, 7, config.hidden_size)).astype(mx.bfloat16)
+    mx.eval(x)
+
+    got = block(x)
+    mx.eval(got)
+
+    # Reference arithmetic: route once, then accumulate per (token, slot).
+    flat = x.reshape(-1, config.hidden_size)
+    probs = mx.softmax(_linear(flat, block.gate).astype(mx.float32), axis=-1, precise=True)
+    indices = mx.argpartition(probs, kth=-block.top_k, axis=-1)[..., -block.top_k :]
+    scores = mx.take_along_axis(probs, indices, axis=-1)
+    if block.norm_topk_prob:
+        scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+    scores = scores.astype(x.dtype)
+
+    routed = mx.zeros_like(flat)
+    rows = []
+    for token in range(flat.shape[0]):
+        acc = mx.zeros_like(flat[token : token + 1])
+        for slot in range(block.top_k):
+            expert = int(indices[token, slot].item())
+            row = flat[token : token + 1]
+            gate = _act(block.activation, _linear(row, block._expert(expert, "gate_proj")))
+            up = _linear(row, block._expert(expert, "up_proj"))
+            down = _linear(gate * up, block._expert(expert, "down_proj"))
+            acc = acc + down * scores[token, slot]
+        routed[token] = acc
+        rows.append([int(indices[token, slot].item()) for slot in range(block.top_k)])
+
+    shared = _act(block.activation, _linear(flat, block.shared_gate_proj))
+    shared = _linear(shared * _linear(flat, block.shared_up_proj), block.shared_down_proj)
+    shared = mx.sigmoid(_linear(flat, block.shared_expert_gate)) * shared
+    want = (routed + shared).reshape(x.shape)
+    mx.eval(want)
+
+    # bf16 accumulation order legitimately differs between the two schedules, so
+    # the comparison is bounded relative error, not bit equality.
+    diff = mx.max(mx.abs(got.astype(mx.float32) - want.astype(mx.float32))).item()
+    scale = mx.max(mx.abs(want.astype(mx.float32))).item()
+    assert diff <= 1e-2 * max(scale, 1.0), (
+        f"expert-major routing diverged from token-major by {diff} (scale {scale})"
+    )
+
+    # The fixture must actually exercise repetition, or the test proves nothing.
+    assignments = [e for token in rows for e in token]
+    assert len(assignments) > len(set(assignments)), "fixture routed each expert at most once"
+    assert flat.shape[0] > config.num_experts, "fixture has fewer tokens than experts"
+
+
 def test_cache_layout_and_roundtrip(bundle):
     """The cache is mlx-lm's own classes and survives a save/load cycle intact."""
     import mlx.core as mx

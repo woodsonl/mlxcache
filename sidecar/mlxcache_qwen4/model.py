@@ -681,18 +681,31 @@ class Qwen4SparseMoeBlock(nn.Module):
             scores = scores / mx.sum(scores, axis=-1, keepdims=True)
         scores = scores.astype(x.dtype)
 
+        # Group (token, slot) assignments BY EXPERT before applying them. A routed
+        # expert is read and dequantized on demand, so iterating token-major
+        # re-reads every expert once per token that uses it: on a 256-token
+        # prefill that is 256 x 10 reads of 3 matrices per layer, and the same
+        # expert is dequantized ten times over. Expert-major makes it one read
+        # and one batched matmul per expert per layer, which is also how the
+        # reference accumulates (`index_add_` over the expert's token set).
         routed = mx.zeros_like(flat)
         tokens = flat.shape[0]
-        for token in range(tokens):
-            row = flat[token : token + 1]
-            acc = mx.zeros_like(row)
-            for slot in range(self.top_k):
-                expert = int(indices[token, slot].item())
-                gate = _act(self.activation, _linear(row, self._expert(expert, "gate_proj")))
-                up = _linear(row, self._expert(expert, "up_proj"))
-                down = _linear(gate * up, self._expert(expert, "down_proj"))
-                acc = acc + down * scores[token, slot]
-            routed[token] = acc
+        # Flatten (token, slot) pairs, then visit each DISTINCT expert once.
+        pair_token = mx.repeat(mx.arange(tokens), self.top_k)
+        pair_expert = indices.reshape(-1)
+        pair_score = scores.reshape(-1)
+        distinct = mx.array(sorted({int(e) for e in pair_expert.tolist()}), dtype=mx.int32)
+
+        for expert in distinct.tolist():
+            member = pair_expert == expert
+            picked = mx.argsort(mx.where(member, 0, 1))[: int(mx.sum(member).item())]
+            rows = mx.take(pair_token, picked, axis=0)
+            weights = mx.take(pair_score, picked, axis=0)
+            current = mx.take(flat, rows, axis=0)
+            gate = _act(self.activation, _linear(current, self._expert(expert, "gate_proj")))
+            up = _linear(current, self._expert(expert, "up_proj"))
+            down = _linear(gate * up, self._expert(expert, "down_proj"))
+            routed = routed.at[rows].add(down * weights[:, None])
 
         shared = _act(self.activation, _linear(flat, self.shared_gate_proj))
         shared = _linear(shared * _linear(flat, self.shared_up_proj), self.shared_down_proj)
