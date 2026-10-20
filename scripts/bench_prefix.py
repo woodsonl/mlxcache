@@ -1197,10 +1197,12 @@ def _chip_identity() -> str:
         return ""
 
 
-def _git_out(*args: str) -> str:
-    """Best-effort git query for artifact provenance: bounded (a hung git
-    must not stall the run), and empty on unavailable git, a non-repository,
-    or any nonzero exit — provenance must never fail a benchmark run."""
+def _git_out(*args: str) -> str | None:
+    """Best-effort, status-aware git query for artifact provenance: bounded
+    (a hung git must not stall the run). None means the command could NOT be
+    completed — unavailable git, a non-repository, a timeout, a nonzero exit;
+    an empty STRING is a successful empty result. Callers must not infer
+    "clean" from an empty output without checking for None first."""
     try:
         out = subprocess.run(
             ["git", *args],
@@ -1209,9 +1211,9 @@ def _git_out(*args: str) -> str:
             timeout=5,
             cwd=REPO,
         )
-        return out.stdout.strip() if out.returncode == 0 else ""
+        return out.stdout.strip() if out.returncode == 0 else None
     except Exception:  # noqa: BLE001 — provenance must never fail a run
-        return ""
+        return None
 
 
 def _daemon_spawn_mode() -> str:
@@ -1297,7 +1299,11 @@ def main() -> int:
         "provenance": {
             "argv": sys.argv,
             "source_revision": _git_out("rev-parse", "HEAD") or "unknown",
-            "source_dirty": bool(_git_out("status", "--porcelain")),
+            # None = the status query itself could not run (non-repo, no git,
+            # timeout): unknown, NOT inferred-clean from an empty output.
+            "source_dirty": (
+                None if (status := _git_out("status", "--porcelain")) is None else bool(status)
+            ),
             "machine": platform.machine(),
             "system": platform.platform(),
             "chip": _chip_identity(),
