@@ -3406,13 +3406,19 @@ async fn a_corrupted_v2_digest_blob_is_quarantined_by_the_rebuild() {
     );
     // The corrupted FILE is gone (reclaimed above), so nothing can resume
     // from it. The honest 8-token prefill prefix remains and may serve a hit
-    // — that is correct reuse, not a resume from bad KV.
+    // — that is correct reuse, not a resume from bad KV. prefill_from pins
+    // the distinction: the reclaimed 72-token blob would have resumed at 71.
     assert!(
         !settled.exists(),
         "the corrupted v2 blob file must be deleted"
     );
     let after = post_prompt(rebuilt.clone(), "corrupt me after publish").await;
     assert_eq!(after["status"], "ok");
+    assert_ne!(
+        after["mlxcache"]["prefill_from"].as_i64(),
+        Some(71),
+        "the reclaimed 72-token checkpoint must not be resumed: {after}"
+    );
 
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");

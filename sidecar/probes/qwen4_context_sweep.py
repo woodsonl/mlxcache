@@ -167,6 +167,11 @@ def main() -> int:
         return _child(args)
 
     sizes = sorted({int(s) for s in args.sizes.split(",")}, reverse=True)
+    if len(sizes) < 2:
+        # The ratios and the monotonicity check both compare a largest and a
+        # smallest sweep row; one size has neither pair.
+        print("REFUSING: the sweep needs at least two distinct sizes.", flush=True)
+        return 2
     control = sizes[-1]
     # Control first (repeatability before trust), then the sweep descending so
     # the coldest SWEEP run is the largest context; see the module docstring
@@ -210,6 +215,17 @@ def main() -> int:
             print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
             print(f"REFUSING: the {size}-token run produced an unreadable row.", flush=True)
             return 2
+        # machine_state() records None when the sysctl read fails; a None
+        # swap sample would TypeError the delta math below and present a
+        # machine failure as a probe crash.
+        if row["swap_before_mb"] is None or row["swap_after_mb"] is None:
+            print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
+            print(
+                f"REFUSING: the {size}-token run could not read swap state; "
+                "the swap guard cannot vouch for it.",
+                flush=True,
+            )
+            return 2
         row["control"] = is_control
         rows.append(row)
         delta = row["swap_after_mb"] - row["swap_before_mb"]
@@ -224,11 +240,15 @@ def main() -> int:
     control_rows = [r for r in rows if r["control"]]
     small, large = sweep_rows[-1], sweep_rows[0]
     prefill_ratio = large["prefill_s"] / small["prefill_s"]
-    decode_ratio = large["decode_s"] / small["decode_s"]
-    print(
-        f"\n{large['tokens']} vs {small['tokens']}: prefill {prefill_ratio:.2f}x, "
-        f"decode {decode_ratio:.2f}x"
-    )
+    print(f"\n{large['tokens']} vs {small['tokens']}: prefill {prefill_ratio:.2f}x", end="")
+    if large["decode_s"] > 0 and small["decode_s"] > 0:
+        decode_ratio = large["decode_s"] / small["decode_s"]
+        print(f", decode {decode_ratio:.2f}x")
+    else:
+        # --decode 0 (or sub-millisecond steps rounding to zero): no decode
+        # ratio exists to bound, and 0/0 must not masquerade as one.
+        decode_ratio = None
+        print(", decode n/a (disabled or below the clock)")
 
     failures: list[str] = []
     if len(control_rows) == 2:
@@ -244,7 +264,7 @@ def main() -> int:
                 "runs, so the machine cannot resolve the effect being measured."
             )
 
-    if decode_ratio > prefill_ratio:
+    if decode_ratio is not None and decode_ratio > prefill_ratio:
         failures.append(
             f"decode grew {decode_ratio:.2f}x but prefill only {prefill_ratio:.2f}x. "
             "Attention over the same positions cannot be the cause; the decode "

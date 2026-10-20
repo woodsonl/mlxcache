@@ -341,30 +341,9 @@ def settle_checkpoint(
     )
     wire = encode(meta, payload)
     digest = hashlib.sha256(payload).hexdigest()
-    # A unique sibling temp + os.replace keeps a concurrent reader (the daemon
-    # reading the staging file after this response) from ever seeing a torn
-    # write, without requiring the caller to coordinate a lock. mkstemp gives
-    # the uniqueness: a FIXED ".part" name would let two overlapping requests
-    # (a daemon retry racing an abandoned attempt) corrupt each other's temp.
-    tmp_path: str | None = None
     try:
-        fd, tmp_path = tempfile.mkstemp(
-            dir=os.path.dirname(settle_path) or ".",
-            prefix=os.path.basename(settle_path) + ".",
-            suffix=".part",
-        )
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(wire)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, settle_path)
+        _atomic_write(settle_path, wire)
     except OSError as exc:
-        # Leave nothing behind: a stranded temp in the blob dir would be
-        # invisible to every reader and accumulate per request. mkstemp can
-        # itself fail (a read-only blob dir), in which case there is no temp.
-        if tmp_path is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
         return {"written": False, "tokens": len(tokens), "reason": f"write_failed: {exc}"}
     return {
         "written": True,
@@ -373,6 +352,36 @@ def settle_checkpoint(
         "sha256": digest,
         "bytes": len(wire),
     }
+
+
+def _atomic_write(path: str, data: bytes) -> None:
+    """Write `data` to `path` so a concurrent reader (the daemon reading the
+    staging file after this response) never sees a torn write, without
+    requiring the caller to coordinate a lock. mkstemp gives the uniqueness:
+    a FIXED ".part" name would let two overlapping requests (a daemon retry
+    racing an abandoned attempt) corrupt each other's temp.
+
+    A failed write leaves nothing behind: a stranded temp in the blob dir
+    would be invisible to every reader and accumulate per request. mkstemp
+    can itself fail (a read-only blob dir), in which case there is no temp;
+    cleanup errors during that failure must not mask the original OSError."""
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".",
+            prefix=os.path.basename(path) + ".",
+            suffix=".part",
+        )
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except OSError:
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+        raise
 
 
 def _engine_id_meta(engine: object) -> str | None:
@@ -822,51 +831,46 @@ class SyntheticEngine:
             # reader still parses the header — the lie is caught by the
             # same_shape conjunct or the engine-domain check it targets,
             # never by a serde rejection that would make the test pass
-            # vacuously. temp+fsync+os.replace keeps the rewrite atomic,
-            # the same write contract settle_checkpoint itself honors.
+            # vacuously.
             import struct as _struct  # noqa: PLC0415
 
             from .blob import CheckpointMeta, Fingerprint, encode  # noqa: PLC0415
 
             if lie_field and lie_field not in Fingerprint.__dataclass_fields__:
                 raise ValueError(f"identity lie targets unknown field {lie_field!r}")
-            with open(settle_path, "rb") as fh:
-                payload = fh.read()
-            (hlen,) = _struct.unpack_from("<I", payload)
-            meta = json.loads(payload[4 : 4 + hlen])
-            if lie_field:
-                fp = dict(meta["fingerprint"])
-                current = fp[lie_field]
-                # Wrong VALUE, right TYPE: a str field gets a foreign hash,
-                # an int field a foreign count.
-                fp[lie_field] = "0" * 64 if isinstance(current, str) else current + 1
-                meta["fingerprint"] = fp
-            else:
-                # lie_engine: engine_id is a CheckpointMeta field, not a
-                # fingerprint field — a foreign engine DOMAIN, so the
-                # engine-domain guard fires while same_shape still agrees.
-                meta["engine_id"] = "llama-cpp"
-            fields = {k: v for k, v in meta.items() if k != "fingerprint"}
-            wire = encode(
-                CheckpointMeta(fingerprint=Fingerprint(**meta["fingerprint"]), **fields),
-                payload[4 + hlen :],
-            )
-            tmp_path: str | None = None
             try:
-                fd, tmp_path = tempfile.mkstemp(
-                    dir=os.path.dirname(settle_path) or ".",
-                    prefix=os.path.basename(settle_path) + ".",
-                    suffix=".part",
+                with open(settle_path, "rb") as fh:
+                    payload = fh.read()
+                (hlen,) = _struct.unpack_from("<I", payload)
+                meta = json.loads(payload[4 : 4 + hlen])
+                if lie_field:
+                    fp = dict(meta["fingerprint"])
+                    current = fp[lie_field]
+                    # Wrong VALUE, right TYPE: a str field gets a foreign
+                    # hash, an int field a foreign count.
+                    fp[lie_field] = "0" * 64 if isinstance(current, str) else current + 1
+                    meta["fingerprint"] = fp
+                else:
+                    # lie_engine: engine_id is a CheckpointMeta field, not a
+                    # fingerprint field — a foreign engine DOMAIN, so the
+                    # engine-domain guard fires while same_shape still
+                    # agrees.
+                    meta["engine_id"] = "llama-cpp"
+                fields = {k: v for k, v in meta.items() if k != "fingerprint"}
+                wire = encode(
+                    CheckpointMeta(fingerprint=Fingerprint(**meta["fingerprint"]), **fields),
+                    payload[4 + hlen :],
                 )
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(wire)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp_path, settle_path)
-            except OSError:
-                if tmp_path is not None:
-                    os.unlink(tmp_path)
-                raise
+                _atomic_write(settle_path, wire)
+            except OSError as exc:
+                # A rewrite that cannot complete is an unsuccessful settle —
+                # the same write_failed contract settle_checkpoint honors —
+                # never an exception through the generation path.
+                return {
+                    "written": False,
+                    "tokens": len(total),
+                    "reason": f"write_failed: {exc}",
+                }
         # Test knob (same family as MLXCACHE_GENERATE_FAIL): let a e2e spawn
         # an engine that lies about its digest, or omits it, so the daemon's
         # publish-time guards are exercised over the real HTTP path.

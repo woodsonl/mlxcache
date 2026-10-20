@@ -15,7 +15,25 @@ import sys
 import tempfile
 import textwrap
 
+import pytest
+
 _PROBES = os.path.join(os.path.dirname(__file__), "..", "probes")
+
+_LOCK_ENV_KEYS = ("MLXCACHE_Q4_PROBE_LOCK_PATH", "MLXCACHE_Q4_PROBE_LOCK")
+
+
+@pytest.fixture(autouse=True)
+def _restore_lock_env():
+    """_lock_module overrides LOCK_PATH through the environment at import,
+    and the bypass test flips MLXCACHE_Q4_PROBE_LOCK — one test's knobs must
+    never leak into the next, and keys that started unset stay unset."""
+    saved = {key: os.environ.get(key) for key in _LOCK_ENV_KEYS}
+    yield
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def _lock_module(lock_path: str):
