@@ -42,7 +42,11 @@ def checkpoint_lock(what: str) -> Iterator[None]:
         yield
         return
 
-    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    # dirname('') is '' for a bare filename override, and makedirs('') raises
+    # FileNotFoundError before any diagnostic names the bad path.
+    lock_dir = os.path.dirname(LOCK_PATH)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
     with open(LOCK_PATH, "a+") as fh:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -16,8 +16,13 @@ process per row gives every measurement the same starting conditions.
 Ordering matters for the other confounder. The weights stream from disk, so a
 run that measures ascending leaves its largest context measured with the
 warmest page cache -- which is exactly the row a long-context claim rests on.
-Sizes are measured descending, so the coldest run lands on the largest
-context and warming cannot manufacture a good number there.
+The plan below runs the smallest-size CONTROL first (repeatability must be
+observed before anything else is trusted), then the sweep sizes descending so
+the coldest SWEEP run lands on the largest context; the control's stream
+warms the page cache for the first sweep row, which biases the largest
+context's prefill DOWN (in its favor) by the amount of the warm-up. The
+before/after control pair bounds that bias, and the ratios are stated against
+the control's own rows so the headline cannot drift on warming.
 
 Self-checks, all refusing rather than warning:
 
@@ -108,12 +113,14 @@ def measure_one(checkpoint: str, size: int, decode_steps: int) -> dict[str, floa
     ttft = prefill + (time.perf_counter() - t0)
 
     step_times: list[float] = []
+    logits = None  # bound here: --decode 0 skips the loop, and the del below
+    # must not NameError away a successful measurement.
     for _ in range(decode_steps):
         t0 = time.perf_counter()
         logits = engine.model(mx.array([[prev]]), cache=cache)
         prev = int(mx.argmax(logits[0, -1]).item())
         step_times.append(time.perf_counter() - t0)
-    decode = statistics.median(step_times)
+    decode = statistics.median(step_times) if step_times else 0.0
 
     blob = io.BytesIO()
     # `load_prompt_cache` dispatches on the name, so keep the extension the
@@ -161,8 +168,9 @@ def main() -> int:
 
     sizes = sorted({int(s) for s in args.sizes.split(",")}, reverse=True)
     control = sizes[-1]
-    # Coldest first on the largest context; the control is measured before and
-    # after so repeatability is observed rather than assumed.
+    # Control first (repeatability before trust), then the sweep descending so
+    # the coldest SWEEP run is the largest context; see the module docstring
+    # for the warm-up bias that ordering admits and what bounds it.
     plan: list[tuple[int, bool]] = [
         (control, True),
         *((size, False) for size in sizes if size != control),
@@ -192,7 +200,16 @@ def main() -> int:
             print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
             print(f"REFUSING: the {size}-token run produced no measurement.", flush=True)
             return 2
-        row = json.loads(line[4:])
+        # A child killed mid-write (OOM inside the ROW print) or emitting
+        # garbage after "ROW " is a refusal, not a traceback: the sweep's
+        # whole job is comparable rows, and one bad child must not lose the
+        # measurements already collected.
+        try:
+            row = json.loads(line[4:])
+        except json.JSONDecodeError:
+            print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
+            print(f"REFUSING: the {size}-token run produced an unreadable row.", flush=True)
+            return 2
         row["control"] = is_control
         rows.append(row)
         delta = row["swap_after_mb"] - row["swap_before_mb"]

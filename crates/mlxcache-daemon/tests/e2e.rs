@@ -3417,3 +3417,56 @@ async fn a_corrupted_v2_digest_blob_is_quarantined_by_the_rebuild() {
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
 }
+
+#[tokio::test]
+async fn a_settle_whose_header_claims_a_foreign_engine_is_discarded() {
+    // The engine-domain guard: the staged header's engine id must match the
+    // engine that served this request, or a blob from another engine's key
+    // domain would publish into this one's. The lie stamps "llama-cpp" into
+    // the header with the payload untouched. Previously this guard had no
+    // e2e knob — the debt the unit set out to close named three guards and
+    // landed two.
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "engine")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "lie about engine").await;
+    assert_eq!(res["status"], "ok");
+
+    await_settle_publication(&state).await;
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8],
+        "{:?}",
+        blob_coverages(&state)
+    );
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn the_identity_lie_targets_one_same_shape_conjunct() {
+    // The same_shape check is a conjunction of six adapter-owned fields; a
+    // lie that swaps all of them proves the branch fires but not that any
+    // SINGLE comparison is live. This drives the cache_layout conjunct —
+    // the one isolating the hybrid engine's KV from a dense model's.
+    let (url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "identity:cache_layout")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "lie about cache_layout only").await;
+    assert_eq!(res["status"], "ok");
+
+    await_settle_publication(&state).await;
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8],
+        "{:?}",
+        blob_coverages(&state)
+    );
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}

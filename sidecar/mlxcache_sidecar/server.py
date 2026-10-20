@@ -793,12 +793,17 @@ class SyntheticEngine:
         if not generated:
             return {"written": False, "tokens": len(total), "reason": "no_generated_tokens"}
         lie = os.environ.get("MLXCACHE_SETTLE_LIE", "")
-        # The tokens/identity lies must change the FILE, not the report: the
-        # daemon cross-checks the staged header against the request, so these
-        # write a checkpoint whose header disagrees with what the engine
-        # reports, which is the exact shape the publish guards reject.
+        # The tokens/identity/engine lies must change the FILE, not the
+        # report: the daemon cross-checks the staged header against the
+        # request, so these write a checkpoint whose header disagrees with
+        # what the engine reports, the exact shape the publish guards reject.
+        # "identity:<field>" targets one same_shape conjunct individually;
+        # bare "identity" defaults to tokenizer_hash.
+        lie_field = None
+        if lie.startswith("identity"):
+            lie_field = lie.split(":", 1)[1] if ":" in lie else "tokenizer_hash"
         lie_tokens = lie == "tokens"
-        lie_identity = lie == "identity"
+        lie_engine = lie == "engine"
         written_tokens = list(total)
         if lie_tokens and len(written_tokens) >= 2:
             # Record a sequence one token LONGER than the one the engine
@@ -810,7 +815,7 @@ class SyntheticEngine:
             written_tokens,
             self._kv_bytes(written_tokens),
         )
-        if lie_identity and report.get("written"):
+        if (lie_field or lie_engine) and report.get("written"):
             # Rewrite the header with a foreign tokenizer: the payload bytes
             # are unchanged, so every digest check passes and ONLY the
             # identity guard can catch it.
