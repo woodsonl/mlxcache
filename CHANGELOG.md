@@ -12,19 +12,23 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   another measurement on the checkpoint instead of explaining the
   contamination afterward, and each context length is measured in its own
   process — MLX retains freed allocator memory, so one long-lived process
-  gave every row after the first less headroom than the row before it, and
-  ascending order measured the warmest page cache against the largest
-  context. One process per row gives every measurement the same starting
-  conditions; descending order puts the coldest run on the largest context.
+  gave every row after the first less headroom than the row before it. One
+  process per row gives every measurement the same starting conditions; the
+  sweep runs descending after a leading control row, so the coldest SWEEP
+  run lands on the largest context and the before/after control pair bounds
+  the warm-up bias that ordering admits.
 
 ### Fixed
 
-- **The settle publish guards are now e2e-covered end to end.** Two new
-  engine lie modes drive the header-token and identity guards over the real
-  HTTP path (a header recording a sequence one token longer than the engine
-  reports; a header claiming a foreign tokenizer with the payload bytes
-  untouched, so only the identity guard can catch it) — previously only the
-  digest guards had knobs, and these two shared the choke point unexercised.
+- **The settle publish guards are now e2e-covered end to end.** Three new
+  engine lie modes drive the three non-digest publish guards over the real
+  HTTP path: `tokens` (a header recording a sequence one token longer than
+  the engine reports), `identity[:field]` (a header claiming a foreign
+  value for ONE adapter-owned identity field, payload bytes untouched, so
+  only the same_shape conjunct under test can catch it), and `engine` (a
+  header stamped with a foreign engine domain, leaving identity intact).
+  Each guard was verified non-vacuous by mutation: disabling the guard
+  makes its test fail. Previously only the digest guards had knobs.
 - **Corrupted digest-bearing (v2) blobs are proven quarantined from disk.**
   An e2e corrupts a published v2 payload AFTER publication and rebuilds the
   index the way a restart does: the boot sweep reclaims the file (D1) and

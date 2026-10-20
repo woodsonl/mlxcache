@@ -1,28 +1,24 @@
-# Rust
-/target/
-**/*.rs.bk
 
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
+!.gstack/pregate.json
+.DS_Store
+.env
+.gstack/*
 .pytest_cache/
 .ruff_cache/
-
-# Design review scratch dirs (process artifacts, not repo content)
+.venv/
+*.egg-info/
+*.py[cod]
 *.review.*
-
-# macOS
-.DS_Store
-
-# Local env
-.env
-bench/*.json
-
+**/*.rs.bk
+/target/
+# Design review scratch dirs (process artifacts, not repo content)
 # gstack tool output (QA and deploy reports); children, not the dir itself,
-# so reviewed config files can be re-included below
-.gstack/*
-
 # lane declarations are reviewed repo config, not tool output
-!.gstack/pregate.json
+# Local env
+# macOS
+# Python
+# Rust
+# so reviewed config files can be re-included below
+bench/*.json
+probe.lock

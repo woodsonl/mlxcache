@@ -816,25 +816,57 @@ class SyntheticEngine:
             self._kv_bytes(written_tokens),
         )
         if (lie_field or lie_engine) and report.get("written"):
-            # Rewrite the header with a foreign tokenizer: the payload bytes
-            # are unchanged, so every digest check passes and ONLY the
-            # identity guard can catch it.
+            # Rewrite the header so exactly ONE guard can catch it: the
+            # payload bytes are untouched (every digest check passes), and
+            # the forged value keeps the field's own type so the daemon's
+            # reader still parses the header — the lie is caught by the
+            # same_shape conjunct or the engine-domain check it targets,
+            # never by a serde rejection that would make the test pass
+            # vacuously. temp+fsync+os.replace keeps the rewrite atomic,
+            # the same write contract settle_checkpoint itself honors.
             import struct as _struct  # noqa: PLC0415
 
             from .blob import CheckpointMeta, Fingerprint, encode  # noqa: PLC0415
 
+            if lie_field and lie_field not in Fingerprint.__dataclass_fields__:
+                raise ValueError(f"identity lie targets unknown field {lie_field!r}")
             with open(settle_path, "rb") as fh:
                 payload = fh.read()
             (hlen,) = _struct.unpack_from("<I", payload)
             meta = json.loads(payload[4 : 4 + hlen])
-            meta["fingerprint"]["tokenizer_hash"] = "0" * 64
+            if lie_field:
+                fp = dict(meta["fingerprint"])
+                current = fp[lie_field]
+                # Wrong VALUE, right TYPE: a str field gets a foreign hash,
+                # an int field a foreign count.
+                fp[lie_field] = "0" * 64 if isinstance(current, str) else current + 1
+                meta["fingerprint"] = fp
+            else:
+                # lie_engine: engine_id is a CheckpointMeta field, not a
+                # fingerprint field — a foreign engine DOMAIN, so the
+                # engine-domain guard fires while same_shape still agrees.
+                meta["engine_id"] = "llama-cpp"
             fields = {k: v for k, v in meta.items() if k != "fingerprint"}
             wire = encode(
                 CheckpointMeta(fingerprint=Fingerprint(**meta["fingerprint"]), **fields),
                 payload[4 + hlen :],
             )
-            with open(settle_path, "wb") as fh:
-                fh.write(wire)
+            tmp_path: str | None = None
+            try:
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=os.path.dirname(settle_path) or ".",
+                    prefix=os.path.basename(settle_path) + ".",
+                    suffix=".part",
+                )
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(wire)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, settle_path)
+            except OSError:
+                if tmp_path is not None:
+                    os.unlink(tmp_path)
+                raise
         # Test knob (same family as MLXCACHE_GENERATE_FAIL): let a e2e spawn
         # an engine that lies about its digest, or omits it, so the daemon's
         # publish-time guards are exercised over the real HTTP path.
