@@ -86,9 +86,11 @@ workloads; input length is held constant only WITHIN each workload's own
 cold/warm comparison — W1, W1np and W2 share the same ~1,975-token prefix
 while W3 deliberately uses short distinct prompts (decode-bound by design),
 so cross-workload rows are not input-length-controlled and are not
-comparable as such. Every workload runs twice: **cold** (empty store, fresh
-process) and **warm** (fresh process over the same store) — the cross-restart
-tier, which is what a persistent cache is for.
+comparable as such. Each workload in the cold/warm grid below (W1, W1np,
+W2, W3) runs twice: **cold** (empty store, fresh process) and **warm**
+(fresh process over the same store) — the cross-restart tier, which is what
+a persistent cache is for. W4 (pressure) and W5 (trace/stat agreement) are
+adversarial validation arms, not part of the cold/warm comparison.
 
 The `direct` arm runs the same requests against plain `mlx_lm.server`, whose
 `LRUPromptCache` is process-local and therefore cold after every restart. That

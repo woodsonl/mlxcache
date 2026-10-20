@@ -1157,6 +1157,13 @@ async fn publish_settled_blob(
         tracing::debug!("not settling: startup recovery incomplete");
         return;
     }
+    // Same fail-closed rule as route() and publish_leader_blob: the "missing"
+    // tokenizer sentinel is a non-persistent identity, so a settled blob
+    // under it must not be read, verified, or published.
+    if fingerprint.tokenizer_hash == "missing" {
+        tracing::debug!("not settling: adapter reported no vocabulary identity");
+        return;
+    }
     let mut total: Vec<u32> = Vec::with_capacity(request_tokens.len() + generated.len());
     total.extend_from_slice(request_tokens);
     total.extend_from_slice(generated);

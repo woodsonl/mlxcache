@@ -267,7 +267,13 @@ class PersistentPromptCache(LRUPromptCache):
             # coverage convention (see module docstring); sub-2 streams
             # cover nothing (§3.2).
             return
+        # Resolve the store identity FIRST: an unresolved identity pays for
+        # no persistence work at all — the deepcopy/trim/save below would
+        # process a multi-GB cache only for the put to be refused at the end.
         try:
+            fp = self._persistent_fp(model)
+            if fp is None:
+                return  # unresolved identity: never persist under a sentinel
             from mlx_lm.models.cache import (  # noqa: PLC0415
                 can_trim_prompt_cache,
                 trim_prompt_cache,
@@ -282,9 +288,6 @@ class PersistentPromptCache(LRUPromptCache):
                 return  # could not trim exactly one position: do not persist
             payload = self._save(trimmed)
             if payload:
-                fp = self._persistent_fp(model)
-                if fp is None:
-                    return  # unresolved identity: never persist under a sentinel
                 self.store.put(ENGINE_ID, fp, list(tokens), payload)
                 self.persisted += 1
         except Exception:  # noqa: BLE001 — persistence failure never breaks serving

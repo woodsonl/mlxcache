@@ -121,6 +121,16 @@ def sse_lines(resp, timeout: float):
     a torn multi-byte char should not kill a stream whose budget was fine)."""
     deadline = time.monotonic() + timeout
     sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
+    if sock is None:
+        # Without the socket handle the per-read settimeout below cannot run;
+        # reads are then bounded only by the urlopen timeout (the full
+        # budget), so the total bound still holds but one read may consume
+        # all of it. Say so once instead of silently degrading — a wrapper
+        # whose response object hides the socket deserves the visibility.
+        print(
+            "warning: SSE socket handle unavailable; per-read bounding skipped",
+            file=sys.stderr,
+        )
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:

@@ -130,6 +130,18 @@ impl Orchestrator {
         request_fingerprint: &ModelFingerprint,
         engine_id: Option<&str>,
     ) -> RouteOutcome {
+        // The "missing" tokenizer sentinel is a NON-PERSISTENT identity: the
+        // adapter could not establish a vocabulary identity, so nothing in
+        // the store belongs to it. Scratch before the lookup — an adoption
+        // from a legacy blob that happens to share the sentinel would serve
+        // KV no resolved identity can justify.
+        if request_fingerprint.tokenizer_hash == "missing" {
+            return RouteOutcome {
+                decision: mlxcache_core::policy::scratch_decision(tokens.len()),
+                blob: None,
+                prefill_from: 0,
+            };
+        }
         let lookup = self
             .index
             .lookup_with_engine(tokens, Some(request_fingerprint), engine_id);
@@ -1091,6 +1103,31 @@ mod tests {
         assert_eq!(
             orch.evict_cold(&persistence, 0, 0, std::time::Duration::ZERO),
             0
+        );
+    }
+
+    #[test]
+    fn route_scratches_a_missing_tokenizer_sentinel_even_on_a_hit() {
+        // The "missing" tokenizer hash is a non-persistent identity: even
+        // with a published entry at the exact prefix, a request carrying the
+        // sentinel must classify as scratch — the store's contents never
+        // belong to an identity the adapter could not establish.
+        let orch = Orchestrator::new();
+        publish(&orch, &[1, 2, 3], meta("m", 3), "blob", 1);
+        let mut sentinel = fp("m");
+        sentinel.tokenizer_hash = "missing".into();
+        let out = orch.route(&[1, 2, 3], &sentinel, None);
+        assert_eq!(out.decision.verdict, CacheVerdict::Miss);
+        assert!(
+            out.blob.is_none(),
+            "nothing is adoptable under the sentinel"
+        );
+        assert_eq!(out.prefill_from, 0);
+        // A resolved identity at the same prefix still hits: the gate is
+        // per-request, not a store-wide poison.
+        assert_eq!(
+            orch.route(&[1, 2, 3], &fp("m"), None).decision.verdict,
+            CacheVerdict::Hit
         );
     }
 }
