@@ -1114,6 +1114,7 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
         assert_eq!(res.status(), 200);
     }
 
+    await_settle_publication(&state).await;
     let ckpts: Vec<_> = std::fs::read_dir(blobs.path())
         .unwrap()
         .filter_map(|e| e.ok())
@@ -1131,7 +1132,6 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
         2,
         "exactly one blob per coverage node, no superseded generation: {ckpts:?}"
     );
-    await_settle_publication(&state).await;
     assert_eq!(blob_coverages(&state), vec![8, 72], "{ckpts:?}");
     for path in state.persistence.list_blobs().unwrap() {
         let (meta, _) = state.persistence.load(&path).unwrap();
