@@ -71,17 +71,29 @@ impl Persistence {
         for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !(name.starts_with(".settle-")
-                && (name.ends_with(".staging") || name.ends_with(".part")))
-            {
+            let is_staging = name.starts_with(".settle-")
+                && (name.ends_with(".staging") || name.ends_with(".part"));
+            // A publication killed between temp-create and rename strands a
+            // <hash>-<gen>.<pid>.<seq>.ckpt.tmp that no guard owns (detached
+            // tasks are cancelled at shutdown); same age rule, and
+            // list_blobs already excludes the suffix.
+            let is_publish_temp = name.ends_with(".ckpt.tmp");
+            if !(is_staging || is_publish_temp) {
                 continue;
             }
-            let stale = entry
+            let age = entry
                 .metadata()
                 .and_then(|m| m.modified())
                 .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age >= older_than);
+                .and_then(|t| t.elapsed().ok());
+            // At boot (threshold ZERO) nothing can be live, so a file whose
+            // age cannot be computed (mtime skew, stat failure) is stale too;
+            // under a recurring threshold, an unknown age conservatively
+            // spares the file.
+            let stale = match age {
+                Some(a) => a >= older_than,
+                None => older_than.is_zero(),
+            };
             if !stale {
                 continue;
             }

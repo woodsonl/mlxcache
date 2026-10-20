@@ -152,6 +152,28 @@ fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
             max_bytes = cfg.max_bytes,
             "eviction reaper disabled (set MLXCACHE_EVICT_INTERVAL_S and a cap to enable; blob growth is unbounded)"
         );
+        // Staging hygiene must not depend on the eviction knobs: abandoned
+        // settle files are invisible to list_blobs and otherwise strand until
+        // the next boot, so their age sweep runs on its own always-on ticker
+        // even when eviction itself is off.
+        let hygiene = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let hygiene = hygiene.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    // Same threshold logic evict_pass applies; mirrored here
+                    // because the knobs' defaults must stay the single source.
+                    hygiene.persistence.reap_stale_settle_staging(
+                        mlxcache_daemon::http::staging_hygiene_threshold(),
+                    )
+                })
+                .await;
+            }
+        });
         return;
     }
     tracing::info!(

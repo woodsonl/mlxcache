@@ -743,7 +743,7 @@ async fn chat_completions(
     // Non-streaming from here on: this call's scope owns the staging file, so a
     // destructor covers every early return (a failed generate, a refused
     // scratch retry) without a cleanup line at each one.
-    let staging = SettleStaging::new(settle_path.clone());
+    let mut staging = SettleStaging::new(settle_path.clone());
 
     // Generate: full context tokens, continuation from the request length.
     // The adapter opens the blob directly, so it needs the absolute path.
@@ -807,6 +807,14 @@ async fn chat_completions(
                     .await
                 {
                     Ok(t) => {
+                        // The RETRY wrote the file the engine's report
+                        // describes, so the request scope must adopt the
+                        // retry's guard and path: dropping it here would
+                        // delete the settled file before publication ever
+                        // reads it, and publishing through the first
+                        // attempt's path reads a file nobody (or a racing
+                        // abandoned writer) wrote.
+                        staging = retry_staging;
                         // Correct the aggregate only after the scratch retry
                         // succeeds: the covered KV counted at record() was never
                         // in hand. A 502 must not be counted as a served miss.
@@ -1282,6 +1290,17 @@ async fn publish_settled_blob(
         tokens = total.len(),
         "settled checkpoint published"
     );
+}
+
+/// The age after which a staging/publish-temp file belongs to no live
+/// request: the sidecar timeout bounds any sidecar call, and the margin
+/// covers the settle encode/write that follows generation inside it.
+pub fn staging_hygiene_threshold() -> std::time::Duration {
+    let sidecar_timeout = std::env::var("MLXCACHE_SIDECAR_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
+    std::time::Duration::from_secs(sidecar_timeout.saturating_add(60))
 }
 
 /// Remove a settle staging file, logging (never propagating) a failure.
@@ -2830,6 +2849,37 @@ mod tests {
         assert_eq!(prefix_hash(&a), prefix_hash(&[1, 2, 3, 4]));
         // Must exceed 64 bits (the 128-bit widening).
         assert!(prefix_hash(&a) > u64::MAX as u128);
+    }
+
+    #[test]
+    fn evict_pass_reaps_stale_staging_files() {
+        // The wiring (not the persistence function): a backdated staging file
+        // in the blob dir disappears on an evict pass while a fresh one
+        // survives, proving the recurring sweep actually runs where the
+        // abandoned-sidecar-request leak is fixed.
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::http::AppState {
+            orchestrator: crate::orchestrator::Orchestrator::new(),
+            singleflight: SingleFlight::new(),
+            stats: std::sync::Arc::new(crate::http::Stats::default()),
+            served_models: vec!["t".into()],
+            sidecar: None,
+            persistence: crate::persistence::Persistence::new(dir.path()).unwrap(),
+            trace: None,
+        };
+        let old = dir.path().join(".settle-9-9-9.staging");
+        std::fs::write(&old, b"orphan").unwrap();
+        let past = std::time::SystemTime::now()
+            - staging_hygiene_threshold()
+            - std::time::Duration::from_secs(60);
+        let f = std::fs::File::options().append(true).open(&old).unwrap();
+        f.set_modified(past).unwrap();
+        let fresh = dir.path().join(".settle-8-8-8.staging");
+        std::fs::write(&fresh, b"live").unwrap();
+
+        state.evict_pass(0, 0, std::time::Duration::ZERO);
+        assert!(!old.exists(), "backdated staging file reaped by the pass");
+        assert!(fresh.exists(), "fresh staging file spared");
     }
 
     #[test]

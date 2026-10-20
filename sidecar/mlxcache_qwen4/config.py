@@ -235,6 +235,7 @@ class Qwen4TextConfig:
 
     @classmethod
     def from_checkpoint(cls, config_dict: dict) -> Qwen4TextConfig:
+        """Build from the parsed `config.json` dict (wrapper or text subtree)."""
         # Single source of defaults: every scalar fallback below reads the
         # dataclass field default via _default(), never a second hand-typed
         # literal. Two disagreeing default sets meant a config.json missing a
@@ -280,7 +281,9 @@ class Qwen4TextConfig:
             ),
             rope_theta=float(rope.get("rope_theta", raw.get("rope_theta", _default("rope_theta")))),
             partial_rotary_factor=float(partial),
-            mrope_section=list(rope.get("mrope_section", [11, 11, 10])),
+            mrope_section=list(  # literal mirrors the dataclass default_factory below
+                rope.get("mrope_section", [11, 11, 10])
+            ),
             linear_conv_kernel_dim=int(
                 raw.get("linear_conv_kernel_dim", _default("linear_conv_kernel_dim"))
             ),
@@ -319,7 +322,9 @@ class Qwen4TextConfig:
             ),
             ngram_size=int(raw.get("ngram_size", _default("ngram_size"))),
             heads_per_ngram=int(raw.get("heads_per_ngram", _default("heads_per_ngram"))),
-            ngram_vocab_size_base=int(raw.get("ngram_vocab_size_base", 20_000_000)),
+            ngram_vocab_size_base=int(
+                raw.get("ngram_vocab_size_base", _default("ngram_vocab_size_base"))
+            ),
             make_ngram_vocab_size_divisible_by=int(
                 raw.get(
                     "make_ngram_vocab_size_divisible_by",

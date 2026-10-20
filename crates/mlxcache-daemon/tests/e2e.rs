@@ -3070,3 +3070,62 @@ async fn await_settle_publication(state: &Arc<AppState>) {
     }
     panic!("settle publication did not reach quiescence within 5s");
 }
+
+#[tokio::test]
+async fn scratch_retry_success_publishes_the_retrys_settle() {
+    // The retry writes its OWN staging path; publication must read that path,
+    // not the abandoned first attempt's. Before the guard transfer, the retry
+    // guard's Drop deleted the settled file before publication read it, and
+    // publication probed the first attempt's (usually nonexistent) file: the
+    // retry silently lost its settle.
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_GENERATE_FAIL_AT", "2")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    // Request 1 (generate call #1) succeeds and publishes a blob.
+    let first = post_prompt(state.clone(), "fail once then settle").await;
+    assert_eq!(
+        first["mlxcache"]["verdict"], "miss",
+        "first request body: {first}"
+    );
+    await_settle_publication(&state).await;
+
+    let first_settled_name = blob_with_coverage(&state, 72)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // Request 2 HITS that blob; its generate (call #2) fails, the daemon
+    // retries from scratch (call #3) and the retry's settle must publish.
+    let res = post_prompt(state.clone(), "fail once then settle").await;
+    assert_eq!(
+        res["status"], "ok",
+        "the scratch retry must serve the request: {res}"
+    );
+    assert_eq!(
+        res["settle"]["written"], true,
+        "the retry's own settle report must reach the response: {res}"
+    );
+
+    await_settle_publication(&state).await;
+    // A republish of the same 72-token node neither changes the file count
+    // nor the index's Published-state count (it replaces in place), so the
+    // proof is the FILE IDENTITY: a successful retry settle writes a NEW
+    // generation file and reclaims the old one. Before the guard transfer,
+    // the retry's guard deleted its own settled file before publication read
+    // it, so the old generation survived untouched.
+    let settled_now = blob_with_coverage(&state, 72)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(
+        settled_now, first_settled_name,
+        "the retry's settle must republish the node with a new generation"
+    );
+    assert_eq!(blob_coverages(&state), vec![8, 72]);
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
