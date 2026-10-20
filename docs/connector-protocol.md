@@ -132,15 +132,15 @@ gone raises `Unavailable(io)`.
     before compositions were recorded stays usable until the current engine
     rewrites its blobs (legacy-to-legacy only: the moment either side knows
     its composition, the comparison is exact).
+
+  This is not a compatibility grace period to be relaxed later: an engine
+  that reports no composition asserts it cannot prove compatibility, and
+  exact equality is the only safe reading of that assertion.
 - **Non-text content** `[CURRENT]`: an entry matches only when its
   `fingerprint.content_digest` equals the caller's, exactly. Unlike cache
   composition there is no legacy-tolerant branch: `""` asserts that the
   prefix carries no media, so it never matches a request that does and is
   never matched by one.
-
-  This is not a compatibility grace period to be relaxed later: an engine
-  that reports no composition asserts it cannot prove compatibility, and
-  exact equality is the only safe reading of that assertion.
 - **End-anchored rule** `[CURRENT in daemon]`: a request whose stream
   equals the entry's `tokens` through `len-1` but DIVERGES at the final
   token still matches — the payload covers exactly `0..matched_len-1`,
