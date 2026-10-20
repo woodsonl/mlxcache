@@ -128,15 +128,15 @@ gone raises `Unavailable(io)`.
     unrecorded-layout entry — nothing proves that payload has the shape the
     caller's engine will deserialize, and deserializing the wrong shape is
     silent wrong output, not an error;
-  - **Non-text content** `[CURRENT]`: an entry matches only when its
-  `fingerprint.content_digest` equals the caller's, exactly. Unlike cache
-  composition there is no legacy-tolerant branch: `""` asserts that the
-  prefix carries no media, so it never matches a request that does and is
-  never matched by one.
   - a request reporting `""` may be served a `""` entry, so a store written
     before compositions were recorded stays usable until the current engine
     rewrites its blobs (legacy-to-legacy only: the moment either side knows
     its composition, the comparison is exact).
+- **Non-text content** `[CURRENT]`: an entry matches only when its
+  `fingerprint.content_digest` equals the caller's, exactly. Unlike cache
+  composition there is no legacy-tolerant branch: `""` asserts that the
+  prefix carries no media, so it never matches a request that does and is
+  never matched by one.
 
   This is not a compatibility grace period to be relaxed later: an engine
   that reports no composition asserts it cannot prove compatibility, and

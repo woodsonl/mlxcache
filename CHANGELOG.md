@@ -16,7 +16,7 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   `cache_layout` rule, because an empty digest asserts "no media" rather than
   "unmeasured" — so neither direction cross-serves. Computed in the daemon,
   the only point that still sees the messages. Documented in
-  `docs/connector-protocol.md` §3.2/§4 with a shared cross-language golden.
+  `docs/connector-protocol.md` §2/§3.3/§4 with a shared cross-language golden.
 
 ## 0.2.1 — 2026-10-20
 
