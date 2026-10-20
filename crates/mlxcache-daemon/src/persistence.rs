@@ -227,6 +227,20 @@ impl Persistence {
                     reason: format!("meta parse: {e}"),
                 }
             })?;
+        // Same version policy as load(): the staged file is untrusted engine
+        // output, and a format the daemon cannot interpret must not publish.
+        // (The v2 payload digest is NOT re-verified here — the caller
+        // cross-checks the ENGINE-reported digest against the payload slice,
+        // which is the stronger guarantee for staging: it binds the file to
+        // this request, not just to itself.)
+        match meta.format_version {
+            1 | 2 => {}
+            v => {
+                return Err(PersistError::Corrupt {
+                    reason: format!("format version {v}"),
+                })
+            }
+        }
         Ok((meta, bytes, 4 + header_len))
     }
 
@@ -508,6 +522,26 @@ mod tests {
         p.publish_atomic(0x2, 1, meta(2), b"b").unwrap();
         fs::write(dir.path().join("stray.txt"), b"nope").unwrap();
         assert_eq!(p.list_blobs().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn read_staged_refuses_unknown_format_versions() {
+        // The staged file is untrusted engine output: a version the daemon
+        // cannot interpret must not reach publication (same policy as load).
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        let meta_bytes = br#"{"fingerprint":{"model_id":"m","tokenizer_hash":"h","kv_dtype":"f16","kv_layout_version":1},"token_count":2,"tokens":[1,2],"format_version":3}"#;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
+        blob.extend_from_slice(meta_bytes);
+        blob.extend_from_slice(b"kv");
+        let staged = dir.path().join(".settle-1-1-1.staging");
+        fs::write(&staged, &blob).unwrap();
+        let err = p.read_staged(&staged).unwrap_err();
+        assert!(
+            err.to_string().contains("format version 3"),
+            "reason: {err}"
+        );
     }
 
     #[test]

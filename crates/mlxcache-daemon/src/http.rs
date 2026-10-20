@@ -89,21 +89,11 @@ impl AppState {
         max_bytes: u64,
         anchor_window: std::time::Duration,
     ) -> usize {
-        // Staging files older than the sidecar timeout can belong to no live
-        // request (a live one's sidecar call would have completed or timed
-        // out within it), so the recurring reaper takes them too — the
-        // boot-only sweep left files written by an abandoned sidecar request
-        // stranded until restart.
-        let sidecar_timeout = std::env::var("MLXCACHE_SIDECAR_TIMEOUT_S")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(120);
-        // Margin covers the settle encode/write itself, which happens after
-        // generation inside the same request.
+        // Staging files older than the shared hygiene threshold can belong to
+        // no live request; the boot-only sweep left files written by an
+        // abandoned sidecar request stranded until restart.
         self.persistence
-            .reap_stale_settle_staging(std::time::Duration::from_secs(
-                sidecar_timeout.saturating_add(60),
-            ));
+            .reap_stale_settle_staging(staging_hygiene_threshold());
         let evicted =
             self.orchestrator
                 .evict_cold(&self.persistence, max_entries, max_bytes, anchor_window);
