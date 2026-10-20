@@ -487,7 +487,7 @@ impl Orchestrator {
             tokens: Vec<u32>,
             meta: mlxcache_core::contract::CheckpointMeta,
         }
-        let mut best: std::collections::HashMap<Vec<u32>, Candidate> =
+        let mut best: std::collections::HashMap<(Vec<u32>, String), Candidate> =
             std::collections::HashMap::new();
         let mut stale: Vec<String> = Vec::new();
         // Seed the generation floor from EVERY filename, before any I/O. A file
@@ -524,11 +524,20 @@ impl Orchestrator {
                         continue;
                     }
                     let generation = parse_generation(&name).unwrap_or(0);
-                    // Group by the index's ACTUAL key (the token prefix only): it
-                    // stores one entry per node, so two publications at the same
-                    // prefix (e.g. a tokenizer-hash change) must be reconciled
-                    // here too, or both survive selection and race for the node.
-                    let key = meta.tokens.clone();
+                    // Group by the index's ACTUAL key (the token prefix)
+                    // AND the engine domain: the index stores one entry per
+                    // node per engine, so two publications at the same
+                    // prefix must be reconciled here too, or both survive
+                    // selection and race for the node — but a qwen4-exp blob
+                    // and an mlx-lm blob at the same tokens are DIFFERENT
+                    // nodes and must never reconcile each other away. A
+                    // missing engine_id normalizes to the default engine
+                    // (legacy stores), matching the serde default.
+                    let engine_domain = meta
+                        .engine_id
+                        .clone()
+                        .unwrap_or_else(|| mlxcache_core::contract::DEFAULT_ENGINE.to_string());
+                    let key = (meta.tokens.clone(), engine_domain);
                     let cand = Candidate {
                         name,
                         generation,
