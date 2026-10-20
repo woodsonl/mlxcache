@@ -2,6 +2,22 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.2.2 — 2026-10-20
+
+### Added
+
+- **Cache keys bind non-text prompt content** (`content_digest`): the index
+  keys checkpoints on token ids, and media renders as ordinary ids (every
+  image is the same `<|image_pad|>`), so two different images at one prompt
+  produce an identical token prefix and different KV. `ModelFingerprint` gains
+  a sha256 over the request's non-text content parts, folded into the blob key
+  only when non-empty, so text-only traffic keeps byte-identical keys. The
+  serve rule is exact equality — stricter than the legacy-tolerant
+  `cache_layout` rule, because an empty digest asserts "no media" rather than
+  "unmeasured" — so neither direction cross-serves. Computed in the daemon,
+  the only point that still sees the messages. Documented in
+  `docs/connector-protocol.md` §3.2/§4 with a shared cross-language golden.
+
 ## 0.2.1 — 2026-10-20
 
 ### Fixed
@@ -36,7 +52,6 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   (a client disconnect cannot orphan the write), reads the staged file once,
   and hashes and writes the payload slice of that single buffer. The staged
   file's format version is validated before publication.
-
 ## 0.2.0 — 2026-10-19
 
 ### Added
@@ -89,22 +104,6 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   the pressure sweep reconciles its eviction wait (a timed-out sweep with
   a full store is tagged, never reported as a pressure result) and
   re-checks disk headroom per arm.
-
-## 0.2.2 — 2026-10-20
-
-### Added
-
-- **Cache keys bind non-text prompt content** (`content_digest`): the index
-  keys checkpoints on token ids, and media renders as ordinary ids (every
-  image is the same `<|image_pad|>`), so two different images at one prompt
-  produce an identical token prefix and different KV. `ModelFingerprint` gains
-  a sha256 over the request's non-text content parts, folded into the blob key
-  only when non-empty, so text-only traffic keeps byte-identical keys. The
-  serve rule is exact equality — stricter than the legacy-tolerant
-  `cache_layout` rule, because an empty digest asserts "no media" rather than
-  "unmeasured" — so neither direction cross-serves. Computed in the daemon,
-  the only point that still sees the messages. Documented in
-  `docs/connector-protocol.md` §3.2/§4 with a shared cross-language golden.
 
 ## 0.1.8 — 2026-10-19
 
