@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Template: before launchctl load, substitute the placeholders:
-     sed -e "s|__REPO_ROOT__|$(git rev-parse --show-toplevel)|" \
+     sed -e "s|__REPO_ROOT__|$(git rev-parse --show-toplevel)|" -e "s|__MODEL_ID__|mlx-community/Qwen2.5-7B-Instruct-4bit|" \
          -e "s|__HOME__|$HOME|g" docs/com.mlxcache.daemon.plist > /tmp/com.mlxcache.daemon.plist
      A literal __REPO_ROOT__ working directory will fail silently. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -25,7 +25,7 @@
     <string>127.0.0.1:8420</string>
     <!-- Set to the model(s) this daemon serves. Empty means every request 404s. -->
     <key>MLXCACHE_MODELS</key>
-    <string>REPLACE_WITH_MODEL_ID</string>
+    <string>__MODEL_ID__</string>
     <!-- Set to the sidecar base URL. Do not set an empty string: an empty
          value builds a client whose URLs are malformed. Omit the key entirely
          to run with no adapter (requests then 503 with a clear message). -->

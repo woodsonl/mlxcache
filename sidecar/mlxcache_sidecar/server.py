@@ -315,6 +315,11 @@ def settle_checkpoint(
         # read_wire_checkpoint): publishing it would index a checkpoint that
         # can never be resumed from.
         return {"written": False, "tokens": len(tokens), "reason": "too_short"}
+    if str(getattr(engine, "tokenizer_hash", "")) == "missing":
+        # No cryptographic vocabulary identity: the engine's fingerprint is
+        # the non-persistence sentinel, and a settled blob under it would
+        # key reusable KV on an unverifiable identity. Fail closed.
+        return {"written": False, "tokens": len(tokens), "reason": "identity_unavailable"}
     if max_tokens is not None and len(tokens) > max_tokens:
         return {"written": False, "tokens": len(tokens), "reason": "token_cap"}
     if not payload:
@@ -1033,13 +1038,18 @@ class MlxLmEngine:
         return "unknown"
 
     def _hash_vocab(self) -> str:
+        """Cryptographic digest of the tokenizer's vocabulary, or the
+        literal "missing" sentinel when the tokenizer exposes no
+        vocabulary. The previous fallback hashed name_or_path / the model
+        id — an identity two different tokenizers can share and a path the
+        cache must not pin: a non-cryptographic identity now fails CLOSED
+        (the sentinel disables persistence) instead of silently keying
+        reusable KV on a name."""
         vocab = getattr(self.tokenizer, "get_vocab", None)
-        if callable(vocab):
-            items = sorted(vocab().items())
-            payload = repr(items).encode()
-        else:
-            # Fall back to whatever identity the tokenizer exposes.
-            payload = repr(getattr(self.tokenizer, "name_or_path", self.model_id)).encode()
+        if not callable(vocab):
+            return "missing"
+        items = sorted(vocab().items())
+        payload = repr(items).encode()
         return hashlib.sha256(payload).hexdigest()[:16]
 
     def tokenize(self, prompt: str) -> list[int]:

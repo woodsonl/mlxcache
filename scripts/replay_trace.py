@@ -70,8 +70,17 @@ def score_records(records: list[dict], label: str) -> dict:
 
 
 def replay(records: list[dict], base: str) -> dict:
-    """Re-send every captured request verbatim; report the daemon's own tally."""
+    """Re-send every captured request verbatim; report the daemon's own tally.
+
+    Counters are reported as PER-PASS DELTAS: /stats is cumulative for the
+    process, so a second pass (or a pass against a warm daemon) must be
+    compared against its own baseline or every number after the first is
+    fiction.
+    """
     url = f"{base.rstrip('/')}/v1/chat/completions"
+    stats_url = f"{base.rstrip('/')}/stats"
+    with urllib.request.urlopen(stats_url, timeout=60) as r:
+        before = json.loads(r.read())
     walls: list[float] = []
     for i, rec in enumerate(records):
         body = json.dumps(
@@ -100,20 +109,28 @@ def replay(records: list[dict], base: str) -> dict:
                 file=sys.stderr,
             )
     time.sleep(0.2)
-    stats = json.loads(urllib.request.urlopen(f"{base.rstrip('/')}/stats", timeout=60).read())
+    with urllib.request.urlopen(stats_url, timeout=60) as r:
+        stats = json.loads(r.read())
+
+    def delta(key: str) -> int:
+        return stats.get(key, 0) - before.get(key, 0)
+
+    tokens_total = delta("tokens_total")
+    tokens_cached = delta("tokens_cached")
     return {
         "requests_sent": len(records),
         "wall_ms": walls,
         "daemon_stats": {
-            "requests": stats["requests"],
-            "hits": stats["hits"],
-            "misses": stats["misses"],
-            "partials": stats["partials"],
-            "tokens_total": stats["tokens_total"],
-            "tokens_cached": stats["tokens_cached"],
-            "hit_rate": stats["hit_rate"],
-            "checkpoints_published": stats.get("checkpoints_published", 0),
-            "evictions": stats.get("evictions", 0),
+            "requests": delta("requests"),
+            "hits": delta("hits"),
+            "misses": delta("misses"),
+            "partials": delta("partials"),
+            "tokens_total": tokens_total,
+            "tokens_cached": tokens_cached,
+            # Recomputed from THIS pass's deltas, not the cumulative rate.
+            "hit_rate": round(tokens_cached / tokens_total, 4) if tokens_total else 0.0,
+            "checkpoints_published": delta("checkpoints_published"),
+            "evictions": delta("evictions"),
         },
     }
 
