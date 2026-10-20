@@ -111,7 +111,7 @@ def test_start_stack_spawns_prebuilt_daemon_not_cargo_run(monkeypatch, tmp_path)
 
     monkeypatch.setattr(bw.subprocess, "run", fake_run)
     monkeypatch.setattr(bw.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(bw, "_wait_listening", lambda addr, deadline_s=30.0: None)
+    monkeypatch.setattr(bw, "_wait_listening", lambda addr, deadline_s=30.0, proc=None: None)
 
     bw.start_stack(str(tmp_path))
 
@@ -244,6 +244,12 @@ _STATS = {
 
 
 class _StatsResp:
+    """Successive reads return INCREASING partial counts: the growing-
+    conversation guard reads /stats before and after its loop and compares
+    deltas, so a static stub reads as zero progress."""
+
+    _reads = 0
+
     def __enter__(self):
         return self
 
@@ -251,7 +257,9 @@ class _StatsResp:
         return False
 
     def read(self):
-        return json.dumps(_STATS).encode()
+        _StatsResp._reads += 1
+        stats = dict(_STATS, partials=_STATS["partials"] + _StatsResp._reads)
+        return json.dumps(stats).encode()
 
 
 class _Args:

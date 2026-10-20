@@ -145,7 +145,11 @@ fn rebuild_skips_one_token_legacy_blob() {
     let report = orch.rebuild_from_disk(&p);
     assert_eq!(report.rebuilt, 0, "a one-token blob must not be indexed");
     assert_eq!(report.skipped, 1);
-    let out = orch.route(&[7], &mlxcache_daemon::orchestrator::test_support::fp("m"));
+    let out = orch.route(
+        &[7],
+        &mlxcache_daemon::orchestrator::test_support::fp("m"),
+        None,
+    );
     assert_eq!(
         out.decision.verdict,
         mlxcache_core::policy::CacheVerdict::Miss,
@@ -182,6 +186,7 @@ async fn restart_drops_streams_checkpoints_survive() {
     let out = orch.route(
         &[1, 2, 3, 4],
         &mlxcache_daemon::orchestrator::test_support::fp("m"),
+        None,
     );
     assert_eq!(
         out.decision.verdict,
@@ -261,11 +266,11 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
 
     // Exact hit after rebuild.
     assert_eq!(
-        orch.route(&[1, 2, 3, 4], &fp).decision.verdict,
+        orch.route(&[1, 2, 3, 4], &fp, None).decision.verdict,
         mlxcache_core::policy::CacheVerdict::Hit
     );
     // Extension -> partial hit at the persisted prefix.
-    let ext = orch.route(&[1, 2, 3, 4, 5, 6], &fp);
+    let ext = orch.route(&[1, 2, 3, 4, 5, 6], &fp, None);
     assert_eq!(
         ext.decision.verdict,
         mlxcache_core::policy::CacheVerdict::Partial
@@ -298,7 +303,7 @@ async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report = orch.rebuild_from_disk(&p);
     assert_eq!(report.rebuilt, 1, "one entry per prefix");
-    let out = orch.route(&[1, 2, 3, 4], &fp);
+    let out = orch.route(&[1, 2, 3, 4], &fp, None);
     let name = out.blob.as_ref().map(|(n, _, _)| n.as_str());
     assert_eq!(
         name,
@@ -331,7 +336,7 @@ async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
     let orch2 = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report2 = orch2.rebuild_from_disk(&p);
     assert_eq!(report2.rebuilt, 1);
-    let out2 = orch2.route(&[1, 2, 3, 4], &fp);
+    let out2 = orch2.route(&[1, 2, 3, 4], &fp, None);
     assert_eq!(
         out2.blob.as_ref().map(|(n, _, _)| n.as_str()),
         newer.file_name().map(|n| n.to_string_lossy()).as_deref(),
@@ -474,4 +479,93 @@ fn wait_with_timeout(
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+}
+
+#[test]
+fn two_engines_sharing_a_prefix_coexist_at_rebuild_and_runtime() {
+    // Cross-engine blobs at one token prefix are different cache nodes.
+    // Rebuild groups per (tokens, engine domain) so BOTH are indexed, and
+    // runtime publishing must not treat the second engine's checkpoint as a
+    // supersession of the first (the reclaim hook deletes blob files — a
+    // cross-engine firing would delete the other engine's KV).
+    use mlxcache_core::contract::CheckpointMeta;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p = mlxcache_daemon::persistence::Persistence::new(dir.path()).unwrap();
+    let tokens: Vec<u32> = vec![1, 2, 3, 4];
+    let f = mlxcache_daemon::orchestrator::test_support::fp("m");
+    let meta = |engine: Option<&str>| CheckpointMeta {
+        fingerprint: f.clone(),
+        token_count: tokens.len() as u64,
+        tokens: tokens.clone(),
+        format_version: 1,
+        payload_sha256: None,
+        engine_id: engine.map(str::to_string),
+        granularity: None,
+    };
+    let key_default = mlxcache_daemon::http::blob_key(&f, None, &tokens);
+    let key_qwen = mlxcache_daemon::http::blob_key(&f, Some("redacted-engine"), &tokens);
+    let default_blob = p
+        .publish_atomic(key_default, 1, meta(None), b"kv-default")
+        .unwrap();
+    let qwen_blob = p
+        .publish_atomic(key_qwen, 2, meta(Some("redacted-engine")), b"kv-qwen")
+        .unwrap();
+
+    let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let report = orch.rebuild_from_disk(&p);
+    assert_eq!(report.rebuilt, 2, "both domains index: {report:?}");
+    assert!(report.errors.is_empty());
+
+    let hit_default = orch.route(&tokens, &f, None);
+    assert_eq!(
+        hit_default.decision.verdict,
+        mlxcache_core::policy::CacheVerdict::Hit
+    );
+    let hit_qwen = orch.route(&tokens, &f, Some("redacted-engine"));
+    assert_eq!(
+        hit_qwen.decision.verdict,
+        mlxcache_core::policy::CacheVerdict::Hit
+    );
+    // Each engine resumes from ITS OWN blob, never the sibling's.
+    let default_name = default_blob
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let qwen_name = qwen_blob
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(hit_default
+        .blob
+        .as_ref()
+        .unwrap()
+        .0
+        .ends_with(&default_name));
+    assert!(hit_qwen.blob.as_ref().unwrap().0.ends_with(&qwen_name));
+
+    // Runtime: a fresh publish under the qwen domain at the SAME prefix must
+    // leave the default engine's blob file on disk.
+    let orch2 = mlxcache_daemon::orchestrator::Orchestrator::new();
+    let _ = orch2.rebuild_from_disk(&p);
+    let gen = orch2.reserve_generation();
+    let new_blob = p
+        .publish_atomic(key_qwen, gen, meta(Some("redacted-engine")), b"kv-qwen-v2")
+        .unwrap();
+    assert!(orch2.publish_checkpoint(
+        &p,
+        &tokens,
+        meta(Some("redacted-engine")),
+        new_blob.to_string_lossy().into_owned(),
+        gen,
+    ));
+    assert!(
+        default_blob.exists(),
+        "a cross-engine runtime publish must not reclaim the other engine's blob"
+    );
+    assert!(
+        orch2.route(&tokens, &f, None).decision.verdict == mlxcache_core::policy::CacheVerdict::Hit
+    );
 }

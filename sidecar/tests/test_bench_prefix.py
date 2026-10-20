@@ -304,8 +304,9 @@ def test_join_trace_refuses_a_short_capture(tmp_path):
     trace = tmp_path / "t.jsonl"
     trace.write_text(json.dumps({"n_tokens": 5, "verdict": "miss", "matched_tokens": 0}) + "\n")
     samples = [{"label": "a", "prompt_tokens": 5, "declared_lcp": 0, "served": 0}] * 2
-    with pytest.raises(RuntimeError, match="trace has 1 records"):
-        bench.join_trace(samples, str(trace), base_n=0)
+    with pytest.raises(RuntimeError, match="trace has 1 records") as excinfo:
+        bench.join_trace(samples, str(trace), base_n=0, timeout_s=0.2)
+    assert "1 records for 2" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------

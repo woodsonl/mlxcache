@@ -88,7 +88,9 @@ The R1-5 measurement gate records all three components separately so a budget mi
 ## Eviction policy (v1)
 
 - Anchors (checkpoints a live session can extend) are never evicted (ds4 lesson).
-- Cold, non-extendable blobs evicted first, larger blobs first among equals.
+- Non-anchor blobs are evicted by descending token_count (largest first).
+  Recency and live extension confer anchor status only; neither affects
+  the ordering of non-anchors.
 - A/B against frequency/size-aware policies deferred to real traces (open question in design doc).
 
 ## Measurement gate (R1-5, unchanged)
