@@ -39,6 +39,20 @@ pub fn cache_layout_compatible(entry_layout: &str, request_layout: &str) -> bool
     entry_layout == request_layout
 }
 
+/// Content identity for the non-text part of a prompt: images, and any future
+/// modality that tokenizes to ordinary ids.
+///
+/// Exact equality, deliberately, and NOT the legacy-tolerant rule that
+/// `cache_layout` uses. An empty digest means "no non-text content", which is
+/// a claim about the request, not a missing measurement: a text-only entry and
+/// a text-only request agree, and a text-only entry can never serve a request
+/// that carries a digest. There is no "unknown" state to be tolerant of — the
+/// daemon computes this from the request itself, so a non-empty request digest
+/// is always known before lookup.
+pub fn content_digest_compatible(entry_digest: &str, request_digest: &str) -> bool {
+    entry_digest == request_digest
+}
+
 /// The single identity relation every matching site uses (R1-1): the
 /// fingerprint fields AND the cache-composition rule above. Field-by-field on
 /// purpose — the composition rule is a named decision, not an accident of
@@ -51,6 +65,7 @@ pub fn identity_compatible(entry: &ModelFingerprint, request: &ModelFingerprint)
         && entry.kv_bits == request.kv_bits
         && entry.kv_group_size == request.kv_group_size
         && cache_layout_compatible(&entry.cache_layout, &request.cache_layout)
+        && content_digest_compatible(&entry.content_digest, &request.content_digest)
 }
 
 /// Classification of a lookup against the index + fingerprint rules (R1-1).
@@ -175,6 +190,56 @@ mod tests {
             cache_layout: layout.into(),
             ..fp("m")
         }
+    }
+
+    fn fp_with_digest(digest: &str) -> ModelFingerprint {
+        ModelFingerprint {
+            content_digest: digest.into(),
+            ..fp("m")
+        }
+    }
+
+    #[test]
+    fn same_tokens_different_content_is_a_miss() {
+        // The collision this axis exists to prevent: a multimodal prompt
+        // renders its media as ordinary token ids, so two different images
+        // produce ONE token sequence and two different KV states. If the token
+        // prefix is the whole identity, the second request is served the first
+        // image's KV — no error, wrong answer.
+        let image_a = fp_with_digest("a1b2");
+        let image_b = fp_with_digest("c3d4");
+        assert_eq!(
+            classify(Some(5), 5, Some(&image_a), &image_b),
+            CacheVerdict::Miss
+        );
+
+        // Same image, same tokens: still a hit.
+        assert_eq!(
+            classify(Some(5), 5, Some(&image_a), &fp_with_digest("a1b2")),
+            CacheVerdict::Hit
+        );
+    }
+
+    #[test]
+    fn text_only_never_matches_or_is_matched_by_an_image() {
+        // Empty means "no non-text content", not "unknown". A text-only entry
+        // cannot prove it holds the KV for a request carrying pixels, and an
+        // image entry must not be served to a text-only request either. Both
+        // directions miss; only text-to-text agrees.
+        let text = fp_with_digest("");
+        let image = fp_with_digest("a1b2");
+        assert_eq!(
+            classify(Some(5), 5, Some(&text), &image),
+            CacheVerdict::Miss
+        );
+        assert_eq!(
+            classify(Some(5), 5, Some(&image), &text),
+            CacheVerdict::Miss
+        );
+        assert_eq!(
+            classify(Some(5), 5, Some(&text), &fp_with_digest("")),
+            CacheVerdict::Hit
+        );
     }
 
     #[test]

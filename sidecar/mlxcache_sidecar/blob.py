@@ -43,6 +43,14 @@ class Fingerprint:
     # byte-identical. Never served across a differing value — see
     # `mlxcache_store.cache_layout_compatible`.
     cache_layout: str = ""
+    # Digest of the request's NON-TEXT content (images today, any future
+    # modality by the same "not a text part" rule): `""` = no non-text
+    # content, which is what every text-only and every pre-digest blob
+    # carries. Without this axis two different images at one prompt tokenize
+    # identically and would share one checkpoint. Same forward-compat rule as
+    # the fields above: defaulted, omitted from the wire when empty, zero fold
+    # bytes — and only ever served across an EXACTLY equal value.
+    content_digest: str = ""
 
 
 def _known_fields(data: dict) -> dict:
@@ -80,6 +88,10 @@ def encode(meta: CheckpointMeta, payload: bytes) -> bytes:
     fp = dict(raw.get("fingerprint") or {})
     if not fp.get("cache_layout"):
         fp.pop("cache_layout", None)
+    # Same rule for the non-text content digest: empty means "no non-text
+    # content", which a pre-digest header states by saying nothing.
+    if not fp.get("content_digest"):
+        fp.pop("content_digest", None)
     raw["fingerprint"] = fp
     header = json.dumps(raw, separators=(",", ":")).encode()
     return struct.pack("<I", len(header)) + header + payload
@@ -104,8 +116,8 @@ def decode_header(header: bytes) -> CheckpointMeta:
     and a KeyError/TypeError/RecursionError escape would poison-brick
     every reader (§6). Validated: container types, tokens as a u32 list
     (bools are not ints), granularity in {0,1}, string engine_id /
-    payload_sha256 / fingerprint.cache_layout, int token_count (advisory)
-    and format_version."""
+    payload_sha256 / fingerprint.cache_layout / fingerprint.content_digest, int
+    token_count (advisory) and format_version."""
     try:
         raw = json.loads(header)
     except RecursionError as exc:
@@ -135,6 +147,7 @@ def decode_header(header: bytes) -> CheckpointMeta:
         or type(fp.kv_bits) is not int
         or type(fp.kv_group_size) is not int
         or not isinstance(fp.cache_layout, str)
+        or not isinstance(fp.content_digest, str)
     ):
         # The dataclass does not enforce types; a non-str field would
         # explode later in the fold (.encode()) outside every guarded
