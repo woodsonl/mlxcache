@@ -167,12 +167,15 @@ fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
             loop {
                 ticker.tick().await;
                 let hygiene = hygiene.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                if let Err(join) = tokio::task::spawn_blocking(move || {
                     hygiene.persistence.reap_stale_settle_staging(
                         mlxcache_daemon::http::staging_hygiene_threshold(),
                     )
                 })
-                .await;
+                .await
+                {
+                    tracing::error!(error = %join, "staging hygiene sweep panicked");
+                }
             }
         });
         return;
