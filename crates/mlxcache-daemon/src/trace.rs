@@ -181,6 +181,13 @@ fn spawn_writer(
         .name("mlxcache-trace".into())
         .spawn(move || {
             let mut w = std::io::BufWriter::with_capacity(64 * 1024, file);
+            // Any record write that failed since the previous ACK: an ACK
+            // must certify the WHOLE batch it terminates, not just its own
+            // flush call — a record that errored earlier is already lost,
+            // and true here would report the trace as durable when it is
+            // a sample. Reset after each ACK so one bad record does not
+            // poison every later batch.
+            let mut write_failed_since_ack = false;
             for cmd in rx {
                 match cmd {
                     TraceCommand::Record(r) => {
@@ -195,20 +202,22 @@ fn spawn_writer(
                             .is_err()
                         {
                             err_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            write_failed_since_ack = true;
                         }
                     }
                     TraceCommand::FlushAck(ack) => {
                         // The ACK carries the real outcome: true only when
-                        // every queued record reached the file, false on a
-                        // failed write. Reporting durability for a write
+                        // every queued record reached the file AND this
+                        // flush succeeded. Reporting durability for a write
                         // that failed would be a lie the replay scorer
                         // inherits.
-                        let ok = w.flush().is_ok();
+                        let ok = w.flush().is_ok() && !write_failed_since_ack;
                         if !ok {
                             err_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             tracing::warn!("trace flush on shutdown failed");
                         }
                         let _ = ack.send(ok);
+                        write_failed_since_ack = false;
                     }
                 }
             }
@@ -296,9 +305,10 @@ impl TraceWriter {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    // Writer gone: nothing more can be in flight (losses are
-                    // already counted in `degraded()`).
-                    return true;
+                    // Writer gone: durability is NOT confirmed — records
+                    // still queued at that moment may never reach the file.
+                    // (Losses are counted in `degraded()` either way.)
+                    return false;
                 }
             }
         }

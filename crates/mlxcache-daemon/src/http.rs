@@ -1015,6 +1015,19 @@ async fn publish_leader_blob(
         lead.complete(Ok(String::new()));
         return Ok(());
     }
+    // The adapter reported no cryptographic vocabulary identity (the
+    // "missing" sentinel): persisting would key reusable KV on an
+    // unverifiable identity two different tokenizers could share. Fail
+    // closed — serve from scratch, publish nothing, exactly like the
+    // recovery-blocked case above.
+    if fingerprint.tokenizer_hash == "missing" {
+        tracing::warn!("not caching: adapter reported no vocabulary identity");
+        outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
+        outcome.blob = None;
+        outcome.prefill_from = 0;
+        lead.complete(Ok(String::new()));
+        return Ok(());
+    }
     // Reserve the generation BEFORE writing so the on-disk name is
     // generation-specific (immutable). A republish then never overwrites an
     // earlier generation's file, so a delayed retirement cannot delete a

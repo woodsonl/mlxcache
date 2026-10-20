@@ -373,21 +373,14 @@ def _post_stream(base: str, path: str, body: dict, timeout: float) -> tuple[dict
         headers={"Content-Type": "application/json"},
     )
     t0 = time.perf_counter()
-    deadline = time.monotonic() + timeout
     ttft: float | None = None
     tokens = 0
     meta: dict | None = None
     usage: dict | None = None
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        for raw in resp:
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
-            line = raw.decode(errors="replace").strip()
-            if not line.startswith("data: "):
-                continue
-            frag = line[len("data: ") :]
-            if frag == "[DONE]":
-                break
+        # Shared bounded-read/decode policy (see _harness.sse_lines): one
+        # loop for every SSE consumer, not a drifted copy per script.
+        for frag in _harness.sse_lines(resp, timeout):
             try:
                 frame = json.loads(frag)
             except json.JSONDecodeError:
@@ -1204,6 +1197,23 @@ def _chip_identity() -> str:
         return ""
 
 
+def _git_out(*args: str) -> str:
+    """Best-effort git query for artifact provenance: bounded (a hung git
+    must not stall the run), and empty on unavailable git, a non-repository,
+    or any nonzero exit — provenance must never fail a benchmark run."""
+    try:
+        out = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=REPO,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:  # noqa: BLE001 — provenance must never fail a run
+        return ""
+
+
 def _daemon_spawn_mode() -> str:
     """How the daemon child was spawned: prebuilt binary path or cargo run."""
     binary = REPO / "target/release/mlxcache-daemon"
@@ -1286,18 +1296,8 @@ def main() -> int:
         "model": model,
         "provenance": {
             "argv": sys.argv,
-            "source_revision": subprocess.run(
-                ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=REPO
-            ).stdout.strip()
-            or "unknown",
-            "source_dirty": bool(
-                subprocess.run(
-                    ["git", "status", "--porcelain"],
-                    capture_output=True,
-                    text=True,
-                    cwd=REPO,
-                ).stdout.strip()
-            ),
+            "source_revision": _git_out("rev-parse", "HEAD") or "unknown",
+            "source_dirty": bool(_git_out("status", "--porcelain")),
             "machine": platform.machine(),
             "system": platform.platform(),
             "chip": _chip_identity(),

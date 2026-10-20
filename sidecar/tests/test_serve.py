@@ -372,7 +372,18 @@ def test_sentinel_fingerprint_never_reaches_the_store(tmp_path):
     """The "missing"/"unresolved" sentinel is enforced at
     PersistentPromptCache: no store lookup, no store put — a persisted
     entry under an id two unresolved spellings share could never be
-    adopted by a resolved identity anyway."""
+    adopted by a resolved identity anyway. The store's lookup and put are
+    replaced with RAISING stubs: both call paths swallow exceptions into
+    their error counters, so zero counters prove the methods were never
+    entered, not merely that they failed quietly."""
+
+    class NoStore:
+        def lookup(self, *_args, **_kwargs):
+            raise AssertionError("store.lookup must never run under the sentinel")
+
+        def put(self, *_args, **_kwargs):
+            raise AssertionError("store.put must never run under the sentinel")
+
     from mlxcache_serve.cache import Fingerprint as Fp
 
     sentinel = Fp(
@@ -381,16 +392,16 @@ def test_sentinel_fingerprint_never_reaches_the_store(tmp_path):
         kv_dtype="f16",
         kv_layout_version=1,
     )
-    store = Store(tmp_path, byte_budget=0)
-    c = PersistentPromptCache(store, sentinel, save_fn=fake_save, load_fn=fake_load)
+    c = PersistentPromptCache(NoStore(), sentinel, save_fn=fake_save, load_fn=fake_load)
     # fetch: memory misses, disk must not even be asked.
     cache, rest = c.fetch_nearest_cache(MODEL, [1, 2, 3, 4])
     assert rest == [1, 2, 3, 4], "memory-only serving when identity is unresolved"
     assert c.disk_hits == 0
+    assert c.reuse_errors == 0, "lookup was never attempted (not swallowed)"
     # insert: the payload must not be persisted under the sentinel.
     c.insert_cache(MODEL, [1, 2, 3, 4], FakeCache("full-stream"))
     assert c.persisted == 0, "sentinel identity must never publish to the store"
-    assert list(tmp_path.glob("*.ckpt")) == []
+    assert c.persist_errors == 0, "put was never attempted (not swallowed)"
 
 
 def test_unresolvable_identifier_disables_persistence():

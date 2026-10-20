@@ -199,12 +199,6 @@ def wait_healthy(
     raise RuntimeError(f"daemon did not become healthy at {url}")
 
 
-def _free_port() -> int:
-    # Kept as a thin alias so the call sites read locally; the logic lives in
-    # _harness so the port-picking rules cannot drift between harnesses.
-    return free_port()
-
-
 def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]:
     """Start sidecar (uv, synthetic engine) + daemon (release build).
 
@@ -224,7 +218,7 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
     # The port is picked AFTER the build, immediately before its bind: a
     # port picked earlier has its TOCTOU window widened from milliseconds to
     # the length of the build. Same rule for both children.
-    sidecar_port = _free_port()
+    sidecar_port = free_port()
     env = dict(os.environ, MLXCACHE_TOKENIZE_GROW="growing conversation seed")
     sidecar = subprocess.Popen(
         [
@@ -252,7 +246,7 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
         # boots slower than the daemon (uv discovery + interpreter +
         # imports), so prove it is LISTENING before the daemon exists.
         _wait_listening(("127.0.0.1", sidecar_port), deadline_s=30.0, proc=sidecar)
-        daemon_port = _free_port()
+        daemon_port = free_port()
         daemon = subprocess.Popen(
             [
                 str(Path(__file__).resolve().parents[1] / "target" / "release" / "mlxcache-daemon"),
