@@ -321,17 +321,39 @@ def test_cli_separator_passthrough(monkeypatch, tmp_path):
 
 def test_adapter_switch_isolates_fingerprint(tmp_path):
     """LoRA-B must never serve LoRA-A's KV: the default fingerprint folds
-    adapter and draft model into the model id."""
+    adapter and draft model into the model id. The identifiers must be real
+    local dirs — an unresolvable id now disables persistence (the "missing"
+    sentinel) instead of hashing the raw spelling."""
     from mlxcache_serve import default_fingerprint_for
 
-    fp_a = default_fingerprint_for(("model-a", "lora-a", None))
-    fp_b = default_fingerprint_for(("model-a", "lora-b", None))
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    lora_a = tmp_path / "lora-a"
+    lora_b = tmp_path / "lora-b"
+    draft = tmp_path / "draft"
+    for d in (lora_a, lora_b, draft):
+        d.mkdir()
+        (d / "config.json").write_text("{}")
+    fp_a = default_fingerprint_for((str(model), str(lora_a), None))
+    fp_b = default_fingerprint_for((str(model), str(lora_b), None))
     assert fp_a != fp_b and fp_a.model_id != fp_b.model_id
-    fp_draft = default_fingerprint_for(("model-a", None, "draft"))
+    fp_draft = default_fingerprint_for((str(model), None, str(draft)))
     assert fp_draft.model_id != fp_a.model_id, "draft-model switch isolates too"
-    assert default_fingerprint_for(("model-a", None, None)) is default_fingerprint_for(
-        ("model-a", None, None)
+    assert default_fingerprint_for((str(model), None, None)) is default_fingerprint_for(
+        (str(model), None, None)
     ), "memoized: same key → same fingerprint object"
+
+
+def test_unresolvable_identifier_disables_persistence():
+    """A bare id with no local snapshot must not be fingerprinted as its own
+    spelling (two spellings would collide); it pins the "missing" sentinel
+    so the wrapper treats the model as non-persistent."""
+    from mlxcache_serve import default_fingerprint_for
+
+    fp = default_fingerprint_for(("definitely/not-a-cached-model-xyz", None, None))
+    assert fp.tokenizer_hash == "missing"
+    assert fp.model_id == "unresolved"
 
 
 def test_cli_requires_store_dir():

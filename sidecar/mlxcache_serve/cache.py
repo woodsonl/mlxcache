@@ -272,12 +272,53 @@ class PersistentPromptCache(LRUPromptCache):
             log.warning("disk cache publish failed", exc_info=True)
 
 
+def _resolve_snapshot(raw: str) -> str:
+    """Resolve a bare HF id (org/name) or relative path to a LOCAL snapshot
+    directory, without ever downloading. None-returning is deliberate: an
+    unresolved identifier must not be fingerprinted as itself (two different
+    ids would then collide on whatever string was passed), and must not
+    invent a path the tokenizer hasher would refuse anyway."""
+    expanded = os.path.abspath(os.path.expanduser(raw))
+    if (Path(expanded) / "config.json").is_file():
+        return expanded
+    try:
+        from huggingface_hub import snapshot_download
+
+        snap = snapshot_download(raw, local_files_only=True)
+        if snap and (Path(snap) / "config.json").is_file():
+            return snap
+    except Exception:  # noqa: BLE001 — falls through to the sentinel
+        pass
+    return ""
+
+
 def default_fingerprint_for(model_key, kv_bits: int = 0, kv_group_size: int = 0):
     """Default fingerprint source: model dir realpath + tokenizer bytes,
     with the ADAPTER and DRAFT MODEL folded into the model id (upstream's
     memory trie keys the full triple — a LoRA or draft-model switch must
-    never share KV with the base model). Memoized per (path, tier)."""
+    never share KV with the base model). Memoized per (path, tier).
+
+    Non-directory identifiers (a bare `org/name`, a relative path) are
+    resolved to local snapshot directories FIRST: fingerprinting the raw
+    string would key the cache on the spelling of a name, and every
+    resolution failure DISABLES persistent caching via the `"missing"`
+    tokenizer sentinel rather than pinning an unhashable identity."""
     model, adapter, draft = (list(model_key) + [None, None, None])[:3]
+    model = _resolve_snapshot(model) if model else ""
+    adapter = _resolve_snapshot(adapter) if adapter else ""
+    draft = _resolve_snapshot(draft) if draft else ""
+    if not model:
+        # Unresolvable identity: return a fingerprint whose tokenizer hash is
+        # the "missing" sentinel — the wrapper treats it as non-persistent.
+        return Fingerprint(
+            model_id="unresolved",
+            tokenizer_hash="missing",
+            kv_dtype="f16",
+            kv_layout_version=1,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            cache_layout="",
+        )
     adapter = os.path.realpath(adapter) if adapter else ""
     draft = os.path.realpath(draft) if draft else ""
     model_id = "|".join((os.path.realpath(model), adapter, draft))

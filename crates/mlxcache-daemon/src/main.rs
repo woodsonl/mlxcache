@@ -132,11 +132,14 @@ async fn main() -> Result<()> {
     // Graceful-shutdown trace safety net: records are queued on a bounded
     // channel and drained by the writer thread, and every record is already
     // flushed per-write on capture, so a queued record is at most one write
-    // away from disk. This explicit flush is therefore a near-no-op — it only
-    // matters for a record still in flight inside the writer between channel
-    // receipt and file write when the server finished draining.
+    // away from disk. The SYNC flush waits for the writer's ACK so exit
+    // cannot outrun a record still in flight between channel receipt and
+    // file write (a truncated trace silently understates the load it
+    // measured, and every replay score derived from it inherits the lie).
     if let Some(tracer) = &state.trace {
-        tracer.flush();
+        if !tracer.flush_sync(std::time::Duration::from_secs(5)) {
+            tracing::warn!("trace writer did not acknowledge shutdown flush");
+        }
     }
     tracing::info!("mlxcache daemon stopped");
     Ok(())

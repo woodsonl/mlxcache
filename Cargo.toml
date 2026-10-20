@@ -25,6 +25,9 @@ criterion = "0.7"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Unwinding stays enabled: panic=abort silently killed the lock-poisoning
+# and task-recovery paths (a poisoned lock poisons only when unwinding
+# runs its guards), so abort traded a smaller binary for the daemon's
+# self-healing story.
 strip = "symbols"
 incremental = false

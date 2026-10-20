@@ -10,8 +10,9 @@ checkpoint's headers (values are not compared).
 
 from __future__ import annotations
 
+import dataclasses
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 LINEAR = "linear_attention"
@@ -235,6 +236,13 @@ class Qwen4TextConfig:
 
     @classmethod
     def from_checkpoint(cls, config_dict: dict) -> Qwen4TextConfig:
+        # Omitted checkpoint fields take the DATACLASS defaults, read from the
+        # dataclass itself — duplicated literals here previously disagreed
+        # with the defaults (128 vs 512 in split_ngram_parts, 32768 vs
+        # 262144 in max_position_embeddings, 10000 vs 10_000_000 in
+        # rope_theta), so a config.json missing a field silently built a
+        # different model than a direct construction.
+        d = {f.name: f.default for f in fields(cls) if f.default is not dataclasses.MISSING}
         """Build from the parsed `config.json` dict (wrapper or text subtree)."""
         # Single source of defaults: every scalar fallback below reads the
         # dataclass field default via _default(), never a second hand-typed
@@ -249,7 +257,12 @@ class Qwen4TextConfig:
                 if f.name == name:
                     if f.default is not dataclasses.MISSING:
                         return f.default
-                    raise ValueError(f"{name} has no scalar default")
+                    if f.default_factory is not dataclasses.MISSING:
+                        # Factory fields (mrope_section, layer_types): the
+                        # factory IS the default — a literal copy here would
+                        # be a second source of truth that can drift.
+                        return f.default_factory()
+                    raise ValueError(f"{name} has no default")
             raise ValueError(f"unknown field {name}")
 
         raw = config_dict.get("text_config", config_dict)
@@ -260,7 +273,7 @@ class Qwen4TextConfig:
             "partial_rotary_factor",
             raw.get("partial_rotary_factor", _default("partial_rotary_factor")),
         )
-        layer_types = raw.get("layer_types") or []
+        layer_types = raw.get("layer_types") or _default("layer_types")
         return cls(
             vocab_size=int(raw["vocab_size"]),
             hidden_size=int(raw["hidden_size"]),
@@ -284,9 +297,7 @@ class Qwen4TextConfig:
             ),
             rope_theta=float(rope.get("rope_theta", raw.get("rope_theta", _default("rope_theta")))),
             partial_rotary_factor=float(partial),
-            mrope_section=list(  # literal mirrors the dataclass default_factory below
-                rope.get("mrope_section", [11, 11, 10])
-            ),
+            mrope_section=list(rope.get("mrope_section", _default("mrope_section"))),
             linear_conv_kernel_dim=int(
                 raw.get("linear_conv_kernel_dim", _default("linear_conv_kernel_dim"))
             ),

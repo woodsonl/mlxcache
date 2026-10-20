@@ -155,6 +155,10 @@ struct TraceRecordJson<'a> {
 pub enum TraceCommand {
     Record(TraceRecord),
     Flush,
+    /// Flush with an ACK: the writer sends `()` back on the provided
+    /// channel once the flush (and every queued record before it) has hit
+    /// the file. Shutdown waits on the ACK so exit never outruns the queue.
+    FlushAck(std::sync::mpsc::Sender<()>),
 }
 
 /// Handle cheap enough to build per request: a try-send on a bounded channel.
@@ -198,6 +202,18 @@ fn spawn_writer(
                         if w.flush().is_err() {
                             err_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
+                    }
+                    TraceCommand::FlushAck(ack) => {
+                        if let Err(e) = w.flush() {
+                            err_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = ack.send(());
+                            tracing::warn!("trace flush on shutdown failed: {e}");
+                            continue;
+                        }
+                        // ACK only after the flush succeeded: a wait on a
+                        // failed write would still unblock (the `let _`
+                        // above), but reporting it as durable would be a lie.
+                        let _ = ack.send(());
                     }
                 }
             }
@@ -259,11 +275,28 @@ impl TraceWriter {
         }
     }
 
-    /// Best-effort durability point for tests and graceful shutdown.
+    /// Best-effort durability point for tests and non-shutdown callers.
     pub fn flush(&self) {
         if let Some(tx) = &self.tx {
             let _ = tx.try_send(TraceCommand::Flush);
         }
+    }
+
+    /// Synchronous flush for process exit: waits (bounded) for the writer to
+    /// acknowledge that every queued record — including any still in flight
+    /// between channel receipt and file write — has been flushed. A shutdown
+    /// that outruns the queue silently truncates the trace and every replay
+    /// score derived from it.
+    pub fn flush_sync(&self, timeout: std::time::Duration) -> bool {
+        let Some(tx) = &self.tx else {
+            return true;
+        };
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if tx.send(TraceCommand::FlushAck(ack_tx)).is_err() {
+            // Writer gone: nothing more can be in flight.
+            return true;
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
     }
 
     /// Total records the writer could not accept (full channel) or write
