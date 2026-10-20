@@ -3282,7 +3282,12 @@ async fn a_digest_bearing_blob_survives_a_daemon_restart_rebuild() {
     // rebuild_from_disk reads every header from disk and re-indexes it.
     let rebuilt = app_state(&url, &blobs);
     let report = rebuilt.orchestrator.rebuild_from_disk(&rebuilt.persistence);
-    assert_eq!(report.errors.len(), 0, "rebuild errors: {:?}", report.errors);
+    assert_eq!(
+        report.errors.len(),
+        0,
+        "rebuild errors: {:?}",
+        report.errors
+    );
     assert!(
         report.rebuilt > 0,
         "the rebuild must index the published checkpoints: {report:?}"
@@ -3297,7 +3302,15 @@ async fn a_digest_bearing_blob_survives_a_daemon_restart_rebuild() {
         .list_blobs()
         .unwrap()
         .iter()
-        .map(|p| rebuilt.persistence.load(p).unwrap().0.fingerprint.content_digest)
+        .map(|p| {
+            rebuilt
+                .persistence
+                .load(p)
+                .unwrap()
+                .0
+                .fingerprint
+                .content_digest
+        })
         .filter(|d| !d.is_empty())
         .collect();
     assert!(!digests.is_empty(), "persisted digests survive on disk");

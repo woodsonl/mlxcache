@@ -1705,7 +1705,7 @@ pub fn content_digest(messages: &[Message]) -> String {
     let mut hasher = Sha256::new();
     let mut hashed_any = false;
     let mut encoded = String::new();
-    let mut hash_part = |hasher: &mut sha2::Sha256, encoded: &mut String| {
+    let hash_part = |hasher: &mut sha2::Sha256, encoded: &mut String| {
         hasher.update(encoded.len().to_string().as_bytes());
         hasher.update(b":");
         hasher.update(encoded.as_bytes());
@@ -3395,7 +3395,7 @@ mod tests {
         }];
         assert_eq!(
             content_digest(&string_in_parts),
-            content_digest(&vec![Message {
+            content_digest(&[Message {
                 role: "user".into(),
                 content: serde_json::json!([{"type": "image_url", "image_url": {"url": "u"}}]),
             }]),
