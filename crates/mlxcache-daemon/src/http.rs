@@ -76,6 +76,13 @@ pub struct AppState {
     /// Optional JSONL trace capture (MLXCACHE_TRACE, step 5). None when the
     /// env knob is unset — the hot path costs one `Option::None` check.
     pub trace: Option<crate::trace::TraceWriter>,
+    /// Bounds how many detached settle publications hold a payload buffer at
+    /// once. Publication is detached from the response, so without a bound a
+    /// burst of clients could stage one payload-sized buffer each (the settle
+    /// byte cap) simultaneously — on a unified-memory host that competes with
+    /// the model. Beyond the bound the settle is dropped (best-effort by
+    /// contract); the staging guard still cleans up.
+    pub settle_publish_permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -928,10 +935,7 @@ async fn chat_completions(
         // the sidecar embeds absolute staging paths (inside the daemon's blob
         // dir), and the settle report reaches the response body verbatim
         // otherwise. The full reason stays in the daemon log line below.
-        let reason_code = report
-            .reason
-            .as_deref()
-            .map(|r| r.split(':').next().unwrap_or(r).to_string());
+        let reason_code = report.reason.as_deref().map(settle_reason_code);
         if let Some(full) = report.reason.as_deref() {
             if !report.written {
                 tracing::debug!(reason = %full, "settle not written");
@@ -1282,6 +1286,30 @@ async fn publish_settled_blob(
     );
 }
 
+/// Detached settle publications allowed to hold a payload buffer at once.
+/// Small on purpose: each holds up to the settle byte cap, and publication is
+/// off the response path, so queuing costs memory for zero client benefit.
+pub const SETTLE_PUBLISH_CONCURRENCY: usize = 2;
+
+/// The client-visible form of an engine settle reason: the CODE before the
+/// first colon, and only when it is a plain snake_case token. Anything else
+/// (empty, punctuation, a path, exception text) becomes "unspecified" — the
+/// prefix-extraction this replaces would have forwarded a colon-free reason
+/// verbatim, and an OSError message without a recognizable prefix leaks
+/// whatever the engine embedded.
+fn settle_reason_code(reason: &str) -> String {
+    let code = reason.split(':').next().unwrap_or("").trim();
+    if !code.is_empty()
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        code.to_string()
+    } else {
+        "unspecified".to_string()
+    }
+}
+
 /// The age after which a staging/publish-temp file belongs to no live
 /// request: the sidecar timeout bounds any sidecar call, and the margin
 /// covers the settle encode/write that follows generation inside it.
@@ -1379,6 +1407,17 @@ impl SettleStaging {
         reported_sha256: Option<String>,
     ) {
         tokio::spawn(async move {
+            // One permit per in-flight publication: each holds a payload-sized
+            // buffer for the read/hash/fsync. try_acquire, never wait — the
+            // settle is best-effort and the response has already gone out, so
+            // queueing here would only move the memory problem into tasks.
+            let _permit = match state.settle_publish_permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tracing::debug!("settle dropped: publication queue full");
+                    return; // self (the guard) drops here and removes the file
+                }
+            };
             publish_settled_blob(
                 &state,
                 &fingerprint,
@@ -1796,10 +1835,11 @@ impl ChunkFramer {
                         // text. Clients receive the fixed field set only;
                         // anything else an engine adds is dropped here.
                         .map(|v| {
-                            let reason_code = v
-                                .get("reason")
-                                .and_then(|r| r.as_str())
-                                .map(|r| r.split(':').next().unwrap_or(r));
+                            let raw_reason = v.get("reason").and_then(|r| r.as_str());
+                            let reason_code = raw_reason.map(settle_reason_code);
+                            if let Some(raw) = raw_reason {
+                                tracing::debug!(reason = %raw, "stream settle reason");
+                            }
                             serde_json::json!({
                                 "written": v.get("written").cloned().unwrap_or(serde_json::Value::Bool(false)),
                                 "tokens": v.get("tokens").cloned().unwrap_or(serde_json::Value::from(0)),
@@ -2755,6 +2795,9 @@ mod tests {
             singleflight: SingleFlight::new(),
             stats: Arc::new(Stats::default()),
             served_models: vec!["test-model".into()],
+            settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                SETTLE_PUBLISH_CONCURRENCY,
+            )),
             sidecar: None,
             persistence: crate::persistence::Persistence::new(tempfile::tempdir().unwrap().keep())
                 .unwrap(),
@@ -2853,6 +2896,9 @@ mod tests {
             singleflight: SingleFlight::new(),
             stats: std::sync::Arc::new(crate::http::Stats::default()),
             served_models: vec!["t".into()],
+            settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                SETTLE_PUBLISH_CONCURRENCY,
+            )),
             sidecar: None,
             persistence: crate::persistence::Persistence::new(dir.path()).unwrap(),
             trace: None,

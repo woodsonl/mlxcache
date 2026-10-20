@@ -74,6 +74,9 @@ async fn main() -> Result<()> {
         persistence,
         trace: mlxcache_daemon::trace::TraceWriter::from_env()
             .map_err(|e| anyhow::anyhow!("{e}"))?,
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
     });
     // Warm the native-tokenizer OnceLock NOW, not on the first request: a
     // bad MLXCACHE_NATIVE_TOKENIZER must kill the boot (the module's
@@ -165,8 +168,6 @@ fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
                 ticker.tick().await;
                 let hygiene = hygiene.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    // Same threshold logic evict_pass applies; mirrored here
-                    // because the knobs' defaults must stay the single source.
                     hygiene.persistence.reap_stale_settle_staging(
                         mlxcache_daemon::http::staging_hygiene_threshold(),
                     )

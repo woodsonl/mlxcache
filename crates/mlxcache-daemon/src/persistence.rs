@@ -128,7 +128,7 @@ impl Persistence {
         &self,
         prefix_hash: u128,
         generation: u64,
-        mut meta: CheckpointMeta,
+        meta: CheckpointMeta,
         payload: &[u8],
     ) -> Result<PathBuf, PersistError> {
         // D1 integrity (format_version 2), stamped at the single publish
@@ -136,66 +136,10 @@ impl Persistence {
         // is otherwise undetectable — the wire checks catch bad headers and
         // bad framing, not wrong bytes. The version bump marks the new
         // on-disk contract; legacy version-1 blobs stay loadable, unverified.
-        meta.format_version = 2;
-        meta.payload_sha256 = Some(format!("{:x}", Sha256::digest(payload)));
-        let final_path = self
-            .blob_dir
-            .join(format!("{:032x}-{:016x}.ckpt", prefix_hash, generation));
-        // Unique temp name: two concurrent publishers for the same hash must not
-        // interleave writes into one temp file (that yields a corrupt blob which
-        // the rename then publishes as if complete). pid + counter keeps the
-        // name unique per write; the `.ckpt.tmp` suffix family is still excluded
-        // by list_blobs.
-        let unique = format!(
-            "{:032x}-{:016x}.{}.{}.ckpt.tmp",
-            prefix_hash,
-            generation,
-            std::process::id(),
-            next_temp_seq()
-        );
-        let tmp_path = self.blob_dir.join(unique);
-
-        let header = serde_json::to_vec(&meta).map_err(|e| PersistError::Corrupt {
-            reason: format!("meta serialize: {e}"),
-        })?;
-        // The on-disk header length is a u32; reject rather than silently
-        // truncate (a header this large is pathological, but truncation would
-        // corrupt every later read).
-        let header_len_u32 = u32::try_from(header.len()).map_err(|_| PersistError::Corrupt {
-            reason: format!("checkpoint header too large: {} bytes", header.len()),
-        })?;
-        let header_len = header_len_u32.to_le_bytes();
-
-        let write_result = (|| -> std::io::Result<()> {
-            let mut f = fs::File::create(&tmp_path)?;
-            f.write_all(&header_len)?;
-            f.write_all(&header)?;
-            f.write_all(payload)?;
-            f.sync_all()?;
-            Ok(())
-        })();
-
-        if let Err(source) = write_result {
-            // Best-effort temp cleanup; the final blob is untouched.
-            let _ = fs::remove_file(&tmp_path);
-            // ENOSPC and friends: surface as DiskFull with the path (registry row).
-            return Err(PersistError::DiskFull {
-                path: tmp_path,
-                source,
-            });
-        }
-
-        if let Err(source) = fs::rename(&tmp_path, &final_path) {
-            // A failed rename (ENOSPC on the directory, EACCES, ...) must not
-            // leak the temp file; classify it as DiskFull too so the ENOSPC
-            // rescue path handles it rather than a generic Io.
-            let _ = fs::remove_file(&tmp_path);
-            return Err(PersistError::DiskFull {
-                path: final_path,
-                source,
-            });
-        }
-        Ok(final_path)
+        // The implementation is publish_from_staged with the payload at offset
+        // zero: one writer for the stamp/digest/temp/rename/DiskFull
+        // sequence, so a change to it cannot miss a call site.
+        self.publish_from_staged(prefix_hash, generation, meta, payload, 0)
     }
 
     /// Read a staged settle file ONCE, keeping the single buffer.

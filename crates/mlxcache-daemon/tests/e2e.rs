@@ -24,6 +24,9 @@ fn app_state(sidecar_url: &str, blobs: &tempfile::TempDir) -> Arc<AppState> {
         singleflight: SingleFlight::new(),
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
         served_models: vec!["e2e-model".into()],
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
         sidecar: Some(
             SidecarClient::new(SidecarConfig::new(
                 sidecar_url.to_owned(),
@@ -257,6 +260,9 @@ async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
     std::fs::set_permissions(blobs.path(), perms).unwrap();
 
     let state = Arc::new(AppState {
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
         orchestrator,
         singleflight: SingleFlight::new(),
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
@@ -478,6 +484,9 @@ async fn stream_leg_traces_the_settled_verdict() {
     let tracedir = tempfile::tempdir().unwrap();
     let trace_path = tracedir.path().join("trace.jsonl");
     let state = Arc::new(AppState {
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
         orchestrator: Orchestrator::new(),
         singleflight: SingleFlight::new(),
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
@@ -1082,6 +1091,9 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
     let (sidecar_url, mut child) = spawn_sidecar().await;
     let blobs = tempfile::tempdir().unwrap();
     let state = Arc::new(AppState {
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
         orchestrator: Orchestrator::new(),
         singleflight: SingleFlight::new(),
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
@@ -1158,6 +1170,9 @@ async fn trace_capture_writes_one_jsonl_record_per_request() {
     let trace_path = dir.path().join("trace.jsonl");
     let blobs = tempfile::tempdir().unwrap();
     let state = Arc::new(AppState {
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
         orchestrator: Orchestrator::new(),
         singleflight: SingleFlight::new(),
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
@@ -1275,6 +1290,9 @@ async fn q8_and_f16_blobs_never_share_a_file() {
     .to_string();
     let state = |url: String| {
         Arc::new(AppState {
+            settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+            )),
             orchestrator: Orchestrator::new(),
             singleflight: SingleFlight::new(),
             stats: Arc::new(mlxcache_daemon::http::Stats::default()),
@@ -2390,6 +2408,9 @@ async fn failed_request_gets_one_trace_record_and_stats_agree() {
     let tracedir = tempfile::tempdir().unwrap();
     let trace_path = tracedir.path().join("trace.jsonl");
     let state = Arc::new(AppState {
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
         orchestrator: Orchestrator::new(),
         singleflight: SingleFlight::new(),
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
@@ -2485,6 +2506,9 @@ async fn trace_records_the_settled_verdict_not_the_stale_route() {
     let tracedir = tempfile::tempdir().unwrap();
     let trace_path = tracedir.path().join("trace.jsonl");
     let state = Arc::new(AppState {
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
         orchestrator: Orchestrator::new(),
         singleflight: SingleFlight::new(),
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
@@ -2574,6 +2598,9 @@ async fn stalled_stream_is_cut_by_the_idle_budget_with_an_explicit_error() {
         SidecarClient::with_timeouts(SidecarConfig::new(sidecar_url, "e2e-model".into()), 120, 1)
             .unwrap();
     let state = Arc::new(AppState {
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
         orchestrator: Orchestrator::new(),
         singleflight: SingleFlight::new(),
         stats: Arc::new(mlxcache_daemon::http::Stats::default()),
