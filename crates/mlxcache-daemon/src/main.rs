@@ -74,6 +74,9 @@ async fn main() -> Result<()> {
         persistence,
         trace: mlxcache_daemon::trace::TraceWriter::from_env()
             .map_err(|e| anyhow::anyhow!("{e}"))?,
+        settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+        )),
     });
     // Warm the native-tokenizer OnceLock NOW, not on the first request: a
     // bad MLXCACHE_NATIVE_TOKENIZER must kill the boot (the module's
@@ -152,6 +155,29 @@ fn spawn_reaper(state: Arc<mlxcache_daemon::http::AppState>) {
             max_bytes = cfg.max_bytes,
             "eviction reaper disabled (set MLXCACHE_EVICT_INTERVAL_S and a cap to enable; blob growth is unbounded)"
         );
+        // Staging hygiene must not depend on the eviction knobs: abandoned
+        // settle files are invisible to list_blobs and otherwise strand until
+        // the next boot, so their age sweep runs on its own always-on ticker
+        // even when eviction itself is off.
+        let hygiene = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let hygiene = hygiene.clone();
+                if let Err(join) = tokio::task::spawn_blocking(move || {
+                    hygiene.persistence.reap_stale_settle_staging(
+                        mlxcache_daemon::http::staging_hygiene_threshold(),
+                    )
+                })
+                .await
+                {
+                    tracing::error!(error = %join, "staging hygiene sweep panicked");
+                }
+            }
+        });
         return;
     }
     tracing::info!(
