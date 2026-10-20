@@ -825,9 +825,7 @@ class SyntheticEngine:
             meta["fingerprint"]["tokenizer_hash"] = "0" * 64
             fields = {k: v for k, v in meta.items() if k != "fingerprint"}
             wire = encode(
-                CheckpointMeta(
-                    fingerprint=Fingerprint(**meta["fingerprint"]), **fields
-                ),
+                CheckpointMeta(fingerprint=Fingerprint(**meta["fingerprint"]), **fields),
                 payload[4 + hlen :],
             )
             with open(settle_path, "wb") as fh:

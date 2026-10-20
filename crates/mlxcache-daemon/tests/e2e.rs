@@ -3328,8 +3328,7 @@ async fn a_settle_whose_header_records_the_wrong_tokens_is_discarded() {
     // longer than the engine reports; the response is unaffected and nothing
     // beyond the honest prefill prefix publishes. Previously this guard had
     // no e2e knob — only the digest guards were exercisable end to end.
-    let (url, mut child) =
-        spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "tokens")]).await;
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "tokens")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&url, &blobs);
 
@@ -3338,8 +3337,12 @@ async fn a_settle_whose_header_records_the_wrong_tokens_is_discarded() {
 
     await_settle_publication(&state).await;
     // The lying settle published nothing; only the prefill prefix survives.
-    assert_eq!(blob_coverages(&state), vec![8], "{:?}",
-        blob_coverages(&state));
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8],
+        "{:?}",
+        blob_coverages(&state)
+    );
     assert!(!staging_files(blobs.path()));
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
@@ -3352,8 +3355,7 @@ async fn a_settle_whose_header_claims_a_foreign_identity_is_discarded() {
     // the header's tokenizer hash while leaving the payload bytes untouched,
     // so the digest checks all pass and only the identity guard can catch it.
     // Previously this guard had no e2e knob.
-    let (url, mut child) =
-        spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "identity")]).await;
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "identity")]).await;
     let blobs = tempfile::tempdir().unwrap();
     let state = app_state(&url, &blobs);
 
@@ -3361,8 +3363,12 @@ async fn a_settle_whose_header_claims_a_foreign_identity_is_discarded() {
     assert_eq!(res["status"], "ok");
 
     await_settle_publication(&state).await;
-    assert_eq!(blob_coverages(&state), vec![8], "{:?}",
-        blob_coverages(&state));
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8],
+        "{:?}",
+        blob_coverages(&state)
+    );
     assert!(!staging_files(blobs.path()));
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
@@ -3401,7 +3407,10 @@ async fn a_corrupted_v2_digest_blob_is_quarantined_by_the_rebuild() {
     // The corrupted FILE is gone (reclaimed above), so nothing can resume
     // from it. The honest 8-token prefill prefix remains and may serve a hit
     // — that is correct reuse, not a resume from bad KV.
-    assert!(!settled.exists(), "the corrupted v2 blob file must be deleted");
+    assert!(
+        !settled.exists(),
+        "the corrupted v2 blob file must be deleted"
+    );
     let after = post_prompt(rebuilt.clone(), "corrupt me after publish").await;
     assert_eq!(after["status"], "ok");
 
