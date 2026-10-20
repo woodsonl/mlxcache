@@ -508,7 +508,9 @@ async fn chat_completions(
         // which cannot distinguish two images that render to the same ids.
         content_digest: content_digest(&req.messages),
     };
-    let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
+    let mut outcome = state
+        .orchestrator
+        .route(&tokens, &fingerprint, Some(engine_id.as_str()));
     // The token-only prefix hash for the request log line. The blob filename
     // uses a DIFFERENT key (blob_key = fingerprint + tokens), computed in the
     // leader branch where the fingerprint is in scope; the two are not equal.
@@ -658,7 +660,11 @@ async fn chat_completions(
                     Some(Ok(name)) if !name.is_empty() => {
                         // Re-route: the leader's publish is now visible, so this
                         // follower adopts it (hit/partial) instead of prefilling.
-                        outcome = state.orchestrator.route(&tokens, &fingerprint);
+                        outcome = state.orchestrator.route(
+                            &tokens,
+                            &fingerprint,
+                            Some(engine_id.as_str()),
+                        );
                     }
                     Some(Ok(_)) => {
                         // Leader cached nothing (empty blob: a one-token prompt,

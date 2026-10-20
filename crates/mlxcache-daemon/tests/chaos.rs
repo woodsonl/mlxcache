@@ -145,7 +145,11 @@ fn rebuild_skips_one_token_legacy_blob() {
     let report = orch.rebuild_from_disk(&p);
     assert_eq!(report.rebuilt, 0, "a one-token blob must not be indexed");
     assert_eq!(report.skipped, 1);
-    let out = orch.route(&[7], &mlxcache_daemon::orchestrator::test_support::fp("m"));
+    let out = orch.route(
+        &[7],
+        &mlxcache_daemon::orchestrator::test_support::fp("m"),
+        None,
+    );
     assert_eq!(
         out.decision.verdict,
         mlxcache_core::policy::CacheVerdict::Miss,
@@ -182,6 +186,7 @@ async fn restart_drops_streams_checkpoints_survive() {
     let out = orch.route(
         &[1, 2, 3, 4],
         &mlxcache_daemon::orchestrator::test_support::fp("m"),
+        None,
     );
     assert_eq!(
         out.decision.verdict,
@@ -261,11 +266,11 @@ async fn rebuild_indexes_extension_lookup_and_skips_corrupt() {
 
     // Exact hit after rebuild.
     assert_eq!(
-        orch.route(&[1, 2, 3, 4], &fp).decision.verdict,
+        orch.route(&[1, 2, 3, 4], &fp, None).decision.verdict,
         mlxcache_core::policy::CacheVerdict::Hit
     );
     // Extension -> partial hit at the persisted prefix.
-    let ext = orch.route(&[1, 2, 3, 4, 5, 6], &fp);
+    let ext = orch.route(&[1, 2, 3, 4, 5, 6], &fp, None);
     assert_eq!(
         ext.decision.verdict,
         mlxcache_core::policy::CacheVerdict::Partial
@@ -298,7 +303,7 @@ async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report = orch.rebuild_from_disk(&p);
     assert_eq!(report.rebuilt, 1, "one entry per prefix");
-    let out = orch.route(&[1, 2, 3, 4], &fp);
+    let out = orch.route(&[1, 2, 3, 4], &fp, None);
     let name = out.blob.as_ref().map(|(n, _, _)| n.as_str());
     assert_eq!(
         name,
@@ -331,7 +336,7 @@ async fn rebuild_keeps_the_highest_generation_and_reclaims_the_rest() {
     let orch2 = mlxcache_daemon::orchestrator::Orchestrator::new();
     let report2 = orch2.rebuild_from_disk(&p);
     assert_eq!(report2.rebuilt, 1);
-    let out2 = orch2.route(&[1, 2, 3, 4], &fp);
+    let out2 = orch2.route(&[1, 2, 3, 4], &fp, None);
     assert_eq!(
         out2.blob.as_ref().map(|(n, _, _)| n.as_str()),
         newer.file_name().map(|n| n.to_string_lossy()).as_deref(),

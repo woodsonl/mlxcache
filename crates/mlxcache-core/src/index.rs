@@ -159,10 +159,39 @@ impl PrefixIndex {
         tokens: &[u32],
         fingerprint: Option<&ModelFingerprint>,
     ) -> Option<(IndexEntry, usize)> {
+        self.lookup_with_engine(tokens, fingerprint, None)
+    }
+
+    /// Engine-domain lookup: entries published by a different engine family
+    /// are never adoptable even when their fingerprints match (a qwen4-exp
+    /// checkpoint at the same token prefix as an mlx-lm one is not reuse
+    /// for an mlx-lm request), and WHOLE_CONTEXT entries (granularity 1)
+    /// only qualify on an exact full-prompt match — their documented
+    /// fallback when the match is partial is to not serve, letting the
+    /// walk continue to an ANY_PREFIX candidate.
+    pub fn lookup_with_engine(
+        &self,
+        tokens: &[u32],
+        fingerprint: Option<&ModelFingerprint>,
+        engine_id: Option<&str>,
+    ) -> Option<(IndexEntry, usize)> {
         use std::sync::atomic::Ordering::Relaxed;
         let fp_ok = |entry: &IndexEntry| {
             fingerprint
                 .is_none_or(|f| crate::policy::identity_compatible(&entry.meta.fingerprint, f))
+        };
+        let engine_ok = |entry: &IndexEntry| {
+            let entry_engine = entry
+                .meta
+                .engine_id
+                .as_deref()
+                .unwrap_or(crate::contract::DEFAULT_ENGINE);
+            let request_engine = engine_id.unwrap_or(crate::contract::DEFAULT_ENGINE);
+            entry_engine == request_engine
+        };
+        // WHOLE_CONTEXT entries serve only an exact full-prompt match.
+        let granularity_ok = |entry: &IndexEntry, matched: usize| {
+            entry.meta.granularity.unwrap_or(0) != 1 || matched == entry.key.len()
         };
         let root = self.read_lock();
         let mut node: &Node = &root;
@@ -200,7 +229,7 @@ impl PrefixIndex {
                     // the common single-child chain free of any child scan.
                     if node.children.len() > 1 {
                         if let Some(sib) =
-                            Self::hottest_published_child(node, fingerprint, Some(*t))
+                            Self::hottest_published_child(node, fingerprint, Some(*t), engine_id)
                         {
                             if tokens.len() >= sib.key.len() {
                                 divergent = Some((sib, i + 1));
@@ -209,7 +238,11 @@ impl PrefixIndex {
                     }
                     node = child;
                     if let Some(entry) = &node.entry {
-                        if entry.state == CheckpointState::Published && fp_ok(entry) {
+                        if entry.state == CheckpointState::Published
+                            && fp_ok(entry)
+                            && engine_ok(entry)
+                            && granularity_ok(entry, i + 1)
+                        {
                             // Anchor touch: this entry just served a request, so
                             // it is the base of a live chain. Relaxed is fine —
                             // the value feeds a heuristic (eviction), and a torn
@@ -222,7 +255,9 @@ impl PrefixIndex {
                 None => {
                     // The walk breaks here: every published child diverges from
                     // the request at this position.
-                    if let Some(sib) = Self::hottest_published_child(node, fingerprint, None) {
+                    if let Some(sib) =
+                        Self::hottest_published_child(node, fingerprint, None, engine_id)
+                    {
                         if tokens.len() >= sib.key.len() {
                             divergent = Some((sib, i + 1));
                         }
@@ -236,16 +271,22 @@ impl PrefixIndex {
         // the same depth is full containment of a longer prefix — strictly
         // better than adopting a key that differs at its last token.
         if let Some((entry, matched)) = divergent {
-            let beats_best = best.as_ref().is_none_or(|(_, depth)| matched > *depth);
-            if matched >= 2 && beats_best {
-                // Touch through the reference, only for the entry this lookup
-                // actually serves: a touch before the eligibility check let
-                // unserved walk traffic extend a child's anchor window (review
-                // 2026-10-04). The touch must hit the REAL trie entry: a clone's
-                // last_used_millis is a copy, and storing into it would leave the
-                // base of a live multi-turn chain cold for the reaper.
-                entry.last_used_millis.store(now_millis(), Relaxed);
-                return Some((entry.clone(), matched));
+            if !engine_ok(entry) || !granularity_ok(entry, matched) {
+                // A sibling from another engine domain, or a WHOLE_CONTEXT
+                // sibling against a partial match: not adoptable. Fall
+                // through to the exact-walk candidate rather than serve it.
+            } else {
+                let beats_best = best.as_ref().is_none_or(|(_, depth)| matched > *depth);
+                if matched >= 2 && beats_best {
+                    // Touch through the reference, only for the entry this lookup
+                    // actually serves: a touch before the eligibility check let
+                    // unserved walk traffic extend a child's anchor window (review
+                    // 2026-10-04). The touch must hit the REAL trie entry: a clone's
+                    // last_used_millis is a copy, and storing into it would leave the
+                    // base of a live multi-turn chain cold for the reaper.
+                    entry.last_used_millis.store(now_millis(), Relaxed);
+                    return Some((entry.clone(), matched));
+                }
             }
         }
         best.map(|(entry, depth)| (entry.clone(), depth))
@@ -265,7 +306,11 @@ impl PrefixIndex {
         // A token to EXCLUDE (the child the walk is already taking): a sibling
         // candidate must differ from the request at this depth.
         exclude: Option<u32>,
+        // Engine domain of the request: siblings from other engines are
+        // skipped here so the adoption sites never see them.
+        engine_id: Option<&str>,
     ) -> Option<&'a IndexEntry> {
+        let request_engine = engine_id.unwrap_or(crate::contract::DEFAULT_ENGINE);
         let mut best: Option<(u64, u32, &IndexEntry)> = None;
         for (t, child) in &node.children {
             if Some(*t) == exclude {
@@ -275,6 +320,14 @@ impl PrefixIndex {
                 continue;
             };
             if entry.state != CheckpointState::Published {
+                continue;
+            }
+            let entry_engine = entry
+                .meta
+                .engine_id
+                .as_deref()
+                .unwrap_or(crate::contract::DEFAULT_ENGINE);
+            if entry_engine != request_engine {
                 continue;
             }
             if let Some(f) = fingerprint {

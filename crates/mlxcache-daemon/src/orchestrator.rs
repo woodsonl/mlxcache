@@ -122,9 +122,17 @@ impl Orchestrator {
 
     /// Route a tokenized request: lookup, classify, decide prefill origin.
     /// Tokenization and fingerprint come from the adapter (R1-2); the daemon
-    /// never re-tokenizes.
-    pub fn route(&self, tokens: &[u32], request_fingerprint: &ModelFingerprint) -> RouteOutcome {
-        let lookup = self.index.lookup(tokens, Some(request_fingerprint));
+    /// never re-tokenizes. The engine domain rides along so an entry
+    /// published by a different engine family is never adoptable.
+    pub fn route(
+        &self,
+        tokens: &[u32],
+        request_fingerprint: &ModelFingerprint,
+        engine_id: Option<&str>,
+    ) -> RouteOutcome {
+        let lookup = self
+            .index
+            .lookup_with_engine(tokens, Some(request_fingerprint), engine_id);
         // Borrow, don't clone: the full-prefix key (~80 KB at 20K tokens) and
         // the blob path are needed only when the verdict survives classify —
         // a fingerprint mismatch classifies as Miss and discards them, so
@@ -800,7 +808,7 @@ mod tests {
         let tokens = vec![1, 2, 3, 4];
 
         // Miss: nothing published
-        let out = orch.route(&tokens, &f);
+        let out = orch.route(&tokens, &f, None);
         assert_eq!(out.decision.verdict, CacheVerdict::Miss);
         assert_eq!(out.prefill_from, 0);
 
@@ -808,14 +816,14 @@ mod tests {
         publish(&orch, &tokens, meta("m", 4), "blob-1", 1);
 
         // Hit: full match. KV covers prefix[:-1] = 3 of 4 tokens.
-        let out = orch.route(&tokens, &f);
+        let out = orch.route(&tokens, &f, None);
         assert_eq!(out.decision.verdict, CacheVerdict::Hit);
         assert_eq!(out.prefill_from, 3);
 
         // Partial: extension of the published prefix. The 4-token checkpoint's
         // KV covers 3 tokens, so prefill resumes at 3.
         let ext = vec![1, 2, 3, 4, 5, 6];
-        let out = orch.route(&ext, &f);
+        let out = orch.route(&ext, &f, None);
         assert_eq!(out.decision.verdict, CacheVerdict::Partial);
         assert_eq!(out.prefill_from, 3);
     }
@@ -825,7 +833,7 @@ mod tests {
         let orch = Orchestrator::new();
         let tokens = vec![1, 2, 3];
         publish(&orch, &tokens, meta("model-a", 3), "blob-a", 1);
-        let out = orch.route(&tokens, &fp("model-b"));
+        let out = orch.route(&tokens, &fp("model-b"), None);
         assert_eq!(out.decision.verdict, CacheVerdict::Miss);
         assert_eq!(out.prefill_from, 0);
     }
@@ -844,8 +852,11 @@ mod tests {
         let mut meta_a = meta("m", 3);
         meta_a.fingerprint = a.clone();
         publish(&orch, &tokens, meta_a, "blob-a", 1);
-        assert_eq!(orch.route(&tokens, &a).decision.verdict, CacheVerdict::Hit);
-        let out = orch.route(&tokens, &b);
+        assert_eq!(
+            orch.route(&tokens, &a, None).decision.verdict,
+            CacheVerdict::Hit
+        );
+        let out = orch.route(&tokens, &b, None);
         assert_eq!(out.decision.verdict, CacheVerdict::Miss);
         assert!(
             out.blob.is_none(),
@@ -897,8 +908,11 @@ mod tests {
         assert_eq!(orch.published_count(), 1);
         for (i, name) in names.iter().enumerate() {
             let gone = !persistence.blob_dir.join(name).exists();
-            let still_published =
-                orch.route(&[i as u32, 2, 3], &fp("m")).decision.verdict == CacheVerdict::Hit;
+            let still_published = orch
+                .route(&[i as u32, 2, 3], &fp("m"), None)
+                .decision
+                .verdict
+                == CacheVerdict::Hit;
             assert_eq!(
                 gone, !still_published,
                 "index removal and file unlink must agree for {name}"
@@ -995,7 +1009,7 @@ mod tests {
         assert_eq!(evicted, 1);
         // The 4-token entry is gone: [1,2,3,4] now only PARTIALLY matches the
         // surviving base at depth 2.
-        let out = orch.route(&[1, 2, 3, 4], &fp("m"));
+        let out = orch.route(&[1, 2, 3, 4], &fp("m"), None);
         assert_eq!(
             out.decision.verdict,
             CacheVerdict::Partial,
@@ -1003,11 +1017,11 @@ mod tests {
         );
         assert_eq!(out.decision.matched_tokens, 2);
         assert_eq!(
-            orch.route(&[1, 2], &fp("m")).decision.verdict,
+            orch.route(&[1, 2], &fp("m"), None).decision.verdict,
             CacheVerdict::Hit
         );
         assert_eq!(
-            orch.route(&[7, 7, 7], &fp("m")).decision.verdict,
+            orch.route(&[7, 7, 7], &fp("m"), None).decision.verdict,
             CacheVerdict::Hit
         );
 
@@ -1016,18 +1030,18 @@ mod tests {
         let evicted = orch.evict_cold(&persistence, 1, 0, std::time::Duration::ZERO);
         assert_eq!(evicted, 1);
         assert_eq!(
-            orch.route(&[7, 7, 7], &fp("m")).decision.verdict,
+            orch.route(&[7, 7, 7], &fp("m"), None).decision.verdict,
             CacheVerdict::Miss
         );
 
         // The base is now alone (its chain was reaped, so the structural
         // anchor has lapsed) — but it was just SERVED: within the recency
         // window it is an anchor and must survive even a cap of 0.
-        orch.route(&[1, 2], &fp("m")); // touch via lookup
+        orch.route(&[1, 2], &fp("m"), None); // touch via lookup
         let evicted = orch.evict_cold(&persistence, 0, 0, std::time::Duration::from_secs(900));
         assert_eq!(evicted, 0, "a recently served entry is never evicted");
         assert_eq!(
-            orch.route(&[1, 2], &fp("m")).decision.verdict,
+            orch.route(&[1, 2], &fp("m"), None).decision.verdict,
             CacheVerdict::Hit
         );
 
@@ -1038,7 +1052,7 @@ mod tests {
         let evicted = orch.evict_cold(&persistence, 0, 0, std::time::Duration::ZERO);
         assert_eq!(evicted, 1);
         assert_eq!(
-            orch.route(&[1, 2], &fp("m")).decision.verdict,
+            orch.route(&[1, 2], &fp("m"), None).decision.verdict,
             CacheVerdict::Miss
         );
     }
@@ -1055,7 +1069,7 @@ mod tests {
         let evicted = orch.evict_cold(&persistence, 0, 0, std::time::Duration::from_secs(900));
         assert_eq!(evicted, 0, "a just-published entry is an anchor (recency)");
         assert_eq!(
-            orch.route(&[7, 7, 7], &fp("m")).decision.verdict,
+            orch.route(&[7, 7, 7], &fp("m"), None).decision.verdict,
             CacheVerdict::Hit
         );
         // Window 0: not recently used, no descendants — evictable.
