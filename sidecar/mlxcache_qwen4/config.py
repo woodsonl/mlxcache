@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from typing import Any
 
 LINEAR = "linear_attention"
@@ -251,7 +251,6 @@ class Qwen4TextConfig:
         # (and partial_rotary_factor 1.0 vs 0.25 failed QSA validation).
 
         def _default(name: str):
-            import dataclasses
 
             for f in dataclasses.fields(cls):
                 if f.name == name:

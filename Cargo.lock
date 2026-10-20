@@ -1015,11 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "mlxcache-core"
-<<<<<<< HEAD
 version = "0.2.2"
-=======
-version = "0.2.0"
->>>>>>> b9c8cc7 (fix: CodeRabbit backlog batch A+B — CI hardening, plist placeholder, doc precision, small Rust/Py fixes)
 dependencies = [
  "criterion",
  "serde",
@@ -1031,11 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "mlxcache-daemon"
-<<<<<<< HEAD
 version = "0.2.2"
-=======
-version = "0.2.0"
->>>>>>> b9c8cc7 (fix: CodeRabbit backlog batch A+B — CI hardening, plist placeholder, doc precision, small Rust/Py fixes)
 dependencies = [
  "anyhow",
  "axum",
