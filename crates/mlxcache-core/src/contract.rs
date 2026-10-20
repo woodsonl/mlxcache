@@ -21,6 +21,14 @@ pub fn engine_id_meta(engine: &str) -> Option<String> {
     (engine != DEFAULT_ENGINE).then(|| engine.to_string())
 }
 
+/// Resolve an engine id (request, entry, or header) to its domain: an absent
+/// id IS the default engine. Every adoption, sibling-scan, and rebuild
+/// grouping must compare domains, never raw ids — a `None` entry and a
+/// `"mlx-lm"` request are the same engine (legacy stores rely on this).
+pub fn engine_domain(engine_id: Option<&str>) -> &str {
+    engine_id.unwrap_or(DEFAULT_ENGINE)
+}
+
 /// Fingerprint pinned in every checkpoint's metadata. Any mismatch is a miss (R1-1).
 ///
 /// `kv_bits`/`kv_group_size` pin the KV quantization config (T12): an 8-bit

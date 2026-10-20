@@ -17,7 +17,9 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sidecar"))
+# probes/ lives inside sidecar/: the import root is this file's parent
+# directory, not a sibling named "sidecar".
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
 def _lean_greedy_stream(engine, prompt, cache):

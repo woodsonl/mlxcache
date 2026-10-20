@@ -3,7 +3,7 @@
 //! Longest-prefix match in O(prefix length). No SQLite on the hot path (D2-reopened).
 //! Index rows are only visible after the checkpoint blob's atomic publish (R1-3).
 
-use crate::contract::{CheckpointMeta, CheckpointState, ModelFingerprint};
+use crate::contract::{engine_domain, CheckpointMeta, CheckpointState, ModelFingerprint};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -12,8 +12,20 @@ use std::sync::RwLock;
 #[derive(Debug, Default)]
 struct Node {
     children: HashMap<u32, Node>,
-    /// Present only on nodes that terminate a published checkpoint.
-    entry: Option<IndexEntry>,
+    /// At most one entry per ENGINE DOMAIN: a qwen4-exp checkpoint and an
+    /// mlx-lm checkpoint at the same token prefix are different cache nodes
+    /// and must coexist (a single-slot Option made the second publish
+    /// REPLACE the first, and the replacement hook then deleted the other
+    /// engine's blob). Single-engine stores hold one entry per node, so the
+    /// map stays tiny.
+    entries: HashMap<Box<str>, IndexEntry>,
+}
+
+/// The per-domain storage key for an entry: the normalized engine domain
+/// (an absent engine_id IS the default engine — legacy stores and explicit
+/// `"mlx-lm"` ids share one slot, never two).
+fn domain_key(meta: &CheckpointMeta) -> Box<str> {
+    crate::contract::engine_domain(meta.engine_id.as_deref()).into()
 }
 
 #[derive(Debug)]
@@ -159,11 +171,39 @@ impl PrefixIndex {
         tokens: &[u32],
         fingerprint: Option<&ModelFingerprint>,
     ) -> Option<(IndexEntry, usize)> {
+        self.lookup_with_engine(tokens, fingerprint, None)
+    }
+
+    /// Engine-domain lookup: entries published by a different engine family
+    /// are never adoptable even when their fingerprints match (a qwen4-exp
+    /// checkpoint at the same token prefix as an mlx-lm one is not reuse
+    /// for an mlx-lm request), and WHOLE_CONTEXT entries (granularity 1)
+    /// only qualify on an exact full-prompt match — their documented
+    /// fallback when the match is partial is to not serve, letting the
+    /// walk continue to an ANY_PREFIX candidate.
+    pub fn lookup_with_engine(
+        &self,
+        tokens: &[u32],
+        fingerprint: Option<&ModelFingerprint>,
+        engine_id: Option<&str>,
+    ) -> Option<(IndexEntry, usize)> {
         use std::sync::atomic::Ordering::Relaxed;
         let fp_ok = |entry: &IndexEntry| {
             fingerprint
                 .is_none_or(|f| crate::policy::identity_compatible(&entry.meta.fingerprint, f))
         };
+        // WHOLE_CONTEXT entries serve only when the request IS the entry's
+        // full prompt. `exact` says the walk consumed the whole request
+        // (i + 1 == tokens.len() on the exact path); a divergent sibling by
+        // construction differs from the request, so it can never be an
+        // exact full-prompt match and granularity-1 siblings are rejected
+        // outright.
+        let granularity_ok =
+            |entry: &IndexEntry, exact: bool| entry.meta.granularity.unwrap_or(0) != 1 || exact;
+        // Engine filtering is structural: each node stores at most one entry
+        // PER DOMAIN, so the walk reads exactly the request's domain slot —
+        // foreign-engine entries are never visited, not filtered after.
+        let request_domain = engine_domain(engine_id);
         let root = self.read_lock();
         let mut node: &Node = &root;
         // Borrow-walk: track the best entry by REFERENCE and clone once at
@@ -200,7 +240,7 @@ impl PrefixIndex {
                     // the common single-child chain free of any child scan.
                     if node.children.len() > 1 {
                         if let Some(sib) =
-                            Self::hottest_published_child(node, fingerprint, Some(*t))
+                            Self::hottest_published_child(node, fingerprint, Some(*t), engine_id)
                         {
                             if tokens.len() >= sib.key.len() {
                                 divergent = Some((sib, i + 1));
@@ -208,8 +248,11 @@ impl PrefixIndex {
                         }
                     }
                     node = child;
-                    if let Some(entry) = &node.entry {
-                        if entry.state == CheckpointState::Published && fp_ok(entry) {
+                    if let Some(entry) = node.entries.get(request_domain) {
+                        if entry.state == CheckpointState::Published
+                            && fp_ok(entry)
+                            && granularity_ok(entry, i + 1 == tokens.len())
+                        {
                             // Anchor touch: this entry just served a request, so
                             // it is the base of a live chain. Relaxed is fine —
                             // the value feeds a heuristic (eviction), and a torn
@@ -222,7 +265,9 @@ impl PrefixIndex {
                 None => {
                     // The walk breaks here: every published child diverges from
                     // the request at this position.
-                    if let Some(sib) = Self::hottest_published_child(node, fingerprint, None) {
+                    if let Some(sib) =
+                        Self::hottest_published_child(node, fingerprint, None, engine_id)
+                    {
                         if tokens.len() >= sib.key.len() {
                             divergent = Some((sib, i + 1));
                         }
@@ -236,17 +281,22 @@ impl PrefixIndex {
         // the same depth is full containment of a longer prefix — strictly
         // better than adopting a key that differs at its last token.
         if let Some((entry, matched)) = divergent {
-            let beats_best = best.as_ref().is_none_or(|(_, depth)| matched > *depth);
-            if matched >= 2 && beats_best {
-                // Touch through the reference, only for the entry this lookup
-                // actually serves: a touch before the eligibility check let
-                // unserved walk traffic extend a child's anchor window (review
-                // 2026-10-04). The touch must hit the REAL trie entry: a clone's
-                // last_used_millis is a copy, and storing into it would leave the
-                // base of a live multi-turn chain cold for the reaper.
-                entry.last_used_millis.store(now_millis(), Relaxed);
-                return Some((entry.clone(), matched));
+            if granularity_ok(entry, false) {
+                let beats_best = best.as_ref().is_none_or(|(_, depth)| matched > *depth);
+                if matched >= 2 && beats_best {
+                    // Touch through the reference, only for the entry this lookup
+                    // actually serves: a touch before the eligibility check let
+                    // unserved walk traffic extend a child's anchor window (review
+                    // 2026-10-04). The touch must hit the REAL trie entry: a clone's
+                    // last_used_millis is a copy, and storing into it would leave the
+                    // base of a live multi-turn chain cold for the reaper.
+                    entry.last_used_millis.store(now_millis(), Relaxed);
+                    return Some((entry.clone(), matched));
+                }
             }
+            // A WHOLE_CONTEXT sibling (never an exact full-prompt match on
+            // the divergent path): not adoptable — fall through to the
+            // exact-walk candidate.
         }
         best.map(|(entry, depth)| (entry.clone(), depth))
     }
@@ -265,16 +315,27 @@ impl PrefixIndex {
         // A token to EXCLUDE (the child the walk is already taking): a sibling
         // candidate must differ from the request at this depth.
         exclude: Option<u32>,
+        // Engine domain of the request: each child stores at most one entry
+        // per domain, so reading the request's slot never surfaces a
+        // foreign-engine sibling.
+        engine_id: Option<&str>,
     ) -> Option<&'a IndexEntry> {
+        let request_domain = engine_domain(engine_id);
         let mut best: Option<(u64, u32, &IndexEntry)> = None;
         for (t, child) in &node.children {
             if Some(*t) == exclude {
                 continue;
             }
-            let Some(entry) = &child.entry else {
+            let Some(entry) = child.entries.get(request_domain) else {
                 continue;
             };
             if entry.state != CheckpointState::Published {
+                continue;
+            }
+            // A WHOLE_CONTEXT child serves only its own exact full prompt;
+            // it is never a valid continuation point for a longer request,
+            // so it is skipped exactly like a missing slot.
+            if entry.meta.granularity.unwrap_or(0) == 1 {
                 continue;
             }
             if let Some(f) = fingerprint {
@@ -360,7 +421,10 @@ impl PrefixIndex {
         let mut snapshots: Vec<Snapshot> = Vec::new();
         for i in (0..frames.len()).rev() {
             let mut below_self = frames[i].pub_below;
-            if let Some(entry) = &frames[i].node.entry {
+            // Every domain's entry at this node is an independent candidate;
+            // two engines at one prefix produce two candidates with the same
+            // tokens and different blob paths.
+            for entry in frames[i].node.entries.values() {
                 if entry.state == CheckpointState::Published {
                     below_self = true;
                     let millis = entry.last_used_millis.load(Relaxed);
@@ -432,7 +496,7 @@ impl PrefixIndex {
         // the kept prefix.
         let mut last_keep = 0usize;
         for (j, t) in tokens.iter().enumerate() {
-            if node.entry.is_some() || node.children.len() >= 2 {
+            if !node.entries.is_empty() || node.children.len() >= 2 {
                 last_keep = j;
             }
             match node.children.get_mut(t) {
@@ -440,21 +504,23 @@ impl PrefixIndex {
                 None => return false,
             }
         }
-        let removed = match &mut node.entry {
-            Some(entry)
-                if entry.blob_path == blob_path
+        let slot = node
+            .entries
+            .iter()
+            .find(|(_, entry)| {
+                entry.blob_path == blob_path
                     && entry.generation == generation
-                    && entry.state == CheckpointState::Published =>
-            {
-                node.entry = None;
-                true
-            }
-            _ => false,
+                    && entry.state == CheckpointState::Published
+            })
+            .map(|(k, _)| k.clone());
+        let removed = match slot {
+            Some(k) => node.entries.remove(&k).is_some(),
+            None => false,
         };
         // Prunable suffix: the removed entry's node must be childless (a
         // deeper chain anchored at it survives), and the suffix is non-empty
         // by construction (last_keep <= len-1 < the removed node's depth).
-        if removed && node.children.is_empty() {
+        if removed && node.children.is_empty() && node.entries.is_empty() {
             let mut cur: &mut Node = &mut root;
             for t in &tokens[..last_keep] {
                 cur = cur
@@ -519,25 +585,32 @@ impl PrefixIndex {
         // names, replacing an entry (a fingerprint-miss republish at the same
         // prefix) would otherwise leak the old file forever. Runs under the write
         // lock so a concurrent retire of the old entry cannot race the unlink.
-        if let Some(old) = &node.entry {
+        // Replacement is PER DOMAIN: the same prefix under a different engine
+        // is a different cache node, not a supersession — both blobs stay
+        // live, so the hook never fires across engines.
+        let domain = domain_key(&meta);
+        if let Some(old) = node.entries.get(domain.as_ref()) {
             if old.blob_path != blob_path {
                 on_replaced(&old.blob_path);
             }
         }
-        node.entry = Some(IndexEntry {
-            meta,
-            // The trie path IS the key (publish is the only constructor);
-            // lookups that serve an end-divergent request report this key,
-            // not the request's tokens (T22).
-            key: tokens.to_vec(),
-            blob_path,
-            generation,
-            state: CheckpointState::Published,
-            // A freshly published checkpoint counts as just-used: it must not
-            // be the first thing the reaper picks the moment it goes cold,
-            // since it is by definition the newest KV in the store.
-            last_used_millis: std::sync::atomic::AtomicU64::new(now_millis()),
-        });
+        node.entries.insert(
+            domain,
+            IndexEntry {
+                meta,
+                // The trie path IS the key (publish is the only constructor);
+                // lookups that serve an end-divergent request report this key,
+                // not the request's tokens (T22).
+                key: tokens.to_vec(),
+                blob_path,
+                generation,
+                state: CheckpointState::Published,
+                // A freshly published checkpoint counts as just-used: it must not
+                // be the first thing the reaper picks the moment it goes cold,
+                // since it is by definition the newest KV in the store.
+                last_used_millis: std::sync::atomic::AtomicU64::new(now_millis()),
+            },
+        );
         true
     }
 
@@ -570,17 +643,21 @@ impl PrefixIndex {
                 None => return false,
             }
         }
-        match &mut node.entry {
-            Some(entry)
-                if entry.blob_path == blob_path
-                    && entry.generation == generation
-                    && entry.state == CheckpointState::Published =>
-            {
+        // Blob name + generation identify the entry regardless of which
+        // domain's slot it lives in (a foreign-engine quarantine still
+        // retires the right blob).
+        let hit = node.entries.values_mut().find(|entry| {
+            entry.blob_path == blob_path
+                && entry.generation == generation
+                && entry.state == CheckpointState::Published
+        });
+        match hit {
+            Some(entry) => {
                 entry.state = CheckpointState::Quarantined;
                 on_retired();
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -612,7 +689,7 @@ impl PrefixIndex {
         // quarantined entries (capped, few). (Review 2026-10-04.)
         let mut stack: Vec<&Node> = vec![&root];
         while let Some(node) = stack.pop() {
-            if let Some(entry) = &node.entry {
+            for entry in node.entries.values() {
                 if entry.state == CheckpointState::Quarantined {
                     all.push((
                         entry
@@ -648,7 +725,7 @@ impl PrefixIndex {
         let mut node: &mut Node = &mut root;
         let mut last_keep = 0usize;
         for (j, t) in tokens.iter().enumerate() {
-            if node.entry.is_some() || node.children.len() >= 2 {
+            if !node.entries.is_empty() || node.children.len() >= 2 {
                 last_keep = j;
             }
             match node.children.get_mut(t) {
@@ -656,18 +733,20 @@ impl PrefixIndex {
                 None => return false,
             }
         }
-        let removed = match &mut node.entry {
-            Some(entry)
-                if entry.blob_path == blob_path
+        let slot = node
+            .entries
+            .iter()
+            .find(|(_, entry)| {
+                entry.blob_path == blob_path
                     && entry.generation == generation
-                    && entry.state == CheckpointState::Quarantined =>
-            {
-                node.entry = None;
-                true
-            }
-            _ => false,
+                    && entry.state == CheckpointState::Quarantined
+            })
+            .map(|(k, _)| k.clone());
+        let removed = match slot {
+            Some(k) => node.entries.remove(&k).is_some(),
+            None => false,
         };
-        if removed && node.children.is_empty() {
+        if removed && node.children.is_empty() && node.entries.is_empty() {
             let mut cur: &mut Node = &mut root;
             for t in &tokens[..last_keep] {
                 cur = cur
@@ -687,7 +766,7 @@ impl PrefixIndex {
         let mut n = 0usize;
         let mut stack: Vec<&Node> = vec![&root];
         while let Some(node) = stack.pop() {
-            n += usize::from(node.entry.as_ref().is_some_and(|e| e.state == state));
+            n += node.entries.values().filter(|e| e.state == state).count();
             for child in node.children.values() {
                 stack.push(child);
             }
@@ -1538,6 +1617,149 @@ mod tests {
         assert!(
             after > before,
             "lookup must advance the entry's last_used instant"
+        );
+    }
+
+    #[test]
+    fn whole_context_entry_serves_only_its_exact_prompt() {
+        // granularity=1 (WHOLE_CONTEXT) means the blob holds KV for the
+        // entry's full prompt and nothing looser: a LONGER request must fall
+        // back to the ANY_PREFIX ancestor deeper in its walk, and a
+        // DIVERGENT request must never adopt it as a sibling.
+        let index = PrefixIndex::new();
+        publish_entry(&index, &[1, 2], "ancestor");
+        let generation = index.reserve_generation();
+        let mut whole = meta();
+        whole.granularity = Some(1);
+        assert!(index.publish(&[1, 2, 3], whole, "whole".into(), generation, |_| {}));
+
+        // Exact full-prompt match: the WHOLE_CONTEXT entry serves.
+        let (entry, matched) = index.lookup(&[1, 2, 3], None).unwrap();
+        assert_eq!(entry.blob_path, "whole");
+        assert_eq!(matched, 3);
+
+        // Longer request: [1,2] is walked exactly, [1,2,3] matches but is
+        // WHOLE_CONTEXT against a non-exact request, so the walk must keep
+        // the ANY_PREFIX ancestor at [1,2] instead.
+        let (entry, matched) = index.lookup(&[1, 2, 3, 4, 5], None).unwrap();
+        assert_eq!(
+            entry.blob_path, "ancestor",
+            "a longer request must select the ANY_PREFIX ancestor, not the WHOLE_CONTEXT node"
+        );
+        assert_eq!(matched, 2);
+
+        // Divergent request: diverges at depth 2, so [1,2,3] is a divergent
+        // sibling candidate — a granularity-1 sibling can never be an exact
+        // full-prompt match and must be rejected outright.
+        let (entry, _) = index.lookup(&[1, 2, 9, 9], None).unwrap();
+        assert_eq!(
+            entry.blob_path, "ancestor",
+            "a divergent request must never adopt the WHOLE_CONTEXT sibling"
+        );
+    }
+
+    #[test]
+    fn hottest_child_skips_whole_context_entries() {
+        // The divergent-sibling scan (hottest_published_child) feeds ADOPTION
+        // sites that serve longer requests; a WHOLE_CONTEXT child can never
+        // be a valid continuation point and must be skipped even when it is
+        // the hottest candidate.
+        let index = PrefixIndex::new();
+        publish_entry(&index, &[1, 2], "ancestor");
+        let generation = index.reserve_generation();
+        let mut whole = meta();
+        whole.granularity = Some(1);
+        assert!(index.publish(&[1, 2, 3], whole, "hot-whole".into(), generation, |_| {}));
+        publish_entry(&index, &[1, 2, 4], "any-prefix-sibling");
+
+        // Request [1,2,9,...]: divergent siblings at depth 3 are [1,2,3]
+        // (WHOLE_CONTEXT, hot) and [1,2,4] (ANY_PREFIX). The adopted entry
+        // must be the ANY_PREFIX sibling, never the WHOLE_CONTEXT one.
+        let (entry, matched) = index.lookup(&[1, 2, 9, 9], None).unwrap();
+        assert_eq!(matched, 3, "the deeper divergent sibling wins on coverage");
+        assert_eq!(
+            entry.blob_path, "any-prefix-sibling",
+            "a divergent request must adopt the ANY_PREFIX sibling, never the WHOLE_CONTEXT one"
+        );
+    }
+
+    #[test]
+    fn two_engines_at_the_same_prefix_coexist() {
+        // Two engine domains at one token prefix are two cache nodes: the
+        // second publish must not REPLACE the first (the replacement hook
+        // would delete the other engine's blob file), each lookup reads
+        // only its own domain's slot, and both are independent eviction
+        // candidates. A missing engine_id IS the default engine, so a
+        // legacy entry and an explicit "mlx-lm" entry still share one slot.
+        let index = PrefixIndex::new();
+        let g_default = publish_entry(&index, &[1, 2, 3], "mlx-lm-blob");
+        let g_qwen = index.reserve_generation();
+        let mut qwen = meta();
+        qwen.engine_id = Some("qwen4-exp".into());
+        let mut replaced: Vec<String> = Vec::new();
+        assert!(
+            index.publish(&[1, 2, 3], qwen, "qwen4-blob".into(), g_qwen, |old| {
+                replaced.push(old.to_string())
+            })
+        );
+        assert!(
+            replaced.is_empty(),
+            "a cross-engine publish is not a supersession"
+        );
+        assert_eq!(index.published_count(), 2, "both domains hold their entry");
+
+        let (ml, matched) = index.lookup_with_engine(&[1, 2, 3], None, None).unwrap();
+        assert_eq!((ml.blob_path.as_str(), matched), ("mlx-lm-blob", 3));
+        let (qw, _) = index
+            .lookup_with_engine(&[1, 2, 3], None, Some("qwen4-exp"))
+            .unwrap();
+        assert_eq!(qw.blob_path, "qwen4-blob");
+
+        let blobs: Vec<String> = index
+            .eviction_candidates()
+            .into_iter()
+            .map(|c| c.blob_path)
+            .collect();
+        assert!(blobs.contains(&"mlx-lm-blob".to_string()));
+        assert!(blobs.contains(&"qwen4-blob".to_string()));
+
+        // Removing one domain's entry must leave the other's node intact:
+        // the survivor anchors the trie node the prune would otherwise
+        // reclaim.
+        assert!(index.remove_published(&[1, 2, 3], "mlx-lm-blob", g_default));
+        assert!(index.lookup_with_engine(&[1, 2, 3], None, None).is_none());
+        assert!(index
+            .lookup_with_engine(&[1, 2, 3], None, Some("qwen4-exp"))
+            .is_some());
+
+        // Same-domain republish IS a supersession: with the qwen slot live,
+        // a fresh default-domain publish into an EMPTY slot fires no hook,
+        // and replacing an occupied same-domain slot does.
+        let g_refill = index.reserve_generation();
+        let mut replaced2: Vec<String> = Vec::new();
+        assert!(index.publish(
+            &[1, 2, 3],
+            meta(),
+            "default-blob-v2".into(),
+            g_refill,
+            |old| replaced2.push(old.to_string())
+        ));
+        assert!(
+            replaced2.is_empty(),
+            "refilling an emptied domain slot supersedes nothing"
+        );
+        let g_same = index.reserve_generation();
+        assert!(index.publish(
+            &[1, 2, 3],
+            meta(),
+            "default-blob-v3".into(),
+            g_same,
+            |old| replaced2.push(old.to_string())
+        ));
+        assert_eq!(
+            replaced2,
+            vec!["default-blob-v2".to_string()],
+            "a same-domain republish reclaims the old blob"
         );
     }
 }

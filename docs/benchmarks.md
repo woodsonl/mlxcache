@@ -81,10 +81,16 @@ much text is shared. `bench_prefix.py` therefore runs W1 **both ways**:
 | `W4` | fixed prefix + k unrelated requests between repeats, under a tight entry cap | **does the benefit survive cache pressure?** |
 | `W5` | the captured trace of the above, scored with `scripts/replay_trace.py` | trace and `/stats` must agree |
 
-Model, hardware, concurrency (1), input length and output cap are held constant
-across workloads. Every workload runs twice: **cold** (empty store, fresh
-process) and **warm** (fresh process over the same store) — the cross-restart
-tier, which is what a persistent cache is for.
+Model, hardware, concurrency (1) and output cap are held constant across
+workloads; input length is held constant only WITHIN each workload's own
+cold/warm comparison — W1, W1np and W2 share the same ~1,975-token prefix
+while W3 deliberately uses short distinct prompts (decode-bound by design),
+so cross-workload rows are not input-length-controlled and are not
+comparable as such. Each workload in the cold/warm grid below (W1, W1np,
+W2, W3) runs twice: **cold** (empty store, fresh process) and **warm**
+(fresh process over the same store) — the cross-restart tier, which is what
+a persistent cache is for. W4 (pressure) and W5 (trace/stat agreement) are
+adversarial validation arms, not part of the cold/warm comparison.
 
 The `direct` arm runs the same requests against plain `mlx_lm.server`, whose
 `LRUPromptCache` is process-local and therefore cold after every restart. That
@@ -144,7 +150,7 @@ uv run python scripts/bench_prefix.py --arms pressure --k 0,1,2,4,8,16 \
 
 What the grid says:
 
-1. **Cross-restart reuse is real**: warm TTFT is ~20× the cold leg (3.2 s → ~0.15 s) with 99.93–99.95% of requested prefix tokens served after both processes were killed and restarted from disk. No in-process cache can do this tier at all.
+1. **Cross-restart reuse is real**: warm TTFT drops per workload as the table shows — W1 3,178 → 154 ms (~21× lower), W1np 3,183 → 155 ms (~21×), W2 2,021 → 147 ms (~14×), W3 164 → 87 ms (~1.9×; short prompts, reuse cannot help much). W1, W1np and W2 serve 99.93–99.95% of requested prefix tokens after both processes were killed and restarted from disk (W3: 95%). No in-process cache can do this tier at all.
 2. **TPOT is flat (~12–13 ms) cold vs warm everywhere.** Caching moves prefill, not decode; W3 exists to keep that measured rather than assumed.
 3. **Mid-document divergence is never served**: W2's near-miss traffic (a long shared opening that diverges before either document's end) gets exactly 0% cold, as the end-anchored rule requires.
 4. **Priming matters once**: W1's first question is served ~1,959 tokens because the prefix was published alone; W1np's first question gets 0. After each request publishes its own full-length key, both warm legs converge to ~99.95%.

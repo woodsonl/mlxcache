@@ -2,6 +2,65 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.3.0 — 2026-10-20
+
+### Added
+
+- **Engine-domain cache isolation.** The index stores one entry per engine
+  domain per token prefix: a qwen4-exp checkpoint and an mlx-lm checkpoint
+  at the same prefix are different cache nodes that coexist at runtime and
+  across restarts (rebuild groups by `(tokens, engine)`; the publish
+  reclaim hook never fires across engines). Request routing is
+  engine-aware end to end — foreign-engine entries are never adopted,
+  served, or deleted by another engine's traffic.
+- **Fail-closed identity sentinels.** An unavailable tokenizer (wrapper) or
+  vocabulary digest (sidecar connector) pins the `"missing"` sentinel and
+  disables persistent lookup and publication everywhere — never a fallback
+  to a name-based identity two tokenizers could share. Model, adapter, and
+  draft identifiers resolve to local snapshot directories before
+  fingerprinting (adapters keyed by `adapter_config.json`); a supplied but
+  unresolvable adapter or draft disables persistence rather than silently
+  serving the base model's KV.
+- **Synchronous, acknowledged trace shutdown.** The daemon's exit path
+  waits (bounded) for the trace writer to acknowledge that every queued
+  record reached the file; the ACK carries the batch's real outcome,
+  including any record write that failed since the previous ACK. A
+  truncated trace silently understates measured load — exit can no longer
+  outrun the queue.
+- Canonical encoding for the sidecar `tokenizer_hash` is documented
+  (UTF-8 SHA-256 of `repr(sorted(get_vocab().items()))`, first 16 hex).
+
+### Changed
+
+- **WHOLE_CONTEXT granularity is exact-match only.** A granularity-1 entry
+  serves only its own exact full prompt: longer requests fall back to the
+  ANY_PREFIX ancestor, divergent requests never adopt it, and the
+  divergent-sibling scan skips such entries entirely.
+- Release builds keep unwinding: `panic=abort` is removed (it silently
+  killed lock-poisoning recovery and task cleanup paths).
+- One bounded-read SSE decode policy for every consumer (`_harness.sse_lines`)
+  — the bench scripts no longer carry drifted copies.
+- Bench provenance is status-aware: `source_dirty` is `null` when the git
+  status query cannot run, never inferred-clean from a failed command.
+- CI runs least-privilege (`contents: read`, no credential persistence,
+  `CARGO_INCREMENTAL=0`).
+
+### Fixed
+
+- `qwen4` `from_checkpoint` reads every fallback from the dataclass defaults
+  template — duplicated literals previously disagreed with the defaults
+  (32768 vs 262144 positions, 10_000 vs 10_000_000 rope_theta, 512 vs 640
+  MoE intermediate), silently building a different model from an incomplete
+  `config.json`.
+- Eviction deltas are refreshed immediately before the pressure-timeout
+  decision (a stale zero from the wait loop could mask a real bind).
+- `.ckpt.tmp` orphans are cleaned at startup; blob loads strip headers
+  in place (no second allocation of multi-MB payloads); `settle_path` is
+  omitted rather than null when not settling; `MLXCACHE_MODELS` trims
+  before the emptiness filter.
+- Per-workload warm/cold TTFT ratios; the 99.9%+ prefix-coverage claim is
+  scoped to the workloads that measured it.
+
 ## 0.2.2 — 2026-10-20
 
 ### Added

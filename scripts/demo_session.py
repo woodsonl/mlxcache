@@ -93,7 +93,9 @@ def post(messages: list, max_tokens: int = 64) -> dict:
 
 
 def run(leg: str, out_path: str) -> int:
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    # A bare filename has no dirname to make (""); resolve the parent to an
+    # absolute path so the create works from any cwd.
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     new_file = not os.path.exists(out_path)
     # The handle lives for the whole function (emit() closes over it) and is
     # closed at the end — a context manager would fight the closure.
@@ -106,7 +108,16 @@ def run(leg: str, out_path: str) -> int:
 
     if leg == "cold":
         assert new_file, f"cold leg needs a fresh output file, got {out_path}"
-    convo = build_convo()
+    # Non-cold legs replay the PERSISTED conversation when it exists, rather
+    # than rebuilding from live repo files: the whole point of persisting is
+    # byte-identical messages even if the repo edits between phases.
+    # build_convo() remains the cold leg's source and the fallback.
+    convo = None
+    if leg != "cold" and os.path.exists(CONVO_PATH):
+        with open(CONVO_PATH) as cf:
+            convo = json.load(cf)
+    if convo is None:
+        convo = build_convo()
     r = post(convo)
     emit(
         {
@@ -122,8 +133,11 @@ def run(leg: str, out_path: str) -> int:
         }
     )
     # Persist the exact request once (the cold leg) so the resume leg replays
-    # byte-identical messages even if the repo edits between phases.
+    # byte-identical messages even if the repo edits between phases. The
+    # parent must exist first: the configured path may point into a
+    # directory that does not exist yet.
     if leg == "cold":
+        os.makedirs(os.path.dirname(os.path.abspath(CONVO_PATH)), exist_ok=True)
         with open(CONVO_PATH, "w") as cf:
             json.dump(convo, cf)
     fh.close()

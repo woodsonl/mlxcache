@@ -52,7 +52,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _harness import KILL_WAIT_S, TERM_WAIT_S, free_port  # noqa: E402 — path insert above
+from _harness import (  # noqa: E402 — path insert above
+    KILL_WAIT_S,
+    TERM_WAIT_S,
+    free_port,
+    sse_lines,
+)
 
 
 def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, float, int]:
@@ -75,19 +80,11 @@ def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, fl
         method="POST",
     )
     t0 = time.perf_counter()
-    deadline = time.monotonic() + timeout
     ttft: float | None = None
     tokens = 0
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        for raw in resp:
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
-            line = raw.decode(errors="replace").strip()
-            if not line.startswith("data: "):
-                continue
-            payload = line[len("data: ") :]
-            if payload == "[DONE]":
-                break
+        # Shared bounded-read/decode policy (one loop, not a drifted copy).
+        for payload in sse_lines(resp, timeout):
             try:
                 frame = json.loads(payload)
             except json.JSONDecodeError:
@@ -202,12 +199,6 @@ def wait_healthy(
     raise RuntimeError(f"daemon did not become healthy at {url}")
 
 
-def _free_port() -> int:
-    # Kept as a thin alias so the call sites read locally; the logic lives in
-    # _harness so the port-picking rules cannot drift between harnesses.
-    return free_port()
-
-
 def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]:
     """Start sidecar (uv, synthetic engine) + daemon (release build).
 
@@ -227,7 +218,7 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
     # The port is picked AFTER the build, immediately before its bind: a
     # port picked earlier has its TOCTOU window widened from milliseconds to
     # the length of the build. Same rule for both children.
-    sidecar_port = _free_port()
+    sidecar_port = free_port()
     env = dict(os.environ, MLXCACHE_TOKENIZE_GROW="growing conversation seed")
     sidecar = subprocess.Popen(
         [
@@ -254,8 +245,8 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
         # workload request would die with an unattributable 5xx. The sidecar
         # boots slower than the daemon (uv discovery + interpreter +
         # imports), so prove it is LISTENING before the daemon exists.
-        _wait_listening(("127.0.0.1", sidecar_port), deadline_s=30.0)
-        daemon_port = _free_port()
+        _wait_listening(("127.0.0.1", sidecar_port), deadline_s=30.0, proc=sidecar)
+        daemon_port = free_port()
         daemon = subprocess.Popen(
             [
                 str(Path(__file__).resolve().parents[1] / "target" / "release" / "mlxcache-daemon"),
@@ -280,14 +271,33 @@ def start_stack(blob_dir: str) -> tuple[subprocess.Popen, subprocess.Popen, int]
     return sidecar, daemon, daemon_port
 
 
-def _wait_listening(addr: tuple[str, int], deadline_s: float) -> None:
-    """Block until something accepts TCP connections on addr."""
+def _wait_listening(
+    addr: tuple[str, int], deadline_s: float, proc: subprocess.Popen | None = None
+) -> None:
+    """Block until something accepts TCP connections on addr.
+
+    When the owning child is supplied, its liveness is checked before and
+    after every attempt: a child that dies mid-boot must fail with its exit
+    status, not burn the whole deadline on "nothing listened".
+    """
     import socket
 
     deadline = time.time() + deadline_s
     while time.time() < deadline:
+        rc = proc.poll() if proc is not None else None
+        if rc is not None:
+            raise RuntimeError(f"child exited (code {rc}) before listening on {addr[0]}:{addr[1]}")
         with socket.socket() as s:
             if s.connect_ex(addr) == 0:
+                # Re-check AFTER a successful probe, outside the socket
+                # context: the child can die between accepting the probe
+                # and our return, and a listener that is not OUR child is
+                # exactly the wrong-stack trap the harness exists to avoid.
+                rc = proc.poll() if proc is not None else None
+                if rc is not None:
+                    raise RuntimeError(
+                        f"child exited (code {rc}) right after listening on {addr[0]}:{addr[1]}"
+                    )
                 return
         time.sleep(0.1)
     raise RuntimeError(f"nothing listened on {addr[0]}:{addr[1]} within {deadline_s}s")
@@ -404,6 +414,11 @@ def run_workloads(url: str, args) -> list[dict]:
     #    have on appended text).
     content = "growing conversation seed"
     ttfts, totals, ntoks = [], [], []
+    # Snapshot BEFORE the loop: /stats is cumulative for the process, so
+    # comparing the post-loop count against a pre-loop baseline is the only
+    # way this guard measures THIS workload rather than everything before it.
+    with urllib.request.urlopen(f"{url}/stats", timeout=5) as r:
+        partials_before = json.loads(r.read()).get("partials", 0)
     for r in range(args.grow_rounds):
         content += f" | round {r}"
         ttft, total, ntok = stream_chat(
@@ -418,14 +433,18 @@ def run_workloads(url: str, args) -> list[dict]:
     # Guard the workload's own premise: rounds 1+ must classify as partials
     # (round 0 is the cold miss that seeds the chain). If a tokenizer change
     # ever breaks the prefix property, this bench must fail loudly instead of
-    # quietly benchmarking full prefills.
+    # quietly benchmarking full prefills. Measured as the DELTA across this
+    # workload's own requests.
     with urllib.request.urlopen(f"{url}/stats", timeout=5) as r:
         grow_stats = json.loads(r.read())
+    partials_delta = grow_stats.get("partials", 0) - partials_before
     expected_partials = max(args.grow_rounds - 1, 0)
-    assert grow_stats["partials"] >= expected_partials, (
-        f"growing_conversation produced {grow_stats['partials']} partials, "
-        f"expected >= {expected_partials} — the token prefix chain is broken"
-    )
+    if partials_delta < expected_partials:
+        raise RuntimeError(
+            f"growing_conversation produced {partials_delta} partials across its "
+            f"own requests, expected >= {expected_partials} — the token prefix "
+            "chain is broken"
+        )
 
     # 4. Concurrent identical load: C workers fire the SAME uncached prompt at
     #    once; single-flight must coalesce them into one prefill.

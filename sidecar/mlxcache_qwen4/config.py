@@ -10,6 +10,7 @@ checkpoint's headers (values are not compared).
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -235,21 +236,27 @@ class Qwen4TextConfig:
 
     @classmethod
     def from_checkpoint(cls, config_dict: dict) -> Qwen4TextConfig:
-        """Build from the parsed `config.json` dict (wrapper or text subtree)."""
-        # Single source of defaults: every scalar fallback below reads the
-        # dataclass field default via _default(), never a second hand-typed
-        # literal. Two disagreeing default sets meant a config.json missing a
-        # field built a different architecture depending on which set won
-        # (and partial_rotary_factor 1.0 vs 0.25 failed QSA validation).
+        """Build from the parsed `config.json` dict (wrapper or text subtree).
+
+        Omitted fields take the DATACLASS defaults, read from the dataclass
+        itself via _default() — never a second hand-typed literal. Two
+        disagreeing default sets meant a config.json missing a field built a
+        different architecture depending on which set won (128 vs 512 in
+        split_ngram_parts, 1.0 vs 0.25 in partial_rotary_factor).
+        """
 
         def _default(name: str):
-            import dataclasses
 
             for f in dataclasses.fields(cls):
                 if f.name == name:
                     if f.default is not dataclasses.MISSING:
                         return f.default
-                    raise ValueError(f"{name} has no scalar default")
+                    if f.default_factory is not dataclasses.MISSING:
+                        # Factory fields (mrope_section, layer_types): the
+                        # factory IS the default — a literal copy here would
+                        # be a second source of truth that can drift.
+                        return f.default_factory()
+                    raise ValueError(f"{name} has no default")
             raise ValueError(f"unknown field {name}")
 
         raw = config_dict.get("text_config", config_dict)
@@ -260,7 +267,7 @@ class Qwen4TextConfig:
             "partial_rotary_factor",
             raw.get("partial_rotary_factor", _default("partial_rotary_factor")),
         )
-        layer_types = raw.get("layer_types") or []
+        layer_types = raw.get("layer_types") or _default("layer_types")
         return cls(
             vocab_size=int(raw["vocab_size"]),
             hidden_size=int(raw["hidden_size"]),
@@ -284,9 +291,7 @@ class Qwen4TextConfig:
             ),
             rope_theta=float(rope.get("rope_theta", raw.get("rope_theta", _default("rope_theta")))),
             partial_rotary_factor=float(partial),
-            mrope_section=list(  # literal mirrors the dataclass default_factory below
-                rope.get("mrope_section", [11, 11, 10])
-            ),
+            mrope_section=list(rope.get("mrope_section", _default("mrope_section"))),
             linear_conv_kernel_dim=int(
                 raw.get("linear_conv_kernel_dim", _default("linear_conv_kernel_dim"))
             ),
@@ -335,7 +340,7 @@ class Qwen4TextConfig:
                 )
             ),
             seed=int(raw.get("seed", _default("seed"))),
-            split_ngram_parts=int(raw.get("split_ngram_parts", DEFAULT_SPLIT_NGRAM_PARTS)),
+            split_ngram_parts=int(raw.get("split_ngram_parts", _default("split_ngram_parts"))),
             indexer_n_heads=_as_int(raw.get("indexer_n_heads"), _default("indexer_n_heads")),
             indexer_kv_heads=_as_int(raw.get("indexer_kv_heads"), _default("indexer_kv_heads")),
             indexer_head_dim=_as_int(raw.get("indexer_head_dim"), _default("indexer_head_dim")),

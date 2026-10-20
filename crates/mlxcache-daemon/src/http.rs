@@ -508,7 +508,9 @@ async fn chat_completions(
         // which cannot distinguish two images that render to the same ids.
         content_digest: content_digest(&req.messages),
     };
-    let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
+    let mut outcome = state
+        .orchestrator
+        .route(&tokens, &fingerprint, Some(engine_id.as_str()));
     // The token-only prefix hash for the request log line. The blob filename
     // uses a DIFFERENT key (blob_key = fingerprint + tokens), computed in the
     // leader branch where the fingerprint is in scope; the two are not equal.
@@ -658,7 +660,11 @@ async fn chat_completions(
                     Some(Ok(name)) if !name.is_empty() => {
                         // Re-route: the leader's publish is now visible, so this
                         // follower adopts it (hit/partial) instead of prefilling.
-                        outcome = state.orchestrator.route(&tokens, &fingerprint);
+                        outcome = state.orchestrator.route(
+                            &tokens,
+                            &fingerprint,
+                            Some(engine_id.as_str()),
+                        );
                     }
                     Some(Ok(_)) => {
                         // Leader cached nothing (empty blob: a one-token prompt,
@@ -1009,6 +1015,19 @@ async fn publish_leader_blob(
         lead.complete(Ok(String::new()));
         return Ok(());
     }
+    // The adapter reported no cryptographic vocabulary identity (the
+    // "missing" sentinel): persisting would key reusable KV on an
+    // unverifiable identity two different tokenizers could share. Fail
+    // closed — serve from scratch, publish nothing, exactly like the
+    // recovery-blocked case above.
+    if fingerprint.tokenizer_hash == "missing" {
+        tracing::warn!("not caching: adapter reported no vocabulary identity");
+        outcome.decision = mlxcache_core::policy::scratch_decision(tokens.len());
+        outcome.blob = None;
+        outcome.prefill_from = 0;
+        lead.complete(Ok(String::new()));
+        return Ok(());
+    }
     // Reserve the generation BEFORE writing so the on-disk name is
     // generation-specific (immutable). A republish then never overwrites an
     // earlier generation's file, so a delayed retirement cannot delete a
@@ -1136,6 +1155,13 @@ async fn publish_settled_blob(
     // an unknown generation floor, so writing would leak an unindexed file.
     if !state.orchestrator.can_publish() {
         tracing::debug!("not settling: startup recovery incomplete");
+        return;
+    }
+    // Same fail-closed rule as route() and publish_leader_blob: the "missing"
+    // tokenizer sentinel is a non-persistent identity, so a settled blob
+    // under it must not be read, verified, or published.
+    if fingerprint.tokenizer_hash == "missing" {
+        tracing::debug!("not settling: adapter reported no vocabulary identity");
         return;
     }
     let mut total: Vec<u32> = Vec::with_capacity(request_tokens.len() + generated.len());

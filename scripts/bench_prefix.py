@@ -74,8 +74,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -371,21 +373,14 @@ def _post_stream(base: str, path: str, body: dict, timeout: float) -> tuple[dict
         headers={"Content-Type": "application/json"},
     )
     t0 = time.perf_counter()
-    deadline = time.monotonic() + timeout
     ttft: float | None = None
     tokens = 0
     meta: dict | None = None
     usage: dict | None = None
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        for raw in resp:
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
-            line = raw.decode(errors="replace").strip()
-            if not line.startswith("data: "):
-                continue
-            frag = line[len("data: ") :]
-            if frag == "[DONE]":
-                break
+        # Shared bounded-read/decode policy (see _harness.sse_lines): one
+        # loop for every SSE consumer, not a drifted copy per script.
+        for frag in _harness.sse_lines(resp, timeout):
             try:
                 frame = json.loads(frag)
             except json.JSONDecodeError:
@@ -522,7 +517,13 @@ class DaemonStack:
             RUST_LOG=os.environ.get("RUST_LOG", "warn"),
         )
         daemon_env.update(env_extra or {})
-        self.daemon = self._spawn_daemon(daemon_env)
+        try:
+            self.daemon = self._spawn_daemon(daemon_env)
+        except BaseException:
+            # The sidecar is already running; a daemon that failed to spawn
+            # must not strand it holding a port.
+            self.sidecar.stop()
+            raise
 
     def _spawn_daemon(self, env: dict) -> _DaemonServer:
         binary = REPO / "target/release/mlxcache-daemon"
@@ -1055,8 +1056,8 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                 # ~2s after boot at a 1s interval. Probing without this wait
                 # would measure the pre-eviction cache and label it pressure.
                 evicted = 0
-                before_stats = stack.stats()
-                if "evictions" not in before_stats or "checkpoints_published" not in before_stats:
+                noise_stats = stack.stats()
+                if "evictions" not in noise_stats or "checkpoints_published" not in noise_stats:
                     raise SystemExit(
                         "/stats did not report evictions/checkpoints_published: "
                         "a missing counter would reconcile as zero and route "
@@ -1069,8 +1070,6 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                         evicted = now
                         break
                     time.sleep(0.5)
-                after_stats = stack.stats()
-                published_after = after_stats["checkpoints_published"]
                 # An expired wait is not a pressure result: if the store holds
                 # more than the cap, the reaper never bound and the row would
                 # measure an un-evicted cache while reading green. The noise
@@ -1088,6 +1087,14 @@ def run_pressure_sweep(model: str, args, prefix: str) -> list[dict]:
                         "PREMISE VIOLATION (harness/daemon bug, pressure):\n  "
                         + "\n  ".join(problems)
                     )
+                # Refresh AFTER the premise checks and immediately before the
+                # decision: the reaper removes entries one at a time and
+                # records the count only when its pass returns, so an earlier
+                # read can observe published > cap while evicted still holds
+                # a stale zero from the wait loop.
+                after_stats = stack.stats()
+                evicted = _harness.stats_delta(before_stats, after_stats, "evictions")
+                published_after = after_stats["checkpoints_published"]
                 if evicted == 0 and published_after > cap:
                     row = summarize(
                         wl["name"], f"daemon/pressure_cap{cap}_evict_wait_timeout", noise
@@ -1176,6 +1183,45 @@ def print_table(rows: list[dict]) -> None:
         )
 
 
+def _chip_identity() -> str:
+    """Best-effort chip name for artifact provenance; empty when unknown."""
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001 — provenance must never fail a run
+        return ""
+
+
+def _git_out(*args: str) -> str | None:
+    """Best-effort, status-aware git query for artifact provenance: bounded
+    (a hung git must not stall the run). None means the command could NOT be
+    completed — unavailable git, a non-repository, a timeout, a nonzero exit;
+    an empty STRING is a successful empty result. Callers must not infer
+    "clean" from an empty output without checking for None first."""
+    try:
+        out = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=REPO,
+        )
+        return out.stdout.strip() if out.returncode == 0 else None
+    except Exception:  # noqa: BLE001 — provenance must never fail a run
+        return None
+
+
+def _daemon_spawn_mode() -> str:
+    """How the daemon child was spawned: prebuilt binary path or cargo run."""
+    binary = REPO / "target/release/mlxcache-daemon"
+    return str(binary) if binary.is_file() else "cargo run --release"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1208,6 +1254,12 @@ def main() -> int:
             f"unknown workload(s) {unknown_w} / arm(s) {unknown_a}; "
             f"workloads: {sorted(KNOWN_WORKLOADS)}, arms: {sorted(KNOWN_ARMS)}"
         )
+    if "W4" in args.workloads and "pressure" not in args.arms:
+        raise SystemExit("W4 is pressure-only: select it with --arms pressure")
+    if "daemon" in args.arms and not set(args.workloads) & {"W1", "W1np", "W2", "W3"}:
+        raise SystemExit("the daemon arm has nothing to run: no W1/W1np/W2/W3 selected")
+    if "direct" in args.arms and not set(args.workloads) & {"W1", "W3"}:
+        raise SystemExit("the direct arm has nothing to run: no W1/W3 selected")
     if set(args.workloads) & {"W1np", "W2"} and "direct" in args.arms:
         print("note: W1np/W2 have no direct-baseline analogue; direct arm runs W1/W3 only")
 
@@ -1244,6 +1296,22 @@ def main() -> int:
 
     artifact = {
         "model": model,
+        "provenance": {
+            "argv": sys.argv,
+            "source_revision": _git_out("rev-parse", "HEAD") or "unknown",
+            # None = the status query itself could not run (non-repo, no git,
+            # timeout): unknown, NOT inferred-clean from an empty output.
+            "source_dirty": (
+                None if (status := _git_out("status", "--porcelain")) is None else bool(status)
+            ),
+            "machine": platform.machine(),
+            "system": platform.platform(),
+            "chip": _chip_identity(),
+            "daemon": _daemon_spawn_mode(),
+            "correctness": "premise guards enforced (serialization parity, "
+            "served==held, served<=declared, W5 trace+stats agreement; any "
+            "violation aborts before this artifact is written)",
+        },
         "prefix_tokens_requested": args.prefix_tokens,
         "questions": args.questions,
         "k": args.k,

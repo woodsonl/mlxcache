@@ -7,12 +7,12 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM"]
 ignore = []
 
 [tool.pytest.ini_options]
-testpaths = ["sidecar/tests"]
+testpaths = ["sidecar/tests", "scripts/dedup/tests"]
 asyncio_mode = "auto"
 
 [project]
 name = "mlxcache-sidecar"
-version = "0.2.2"
+version = "0.3.0"
 description = "mlx-lm compatibility sidecar for the mlxcache daemon"
 requires-python = ">=3.12"
 license = { text = "UNLICENSED" }
