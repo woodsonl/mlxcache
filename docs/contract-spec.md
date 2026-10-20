@@ -62,7 +62,7 @@ CheckpointBlob = {
 }
 CheckpointMeta = {
   fingerprint: { model_id, tokenizer_hash, kv_dtype, kv_layout_version,
-                 kv_bits, kv_group_size, cache_layout },
+                 kv_bits, kv_group_size, cache_layout, content_digest },
   token_count: u64,
   tokens: [u32],         // the token-ID prefix this blob covers; makes the blob
                          // self-describing so the index is rebuildable after a
