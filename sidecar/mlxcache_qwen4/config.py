@@ -340,7 +340,7 @@ class Qwen4TextConfig:
                 )
             ),
             seed=int(raw.get("seed", _default("seed"))),
-            split_ngram_parts=int(raw.get("split_ngram_parts", DEFAULT_SPLIT_NGRAM_PARTS)),
+            split_ngram_parts=int(raw.get("split_ngram_parts", _default("split_ngram_parts"))),
             indexer_n_heads=_as_int(raw.get("indexer_n_heads"), _default("indexer_n_heads")),
             indexer_kv_heads=_as_int(raw.get("indexer_kv_heads"), _default("indexer_kv_heads")),
             indexer_head_dim=_as_int(raw.get("indexer_head_dim"), _default("indexer_head_dim")),
