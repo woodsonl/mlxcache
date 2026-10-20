@@ -2,6 +2,41 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.2.1 — 2026-10-20
+
+### Fixed
+
+- **The wheel now carries the qwen4-exp engine** (`mlxcache_qwen4`) and the
+  store package (`mlxcache_store`): the 0.1.8 wheel shipped only
+  `mlxcache_sidecar`, so a wheel install could not start
+  `MLXCACHE_ENGINE=qwen4-exp`. A regression test builds the real wheel and
+  asserts its top-level packages.
+- **Settle reasons no longer leak server paths to clients**: an OSError
+  reason embedded the absolute staging path inside the daemon's blob dir, and
+  both the JSON and SSE legs forwarded it verbatim. Clients now receive the
+  reason code only; the full text stays in the daemon log.
+- **Abandoned staging files no longer strand until the next boot**: the
+  sidecar writes its staging file after generation, so a timeout, a stream
+  failure before the guard exists, or a client disconnect could leave a file
+  no guard owned — invisible to every list and up to the settle byte cap
+  each. An age-based sweep now runs always (its own ticker when eviction is
+  disabled), publication temps are reaped by the same rule, and the scratch
+  retry writes its own path with its own guard.
+- **A failed-then-retried request keeps its settle**: the retry's staging
+  guard was dropped inside its success arm, deleting the settled file before
+  publication read it, while publication probed the abandoned first
+  attempt's path.
+- **One source of config defaults**: `from_checkpoint` carried a second,
+  disagreeing set of fallbacks (a config.json missing a field built a
+  different architecture depending on which set won). Every scalar fallback
+  now reads the dataclass field default; `head_dim`'s derivation is
+  annotated as deliberate.
+- **Settle publication no longer blocks the response or doubles the payload
+  in memory**: publication runs in a detached task that owns its cleanup
+  (a client disconnect cannot orphan the write), reads the staged file once,
+  and hashes and writes the payload slice of that single buffer. The staged
+  file's format version is validated before publication.
+
 ## 0.2.0 — 2026-10-19
 
 ### Added
