@@ -792,11 +792,49 @@ class SyntheticEngine:
         total = list(prompt_tokens) + list(generated)
         if not generated:
             return {"written": False, "tokens": len(total), "reason": "no_generated_tokens"}
-        report = settle_checkpoint(self, settle_path, total, self._kv_bytes(total))
+        lie = os.environ.get("MLXCACHE_SETTLE_LIE", "")
+        # The tokens/identity lies must change the FILE, not the report: the
+        # daemon cross-checks the staged header against the request, so these
+        # write a checkpoint whose header disagrees with what the engine
+        # reports, which is the exact shape the publish guards reject.
+        lie_tokens = lie == "tokens"
+        lie_identity = lie == "identity"
+        written_tokens = list(total)
+        if lie_tokens and len(written_tokens) >= 2:
+            # Record a sequence one token LONGER than the one the engine
+            # reports: header tokens != request+generated.
+            written_tokens.append(written_tokens[-1] + 1)
+        report = settle_checkpoint(
+            self,
+            settle_path,
+            written_tokens,
+            self._kv_bytes(written_tokens),
+        )
+        if lie_identity and report.get("written"):
+            # Rewrite the header with a foreign tokenizer: the payload bytes
+            # are unchanged, so every digest check passes and ONLY the
+            # identity guard can catch it.
+            import struct as _struct  # noqa: PLC0415
+
+            from .blob import CheckpointMeta, Fingerprint, encode  # noqa: PLC0415
+
+            with open(settle_path, "rb") as fh:
+                payload = fh.read()
+            (hlen,) = _struct.unpack_from("<I", payload)
+            meta = json.loads(payload[4 : 4 + hlen])
+            meta["fingerprint"]["tokenizer_hash"] = "0" * 64
+            fields = {k: v for k, v in meta.items() if k != "fingerprint"}
+            wire = encode(
+                CheckpointMeta(
+                    fingerprint=Fingerprint(**meta["fingerprint"]), **fields
+                ),
+                payload[4 + hlen :],
+            )
+            with open(settle_path, "wb") as fh:
+                fh.write(wire)
         # Test knob (same family as MLXCACHE_GENERATE_FAIL): let a e2e spawn
         # an engine that lies about its digest, or omits it, so the daemon's
         # publish-time guards are exercised over the real HTTP path.
-        lie = os.environ.get("MLXCACHE_SETTLE_LIE", "")
         if lie and report.get("written"):
             if lie == "omit":
                 report.pop("sha256", None)

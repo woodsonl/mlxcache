@@ -2,6 +2,41 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.3.1 — 2026-10-20
+
+### Added
+
+- **The measurement probes land**: the smoke probe names its cache buffer
+  `.safetensors` (the loader dispatches on the name, so the old `.ckpt`
+  buffer failed its own reload leg), the context sweep refuses to overlap
+  another measurement on the checkpoint instead of explaining the
+  contamination afterward, and each context length is measured in its own
+  process — MLX retains freed allocator memory, so one long-lived process
+  gave every row after the first less headroom than the row before it, and
+  ascending order measured the warmest page cache against the largest
+  context. One process per row gives every measurement the same starting
+  conditions; descending order puts the coldest run on the largest context.
+
+### Fixed
+
+- **The settle publish guards are now e2e-covered end to end.** Two new
+  engine lie modes drive the header-token and identity guards over the real
+  HTTP path (a header recording a sequence one token longer than the engine
+  reports; a header claiming a foreign tokenizer with the payload bytes
+  untouched, so only the identity guard can catch it) — previously only the
+  digest guards had knobs, and these two shared the choke point unexercised.
+- **Corrupted digest-bearing (v2) blobs are proven quarantined from disk.**
+  An e2e corrupts a published v2 payload AFTER publication and rebuilds the
+  index the way a restart does: the boot sweep reclaims the file (D1) and
+  the honest prefill prefix keeps serving. Previously only the
+  malformed-corpus parse tests covered the reader.
+- **The `mlxcache_serve` text-only boundary is now a written contract** at
+  the one place a future maintainer would touch: the wrapper never sees
+  message JSON (mlx-lm's server owns the request), so it cannot mint a
+  content digest and its fingerprints carry `""` = no media by construction
+  — true for every model this CLI can load. Serving media through it
+  requires teaching that fingerprint a digest producer first.
+
 ## 0.3.0 — 2026-10-20
 
 ### Added

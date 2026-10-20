@@ -3319,3 +3319,92 @@ async fn a_digest_bearing_blob_survives_a_daemon_restart_rebuild() {
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
 }
+
+#[tokio::test]
+async fn a_settle_whose_header_records_the_wrong_tokens_is_discarded() {
+    // The header-token guard: the staged file must describe EXACTLY the
+    // sequence this request settled (request + generated), or the blob would
+    // key a prefix it does not cover. The lie writes a header one token
+    // longer than the engine reports; the response is unaffected and nothing
+    // beyond the honest prefill prefix publishes. Previously this guard had
+    // no e2e knob — only the digest guards were exercisable end to end.
+    let (url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "tokens")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "lie about tokens").await;
+    assert_eq!(res["status"], "ok", "generation itself must not fail");
+
+    await_settle_publication(&state).await;
+    // The lying settle published nothing; only the prefill prefix survives.
+    assert_eq!(blob_coverages(&state), vec![8], "{:?}",
+        blob_coverages(&state));
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_settle_whose_header_claims_a_foreign_identity_is_discarded() {
+    // The identity guard: the staged header's adapter-owned fields must agree
+    // with the identity the daemon resolved for THIS request. The lie swaps
+    // the header's tokenizer hash while leaving the payload bytes untouched,
+    // so the digest checks all pass and only the identity guard can catch it.
+    // Previously this guard had no e2e knob.
+    let (url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "identity")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "lie about identity").await;
+    assert_eq!(res["status"], "ok");
+
+    await_settle_publication(&state).await;
+    assert_eq!(blob_coverages(&state), vec![8], "{:?}",
+        blob_coverages(&state));
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_corrupted_v2_digest_blob_is_quarantined_by_the_rebuild() {
+    // The D1 disk-side gate for digest-bearing (v2) blobs: corrupt a payload
+    // AFTER publication, then rebuild the index from disk the way a restart
+    // does. The boot sweep must quarantine the corrupted blob (its recorded
+    // digest no longer matches its bytes) and the next identical request must
+    // re-prefill from scratch rather than resume from bad KV. Previously no
+    // e2e drove a corrupted DIGEST-BEARING header; only malformed-corpus
+    // parse tests covered the reader.
+    let (url, mut child) = spawn_sidecar().await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let first = post_prompt(state.clone(), "corrupt me after publish").await;
+    assert_eq!(first["mlxcache"]["verdict"], "miss");
+    await_settle_publication(&state).await;
+
+    // Flip one payload byte in the settled (72-token) blob on disk.
+    let settled = blob_with_coverage(&state, 72);
+    let mut bytes = std::fs::read(&settled).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xFF;
+    std::fs::write(&settled, &bytes).unwrap();
+
+    // Rebuild from disk: the corrupted v2 blob is quarantined, not indexed.
+    let rebuilt = app_state(&url, &blobs);
+    let report = rebuilt.orchestrator.rebuild_from_disk(&rebuilt.persistence);
+    assert!(
+        report.reclaimed_corrupt >= 1,
+        "the corrupted v2 blob must be reclaimed: {report:?}"
+    );
+    // The corrupted FILE is gone (reclaimed above), so nothing can resume
+    // from it. The honest 8-token prefill prefix remains and may serve a hit
+    // — that is correct reuse, not a resume from bad KV.
+    assert!(!settled.exists(), "the corrupted v2 blob file must be deleted");
+    let after = post_prompt(rebuilt.clone(), "corrupt me after publish").await;
+    assert_eq!(after["status"], "ok");
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
