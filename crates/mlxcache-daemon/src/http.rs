@@ -1180,7 +1180,7 @@ async fn publish_settled_blob(
         tracing::warn!("settle discarded: engine reported no payload digest");
         return;
     };
-    {
+    let verified_sha256 = {
         use sha2::Digest;
         let actual = format!("{:x}", sha2::Sha256::digest(&buffer[payload_start..]));
         if !actual.eq_ignore_ascii_case(reported) {
@@ -1191,7 +1191,8 @@ async fn publish_settled_blob(
             );
             return;
         }
-    }
+        actual
+    };
     // The header must describe EXACTLY the sequence this request settled, or the
     // blob would key a prefix it does not cover. Both the recorded prefix and
     // the identity the daemon resolved for this request are checked.
@@ -1238,13 +1239,16 @@ async fn publish_settled_blob(
     let key = blob_key(fingerprint, Some(engine_id), &total);
     let generation = state.orchestrator.reserve_generation();
     let blob_name = format!("{:032x}-{:016x}.ckpt", key, generation);
+    // The INDEXED metadata must match what publish_from_staged writes: that
+    // path stamps v2 + the payload digest, and rebuild_from_disk later loads
+    // exactly that header — describing the blob as v1 with no digest in the
+    // live index would make the entry mutate across a restart.
     let published_meta = mlxcache_core::contract::CheckpointMeta {
         fingerprint: fingerprint.clone(),
         token_count: total.len() as u64,
         tokens: total.clone(),
-        // publish_atomic stamps the current version + payload digest (D1).
-        format_version: 1,
-        payload_sha256: None,
+        format_version: 2,
+        payload_sha256: Some(verified_sha256),
         engine_id: mlxcache_core::contract::engine_id_meta(engine_id),
         granularity: None,
     };

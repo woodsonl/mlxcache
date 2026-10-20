@@ -73,11 +73,12 @@ impl Persistence {
             let Some(name) = name.to_str() else { continue };
             let is_staging = name.starts_with(".settle-")
                 && (name.ends_with(".staging") || name.ends_with(".part"));
-            // A publication killed between temp-create and rename strands a
-            // <hash>-<gen>.<pid>.<seq>.ckpt.tmp that no guard owns (detached
-            // tasks are cancelled at shutdown); same age rule, and
-            // list_blobs already excludes the suffix.
-            let is_publish_temp = name.ends_with(".ckpt.tmp");
+            // Publication temps are reaped at BOOT only: a live publish task
+            // owns its .ckpt.tmp until the rename, and a slow fsync can
+            // legitimately outlast the recurring threshold — reaping it
+            // mid-write would kill a publication the request already earned.
+            // At boot no task is live, so every temp is garbage.
+            let is_publish_temp = older_than.is_zero() && name.ends_with(".ckpt.tmp");
             if !(is_staging || is_publish_temp) {
                 continue;
             }

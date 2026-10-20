@@ -3156,3 +3156,45 @@ async fn scratch_retry_success_publishes_the_retrys_settle() {
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
 }
+
+#[tokio::test]
+async fn a_recurring_sweep_never_takes_a_live_publish_temp() {
+    // The recurring reaper must not touch .ckpt.tmp files: a publication
+    // whose fsync outlasts the hygiene threshold still owns its temp, and
+    // reaping it mid-write kills a settle the request already earned. Only
+    // the boot sweep (no live task can exist) takes them.
+    let (url, mut child) = spawn_sidecar().await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    // A backdated publish temp plus a backdated staging file: the recurring
+    // pass (via the persistence fn at its threshold) takes the staging file
+    // and leaves the temp; the boot sweep (threshold zero) takes both.
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    let tmp = blobs
+        .path()
+        .join("deadbeef-0000000000000001.123.4.ckpt.tmp");
+    std::fs::write(&tmp, b"orphan").unwrap();
+    let f = std::fs::File::options().append(true).open(&tmp).unwrap();
+    f.set_modified(past).unwrap();
+    let staging = blobs.path().join(".settle-7-7-7.staging");
+    std::fs::write(&staging, b"orphan").unwrap();
+    let f2 = std::fs::File::options()
+        .append(true)
+        .open(&staging)
+        .unwrap();
+    f2.set_modified(past).unwrap();
+
+    state
+        .persistence
+        .reap_stale_settle_staging(mlxcache_daemon::http::staging_hygiene_threshold());
+    assert!(tmp.exists(), "recurring sweep must spare a publish temp");
+    assert!(!staging.exists(), "recurring sweep takes staging files");
+
+    mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap();
+    assert!(!tmp.exists(), "boot sweep takes every publish temp");
+
+    let _ = post_prompt(state.clone(), "sanity").await;
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
