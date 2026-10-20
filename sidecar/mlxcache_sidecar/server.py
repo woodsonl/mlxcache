@@ -787,6 +787,12 @@ class SyntheticEngine:
                 report.pop("sha256", None)
             elif lie == "bad":
                 report["sha256"] = "0" * 64
+            elif lie == "pathy":
+                # Simulate the leak shape the client scrub guards against: an
+                # OSError reason embedding an absolute staging path.
+                report["reason"] = (
+                    f"write_failed: [Errno 13] Permission denied: '{settle_path}.Nx8fJa.part'"
+                )
         return report
 
     def generate_collect(

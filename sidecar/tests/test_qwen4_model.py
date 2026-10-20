@@ -640,3 +640,49 @@ def test_qsa_multi_tile_selection_matches_single_tile(bundle, monkeypatch):
     assert mx.array_equal(out_multi, out_single), (
         "hoisted per-tile selection must equal the single-tile computation"
     )
+
+
+def test_missing_fields_build_the_dataclass_defaults_not_second_literals():
+    # One source of defaults: a config.json lacking optional fields must build
+    # exactly the dataclass architecture. The from_checkpoint fallbacks used
+    # to be a second, disagreeing set (partial_rotary_factor 1.0 vs 0.25 built
+    # a different rotary dim and failed QSA validation; rope_theta, max
+    # positions, head counts and MoE widths all disagreed too).
+    import dataclasses
+
+    from mlxcache_qwen4 import Qwen4TextConfig
+
+    required = {
+        "model_type": "qwen4_exp_text",
+        "vocab_size": 8,
+        "hidden_size": 16,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        # Interval pattern for 4 layers at interval 4: layer (i+1)%4==0 is
+        # full, so index 3 is the one full-attention layer.
+        "layer_types": [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+    }
+    cfg = Qwen4TextConfig.from_checkpoint(required)
+    defaults = {
+        f.name: f.default
+        for f in dataclasses.fields(Qwen4TextConfig)
+        if f.default is not dataclasses.MISSING
+    }
+    for name in (
+        "partial_rotary_factor",
+        "rope_theta",
+        "max_position_embeddings",
+        "linear_num_value_heads",
+        "moe_intermediate_size",
+        "shared_expert_intermediate_size",
+        "num_experts",
+        "hc_lowrank",
+    ):
+        got = getattr(cfg, name)
+        assert got == defaults[name], f"{name}: {got!r} != dataclass default {defaults[name]!r}"

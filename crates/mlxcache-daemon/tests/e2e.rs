@@ -160,17 +160,22 @@ async fn eviction_reaper_unlinks_and_stats_and_next_request_misses() {
     // settled checkpoint covering prompt + generated.
     let res = post(body.clone()).await;
     assert_eq!(res.status(), 200);
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         state.orchestrator.published_count(),
         2,
         "the prefill prefix and the settled checkpoint are both published"
     );
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![8, 72],
         "prefill prefix + settled checkpoint: {:?}",
         blob_coverages(&state)
     );
+    await_settle_publication(&state).await;
     let prefix = blob_with_coverage(&state, 8);
     let settled = blob_with_coverage(&state, 72);
 
@@ -191,10 +196,12 @@ async fn eviction_reaper_unlinks_and_stats_and_next_request_misses() {
         "evicted blob file must be unlinked, or the next restart resurrects it"
     );
     assert!(prefix.exists(), "an anchor must survive a reaper pass");
+    await_settle_publication(&state).await;
     assert_eq!(state.orchestrator.published_count(), 1);
 
     let evicted = state.evict_pass(0, 0, std::time::Duration::ZERO);
     assert_eq!(evicted, 1, "the now-unanchored prefix must be reaped");
+    await_settle_publication(&state).await;
     assert_eq!(state.orchestrator.published_count(), 0);
     assert!(!prefix.exists(), "the prefix file must be unlinked");
 
@@ -281,6 +288,8 @@ async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["mlxcache"]["verdict"], "miss");
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         state.orchestrator.published_count(),
         0,
@@ -334,11 +343,14 @@ async fn one_token_prompt_serves_and_publishes_no_prefill_blob() {
     // itself built KV for prompt + generated, so exactly one settled checkpoint
     // exists — and it can never serve this one-token prompt, whose lookup cannot
     // match a 65-token key.
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![65],
         "only the settled checkpoint may exist; the prefill published nothing"
     );
+    await_settle_publication(&state).await;
     assert_eq!(state.orchestrator.published_count(), 1);
 
     child.kill().expect("kill sidecar");
@@ -441,11 +453,14 @@ async fn concurrent_one_token_requests_all_run_from_scratch() {
     );
     // The prefill publishes nothing; the settled checkpoint (prompt + generated)
     // is the only blob, and a 1-token lookup cannot match its 65-token key.
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![65],
         "no PREFILL checkpoint may exist"
     );
+    await_settle_publication(&state).await;
     assert_eq!(state.orchestrator.published_count(), 1);
 
     child.kill().expect("kill sidecar");
@@ -751,6 +766,8 @@ async fn one_token_streaming_serves_and_publishes_no_prefill_blob() {
     );
     // The stream leg publishes the same way the JSON leg does: no prefill
     // checkpoint, exactly one settled one.
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![65],
@@ -809,6 +826,8 @@ async fn end_to_end_miss_then_hit() {
 
     // Blob must be on disk now: the 8-token prefill prefix, plus the settled
     // checkpoint covering prompt + generated.
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![8, 72],
@@ -1112,6 +1131,7 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
         2,
         "exactly one blob per coverage node, no superseded generation: {ckpts:?}"
     );
+    await_settle_publication(&state).await;
     assert_eq!(blob_coverages(&state), vec![8, 72], "{ckpts:?}");
     for path in state.persistence.list_blobs().unwrap() {
         let (meta, _) = state.persistence.load(&path).unwrap();
@@ -1290,6 +1310,7 @@ async fn q8_and_f16_blobs_never_share_a_file() {
     // 1) q8 run: miss → publish.
     let res = post(state_q8.clone(), body.clone()).await;
     assert_eq!(res.status(), 200);
+    await_settle_publication(&state_q8).await;
     assert_eq!(
         state_q8.orchestrator.published_count(),
         2,
@@ -1305,6 +1326,7 @@ async fn q8_and_f16_blobs_never_share_a_file() {
     let state_f16 = state(f16_url.clone());
     let res = post(state_f16.clone(), body.clone()).await;
     assert_eq!(res.status(), 200);
+    await_settle_publication(&state_f16).await;
     assert_eq!(
         state_f16.orchestrator.published_count(),
         2,
@@ -1470,6 +1492,8 @@ async fn concurrent_identical_requests_share_one_prefill() {
     // One blob per coverage node, not N: the leader's prefill prefix and the
     // settled checkpoint (each follower's settle lands on the same node and
     // replaces the previous publication).
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![8, 72],
@@ -1608,6 +1632,7 @@ async fn publish_failure_serves_leader_and_followers_from_scratch() {
         .await
         .unwrap();
     assert_eq!(stats["prefill_count"].as_u64(), Some(1));
+    await_settle_publication(&state).await;
     assert_eq!(state.orchestrator.published_count(), 0);
     assert_eq!(state.orchestrator.quarantined_count(), 0);
 
@@ -1854,6 +1879,8 @@ async fn partial_hit_delta_prefills_only_the_delta() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["mlxcache"]["verdict"], "miss");
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![8, 72],
@@ -1888,6 +1915,8 @@ async fn partial_hit_delta_prefills_only_the_delta() {
     );
     // Both the ancestor (8-token) and the new (16-token) prefill checkpoints
     // exist, each with its own settled extension (72 and 80 tokens).
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![8, 16, 72, 80],
@@ -1986,6 +2015,8 @@ async fn transient_prefill_failure_keeps_ancestor_and_recovers() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["mlxcache"]["verdict"], "miss");
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![8, 72],
@@ -2022,6 +2053,8 @@ async fn transient_prefill_failure_keeps_ancestor_and_recovers() {
             .contains("synthetic induced prefill failure"),
         "the induced failure must be surfaced verbatim: {v}"
     );
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![8, 72],
@@ -2047,6 +2080,8 @@ async fn transient_prefill_failure_keeps_ancestor_and_recovers() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["mlxcache"]["verdict"], "partial", "recovered: {v}");
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state),
         vec![8, 16, 72, 80],
@@ -2191,11 +2226,15 @@ async fn multi_turn_end_divergent_serves_t22() {
     // a HIT: it publishes no PREFILL checkpoint (nothing was prefilled), and the
     // only new blob is its own settled one — the KV it just produced, which a
     // later turn can resume from. So: 2 from turn 1, plus turn 2's settle.
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         state.persistence.list_blobs().unwrap().len(),
         3,
         "a hit publishes no prefill checkpoint; the settle is a separate publication"
     );
+    await_settle_publication(&state).await;
+    await_settle_publication(&state).await;
     assert_eq!(
         state.orchestrator.published_count(),
         3,
@@ -2691,8 +2730,10 @@ async fn default_engine_identity_keeps_the_legacy_key_and_header() {
 
     // One request publishes two checkpoints (prefill prefix + settled); the
     // prefix's filename is the one whose key the sidecar identity recomputes.
+    await_settle_publication(&state).await;
     let prefix = blob_with_coverage(&state, 8);
     let prefix_name = prefix.file_name().unwrap().to_string_lossy().into_owned();
+    await_settle_publication(&state).await;
     let names = blob_names(blobs.path());
     assert_eq!(names.len(), 2, "{names:?}");
     let key_hex = prefix_name.split('-').next().unwrap().to_string();
@@ -2780,6 +2821,7 @@ async fn a_different_cache_layout_never_serves_the_other_blob() {
 
     let first = post_prompt(state_a.clone(), content).await;
     assert_eq!(first["mlxcache"]["verdict"], "miss");
+    await_settle_publication(&state_a).await;
     assert_eq!(state_a.orchestrator.published_count(), 2);
     let after_a = blob_names(blobs.path());
     assert_eq!(
@@ -2799,6 +2841,7 @@ async fn a_different_cache_layout_never_serves_the_other_blob() {
         second["mlxcache"]["verdict"], "miss",
         "a different cache composition must never be served the dense blob"
     );
+    await_settle_publication(&state_b).await;
     assert_eq!(
         state_b.orchestrator.published_count(),
         2,
@@ -2894,6 +2937,7 @@ async fn a_settle_report_omitting_the_digest_is_discarded() {
 
     let res = post_prompt(state.clone(), "settle without a digest").await;
     assert_eq!(res["status"], "ok", "generation itself must not fail");
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state).len(),
         1,
@@ -2915,6 +2959,7 @@ async fn a_settle_report_with_a_wrong_digest_is_discarded() {
 
     let res = post_prompt(state.clone(), "settle with a wrong digest").await;
     assert_eq!(res["status"], "ok");
+    await_settle_publication(&state).await;
     assert_eq!(
         blob_coverages(&state).len(),
         1,
@@ -2937,4 +2982,91 @@ fn staging_files(dir: &std::path::Path) -> bool {
                 .to_str()
                 .is_some_and(|n| n.starts_with(".settle-"))
         })
+}
+
+#[tokio::test]
+async fn settle_reasons_reach_clients_as_codes_without_paths() {
+    // CodeRabbit #36 (information disclosure): the engine's settle reason is
+    // built from OSError text, which embeds the absolute staging path inside
+    // the daemon's blob dir. Both legs must emit only the reason CODE; the
+    // full text stays in the daemon log. The sidecar knob simulates the leak
+    // shape deterministically.
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "pathy")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    // Non-streaming leg.
+    let res = post_prompt(state.clone(), "scrub the reason").await;
+    assert_eq!(res["status"], "ok");
+    // The knob injects the path-bearing reason on a successful settle; the
+    // point under test is what the client SEES, not the engine's written flag.
+    let settle = &res["settle"];
+    let reason = settle["reason"].as_str().unwrap_or_default();
+    assert!(
+        !reason.contains('/') && !reason.contains("Errno") && !reason.contains(".part"),
+        "client-visible reason must carry no path detail: {reason:?}"
+    );
+    assert_eq!(
+        reason, "write_failed",
+        "the code survives, the detail does not"
+    );
+
+    // Streaming leg: the settle rides the terminal chunk.
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "scrub the stream reason"}],
+        "stream": true,
+    });
+    let app = router(state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    let done = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v.get("settle").is_some())
+        .expect("terminal chunk carries the settle");
+    let reason = done["settle"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        !reason.contains('/') && !reason.contains("Errno") && !reason.contains(".part"),
+        "streaming reason must carry no path detail: {reason:?}"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+/// Wait until every detached settle publication for this blob dir has
+/// finished: the staging file (and any temp) is gone, meaning the publication
+/// task's guard dropped. Publication is detached from the response by design,
+/// so tests asserting blob counts must first wait for quiescence.
+async fn await_settle_publication(state: &Arc<AppState>) {
+    let dir = state.persistence.blob_dir.clone();
+    for _ in 0..500 {
+        let busy = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(".settle-") || n.ends_with(".ckpt.tmp"))
+            });
+        if !busy {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("settle publication did not reach quiescence within 5s");
 }

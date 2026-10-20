@@ -45,4 +45,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["sidecar/mlxcache_sidecar"]
+# Explicit package selection: the wheel must carry every package the sidecar
+# imports at runtime. mlxcache_qwen4 is the qwen4-exp engine (imported by
+# engine_qwen4.py); mlxcache_store is the L1 store the sidecar embeds. A wheel
+# missing either cannot start the engine that selects it (CodeRabbit #36).
+packages = [
+    "sidecar/mlxcache_sidecar",
+    "sidecar/mlxcache_qwen4",
+    "sidecar/mlxcache_store",
+]

@@ -89,6 +89,21 @@ impl AppState {
         max_bytes: u64,
         anchor_window: std::time::Duration,
     ) -> usize {
+        // Staging files older than the sidecar timeout can belong to no live
+        // request (a live one's sidecar call would have completed or timed
+        // out within it), so the recurring reaper takes them too — the
+        // boot-only sweep left files written by an abandoned sidecar request
+        // stranded until restart.
+        let sidecar_timeout = std::env::var("MLXCACHE_SIDECAR_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
+        // Margin covers the settle encode/write itself, which happens after
+        // generation inside the same request.
+        self.persistence
+            .reap_stale_settle_staging(std::time::Duration::from_secs(
+                sidecar_timeout.saturating_add(60),
+            ));
         let evicted =
             self.orchestrator
                 .evict_cold(&self.persistence, max_entries, max_bytes, anchor_window);
@@ -717,7 +732,7 @@ async fn chat_completions(
                 fingerprint,
                 engine_id,
                 settle_arg: settle_path.to_string_lossy().into_owned(),
-                settle_path,
+                settle_path: settle_path.clone(),
             },
             outcome,
             blob_arg,
@@ -728,7 +743,7 @@ async fn chat_completions(
     // Non-streaming from here on: this call's scope owns the staging file, so a
     // destructor covers every early return (a failed generate, a refused
     // scratch retry) without a cleanup line at each one.
-    let staging = SettleStaging::new(settle_path);
+    let staging = SettleStaging::new(settle_path.clone());
 
     // Generate: full context tokens, continuation from the request length.
     // The adapter opens the blob directly, so it needs the absolute path.
@@ -780,8 +795,15 @@ async fn chat_completions(
                         "blob run failed with a non-rejection error; retrying from scratch without quarantine (effective prefill_from=0)"
                     );
                 }
+                // Own staging path AND own guard for the retry: the first
+                // attempt's sidecar call may still be running and writing its
+                // own file, and two writers on one path race (the digest
+                // check catches it, but the retry would then lose its settle).
+                let retry_staging =
+                    SettleStaging::new(settle_staging_path(&state.persistence.blob_dir));
+                let retry_arg = retry_staging.path.to_string_lossy().into_owned();
                 match client
-                    .generate(&tokens, max_tokens, None, Some(&settle_arg))
+                    .generate(&tokens, max_tokens, None, Some(&retry_arg))
                     .await
                 {
                     Ok(t) => {
@@ -810,16 +832,17 @@ async fn chat_completions(
     // blob dir — including when the engine reported `written: false`.
     let mut settled = settle_report;
     if settled.as_ref().is_some_and(|r| r.written) {
-        staging
-            .publish(
-                &state,
-                &fingerprint,
-                &engine_id,
-                &tokens,
-                &generated,
-                settled.as_ref().and_then(|r| r.sha256.as_deref()),
-            )
-            .await;
+        staging.spawn_publish(
+            state.clone(),
+            fingerprint.clone(),
+            engine_id.clone(),
+            tokens.clone(),
+            generated.clone(),
+            settled
+                .as_ref()
+                .and_then(|r| r.sha256.as_deref())
+                .map(str::to_owned),
+        );
     } else if let Some(reason) = settled.as_ref().and_then(|r| r.reason.as_deref()) {
         // Not an error: the engine declined (too short, over a cap, no KV).
         tracing::debug!(reason, "engine declined to settle this completion");
@@ -903,11 +926,24 @@ async fn chat_completions(
     // payload digest. Additive and optional — an older client, or a response
     // whose request did not settle, simply has no such field.
     if let Some(report) = settled.take() {
+        // Clients get a reason CODE, not the engine's text: an OSError from
+        // the sidecar embeds absolute staging paths (inside the daemon's blob
+        // dir), and the settle report reaches the response body verbatim
+        // otherwise. The full reason stays in the daemon log line below.
+        let reason_code = report
+            .reason
+            .as_deref()
+            .map(|r| r.split(':').next().unwrap_or(r).to_string());
+        if let Some(full) = report.reason.as_deref() {
+            if !report.written {
+                tracing::debug!(reason = %full, "settle not written");
+            }
+        }
         body["settle"] = serde_json::json!({
             "written": report.written,
             "tokens": report.tokens,
             "sha256": report.sha256,
-            "reason": report.reason,
+            "reason": reason_code,
         });
     }
     Ok((StatusCode::OK, Json(body)).into_response())
@@ -1105,14 +1141,16 @@ async fn publish_settled_blob(
         tracing::debug!("not settling: fewer than two tokens");
         return;
     }
-    // Read + verify the engine's file before it can become a store entry. This
-    // is the trust boundary the daemon owns: the blob was produced by another
-    // process, so its header and payload are untrusted until checked here. The
-    // sidecar's own digest is not consulted as truth — the payload is hashed
-    // locally and publish_atomic stamps THAT digest.
+    // Read + verify the engine's file before it can become a store entry.
+    // This is the trust boundary the daemon owns: the blob was produced by
+    // another process, so its header and payload are untrusted until checked
+    // here. ONE buffer for the whole path: the staged file is read once, the
+    // digest is computed over the payload SLICE, and the published blob is
+    // written from the same slice — no second full-payload copy, which at the
+    // settle byte cap meant ~2x the payload in daemon memory per request.
     let persistence = state.persistence.clone();
     let path = settle_path.to_path_buf();
-    let loaded = tokio::task::spawn_blocking(move || persistence.load(&path))
+    let staged = tokio::task::spawn_blocking(move || persistence.read_staged(&path))
         .await
         .unwrap_or_else(|join| {
             tracing::error!(error = %join, "settled checkpoint read task panicked");
@@ -1120,7 +1158,7 @@ async fn publish_settled_blob(
                 "settled checkpoint read task panicked",
             )))
         });
-    let (meta, payload) = match loaded {
+    let (meta, buffer, payload_start) = match staged {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "settle discarded: checkpoint unreadable or corrupt");
@@ -1142,7 +1180,7 @@ async fn publish_settled_blob(
     };
     {
         use sha2::Digest;
-        let actual = format!("{:x}", sha2::Sha256::digest(&payload));
+        let actual = format!("{:x}", sha2::Sha256::digest(&buffer[payload_start..]));
         if !actual.eq_ignore_ascii_case(reported) {
             tracing::warn!(
                 reported,
@@ -1211,7 +1249,7 @@ async fn publish_settled_blob(
     let meta_for_write = published_meta.clone();
     let persistence = state.persistence.clone();
     let written = tokio::task::spawn_blocking(move || {
-        persistence.publish_atomic(key, generation, meta_for_write, &payload)
+        persistence.publish_from_staged(key, generation, meta_for_write, &buffer, payload_start)
     })
     .await
     .unwrap_or_else(|join| {
@@ -1311,27 +1349,38 @@ impl SettleStaging {
         Self { path }
     }
 
-    /// Publishes what the engine settled, then (via Drop) removes the staging
-    /// file. Runs at most once per request.
-    async fn publish(
-        &self,
-        state: &Arc<AppState>,
-        fingerprint: &ModelFingerprint,
-        engine_id: &str,
-        request_tokens: &[u32],
-        generated: &[u32],
-        reported_sha256: Option<&str>,
+    /// Consumes the guard and publishes what the engine settled in a DETACHED
+    /// task that owns the cleanup. Returns immediately.
+    ///
+    /// Why detached: the client already has its answer (the settle report in
+    /// the response describes what the ENGINE did, not what publication did),
+    /// so awaiting a full payload read + hash + fsynced write here charges
+    /// the response for work it does not depend on — and a client disconnect
+    /// would drop the awaiting future mid-write, leaving a final blob with no
+    /// index entry and no owner for the cleanup. The spawned task runs to
+    /// completion regardless of the request's fate; its Drop (this guard's
+    /// Drop) removes the staging file on every exit path.
+    fn spawn_publish(
+        self,
+        state: Arc<AppState>,
+        fingerprint: ModelFingerprint,
+        engine_id: String,
+        request_tokens: Vec<u32>,
+        generated: Vec<u32>,
+        reported_sha256: Option<String>,
     ) {
-        publish_settled_blob(
-            state,
-            fingerprint,
-            engine_id,
-            request_tokens,
-            generated,
-            &self.path,
-            reported_sha256,
-        )
-        .await;
+        tokio::spawn(async move {
+            publish_settled_blob(
+                &state,
+                &fingerprint,
+                &engine_id,
+                &request_tokens,
+                &generated,
+                &self.path,
+                reported_sha256.as_deref(),
+            )
+            .await;
+        });
     }
 }
 
@@ -1733,6 +1782,22 @@ impl ChunkFramer {
                         .ok()
                         .and_then(|v| v.get("settle").cloned())
                         .filter(|v| !v.is_null())
+                        // The engine's settle object is untrusted-shaped and
+                        // its `reason` can embed absolute paths from OSError
+                        // text. Clients receive the fixed field set only;
+                        // anything else an engine adds is dropped here.
+                        .map(|v| {
+                            let reason_code = v
+                                .get("reason")
+                                .and_then(|r| r.as_str())
+                                .map(|r| r.split(':').next().unwrap_or(r));
+                            serde_json::json!({
+                                "written": v.get("written").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                                "tokens": v.get("tokens").cloned().unwrap_or(serde_json::Value::from(0)),
+                                "sha256": v.get("sha256").cloned().unwrap_or(serde_json::Value::Null),
+                                "reason": reason_code,
+                            })
+                        })
                 } else {
                     None
                 };
@@ -2245,7 +2310,10 @@ async fn stream_response(
     struct StreamSettle {
         /// Removes the staging file on EVERY exit — including a client
         /// disconnect, which drops this stream before any cleanup line runs.
-        guard: SettleStaging,
+        /// Taken by value at publish time: the detached publication task owns
+        /// the guard from there, so a disconnect after the done frame cannot
+        /// strand the file.
+        guard: Option<SettleStaging>,
         state: Arc<AppState>,
         request_tokens: Vec<u32>,
         fingerprint: mlxcache_core::contract::ModelFingerprint,
@@ -2253,7 +2321,7 @@ async fn stream_response(
     }
 
     let stream_settle = StreamSettle {
-        guard: SettleStaging::new(req.settle_path.clone()),
+        guard: Some(SettleStaging::new(req.settle_path.clone())),
         state: state.clone(),
         request_tokens: req.tokens.clone(),
         fingerprint: req.fingerprint.clone(),
@@ -2421,7 +2489,7 @@ async fn stream_response(
         // The staging guard removes the file on drop whatever happens here.
         if st.terminated && !st.settle_done {
             st.settle_done = true;
-            if let Some(settle) = &st.settle {
+            if let Some(settle) = &mut st.settle {
                 let wrote = st
                     .settle_report
                     .as_ref()
@@ -2429,20 +2497,20 @@ async fn stream_response(
                     .and_then(|w| w.as_bool())
                     .unwrap_or(false);
                 if wrote {
-                    settle
-                        .guard
-                        .publish(
-                            &settle.state,
-                            &settle.fingerprint,
-                            &settle.engine_id,
-                            &settle.request_tokens,
-                            &st.generated,
+                    if let Some(guard) = settle.guard.take() {
+                        guard.spawn_publish(
+                            settle.state.clone(),
+                            settle.fingerprint.clone(),
+                            settle.engine_id.clone(),
+                            settle.request_tokens.clone(),
+                            st.generated.clone(),
                             st.settle_report
                                 .as_ref()
                                 .and_then(|r| r.get("sha256"))
-                                .and_then(|v| v.as_str()),
-                        )
-                        .await;
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned),
+                        );
+                    }
                 }
             }
         }
