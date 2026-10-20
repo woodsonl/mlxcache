@@ -252,7 +252,6 @@ class Qwen4TextConfig:
                     raise ValueError(f"{name} has no scalar default")
             raise ValueError(f"unknown field {name}")
 
-        """Build from the parsed `config.json` dict (wrapper or text subtree)."""
         raw = config_dict.get("text_config", config_dict)
         if raw.get("model_type", "qwen4_exp_text") != "qwen4_exp_text":
             raise ValueError(f"unsupported model_type: {raw.get('model_type')!r}")
@@ -268,6 +267,10 @@ class Qwen4TextConfig:
             num_hidden_layers=int(raw["num_hidden_layers"]),
             num_attention_heads=int(raw["num_attention_heads"]),
             num_key_value_heads=int(raw["num_key_value_heads"]),
+            # DERIVED fallback, not a second default: when the field is absent
+            # the checkpoint layout itself fixes head_dim at hidden_size //
+            # heads (the dataclass default 256 describes this checkpoint's
+            # value, not a general constant), so deriving beats importing it.
             head_dim=int(raw.get("head_dim") or raw["hidden_size"] // raw["num_attention_heads"]),
             hidden_act=raw.get("hidden_act", _default("hidden_act")),
             rms_norm_eps=float(raw.get("rms_norm_eps", _default("rms_norm_eps"))),
