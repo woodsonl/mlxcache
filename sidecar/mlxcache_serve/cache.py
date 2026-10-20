@@ -25,6 +25,7 @@ at token stream T covers exactly T[:-1] positions; a lookup returning
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import io
 import logging
@@ -212,6 +213,19 @@ class PersistentPromptCache(LRUPromptCache):
         fp = self.fingerprint
         return fp(model) if callable(fp) else fp
 
+    def _persistent_fp(self, model: Any) -> Fingerprint | None:
+        """The fingerprint to key the STORE by, or None when the identity is
+        unresolved. `default_fingerprint_for` pins unresolved identities as
+        the "missing"/"unresolved" sentinel; this is the enforcement point —
+        a sentinel must never reach the store in either direction (a lookup
+        would miss anyway, but a PUT would persist an entry no future
+        resolved identity can ever adopt, under an id two different
+        unresolved spellings share)."""
+        fp = self._fp(model)
+        if fp.tokenizer_hash == "missing" or fp.model_id == "unresolved":
+            return None
+        return fp
+
     def fetch_nearest_cache(self, model: Any, tokens: list[int]):
         # super() deepcopies the memory entry before we know whether disk
         # wins; avoiding that copy means reimplementing upstream's trie
@@ -221,7 +235,10 @@ class PersistentPromptCache(LRUPromptCache):
         if not rest:
             return cache, rest  # exact in-memory hit: nothing on disk can beat it
         try:
-            matched, ref = self.store.lookup(ENGINE_ID, self._fp(model), list(tokens))
+            fp = self._persistent_fp(model)
+            if fp is None:
+                return cache, rest  # unresolved identity: store is unreachable by design
+            matched, ref = self.store.lookup(ENGINE_ID, fp, list(tokens))
             if ref is None or matched < 2:
                 return cache, rest
             disk_covered = matched - 1  # payload at T covers T[:-1]
@@ -265,27 +282,38 @@ class PersistentPromptCache(LRUPromptCache):
                 return  # could not trim exactly one position: do not persist
             payload = self._save(trimmed)
             if payload:
-                self.store.put(ENGINE_ID, self._fp(model), list(tokens), payload)
+                fp = self._persistent_fp(model)
+                if fp is None:
+                    return  # unresolved identity: never persist under a sentinel
+                self.store.put(ENGINE_ID, fp, list(tokens), payload)
                 self.persisted += 1
         except Exception:  # noqa: BLE001 — persistence failure never breaks serving
             self.persist_errors += 1
             log.warning("disk cache publish failed", exc_info=True)
 
 
-def _resolve_snapshot(raw: str) -> str:
+@functools.lru_cache(maxsize=64)
+def _resolve_snapshot(raw: str, marker: str | None = "config.json") -> str:
     """Resolve a bare HF id (org/name) or relative path to a LOCAL snapshot
-    directory, without ever downloading. None-returning is deliberate: an
-    unresolved identifier must not be fingerprinted as itself (two different
-    ids would then collide on whatever string was passed), and must not
-    invent a path the tokenizer hasher would refuse anyway."""
+    directory, without ever downloading; returns "" when nothing resolves.
+    An unresolved identifier must not be fingerprinted as itself (two
+    different ids would then collide on whatever string was passed), and
+    must not invent a path the tokenizer hasher would refuse anyway.
+    `marker` names the file whose presence identifies a directory:
+    config.json for models and drafts, adapter_config.json for LoRA
+    adapters; None accepts any existing directory (no marker required).
+    Memoized per (raw, marker) — failures included, so a resolution miss
+    costs one probe per identifier for the process lifetime."""
     expanded = os.path.abspath(os.path.expanduser(raw))
-    if (Path(expanded) / "config.json").is_file():
+    if marker is None:
+        return expanded if Path(expanded).is_dir() else ""
+    if (Path(expanded) / marker).is_file():
         return expanded
     try:
         from huggingface_hub import snapshot_download
 
         snap = snapshot_download(raw, local_files_only=True)
-        if snap and (Path(snap) / "config.json").is_file():
+        if snap and (Path(snap) / marker).is_file():
             return snap
     except Exception:  # noqa: BLE001 — falls through to the sentinel
         pass
@@ -300,14 +328,21 @@ def default_fingerprint_for(model_key, kv_bits: int = 0, kv_group_size: int = 0)
 
     Non-directory identifiers (a bare `org/name`, a relative path) are
     resolved to local snapshot directories FIRST: fingerprinting the raw
-    string would key the cache on the spelling of a name, and every
-    resolution failure DISABLES persistent caching via the `"missing"`
-    tokenizer sentinel rather than pinning an unhashable identity."""
-    model, adapter, draft = (list(model_key) + [None, None, None])[:3]
-    model = _resolve_snapshot(model) if model else ""
-    adapter = _resolve_snapshot(adapter) if adapter else ""
-    draft = _resolve_snapshot(draft) if draft else ""
-    if not model:
+    string would key the cache on the spelling of a name. Adapters resolve
+    against adapter_config.json (mlx-lm requires it to load a LoRA anyway);
+    models and drafts against config.json. Any identifier that was SUPPLIED
+    but fails to resolve DISABLES persistent caching via the `"missing"`
+    tokenizer sentinel — a vanished adapter must not silently collapse to
+    the empty component and serve the base model's KV as if no LoRA was
+    requested."""
+    model_raw, adapter_raw, draft_raw = (list(model_key) + [None, None, None])[:3]
+    model = _resolve_snapshot(model_raw) if model_raw else ""
+    adapter = _resolve_snapshot(adapter_raw, marker="adapter_config.json") if adapter_raw else ""
+    draft = _resolve_snapshot(draft_raw) if draft_raw else ""
+    supplied_but_unresolved = bool(
+        (model_raw and not model) or (adapter_raw and not adapter) or (draft_raw and not draft)
+    )
+    if supplied_but_unresolved:
         # Unresolvable identity: return a fingerprint whose tokenizer hash is
         # the "missing" sentinel — the wrapper treats it as non-persistent.
         return Fingerprint(

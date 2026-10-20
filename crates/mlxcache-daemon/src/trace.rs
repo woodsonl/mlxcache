@@ -154,11 +154,10 @@ struct TraceRecordJson<'a> {
 
 pub enum TraceCommand {
     Record(TraceRecord),
-    Flush,
-    /// Flush with an ACK: the writer sends `()` back on the provided
-    /// channel once the flush (and every queued record before it) has hit
-    /// the file. Shutdown waits on the ACK so exit never outruns the queue.
-    FlushAck(std::sync::mpsc::Sender<()>),
+    /// Flush with an ACK: the writer sends back whether the flush (and every
+    /// queued record before it) reached the file. Shutdown waits on the ACK
+    /// so exit never outruns the queue.
+    FlushAck(std::sync::mpsc::Sender<bool>),
 }
 
 /// Handle cheap enough to build per request: a try-send on a bounded channel.
@@ -198,22 +197,18 @@ fn spawn_writer(
                             err_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    TraceCommand::Flush => {
-                        if w.flush().is_err() {
-                            err_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
                     TraceCommand::FlushAck(ack) => {
-                        if let Err(e) = w.flush() {
+                        // The ACK carries the real outcome: true only when
+                        // every queued record reached the file, false on a
+                        // failed write. Reporting durability for a write
+                        // that failed would be a lie the replay scorer
+                        // inherits.
+                        let ok = w.flush().is_ok();
+                        if !ok {
                             err_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let _ = ack.send(());
-                            tracing::warn!("trace flush on shutdown failed: {e}");
-                            continue;
+                            tracing::warn!("trace flush on shutdown failed");
                         }
-                        // ACK only after the flush succeeded: a wait on a
-                        // failed write would still unblock (the `let _`
-                        // above), but reporting it as durable would be a lie.
-                        let _ = ack.send(());
+                        let _ = ack.send(ok);
                     }
                 }
             }
@@ -275,28 +270,43 @@ impl TraceWriter {
         }
     }
 
-    /// Best-effort durability point for tests and non-shutdown callers.
-    pub fn flush(&self) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.try_send(TraceCommand::Flush);
-        }
-    }
-
     /// Synchronous flush for process exit: waits (bounded) for the writer to
-    /// acknowledge that every queued record — including any still in flight
-    /// between channel receipt and file write — has been flushed. A shutdown
-    /// that outruns the queue silently truncates the trace and every replay
-    /// score derived from it.
+    /// acknowledge — with the flush's real outcome — that every queued
+    /// record, including any still in flight between channel receipt and
+    /// file write, has been flushed. A shutdown that outruns the queue
+    /// silently truncates the trace and every replay score derived from it.
     pub fn flush_sync(&self, timeout: std::time::Duration) -> bool {
         let Some(tx) = &self.tx else {
             return true;
         };
+        let deadline = std::time::Instant::now() + timeout;
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        if tx.send(TraceCommand::FlushAck(ack_tx)).is_err() {
-            // Writer gone: nothing more can be in flight.
-            return true;
+        // The enqueue shares the timeout budget: a blocked SyncSender::send
+        // on a full channel would hang past the deadline before the wait
+        // even started, so try_send against the deadline instead.
+        let mut cmd = TraceCommand::FlushAck(ack_tx);
+        loop {
+            match tx.try_send(cmd) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    cmd = back;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    // Writer gone: nothing more can be in flight (losses are
+                    // already counted in `degraded()`).
+                    return true;
+                }
+            }
         }
-        ack_rx.recv_timeout(timeout).is_ok()
+        ack_rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            // Timeout: the writer never acknowledged within the budget —
+            // report not-durable rather than guess.
+            .unwrap_or_default()
     }
 
     /// Total records the writer could not accept (full channel) or write
@@ -437,23 +447,15 @@ mod tests {
         let w = TraceWriter::from_env().unwrap().unwrap();
         let d = decision(CacheVerdict::Partial, 20, 40);
         w.record(TraceRecord::from_decision(9, &d));
-        w.flush();
-        // Poll instead of assume: the flush command takes the same bounded
-        // channel as the record, so once the file shows the verdict the
-        // ordering guarantee has caught up (both are FIFO).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let body = std::fs::read_to_string(&path).unwrap_or_default();
-            if body.contains("\"verdict\":\"partial\"") {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "flush never landed in {}: {body}",
-                path.display()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // flush_sync ACKs after the record reached the file, so no polling
+        // is needed: the returned true IS the ordering guarantee. The ACK
+        // says flushed — assert the verdict actually landed too.
+        assert!(w.flush_sync(std::time::Duration::from_secs(5)));
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            body.contains("\"verdict\":\"partial\""),
+            "acked flush must contain the record: {body}"
+        );
         unsafe { std::env::remove_var("MLXCACHE_TRACE") };
         // Restore whatever the environment had before this test touched it.
         if let Some(v) = old {
@@ -477,7 +479,7 @@ mod tests {
                 .as_nanos()
         ));
         let w = TraceWriter::from_path(&path).expect("trace writer builds");
-        w.flush();
+        let _ = w.flush_sync(std::time::Duration::from_secs(5));
         drop(w);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(

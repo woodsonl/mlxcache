@@ -236,13 +236,13 @@ class Qwen4TextConfig:
 
     @classmethod
     def from_checkpoint(cls, config_dict: dict) -> Qwen4TextConfig:
+        """Build from the parsed `config.json` dict (wrapper or text subtree)."""
         # Omitted checkpoint fields take the DATACLASS defaults, read from the
         # dataclass itself — duplicated literals here previously disagreed
         # with the defaults (128 vs 512 in split_ngram_parts, 32768 vs
         # 262144 in max_position_embeddings, 10000 vs 10_000_000 in
         # rope_theta), so a config.json missing a field silently built a
         # different model than a direct construction.
-        d = {f.name: f.default for f in fields(cls) if f.default is not dataclasses.MISSING}
         """Build from the parsed `config.json` dict (wrapper or text subtree)."""
         # Single source of defaults: every scalar fallback below reads the
         # dataclass field default via _default(), never a second hand-typed

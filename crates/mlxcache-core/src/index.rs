@@ -3,7 +3,7 @@
 //! Longest-prefix match in O(prefix length). No SQLite on the hot path (D2-reopened).
 //! Index rows are only visible after the checkpoint blob's atomic publish (R1-3).
 
-use crate::contract::{CheckpointMeta, CheckpointState, ModelFingerprint};
+use crate::contract::{engine_domain, CheckpointMeta, CheckpointState, ModelFingerprint};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -181,18 +181,16 @@ impl PrefixIndex {
                 .is_none_or(|f| crate::policy::identity_compatible(&entry.meta.fingerprint, f))
         };
         let engine_ok = |entry: &IndexEntry| {
-            let entry_engine = entry
-                .meta
-                .engine_id
-                .as_deref()
-                .unwrap_or(crate::contract::DEFAULT_ENGINE);
-            let request_engine = engine_id.unwrap_or(crate::contract::DEFAULT_ENGINE);
-            entry_engine == request_engine
+            engine_domain(entry.meta.engine_id.as_deref()) == engine_domain(engine_id)
         };
-        // WHOLE_CONTEXT entries serve only an exact full-prompt match.
-        let granularity_ok = |entry: &IndexEntry, matched: usize| {
-            entry.meta.granularity.unwrap_or(0) != 1 || matched == entry.key.len()
-        };
+        // WHOLE_CONTEXT entries serve only when the request IS the entry's
+        // full prompt. `exact` says the walk consumed the whole request
+        // (i + 1 == tokens.len() on the exact path); a divergent sibling by
+        // construction differs from the request, so it can never be an
+        // exact full-prompt match and granularity-1 siblings are rejected
+        // outright.
+        let granularity_ok =
+            |entry: &IndexEntry, exact: bool| entry.meta.granularity.unwrap_or(0) != 1 || exact;
         let root = self.read_lock();
         let mut node: &Node = &root;
         // Borrow-walk: track the best entry by REFERENCE and clone once at
@@ -241,7 +239,7 @@ impl PrefixIndex {
                         if entry.state == CheckpointState::Published
                             && fp_ok(entry)
                             && engine_ok(entry)
-                            && granularity_ok(entry, i + 1)
+                            && granularity_ok(entry, i + 1 == tokens.len())
                         {
                             // Anchor touch: this entry just served a request, so
                             // it is the base of a live chain. Relaxed is fine —
@@ -271,11 +269,7 @@ impl PrefixIndex {
         // the same depth is full containment of a longer prefix — strictly
         // better than adopting a key that differs at its last token.
         if let Some((entry, matched)) = divergent {
-            if !engine_ok(entry) || !granularity_ok(entry, matched) {
-                // A sibling from another engine domain, or a WHOLE_CONTEXT
-                // sibling against a partial match: not adoptable. Fall
-                // through to the exact-walk candidate rather than serve it.
-            } else {
+            if engine_ok(entry) && granularity_ok(entry, false) {
                 let beats_best = best.as_ref().is_none_or(|(_, depth)| matched > *depth);
                 if matched >= 2 && beats_best {
                     // Touch through the reference, only for the entry this lookup
@@ -288,6 +282,9 @@ impl PrefixIndex {
                     return Some((entry.clone(), matched));
                 }
             }
+            // A sibling from another engine domain, or a WHOLE_CONTEXT sibling
+            // (never an exact full-prompt match on the divergent path): not
+            // adoptable — fall through to the exact-walk candidate.
         }
         best.map(|(entry, depth)| (entry.clone(), depth))
     }
@@ -310,7 +307,7 @@ impl PrefixIndex {
         // skipped here so the adoption sites never see them.
         engine_id: Option<&str>,
     ) -> Option<&'a IndexEntry> {
-        let request_engine = engine_id.unwrap_or(crate::contract::DEFAULT_ENGINE);
+        let request_engine = engine_domain(engine_id);
         let mut best: Option<(u64, u32, &IndexEntry)> = None;
         for (t, child) in &node.children {
             if Some(*t) == exclude {
@@ -322,12 +319,13 @@ impl PrefixIndex {
             if entry.state != CheckpointState::Published {
                 continue;
             }
-            let entry_engine = entry
-                .meta
-                .engine_id
-                .as_deref()
-                .unwrap_or(crate::contract::DEFAULT_ENGINE);
-            if entry_engine != request_engine {
+            if engine_domain(entry.meta.engine_id.as_deref()) != request_engine {
+                continue;
+            }
+            // A WHOLE_CONTEXT child serves only its own exact full prompt;
+            // it is never a valid continuation point for a longer request,
+            // so it is skipped exactly like a foreign-engine sibling.
+            if entry.meta.granularity.unwrap_or(0) == 1 {
                 continue;
             }
             if let Some(f) = fingerprint {
@@ -1591,6 +1589,69 @@ mod tests {
         assert!(
             after > before,
             "lookup must advance the entry's last_used instant"
+        );
+    }
+
+    #[test]
+    fn whole_context_entry_serves_only_its_exact_prompt() {
+        // granularity=1 (WHOLE_CONTEXT) means the blob holds KV for the
+        // entry's full prompt and nothing looser: a LONGER request must fall
+        // back to the ANY_PREFIX ancestor deeper in its walk, and a
+        // DIVERGENT request must never adopt it as a sibling.
+        let index = PrefixIndex::new();
+        publish_entry(&index, &[1, 2], "ancestor");
+        let generation = index.reserve_generation();
+        let mut whole = meta();
+        whole.granularity = Some(1);
+        assert!(index.publish(&[1, 2, 3], whole, "whole".into(), generation, |_| {}));
+
+        // Exact full-prompt match: the WHOLE_CONTEXT entry serves.
+        let (entry, matched) = index.lookup(&[1, 2, 3], None).unwrap();
+        assert_eq!(entry.blob_path, "whole");
+        assert_eq!(matched, 3);
+
+        // Longer request: [1,2] is walked exactly, [1,2,3] matches but is
+        // WHOLE_CONTEXT against a non-exact request, so the walk must keep
+        // the ANY_PREFIX ancestor at [1,2] instead.
+        let (entry, matched) = index.lookup(&[1, 2, 3, 4, 5], None).unwrap();
+        assert_eq!(
+            entry.blob_path, "ancestor",
+            "a longer request must select the ANY_PREFIX ancestor, not the WHOLE_CONTEXT node"
+        );
+        assert_eq!(matched, 2);
+
+        // Divergent request: diverges at depth 2, so [1,2,3] is a divergent
+        // sibling candidate — a granularity-1 sibling can never be an exact
+        // full-prompt match and must be rejected outright.
+        let (entry, _) = index.lookup(&[1, 2, 9, 9], None).unwrap();
+        assert_eq!(
+            entry.blob_path, "ancestor",
+            "a divergent request must never adopt the WHOLE_CONTEXT sibling"
+        );
+    }
+
+    #[test]
+    fn hottest_child_skips_whole_context_entries() {
+        // The divergent-sibling scan (hottest_published_child) feeds ADOPTION
+        // sites that serve longer requests; a WHOLE_CONTEXT child can never
+        // be a valid continuation point and must be skipped even when it is
+        // the hottest candidate.
+        let index = PrefixIndex::new();
+        publish_entry(&index, &[1, 2], "ancestor");
+        let generation = index.reserve_generation();
+        let mut whole = meta();
+        whole.granularity = Some(1);
+        assert!(index.publish(&[1, 2, 3], whole, "hot-whole".into(), generation, |_| {}));
+        publish_entry(&index, &[1, 2, 4], "any-prefix-sibling");
+
+        // Request [1,2,9,...]: divergent siblings at depth 3 are [1,2,3]
+        // (WHOLE_CONTEXT, hot) and [1,2,4] (ANY_PREFIX). The adopted entry
+        // must be the ANY_PREFIX sibling, never the WHOLE_CONTEXT one.
+        let (entry, matched) = index.lookup(&[1, 2, 9, 9], None).unwrap();
+        assert_eq!(matched, 3, "the deeper divergent sibling wins on coverage");
+        assert_eq!(
+            entry.blob_path, "any-prefix-sibling",
+            "a divergent request must adopt the ANY_PREFIX sibling, never the WHOLE_CONTEXT one"
         );
     }
 }

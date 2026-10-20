@@ -138,7 +138,9 @@ async fn main() -> Result<()> {
     // measured, and every replay score derived from it inherits the lie).
     if let Some(tracer) = &state.trace {
         if !tracer.flush_sync(std::time::Duration::from_secs(5)) {
-            tracing::warn!("trace writer did not acknowledge shutdown flush");
+            tracing::warn!(
+                "shutdown trace flush not confirmed durable (writer timeout or flush failure)"
+            );
         }
     }
     tracing::info!("mlxcache daemon stopped");

@@ -322,8 +322,10 @@ def test_cli_separator_passthrough(monkeypatch, tmp_path):
 def test_adapter_switch_isolates_fingerprint(tmp_path):
     """LoRA-B must never serve LoRA-A's KV: the default fingerprint folds
     adapter and draft model into the model id. The identifiers must be real
-    local dirs — an unresolvable id now disables persistence (the "missing"
-    sentinel) instead of hashing the raw spelling."""
+    local dirs — an unresolvable id disables persistence (the "missing"
+    sentinel) instead of hashing the raw spelling. Adapters are recognized
+    by adapter_config.json (mlx-lm requires it to load a LoRA anyway);
+    models and drafts by config.json."""
     from mlxcache_serve import default_fingerprint_for
 
     model = tmp_path / "model"
@@ -331,18 +333,64 @@ def test_adapter_switch_isolates_fingerprint(tmp_path):
     (model / "config.json").write_text("{}")
     lora_a = tmp_path / "lora-a"
     lora_b = tmp_path / "lora-b"
+    for lora in (lora_a, lora_b):
+        lora.mkdir()
+        (lora / "adapter_config.json").write_text("{}")
     draft = tmp_path / "draft"
-    for d in (lora_a, lora_b, draft):
-        d.mkdir()
-        (d / "config.json").write_text("{}")
+    draft.mkdir()
+    (draft / "config.json").write_text("{}")
     fp_a = default_fingerprint_for((str(model), str(lora_a), None))
     fp_b = default_fingerprint_for((str(model), str(lora_b), None))
     assert fp_a != fp_b and fp_a.model_id != fp_b.model_id
+    assert str(lora_a) in fp_a.model_id, "resolved adapter dir rides in the model id"
     fp_draft = default_fingerprint_for((str(model), None, str(draft)))
     assert fp_draft.model_id != fp_a.model_id, "draft-model switch isolates too"
     assert default_fingerprint_for((str(model), None, None)) is default_fingerprint_for(
         (str(model), None, None)
     ), "memoized: same key → same fingerprint object"
+
+
+def test_unresolved_adapter_disables_persistence(tmp_path):
+    """A SUPPLIED adapter that fails to resolve (a dir with no
+    adapter_config.json, a bare HF id with no local snapshot) must pin the
+    sentinel — silently collapsing it to the empty component would serve
+    the BASE model's KV as if no LoRA was requested."""
+    from mlxcache_serve import default_fingerprint_for
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    not_an_adapter = tmp_path / "empty-dir"
+    not_an_adapter.mkdir()  # exists, but no adapter_config.json
+    for supplied in (str(not_an_adapter), "definitely/not-a-cached-adapter-xyz"):
+        fp = default_fingerprint_for((str(model), supplied, None))
+        assert fp.tokenizer_hash == "missing", f"{supplied}: sentinel expected"
+        assert fp.model_id == "unresolved", f"{supplied}: sentinel expected"
+
+
+def test_sentinel_fingerprint_never_reaches_the_store(tmp_path):
+    """The "missing"/"unresolved" sentinel is enforced at
+    PersistentPromptCache: no store lookup, no store put — a persisted
+    entry under an id two unresolved spellings share could never be
+    adopted by a resolved identity anyway."""
+    from mlxcache_serve.cache import Fingerprint as Fp
+
+    sentinel = Fp(
+        model_id="unresolved",
+        tokenizer_hash="missing",
+        kv_dtype="f16",
+        kv_layout_version=1,
+    )
+    store = Store(tmp_path, byte_budget=0)
+    c = PersistentPromptCache(store, sentinel, save_fn=fake_save, load_fn=fake_load)
+    # fetch: memory misses, disk must not even be asked.
+    cache, rest = c.fetch_nearest_cache(MODEL, [1, 2, 3, 4])
+    assert rest == [1, 2, 3, 4], "memory-only serving when identity is unresolved"
+    assert c.disk_hits == 0
+    # insert: the payload must not be persisted under the sentinel.
+    c.insert_cache(MODEL, [1, 2, 3, 4], FakeCache("full-stream"))
+    assert c.persisted == 0, "sentinel identity must never publish to the store"
+    assert list(tmp_path.glob("*.ckpt")) == []
 
 
 def test_unresolvable_identifier_disables_persistence():

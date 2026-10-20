@@ -109,6 +109,45 @@ def stats_delta(pre: dict, post: dict, key: str) -> int:
     return post[key] - pre[key]
 
 
+def sse_lines(resp, timeout: float):
+    """Bounded-read SSE decoder: yield each `data:` payload string, stopping
+    at EOF or [DONE]. urllib's line iteration over the response is buffered,
+    so a record split across TCP reads is reassembled before we see it. The
+    socket timeout bounds ONE read, not the stream — so the socket's timeout
+    is reset to the REMAINING total budget before every read and a server
+    dripping a frame every few seconds can neither hold the connection past
+    the deadline nor block one read longer than the budget allows. Single
+    decode policy for every consumer: errors="replace" (payloads are JSON;
+    a torn multi-byte char should not kill a stream whose budget was fine)."""
+    deadline = time.monotonic() + timeout
+    sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
+        if sock is not None:
+            # Bound the NEXT blocking read by what is left of the total
+            # budget, not by the original per-read timeout.
+            sock.settimeout(max(0.05, remaining))
+        try:
+            raw_line = resp.readline()
+        except TimeoutError:
+            # The remaining-budget read timed out: same verdict as the
+            # deadline check, raised as the documented error.
+            raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget") from None
+        if not raw_line:
+            return  # EOF: the server closed the stream
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
+        line = raw_line.decode(errors="replace").strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: ") :]
+        if payload == "[DONE]":
+            return
+        yield payload
+
+
 class Server:
     """One localhost server child: spawn, readiness-probe, kill, reap, unlink.
 
@@ -234,50 +273,16 @@ class Server:
                 return e.code, raw
 
     def stream(self, path: str, body: dict, timeout: float = 600) -> list[dict]:
-        """Return parsed SSE `data:` payloads (skipping [DONE]).
-
-        urllib's line iteration over the response is buffered, so a `data:`
-        record split across TCP reads is reassembled before we see it. The
-        socket timeout bounds one read, not the stream — so the socket's
-        timeout is reset to the REMAINING total budget before every read
-        and a server dripping a frame every few seconds can neither hold
-        the connection past the deadline nor block one read longer than
-        the budget allows. EOF (empty read) ends consumption cleanly.
-        """
+        """Return parsed SSE `data:` payloads (skipping [DONE]). The
+        bounded-read and decode policies live in `sse_lines`, shared with
+        every other SSE consumer."""
         req = urllib.request.Request(
             f"{self.base}{path}",
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
         )
-        events = []
-        deadline = time.monotonic() + timeout
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            sock = getattr(getattr(r.fp, "raw", None), "_sock", None)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
-                if sock is not None:
-                    # Bound the NEXT blocking read by what is left of the
-                    # total budget, not by the original per-read timeout.
-                    sock.settimeout(max(0.05, remaining))
-                try:
-                    raw_line = r.readline()
-                except TimeoutError:
-                    # The remaining-budget read timed out: same verdict as
-                    # the deadline check, raised as the documented error.
-                    raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget") from None
-                if not raw_line:
-                    break  # EOF: the server closed the stream
-                if time.monotonic() > deadline:
-                    raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
-                line = raw_line.decode().strip()
-                if line.startswith("data: "):
-                    payload = line[6:]
-                    if payload == "[DONE]":
-                        break
-                    events.append(json.loads(payload))
-        return events
+            return [json.loads(p) for p in sse_lines(r, timeout)]
 
     def stop(self) -> None:
         if self.proc.poll() is None:

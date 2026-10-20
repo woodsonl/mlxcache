@@ -368,7 +368,6 @@ impl SidecarClient {
         if let Some(p) = settle_path {
             body["settle_path"] = serde_json::json!(p);
         }
-        let body = body;
         let fut = async { self.stream_http.post(&url).json(&body).send().await };
         let resp = match tokio::time::timeout(open, fut).await {
             // Elapsed before headers: the sidecar wedged opening the stream.

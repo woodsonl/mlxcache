@@ -52,7 +52,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _harness import KILL_WAIT_S, TERM_WAIT_S, free_port  # noqa: E402 — path insert above
+from _harness import (  # noqa: E402 — path insert above
+    KILL_WAIT_S,
+    TERM_WAIT_S,
+    free_port,
+    sse_lines,
+)
 
 
 def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, float, int]:
@@ -75,33 +80,11 @@ def stream_chat(url: str, body: dict, timeout: float = 120.0) -> tuple[float, fl
         method="POST",
     )
     t0 = time.perf_counter()
-    deadline = time.monotonic() + timeout
     ttft: float | None = None
     tokens = 0
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        sock = getattr(getattr(resp.fp, "raw", None), "_sock", None)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
-            if sock is not None:
-                # Bound the NEXT blocking read by the remaining total
-                # budget, not by the original per-read timeout.
-                sock.settimeout(max(0.05, remaining))
-            try:
-                raw = resp.readline()
-            except TimeoutError:
-                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget") from None
-            if not raw:
-                break  # EOF: stream closed
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"SSE stream exceeded its {timeout}s total budget")
-            line = raw.decode(errors="replace").strip()
-            if not line.startswith("data: "):
-                continue
-            payload = line[len("data: ") :]
-            if payload == "[DONE]":
-                break
+        # Shared bounded-read/decode policy (one loop, not a drifted copy).
+        for payload in sse_lines(resp, timeout):
             try:
                 frame = json.loads(payload)
             except json.JSONDecodeError:
@@ -305,15 +288,9 @@ def _wait_listening(
     """
     import socket
 
-    def _child_dead() -> int | None:
-        if proc is None:
-            return None
-        rc = proc.poll()
-        return rc
-
     deadline = time.time() + deadline_s
     while time.time() < deadline:
-        rc = _child_dead()
+        rc = proc.poll() if proc is not None else None
         if rc is not None:
             raise RuntimeError(f"child exited (code {rc}) before listening on {addr[0]}:{addr[1]}")
         with socket.socket() as s:
@@ -322,7 +299,7 @@ def _wait_listening(
                 # context: the child can die between accepting the probe
                 # and our return, and a listener that is not OUR child is
                 # exactly the wrong-stack trap the harness exists to avoid.
-                rc = _child_dead()
+                rc = proc.poll() if proc is not None else None
                 if rc is not None:
                     raise RuntimeError(
                         f"child exited (code {rc}) right after listening on {addr[0]}:{addr[1]}"

@@ -4,14 +4,14 @@ on:
   push:
     branches: [init, main]
   pull_request:
-
-permissions:
-  contents: read
   # The real-model gate downloads a model; run it on demand and weekly, not on
   # every PR. Nightly-style coverage catches mlx-lm drift without slowing PRs.
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   rust:

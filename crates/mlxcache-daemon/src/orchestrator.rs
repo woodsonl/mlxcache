@@ -533,11 +533,9 @@ impl Orchestrator {
                     // nodes and must never reconcile each other away. A
                     // missing engine_id normalizes to the default engine
                     // (legacy stores), matching the serde default.
-                    let engine_domain = meta
-                        .engine_id
-                        .clone()
-                        .unwrap_or_else(|| mlxcache_core::contract::DEFAULT_ENGINE.to_string());
-                    let key = (meta.tokens.clone(), engine_domain);
+                    let domain = mlxcache_core::contract::engine_domain(meta.engine_id.as_deref())
+                        .to_string();
+                    let key = (meta.tokens.clone(), domain);
                     let cand = Candidate {
                         name,
                         generation,
