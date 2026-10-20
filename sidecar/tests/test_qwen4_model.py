@@ -659,14 +659,10 @@ def test_missing_fields_build_the_dataclass_defaults_not_second_literals():
         "num_hidden_layers": 4,
         "num_attention_heads": 2,
         "num_key_value_heads": 2,
-        # Interval pattern for 4 layers at interval 4: layer (i+1)%4==0 is
-        # full, so index 3 is the one full-attention layer.
-        "layer_types": [
-            "linear_attention",
-            "linear_attention",
-            "linear_attention",
-            "full_attention",
-        ],
+        # layer_types deliberately OMITTED: the factory-backed fallback must
+        # resolve through _default("layer_types") -> [] -> the derived
+        # interval pattern (4 layers at interval 4: index 3 is the one
+        # full-attention layer).
     }
     cfg = Qwen4TextConfig.from_checkpoint(required)
     defaults = {
@@ -686,3 +682,15 @@ def test_missing_fields_build_the_dataclass_defaults_not_second_literals():
     ):
         got = getattr(cfg, name)
         assert got == defaults[name], f"{name}: {got!r} != dataclass default {defaults[name]!r}"
+    # Factory-backed defaults (excluded from the loop's dict): omitted
+    # mrope_section takes its default_factory value, omitted layer_types
+    # derives the interval pattern — both regress if the _default()
+    # factory branch breaks.
+    fresh = Qwen4TextConfig()
+    assert cfg.mrope_section == fresh.mrope_section
+    assert cfg.layer_types == [
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+    ]
