@@ -635,6 +635,13 @@ class SyntheticEngine:
         # 502 to the client, exactly one trace record, and the stats claim
         # corrected so capture and /stats keep agreeing.
         self._generate_fail = os.environ.get("MLXCACHE_GENERATE_FAIL") == "1"
+        # Test knob: fail exactly the Nth non-stream /generate (1-based), then
+        # succeed. Exercises the scratch-retry-success path on a blob-backed
+        # request: the abandoned attempt leaves its staging file, the retry
+        # writes its own, and the settled checkpoint must publish from the
+        # RETRY's path.
+        self._generate_fail_at = int(os.environ.get("MLXCACHE_GENERATE_FAIL_AT", "0") or 0)
+        self._generate_count = 0
         # Phase timers (B2): last prefill's coverage, for the delta-prefill test.
         self.last_prefill_tokens = 0
         self.last_prefill_delta_tokens = 0
@@ -753,6 +760,9 @@ class SyntheticEngine:
         # Deterministic continuation: token ids derived from context length.
         if self._generate_fail:
             raise RuntimeError("synthetic induced generate failure (test knob)")
+        self._generate_count += 1
+        if self._generate_fail_at and self._generate_count == self._generate_fail_at:
+            raise RuntimeError("synthetic induced generate failure (test knob)")
         base = len(tokens)
         return [(base + i) % 2**31 for i in range(max_tokens)]
 
@@ -787,6 +797,12 @@ class SyntheticEngine:
                 report.pop("sha256", None)
             elif lie == "bad":
                 report["sha256"] = "0" * 64
+            elif lie == "pathy":
+                # Simulate the leak shape the client scrub guards against: an
+                # OSError reason embedding an absolute staging path.
+                report["reason"] = (
+                    f"write_failed: [Errno 13] Permission denied: '{settle_path}.Nx8fJa.part'"
+                )
         return report
 
     def generate_collect(
@@ -1897,6 +1913,7 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "prefill_count": getattr(engine, "prefill_count", None),
+                    "generate_count": getattr(engine, "_generate_count", -1),
                     "last_prefill_tokens": getattr(engine, "last_prefill_tokens", 0),
                     "last_prefill_delta_tokens": getattr(engine, "last_prefill_delta_tokens", 0),
                     "phases": _phase_stats(),

@@ -236,11 +236,30 @@ class Qwen4TextConfig:
     @classmethod
     def from_checkpoint(cls, config_dict: dict) -> Qwen4TextConfig:
         """Build from the parsed `config.json` dict (wrapper or text subtree)."""
+        # Single source of defaults: every scalar fallback below reads the
+        # dataclass field default via _default(), never a second hand-typed
+        # literal. Two disagreeing default sets meant a config.json missing a
+        # field built a different architecture depending on which set won
+        # (and partial_rotary_factor 1.0 vs 0.25 failed QSA validation).
+
+        def _default(name: str):
+            import dataclasses
+
+            for f in dataclasses.fields(cls):
+                if f.name == name:
+                    if f.default is not dataclasses.MISSING:
+                        return f.default
+                    raise ValueError(f"{name} has no scalar default")
+            raise ValueError(f"unknown field {name}")
+
         raw = config_dict.get("text_config", config_dict)
         if raw.get("model_type", "qwen4_exp_text") != "qwen4_exp_text":
             raise ValueError(f"unsupported model_type: {raw.get('model_type')!r}")
         rope = raw.get("rope_parameters") or {}
-        partial = rope.get("partial_rotary_factor", raw.get("partial_rotary_factor", 1.0))
+        partial = rope.get(
+            "partial_rotary_factor",
+            raw.get("partial_rotary_factor", _default("partial_rotary_factor")),
+        )
         layer_types = raw.get("layer_types") or []
         return cls(
             vocab_size=int(raw["vocab_size"]),
@@ -248,45 +267,82 @@ class Qwen4TextConfig:
             num_hidden_layers=int(raw["num_hidden_layers"]),
             num_attention_heads=int(raw["num_attention_heads"]),
             num_key_value_heads=int(raw["num_key_value_heads"]),
+            # DERIVED fallback, not a second default: when the field is absent
+            # the checkpoint layout itself fixes head_dim at hidden_size //
+            # heads (the dataclass default 256 describes this checkpoint's
+            # value, not a general constant), so deriving beats importing it.
             head_dim=int(raw.get("head_dim") or raw["hidden_size"] // raw["num_attention_heads"]),
-            hidden_act=raw.get("hidden_act", "silu"),
-            rms_norm_eps=float(raw.get("rms_norm_eps", 1e-6)),
-            max_position_embeddings=int(raw.get("max_position_embeddings", 32768)),
-            attention_bias=bool(raw.get("attention_bias", False)),
+            hidden_act=raw.get("hidden_act", _default("hidden_act")),
+            rms_norm_eps=float(raw.get("rms_norm_eps", _default("rms_norm_eps"))),
+            max_position_embeddings=int(
+                raw.get("max_position_embeddings", _default("max_position_embeddings"))
+            ),
+            attention_bias=bool(raw.get("attention_bias", _default("attention_bias"))),
             layer_types=list(layer_types),
-            full_attention_interval=int(raw.get("full_attention_interval", 4)),
-            rope_theta=float(rope.get("rope_theta", raw.get("rope_theta", 10000.0))),
+            full_attention_interval=int(
+                raw.get("full_attention_interval", _default("full_attention_interval"))
+            ),
+            rope_theta=float(rope.get("rope_theta", raw.get("rope_theta", _default("rope_theta")))),
             partial_rotary_factor=float(partial),
-            mrope_section=list(rope.get("mrope_section", [11, 11, 10])),
-            linear_conv_kernel_dim=int(raw.get("linear_conv_kernel_dim", 4)),
-            linear_key_head_dim=int(raw.get("linear_key_head_dim", 128)),
-            linear_value_head_dim=int(raw.get("linear_value_head_dim", 128)),
-            linear_num_key_heads=int(raw.get("linear_num_key_heads", 16)),
-            linear_num_value_heads=int(raw.get("linear_num_value_heads", 32)),
+            mrope_section=list(  # literal mirrors the dataclass default_factory below
+                rope.get("mrope_section", [11, 11, 10])
+            ),
+            linear_conv_kernel_dim=int(
+                raw.get("linear_conv_kernel_dim", _default("linear_conv_kernel_dim"))
+            ),
+            linear_key_head_dim=int(
+                raw.get("linear_key_head_dim", _default("linear_key_head_dim"))
+            ),
+            linear_value_head_dim=int(
+                raw.get("linear_value_head_dim", _default("linear_value_head_dim"))
+            ),
+            linear_num_key_heads=int(
+                raw.get("linear_num_key_heads", _default("linear_num_key_heads"))
+            ),
+            linear_num_value_heads=int(
+                raw.get("linear_num_value_heads", _default("linear_num_value_heads"))
+            ),
             output_gate_type=raw.get("output_gate_type"),
-            moe_intermediate_size=int(raw.get("moe_intermediate_size", 512)),
-            shared_expert_intermediate_size=int(raw.get("shared_expert_intermediate_size", 512)),
-            num_experts=int(raw.get("num_experts", 512)),
-            num_experts_per_tok=int(raw.get("num_experts_per_tok", 10)),
-            norm_topk_prob=bool(raw.get("norm_topk_prob", True)),
-            hc_count=int(raw.get("hc_count", 4)),
-            hc_lowrank=int(raw.get("hc_lowrank", 320)),
+            moe_intermediate_size=int(
+                raw.get("moe_intermediate_size", _default("moe_intermediate_size"))
+            ),
+            shared_expert_intermediate_size=int(
+                raw.get(
+                    "shared_expert_intermediate_size", _default("shared_expert_intermediate_size")
+                )
+            ),
+            num_experts=int(raw.get("num_experts", _default("num_experts"))),
+            num_experts_per_tok=int(
+                raw.get("num_experts_per_tok", _default("num_experts_per_tok"))
+            ),
+            norm_topk_prob=bool(raw.get("norm_topk_prob", _default("norm_topk_prob"))),
+            hc_count=int(raw.get("hc_count", _default("hc_count"))),
+            hc_lowrank=int(raw.get("hc_lowrank", _default("hc_lowrank"))),
             ple_layer_ids=list(raw.get("ple_layer_ids") or []),
             ple_embed_dim=_as_int(raw.get("ple_embed_dim"), None),
-            ple_conv_kernel_size=int(raw.get("ple_conv_kernel_size", 4)),
-            ngram_size=int(raw.get("ngram_size", 3)),
-            heads_per_ngram=int(raw.get("heads_per_ngram", 8)),
-            ngram_vocab_size_base=int(raw.get("ngram_vocab_size_base", 20_000_000)),
-            make_ngram_vocab_size_divisible_by=int(
-                raw.get("make_ngram_vocab_size_divisible_by", 128)
+            ple_conv_kernel_size=int(
+                raw.get("ple_conv_kernel_size", _default("ple_conv_kernel_size"))
             ),
-            seed=int(raw.get("seed", 1234)),
+            ngram_size=int(raw.get("ngram_size", _default("ngram_size"))),
+            heads_per_ngram=int(raw.get("heads_per_ngram", _default("heads_per_ngram"))),
+            ngram_vocab_size_base=int(
+                raw.get("ngram_vocab_size_base", _default("ngram_vocab_size_base"))
+            ),
+            make_ngram_vocab_size_divisible_by=int(
+                raw.get(
+                    "make_ngram_vocab_size_divisible_by",
+                    _default("make_ngram_vocab_size_divisible_by"),
+                )
+            ),
+            seed=int(raw.get("seed", _default("seed"))),
             split_ngram_parts=int(raw.get("split_ngram_parts", DEFAULT_SPLIT_NGRAM_PARTS)),
-            indexer_n_heads=_as_int(raw.get("indexer_n_heads"), None),
-            indexer_kv_heads=_as_int(raw.get("indexer_kv_heads"), None),
-            indexer_head_dim=_as_int(raw.get("indexer_head_dim"), None),
-            indexer_budget=_as_int(raw.get("indexer_budget"), None),
-            indexer_compress_ratio=_as_int(raw.get("indexer_compress_ratio"), None),
+            indexer_n_heads=_as_int(raw.get("indexer_n_heads"), _default("indexer_n_heads")),
+            indexer_kv_heads=_as_int(raw.get("indexer_kv_heads"), _default("indexer_kv_heads")),
+            indexer_head_dim=_as_int(raw.get("indexer_head_dim"), _default("indexer_head_dim")),
+            indexer_budget=_as_int(raw.get("indexer_budget"), _default("indexer_budget")),
+            indexer_compress_ratio=_as_int(
+                raw.get("indexer_compress_ratio"), _default("indexer_compress_ratio")
+            ),
             eos_token_id=raw.get("eos_token_id"),
             bos_token_id=raw.get("bos_token_id"),
         )
