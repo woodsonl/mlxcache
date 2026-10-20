@@ -1,24 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
 
+# Python
 __pycache__/
-!.gstack/pregate.json
-.DS_Store
-.env
-.gstack/*
+*.py[cod]
+*.egg-info/
+.venv/
 .pytest_cache/
 .ruff_cache/
-.venv/
-*.egg-info/
-*.py[cod]
-*.review.*
-**/*.rs.bk
-/target/
+
 # Design review scratch dirs (process artifacts, not repo content)
-# gstack tool output (QA and deploy reports); children, not the dir itself,
-# lane declarations are reviewed repo config, not tool output
-# Local env
+*.review.*
+
 # macOS
-# Python
-# Rust
-# so reviewed config files can be re-included below
+.DS_Store
+
+# Local env
+.env
 bench/*.json
+
+# gstack tool output (QA and deploy reports); children, not the dir itself,
+# so reviewed config files can be re-included below
+.gstack/*
+
+# lane declarations are reviewed repo config, not tool output
+!.gstack/pregate.json
+
+# runtime flock target for timing probes; a stale pid inside is display-only
 probe.lock
