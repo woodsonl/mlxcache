@@ -236,7 +236,7 @@ tradeoff each knob buys, and the thrashing failure mode are in
 [`docs/ops.md`](docs/ops.md#qwen38-flash-next-residency-redacted-engine).
 
 Status: the cache integration is the engine-generic path, so identity
-(`engine_id` plus `cache_layout`), persistence, digest checks, and delta
+(`engine_id`, `cache_layout`, `content_digest`), persistence, digest checks, and delta
 resume apply unchanged. Measured on the real checkpoint (48 GB machine,
 NVFP4 on disk, no residency): boot 4.6 s, prefill 46.1-76.6 s across 256-8K
 tokens, decode 2.0-2.2 s/token through 2K, checkpoint ≈132 MB fixed GDN recurrent state

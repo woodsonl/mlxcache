@@ -45,6 +45,18 @@ def cache_layout_compatible(entry_layout: str, request_layout: str) -> bool:
     return entry_layout == request_layout
 
 
+def content_digest_compatible(entry_digest: str, request_digest: str) -> bool:
+    """Non-text content identity (the B2 rule): exact equality.
+
+    Not the legacy-tolerant rule that `cache_layout` uses. `""` means "this
+    request carries no non-text content" — a claim, not a missing measurement,
+    since the daemon computes it from the request before lookup. So a
+    text-only entry and a text-only request agree, and a text-only entry can
+    never serve a request carrying pixels (or any other modality).
+    """
+    return entry_digest == request_digest
+
+
 def identity_compatible(entry: Fingerprint, request: Fingerprint) -> bool:
     """The single identity relation every matching site uses. Field-by-field
     on purpose: the composition rule is a named decision, not an accident of
@@ -58,6 +70,7 @@ def identity_compatible(entry: Fingerprint, request: Fingerprint) -> bool:
         and entry.kv_bits == request.kv_bits
         and entry.kv_group_size == request.kv_group_size
         and cache_layout_compatible(entry.cache_layout, request.cache_layout)
+        and content_digest_compatible(entry.content_digest, request.content_digest)
     )
 
 
@@ -116,6 +129,11 @@ def blob_key(fp: Fingerprint, engine_id: str | None, tokens: list[int]) -> int:
     ]
     if fp.cache_layout:
         fields.append(fp.cache_layout)
+    # Content identity, folded last (the same position as the Rust fold) and
+    # only when recorded: an empty digest adds zero bytes, keeping text-only
+    # keys byte-identical to the pre-digest fold.
+    if fp.content_digest:
+        fields.append(fp.content_digest)
     words.extend(_chunks_of_concat(fields))
     words.append(_DOMAIN_SEP)
     words.extend(t & 0xFFFFFFFF for t in tokens)

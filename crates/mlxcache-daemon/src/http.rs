@@ -503,6 +503,10 @@ async fn chat_completions(
         kv_bits: identity.kv_bits,
         kv_group_size: identity.kv_group_size,
         cache_layout: identity.cache_layout,
+        // Computed here because this is the only point in the pipeline that
+        // still sees the messages: everything downstream carries token ids,
+        // which cannot distinguish two images that render to the same ids.
+        content_digest: content_digest(&req.messages),
     };
     let mut outcome = state.orchestrator.route(&tokens, &fingerprint);
     // The token-only prefix hash for the request log line. The blob filename
@@ -1204,6 +1208,13 @@ async fn publish_settled_blob(
         );
         return;
     }
+    // content_digest is deliberately ABSENT here, and that is a property of
+    // the handshake, not an omission: the staging header is written by the
+    // sidecar (server.py :: _settle_fingerprint), which never sees the
+    // messages and cannot know the digest. Comparing it would discard every
+    // settle from a request carrying media. The bytes-belong-to-this-request
+    // guarantee is carried by the payload-sha256 cross-check above.
+    //
     // Compare the identity fields the ADAPTER owns, not `model_id`: the sidecar's
     // engine is configured with its own model name, and the daemon's served name
     // for that engine may differ. The published metadata is rebuilt from the
@@ -1612,6 +1623,123 @@ pub fn prefix_hash(tokens: &[u32]) -> u128 {
     ((hi as u128) << 64) | lo as u128
 }
 
+/// Fold the request's NON-TEXT content into a stable digest.
+///
+/// Why this exists: the index keys checkpoints on token ids. A multimodal
+/// prompt renders its media as ordinary tokens — `<|image_pad|>` is a plain
+/// vocab id — so two different images at the same prompt tokenize identically
+/// while their KV differs at every position the media occupies. Without a
+/// content axis in the identity, one image's checkpoint would be served to the
+/// other: no error, no mismatch, just the wrong picture cached as if it were
+/// this one's.
+///
+/// Rule: every content part that is not text contributes its canonical JSON;
+/// text parts and plain-string content contribute nothing. Text-only requests
+/// therefore digest to `""` and keep byte-identical keys. This is deliberately
+/// type-agnostic — any future modality (audio, video, file) is covered by
+/// "not a text part" without a per-type table that would silently miss the
+/// next one.
+///
+/// Canonical JSON because a digest over key order would let two identical
+/// images with differently-ordered fields miss each other's cache (a
+/// performance bug), or worse, invite someone to "fix" that by hashing a
+/// looser form. Sorting keys makes the identity depend on content only.
+pub fn content_digest(messages: &[Message]) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn canonical(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                    out.push(':');
+                    canonical(&map[*k], out);
+                }
+                out.push('}');
+            }
+            serde_json::Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    canonical(item, out);
+                }
+                out.push(']');
+            }
+            other => {
+                // Strings, numbers, bools, null: serde_json's own encoding is
+                // already canonical for scalars.
+                out.push_str(&serde_json::to_string(other).unwrap_or_default());
+            }
+        }
+    }
+
+    fn is_text_part(part: &serde_json::Value) -> bool {
+        // A bare string inside a parts array is text, same as the top-level
+        // string form of `content` — hashing it would needlessly split the
+        // cache between two encodings of the same prompt.
+        if part.is_string() {
+            return true;
+        }
+        matches!(
+            part.get("type").and_then(|t| t.as_str()),
+            Some("text") | Some("input_text")
+        )
+    }
+
+    // One part at a time, each canonical encoding fed to the hasher behind
+    // its own length prefix — the same discipline blob_key's `put` uses.
+    // Without the prefix the concatenation is re-splittable across part and
+    // message boundaries (parts `[1, 23]` and `[12, 3]` both hash "123"):
+    // a canonicalization collision between different media payloads, the
+    // exact class this axis exists to prevent. Hashing incrementally also
+    // never materializes a second full copy of an already-buffered request
+    // body (multi-MB base64 data URLs are the normal case, not an attack).
+    let mut hasher = Sha256::new();
+    let mut hashed_any = false;
+    let mut encoded = String::new();
+    let hash_part = |hasher: &mut sha2::Sha256, encoded: &mut String| {
+        hasher.update(encoded.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(encoded.as_bytes());
+        encoded.clear();
+    };
+    for message in messages {
+        match &message.content {
+            serde_json::Value::Array(parts) => {
+                for part in parts {
+                    if is_text_part(part) {
+                        continue;
+                    }
+                    canonical(part, &mut encoded);
+                    hash_part(&mut hasher, &mut encoded);
+                    hashed_any = true;
+                }
+            }
+            // A non-string, non-null scalar or object `content` (out-of-spec
+            // for the Chat shape, but not impossible) is ONE non-text part:
+            // hashing it as text would under-claim the media it carries.
+            serde_json::Value::Null | serde_json::Value::String(_) => {}
+            other => {
+                canonical(other, &mut encoded);
+                hash_part(&mut hasher, &mut encoded);
+                hashed_any = true;
+            }
+        }
+    }
+    if !hashed_any {
+        return String::new();
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// On-disk blob key: `prefix_hash(tokens)` folded with the model fingerprint.
 ///
 /// The index key is the token prefix and the fingerprint is checked on every
@@ -1667,6 +1795,15 @@ pub fn blob_key(
     // field boundary to alias another composition.
     if !fingerprint.cache_layout.is_empty() {
         put(&mut f, &fingerprint.cache_layout);
+    }
+    // Content identity for non-text prompt parts: folded only when present, so
+    // text-only keys are byte-identical to the pre-digest fold. A non-empty
+    // digest is length-prefixed like every other field, so no digest string can
+    // re-split across a field boundary. It is folded AFTER the layout because
+    // it is the last identity axis and the goldens for every earlier field must
+    // not move.
+    if !fingerprint.content_digest.is_empty() {
+        put(&mut f, &fingerprint.content_digest);
     }
     // Fold the fingerprint into the token hash: hash the fingerprint bytes into
     // both lanes first, then continue with the tokens.
@@ -2936,6 +3073,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
             cache_layout: String::new(),
+            content_digest: String::new(),
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "model-b".into(),
@@ -2945,6 +3083,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
             cache_layout: String::new(),
+            content_digest: String::new(),
         };
         assert_ne!(blob_key(&a, None, &tokens), blob_key(&b, None, &tokens));
         // Tokenizer-only difference must also separate.
@@ -2956,6 +3095,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
             cache_layout: String::new(),
+            content_digest: String::new(),
         };
         assert_ne!(blob_key(&a, None, &tokens), blob_key(&c, None, &tokens));
         // Deterministic and distinct from the bare token hash.
@@ -2980,6 +3120,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
             cache_layout: layout.into(),
+            content_digest: String::new(),
         };
         let tokens: Vec<u32> = (1..=8).collect();
         let dense = with_layout("KV-KV");
@@ -3020,6 +3161,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
             cache_layout: format!("{}6:KV-KV", "0"),
+            content_digest: String::new(),
         };
         assert_ne!(
             blob_key(&dense, None, &tokens),
@@ -3043,6 +3185,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
             cache_layout: String::new(),
+            content_digest: String::new(),
         };
         let tokens: Vec<u32> = (1..=8).collect();
         assert_eq!(
@@ -3078,6 +3221,196 @@ mod tests {
     }
 
     #[test]
+    fn blob_key_content_digest_golden() {
+        // Shared verbatim with sidecar/tests/test_store.py: one fold, two
+        // languages. A digest is folded only when present, in the LAST
+        // fingerprint position, so this golden and the empty-digest golden
+        // together pin both halves of the rule.
+        let with_digest = mlxcache_core::contract::ModelFingerprint {
+            model_id: "golden-model".into(),
+            tokenizer_hash: "golden-tok".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
+            cache_layout: String::new(),
+            content_digest: "b1946ac92492d2347c6235b4d2611184".into(),
+        };
+        let tokens: Vec<u32> = (1..=8).collect();
+        assert_eq!(
+            format!("{:032x}", blob_key(&with_digest, None, &tokens)),
+            "831a3b8ca657914f65c4de75cf8a4a61",
+            "the digest fold must match the Python twin"
+        );
+    }
+
+    #[test]
+    fn blob_key_separates_identical_tokens_with_different_content() {
+        // The image-collision case at the key level: same model, same tokens,
+        // different pixels MUST be different blob files. If they alias, the
+        // second prefill overwrites the first and a stale index entry hands
+        // image A's KV to image B.
+        let tokens = vec![10, 20, 30];
+        let with_digest = |digest: &str| mlxcache_core::contract::ModelFingerprint {
+            model_id: "model-a".into(),
+            tokenizer_hash: "tok-a".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
+            cache_layout: String::new(),
+            content_digest: digest.into(),
+        };
+        assert_ne!(
+            blob_key(&with_digest("image-a"), None, &tokens),
+            blob_key(&with_digest("image-b"), None, &tokens)
+        );
+        assert_eq!(
+            blob_key(&with_digest("image-a"), None, &tokens),
+            blob_key(&with_digest("image-a"), None, &tokens),
+            "deterministic"
+        );
+        // An empty digest contributes zero bytes: the text-only key is the
+        // pre-digest key, so no existing store is re-keyed.
+        assert_eq!(
+            blob_key(&with_digest(""), None, &tokens),
+            blob_key(
+                &mlxcache_core::contract::ModelFingerprint {
+                    content_digest: String::new(),
+                    ..with_digest("image-a")
+                },
+                None,
+                &tokens
+            )
+        );
+    }
+
+    #[test]
+    fn content_digest_ignores_text_and_separates_images() {
+        let text_only = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!("hello"),
+        }];
+        assert_eq!(content_digest(&text_only), "", "text keeps the legacy key");
+
+        let text_parts = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([{"type": "text", "text": "hello"}]),
+        }];
+        assert_eq!(content_digest(&text_parts), "");
+
+        let image = |url: &str| {
+            vec![Message {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": url}}
+                ]),
+            }]
+        };
+        let a = content_digest(&image("data:image/png;base64,AAAA"));
+        let b = content_digest(&image("data:image/png;base64,BBBB"));
+        assert_ne!(a, b, "different pixels must digest differently");
+        assert!(!a.is_empty());
+        // Same image, same digest, even if the prompt text changes: the digest
+        // tracks CONTENT, and the differing text already separates the tokens.
+        assert_eq!(a, content_digest(&image("data:image/png;base64,AAAA")));
+
+        // Object key order must not change the digest: two encodings of the
+        // same image are the same image.
+        let ordered = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                {"type": "image_url", "image_url": {"url": "u", "detail": "high"}}
+            ]),
+        }];
+        let reordered = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                {"image_url": {"detail": "high", "url": "u"}, "type": "image_url"}
+            ]),
+        }];
+        assert_eq!(content_digest(&ordered), content_digest(&reordered));
+
+        // A non-text part of ANY type is covered, not just image_url: the rule
+        // is "not a text part", so a future modality cannot slip past it.
+        let audio = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([{"type": "input_audio", "input_audio": {"data": "x"}}]),
+        }];
+        assert!(!content_digest(&audio).is_empty());
+        assert_ne!(content_digest(&audio), a);
+
+        // The concatenation is length-prefixed: a number split across parts
+        // (or across messages) must not reassemble into another payload's
+        // bytes. Before the prefix, parts [1, 23] and [12, 3] both hashed
+        // "123" — a canonicalization collision between different media.
+        let split_a = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([1, 23]),
+        }];
+        let split_b = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([12, 3]),
+        }];
+        assert_ne!(
+            content_digest(&split_a),
+            content_digest(&split_b),
+            "part boundaries must be unambiguous"
+        );
+        let cross_message_a = vec![
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([1]),
+            },
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([23]),
+            },
+        ];
+        let cross_message_b = vec![
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([12]),
+            },
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([3]),
+            },
+        ];
+        assert_ne!(
+            content_digest(&cross_message_a),
+            content_digest(&cross_message_b)
+        );
+        // Same parts across different message splits hash identically: the
+        // prefix delimits parts, it does not conflate the same media arranged
+        // as one message or two.
+        assert_eq!(content_digest(&split_a), content_digest(&cross_message_a));
+
+        // A bare string inside a parts array is TEXT (same as the top-level
+        // string form), so this prompt stays on the legacy text-only key.
+        let string_in_parts = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!(["describe this", {"type": "image_url", "image_url": {"url": "u"}}]),
+        }];
+        assert_eq!(
+            content_digest(&string_in_parts),
+            content_digest(&[Message {
+                role: "user".into(),
+                content: serde_json::json!([{"type": "image_url", "image_url": {"url": "u"}}]),
+            }]),
+            "bare strings in parts are text and contribute nothing"
+        );
+
+        // Out-of-spec object `content` is one non-text part, not silent text.
+        let object_content = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!({"type": "image_url", "image_url": {"url": "u"}}),
+        }];
+        assert!(!content_digest(&object_content).is_empty());
+    }
+
+    #[test]
     fn blob_key_folds_fields_unambiguously() {
         // Length-prefixed fields: model_id is request-controlled and could carry
         // the old separator, which would let two distinct fingerprints fold to
@@ -3092,6 +3425,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
             cache_layout: String::new(),
+            content_digest: String::new(),
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "m".into(),
@@ -3101,6 +3435,7 @@ mod tests {
             kv_bits: 0,
             kv_group_size: 0,
             cache_layout: String::new(),
+            content_digest: String::new(),
         };
         assert_ne!(blob_key(&a, None, &tokens), blob_key(&b, None, &tokens));
     }

@@ -15,6 +15,7 @@ from .fingerprint import (
     Fingerprint,
     blob_key,
     cache_layout_compatible,
+    content_digest_compatible,
     identity_compatible,
 )
 from .store import DEFAULT_ANCHOR_WINDOW_S, DEFAULT_BUDGET, Granularity, Store
@@ -29,6 +30,7 @@ __all__ = [
     "Fingerprint",
     "blob_key",
     "cache_layout_compatible",
+    "content_digest_compatible",
     "identity_compatible",
     "Granularity",
     "Store",

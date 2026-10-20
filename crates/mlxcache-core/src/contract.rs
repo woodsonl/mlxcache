@@ -69,6 +69,26 @@ pub struct ModelFingerprint {
     /// carrying no information.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cache_layout: String,
+    /// Digest of the request's NON-TEXT content — images today, any future
+    /// modality by the same rule — so that two requests with identical token
+    /// prefixes but different pixels can never share a checkpoint.
+    ///
+    /// The index keys on tokens alone, and a multimodal prompt renders its
+    /// media as ordinary tokens (`<|image_pad|>` is a plain id, not a
+    /// placeholder the tokenizer keeps distinct per image). Two different
+    /// images therefore produce the SAME token sequence while their KV state
+    /// differs at every position the media occupies. Keying on tokens alone
+    /// would serve one image's KV to the other: silent, plausible-looking,
+    /// wrong output.
+    ///
+    /// Empty means "this prefix carries no non-text content", which is the
+    /// text-only case and the only case any checkpoint written before this
+    /// field existed can represent. Like `cache_layout`, an empty digest
+    /// contributes ZERO fold bytes, so text-only keys stay byte-identical,
+    /// and the serve rule in `crate::policy` compares digests exactly — an
+    /// unrecorded digest never matches a recorded one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_digest: String,
 }
 
 /// Metadata header for a checkpoint blob. Stored alongside the KV tensors.

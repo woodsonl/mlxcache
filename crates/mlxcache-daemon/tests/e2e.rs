@@ -2677,6 +2677,30 @@ async fn post_prompt(state: Arc<AppState>, content: &str) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// Serve one messages array (multimodal content shapes) through a state.
+async fn post_messages(state: Arc<AppState>, messages: serde_json::Value) -> serde_json::Value {
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": messages,
+        "stream": false,
+    })
+    .to_string();
+    let res = router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 /// Token coverage of every published checkpoint, sorted.
 ///
 /// A request that generates publishes TWO kinds of checkpoint: the prefill
@@ -3195,6 +3219,103 @@ async fn a_recurring_sweep_never_takes_a_live_publish_temp() {
     assert!(!tmp.exists(), "boot sweep takes every publish temp");
 
     let _ = post_prompt(state.clone(), "sanity").await;
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn an_identical_image_request_is_a_serve_side_hit() {
+    // The WRITE side (digest stamped into headers) is covered by the stamping
+    // test; this is the READ side. The same image request must come back a
+    // HIT through the daemon's index lookup and identity_compatible path —
+    // the only place a nondeterminism between the digest computed for request
+    // 1 and request 2 could hide (unit layers pin equality, but the daemon
+    // recomputes the digest from the messages on every request).
+    let (url, mut child) = spawn_sidecar().await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let image_messages = serde_json::json!([
+        {"role": "user", "content": [
+            {"type": "text", "text": "what is in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ]}
+    ]);
+    let first = post_messages(state.clone(), image_messages.clone()).await;
+    assert_eq!(first["mlxcache"]["verdict"], "miss");
+
+    let second = post_messages(state.clone(), image_messages).await;
+    assert_eq!(
+        second["mlxcache"]["verdict"], "hit",
+        "the identical image request must reuse its checkpoint: {second}"
+    );
+    assert!(
+        second["mlxcache"]["prefill_from"].as_u64().unwrap_or(0) > 0,
+        "the hit must actually cover prompt KV: {second}"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_digest_bearing_blob_survives_a_daemon_restart_rebuild() {
+    // R1-4: the index is rebuilt from headers alone after a restart. The
+    // digest is persisted in CheckpointMeta for exactly this reason — if the
+    // header read or rebuild dropped content_digest (a serde-default
+    // mistake), every image checkpoint would silently degrade to "" on
+    // restart and start cross-matching text-only traffic.
+    let (url, mut child) = spawn_sidecar().await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let image_messages = serde_json::json!([
+        {"role": "user", "content": [
+            {"type": "text", "text": "what is in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ]}
+    ]);
+    let first = post_messages(state.clone(), image_messages.clone()).await;
+    assert_eq!(first["mlxcache"]["verdict"], "miss");
+
+    // Rebuild a FRESH state over the same blob dir the way boot does:
+    // rebuild_from_disk reads every header from disk and re-indexes it.
+    let rebuilt = app_state(&url, &blobs);
+    let report = rebuilt.orchestrator.rebuild_from_disk(&rebuilt.persistence);
+    assert_eq!(
+        report.errors.len(),
+        0,
+        "rebuild errors: {:?}",
+        report.errors
+    );
+    assert!(
+        report.rebuilt > 0,
+        "the rebuild must index the published checkpoints: {report:?}"
+    );
+    let after = post_messages(rebuilt.clone(), image_messages).await;
+    assert_eq!(
+        after["mlxcache"]["verdict"], "hit",
+        "digest-bearing checkpoint must be re-indexed from its header: {after}"
+    );
+    let digests: Vec<String> = rebuilt
+        .persistence
+        .list_blobs()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            rebuilt
+                .persistence
+                .load(p)
+                .unwrap()
+                .0
+                .fingerprint
+                .content_digest
+        })
+        .filter(|d| !d.is_empty())
+        .collect();
+    assert!(!digests.is_empty(), "persisted digests survive on disk");
+    assert!(digests.iter().all(|d| d.len() == 64));
+
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
 }
