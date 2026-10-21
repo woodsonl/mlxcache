@@ -2,6 +2,30 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.4.0 — 2026-10-21
+
+### Removed
+
+- **The `qwen4-exp` engine is gone**: the `mlxcache_qwen4` package (the
+  Qwen3.8-Flash-Next architecture port, NVFP4 reader, PLE table), the sidecar
+  adapter, its 1,461 lines of tests, its four probes (smoke, context sweep,
+  inventory, checkpoint lock), the design record, and the residency knobs
+  (`MLXCACHE_Q4_EXPERT_RESIDENT_N`, `MLXCACHE_Q4_PLE_CACHE_MB`) — about 4,300
+  lines of inference implementation inside a cache layer. The model is served
+  by another runtime; a cache project carrying a bespoke architecture port
+  for one checkpoint was scope the project does not want. BREAKING:
+  `MLXCACHE_ENGINE=qwen4-exp` now fails at boot with the unknown-engine
+  error listing `synthetic` and `mlx-lm`.
+- **What the engine motivated stays**: engine-domain isolation in the index
+  and key fold, `cache_layout` and `content_digest` as identity axes, and the
+  settle publish guards — all generic, all still e2e-covered via the
+  synthetic engine. The engine-agnostic contract now has one shipped adapter
+  (mlx-lm) plus the hermetic synthetic engine.
+- The README's Qwen3.8-Flash-Next section, its measured paragraphs, and the
+  residency docs in `docs/ops.md` are removed with the code they describe;
+  the remaining probes (capability, quantized-KV, decode A/B, resume budget)
+  are kept.
+
 ## 0.3.2 — 2026-10-21
 
 ### Docs

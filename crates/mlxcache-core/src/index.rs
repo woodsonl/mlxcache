@@ -12,7 +12,7 @@ use std::sync::RwLock;
 #[derive(Debug, Default)]
 struct Node {
     children: HashMap<u32, Node>,
-    /// At most one entry per ENGINE DOMAIN: a qwen4-exp checkpoint and an
+    /// At most one entry per ENGINE DOMAIN: a llama-cpp checkpoint and an
     /// mlx-lm checkpoint at the same token prefix are different cache nodes
     /// and must coexist (a single-slot Option made the second publish
     /// REPLACE the first, and the replacement hook then deleted the other
@@ -175,7 +175,7 @@ impl PrefixIndex {
     }
 
     /// Engine-domain lookup: entries published by a different engine family
-    /// are never adoptable even when their fingerprints match (a qwen4-exp
+    /// are never adoptable even when their fingerprints match (a llama-cpp
     /// checkpoint at the same token prefix as an mlx-lm one is not reuse
     /// for an mlx-lm request), and WHOLE_CONTEXT entries (granularity 1)
     /// only qualify on an exact full-prompt match — their documented
@@ -1693,12 +1693,12 @@ mod tests {
         // legacy entry and an explicit "mlx-lm" entry still share one slot.
         let index = PrefixIndex::new();
         let g_default = publish_entry(&index, &[1, 2, 3], "mlx-lm-blob");
-        let g_qwen = index.reserve_generation();
-        let mut qwen = meta();
-        qwen.engine_id = Some("qwen4-exp".into());
+        let g_llama = index.reserve_generation();
+        let mut llama = meta();
+        llama.engine_id = Some("llama-cpp".into());
         let mut replaced: Vec<String> = Vec::new();
         assert!(
-            index.publish(&[1, 2, 3], qwen, "qwen4-blob".into(), g_qwen, |old| {
+            index.publish(&[1, 2, 3], llama, "llama-blob".into(), g_llama, |old| {
                 replaced.push(old.to_string())
             })
         );
@@ -1710,10 +1710,10 @@ mod tests {
 
         let (ml, matched) = index.lookup_with_engine(&[1, 2, 3], None, None).unwrap();
         assert_eq!((ml.blob_path.as_str(), matched), ("mlx-lm-blob", 3));
-        let (qw, _) = index
-            .lookup_with_engine(&[1, 2, 3], None, Some("qwen4-exp"))
+        let (ll, _) = index
+            .lookup_with_engine(&[1, 2, 3], None, Some("llama-cpp"))
             .unwrap();
-        assert_eq!(qw.blob_path, "qwen4-blob");
+        assert_eq!(ll.blob_path, "llama-blob");
 
         let blobs: Vec<String> = index
             .eviction_candidates()
@@ -1721,7 +1721,7 @@ mod tests {
             .map(|c| c.blob_path)
             .collect();
         assert!(blobs.contains(&"mlx-lm-blob".to_string()));
-        assert!(blobs.contains(&"qwen4-blob".to_string()));
+        assert!(blobs.contains(&"llama-blob".to_string()));
 
         // Removing one domain's entry must leave the other's node intact:
         // the survivor anchors the trie node the prune would otherwise
@@ -1729,10 +1729,10 @@ mod tests {
         assert!(index.remove_published(&[1, 2, 3], "mlx-lm-blob", g_default));
         assert!(index.lookup_with_engine(&[1, 2, 3], None, None).is_none());
         assert!(index
-            .lookup_with_engine(&[1, 2, 3], None, Some("qwen4-exp"))
+            .lookup_with_engine(&[1, 2, 3], None, Some("llama-cpp"))
             .is_some());
 
-        // Same-domain republish IS a supersession: with the qwen slot live,
+        // Same-domain republish IS a supersession: with the llama slot live,
         // a fresh default-domain publish into an EMPTY slot fires no hook,
         // and replacing an occupied same-domain slot does.
         let g_refill = index.reserve_generation();

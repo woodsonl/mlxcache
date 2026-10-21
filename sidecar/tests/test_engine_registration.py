@@ -1,14 +1,11 @@
-"""Engine registration and the construction seam shared by both model engines.
+"""Engine registration and the construction seam every engine shares.
 
-The adapter for a second architecture is only safe if it cannot drift from the
+An adapter for a second architecture is only safe if it cannot drift from the
 one that carries the cache convention and the checkpoint trust boundary. These
 tests pin that seam: registration is explicit, an unknown engine fails loudly
 instead of silently serving toy tokens, and a model built by ANY means goes
 through the same post-load adoption.
 """
-
-import importlib
-import os
 
 import pytest
 from mlxcache_sidecar import server
@@ -27,56 +24,6 @@ def test_default_engine_is_still_synthetic(monkeypatch):
     # The default engine owns the historical key domain, so every blob written
     # before engine selection existed keeps its identity.
     assert engine.engine_id == "mlx-lm"
-
-
-def test_qwen4_engine_reports_its_own_key_domain():
-    from mlxcache_sidecar.engine_qwen4 import Qwen4ExpEngine
-
-    # Distinct from the generic engine: the two architectures cannot exchange
-    # blobs even if model id, tokenizer, dtype and KV tier all agree.
-    assert Qwen4ExpEngine.engine_id == "qwen4-exp"
-    assert Qwen4ExpEngine.engine_id != server.MlxLmEngine.engine_id
-
-
-def test_qwen4_engine_is_a_construction_subclass():
-    from mlxcache_sidecar.engine_qwen4 import Qwen4ExpEngine
-
-    # The adapter surface is inherited, not reimplemented: a second copy of the
-    # cache convention is how wrong KV gets served silently.
-    assert issubclass(Qwen4ExpEngine, server.MlxLmEngine)
-    for name in (
-        "prefill",
-        "generate_with_text",
-        "stream",
-        "prepare_stream",
-        "stream_prepared",
-        "_load_cache_delta",
-        "_load_cache_from_payload",
-        "_quantize_cache",
-        "_assert_quantization_supported",
-        "_cache_layout_of",
-    ):
-        assert getattr(Qwen4ExpEngine, name) is getattr(server.MlxLmEngine, name), name
-
-
-def test_qwen4_engine_build_is_the_only_overridden_seam():
-    from mlxcache_sidecar.engine_qwen4 import Qwen4ExpEngine
-
-    # Members of the parent the adapter replaces. `engine_id` is the key domain.
-    overridden = {
-        name
-        for name, value in vars(Qwen4ExpEngine).items()
-        if not name.startswith("__") and name in vars(server.MlxLmEngine)
-    }
-    assert overridden == {"engine_id"}, overridden
-    # `_build` is new (the parent constructs with mlx_lm.load), and it is the
-    # only method the adapter adds. Anything else means it started diverging.
-    added = {
-        name
-        for name, value in vars(Qwen4ExpEngine).items()
-        if not name.startswith("__") and name not in vars(server.MlxLmEngine) and callable(value)
-    }
-    assert added == {"_build"}, added
 
 
 class _StubTokenizer:
@@ -171,54 +118,3 @@ def test_engine_selection_does_not_leak_between_engines(monkeypatch):
     with pytest.raises(ValueError):
         server.make_engine("m")
     assert isinstance(first, server.SyntheticEngine)
-
-
-def _real_stack_available() -> bool:
-    """The checkpoint AND every module the adapter builds from.
-
-    Checking package presence alone is not enough: the package can exist while
-    a module the engine imports is missing or half-written, which turns a skip
-    into a failure that says nothing about the engine.
-    """
-    if not os.path.isdir(
-        os.environ.get(
-            "MLXCACHE_Q4_CHECKPOINT", "/Users/lance/models/Qwen3.8-Flash-Next-NVFP4-mlxstream"
-        )
-    ):
-        return False
-    try:
-        importlib.import_module("mlxcache_qwen4.loader")
-        importlib.import_module("mlxcache_qwen4.model")
-    except ImportError:
-        return False
-    return True
-
-
-@pytest.mark.skipif(
-    not _real_stack_available(),
-    reason="qwen4_exp checkpoint or architecture/loader modules not present",
-)
-def test_qwen4_engine_boots_on_the_real_checkpoint():
-    """The adapter over the real stack: identity fields must be real, not
-    placeholders, and the cache composition must be a hybrid one."""
-    from mlxcache_sidecar.engine_qwen4 import Qwen4ExpEngine
-
-    engine = Qwen4ExpEngine(
-        os.environ.get(
-            "MLXCACHE_Q4_CHECKPOINT", "/Users/lance/models/Qwen3.8-Flash-Next-NVFP4-mlxstream"
-        )
-    )
-    assert engine.engine_id == "qwen4-exp"
-    assert len(engine.cache_layout) == 16
-    assert engine.tokenizer_hash and engine.tokenizer_hash != "synthetic"
-    assert engine.kv_dtype != "unknown"
-    # Hybrid: 12 full-attention layers cannot be the whole stack, so the
-    # composition must NOT be a dense KV repeat. The dense baseline is built
-    # from KVCache entries directly: `type(c)()` cannot construct ArraysCache,
-    # which requires a slot count.
-    from mlx_lm.models.cache import KVCache  # noqa: PLC0415
-
-    probe = engine._prompt_cache_probe()
-    dense = server.MlxLmEngine._cache_layout_of([KVCache() for _ in range(len(probe))])
-    assert len(probe) == 48
-    assert engine.cache_layout != dense
