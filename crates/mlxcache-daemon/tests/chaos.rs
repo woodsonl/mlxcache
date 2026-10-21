@@ -504,12 +504,12 @@ fn two_engines_sharing_a_prefix_coexist_at_rebuild_and_runtime() {
         granularity: None,
     };
     let key_default = mlxcache_daemon::http::blob_key(&f, None, &tokens);
-    let key_qwen = mlxcache_daemon::http::blob_key(&f, Some("qwen4-exp"), &tokens);
+    let key_llama = mlxcache_daemon::http::blob_key(&f, Some("llama-cpp"), &tokens);
     let default_blob = p
         .publish_atomic(key_default, 1, meta(None), b"kv-default")
         .unwrap();
-    let qwen_blob = p
-        .publish_atomic(key_qwen, 2, meta(Some("qwen4-exp")), b"kv-qwen")
+    let llama_blob = p
+        .publish_atomic(key_llama, 2, meta(Some("llama-cpp")), b"kv-llama")
         .unwrap();
 
     let orch = mlxcache_daemon::orchestrator::Orchestrator::new();
@@ -522,9 +522,9 @@ fn two_engines_sharing_a_prefix_coexist_at_rebuild_and_runtime() {
         hit_default.decision.verdict,
         mlxcache_core::policy::CacheVerdict::Hit
     );
-    let hit_qwen = orch.route(&tokens, &f, Some("qwen4-exp"));
+    let hit_llama = orch.route(&tokens, &f, Some("llama-cpp"));
     assert_eq!(
-        hit_qwen.decision.verdict,
+        hit_llama.decision.verdict,
         mlxcache_core::policy::CacheVerdict::Hit
     );
     // Each engine resumes from ITS OWN blob, never the sibling's.
@@ -533,7 +533,7 @@ fn two_engines_sharing_a_prefix_coexist_at_rebuild_and_runtime() {
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let qwen_name = qwen_blob
+    let llama_name = llama_blob
         .file_name()
         .unwrap()
         .to_string_lossy()
@@ -544,20 +544,20 @@ fn two_engines_sharing_a_prefix_coexist_at_rebuild_and_runtime() {
         .unwrap()
         .0
         .ends_with(&default_name));
-    assert!(hit_qwen.blob.as_ref().unwrap().0.ends_with(&qwen_name));
+    assert!(hit_llama.blob.as_ref().unwrap().0.ends_with(&llama_name));
 
-    // Runtime: a fresh publish under the qwen domain at the SAME prefix must
+    // Runtime: a fresh publish under the llama domain at the SAME prefix must
     // leave the default engine's blob file on disk.
     let orch2 = mlxcache_daemon::orchestrator::Orchestrator::new();
     let _ = orch2.rebuild_from_disk(&p);
     let gen = orch2.reserve_generation();
     let new_blob = p
-        .publish_atomic(key_qwen, gen, meta(Some("qwen4-exp")), b"kv-qwen-v2")
+        .publish_atomic(key_llama, gen, meta(Some("llama-cpp")), b"kv-llama-v2")
         .unwrap();
     assert!(orch2.publish_checkpoint(
         &p,
         &tokens,
-        meta(Some("qwen4-exp")),
+        meta(Some("llama-cpp")),
         new_blob.to_string_lossy().into_owned(),
         gen,
     ));

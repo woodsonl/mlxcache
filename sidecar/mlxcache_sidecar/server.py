@@ -20,8 +20,8 @@ Endpoints (daemon -> sidecar protocol):
                    it must be captured here; a separate endpoint could not
                    rebuild it from tokens.
 
-Engine selection: MLXCACHE_ENGINE=synthetic (default, hermetic), mlx-lm, or qwen4-exp
-(lazy import; requires a local model). The daemon is the only client; this
+Engine selection: MLXCACHE_ENGINE=synthetic (default, hermetic) or mlx-lm
+(requires a local model). The daemon is the only client; this
 server binds 127.0.0.1 by default.
 
 Run: uv run python -m mlxcache_sidecar.server
@@ -1609,16 +1609,8 @@ def make_engine(model_id: str) -> SyntheticEngine | MlxLmEngine:
     engine = os.environ.get("MLXCACHE_ENGINE", "synthetic")
     if engine == "mlx-lm":
         return MlxLmEngine(model_id)
-    if engine == "qwen4-exp":
-        # Imported here, not at module scope: this adapter pulls in the
-        # architecture and loader modules, which the other engines never need.
-        from .engine_qwen4 import Qwen4ExpEngine  # noqa: PLC0415
-
-        return Qwen4ExpEngine(model_id)
     if engine != "synthetic":
-        raise ValueError(
-            f"unknown MLXCACHE_ENGINE={engine!r}; expected 'synthetic', 'mlx-lm', or 'qwen4-exp'"
-        )
+        raise ValueError(f"unknown MLXCACHE_ENGINE={engine!r}; expected 'synthetic' or 'mlx-lm'")
     return SyntheticEngine(model_id)
 
 

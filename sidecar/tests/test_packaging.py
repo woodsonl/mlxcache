@@ -1,7 +1,7 @@
 """Wheel packaging (CodeRabbit #36 regression guard).
 
 The 0.1.8 wheel shipped only mlxcache_sidecar, so a wheel install could not
-start MLXCACHE_ENGINE=qwen4-exp. The packages list is now asserted from the
+start a real engine. The packages list is now asserted from the
 BUILT WHEEL, not from the pyproject source: the list can drift (or the hatch
 target can change shape) while the declared config still looks right.
 """
@@ -11,7 +11,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-REQUIRED = {"mlxcache_sidecar", "mlxcache_qwen4", "mlxcache_store"}
+REQUIRED = {"mlxcache_sidecar", "mlxcache_store"}
 
 
 def test_wheel_carries_every_runtime_package():
