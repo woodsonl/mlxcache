@@ -3414,8 +3414,12 @@ async fn a_corrupted_v2_digest_blob_is_quarantined_by_the_rebuild() {
     );
     let after = post_prompt(rebuilt.clone(), "corrupt me after publish").await;
     assert_eq!(after["status"], "ok");
+    // The field must exist before the comparison: a missing prefill_from
+    // would make as_i64() None, and None != Some(71) passes vacuously.
+    let prefill_from = after["mlxcache"]["prefill_from"].as_i64();
+    assert!(prefill_from.is_some(), "prefill_from missing: {after}");
     assert_ne!(
-        after["mlxcache"]["prefill_from"].as_i64(),
+        prefill_from,
         Some(71),
         "the reclaimed 72-token checkpoint must not be resumed: {after}"
     );

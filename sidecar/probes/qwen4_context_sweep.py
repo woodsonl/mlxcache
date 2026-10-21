@@ -173,12 +173,14 @@ def main() -> int:
         print("REFUSING: the sweep needs at least two distinct sizes.", flush=True)
         return 2
     control = sizes[-1]
-    # Control first (repeatability before trust), then the sweep descending so
-    # the coldest SWEEP run is the largest context; see the module docstring
-    # for the warm-up bias that ordering admits and what bounds it.
+    # Control first (repeatability before trust), then EVERY size descending
+    # as a measured sweep row — the smallest size is the control AND a sweep
+    # row, so the ratio's small end is a requested size, not the
+    # second-smallest. See the module docstring for the warm-up bias that
+    # ordering admits and what bounds it.
     plan: list[tuple[int, bool]] = [
         (control, True),
-        *((size, False) for size in sizes if size != control),
+        *((size, False) for size in sizes),
         (control, True),
     ]
 
@@ -271,10 +273,13 @@ def main() -> int:
             "numbers were taken under contention."
         )
     for a, b in itertools.pairwise(sweep_rows):
-        if b["prefill_s"] < a["prefill_s"]:
+        # Rows run largest to smallest, so `b` is the SMALLER context: fewer
+        # tokens must be cheaper. A smaller context measuring SLOWER than the
+        # larger one before it is the machine lying.
+        if b["prefill_s"] > a["prefill_s"]:
             failures.append(
-                f"prefill at {b['tokens']} ({b['prefill_s']:.2f}s) is cheaper than at "
-                f"{a['tokens']} ({a['prefill_s']:.2f}s); more tokens is more work."
+                f"prefill at {b['tokens']} ({b['prefill_s']:.2f}s) is slower than at "
+                f"{a['tokens']} ({a['prefill_s']:.2f}s); fewer tokens should cost less."
             )
     for row in rows:
         grew = row["swap_after_mb"] - row["swap_before_mb"]

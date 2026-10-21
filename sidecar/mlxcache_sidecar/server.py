@@ -836,7 +836,23 @@ class SyntheticEngine:
 
             from .blob import CheckpointMeta, Fingerprint, encode  # noqa: PLC0415
 
-            if lie_field and lie_field not in Fingerprint.__dataclass_fields__:
+            # Only the fields the daemon's same_shape check actually compares
+            # (http.rs publish_settled_blob): a knob for any other field is a
+            # trap — model_id is never compared (publication proceeds, the
+            # test fails confusingly), and content_digest is OMITTED from the
+            # header when empty, so forging it KeyErrors out of the settle
+            # path as a 500 instead of a discard.
+            same_shape_fields = frozenset(
+                {
+                    "tokenizer_hash",
+                    "kv_dtype",
+                    "kv_bits",
+                    "kv_group_size",
+                    "kv_layout_version",
+                    "cache_layout",
+                }
+            )
+            if lie_field and lie_field not in same_shape_fields:
                 raise ValueError(f"identity lie targets unknown field {lie_field!r}")
             try:
                 with open(settle_path, "rb") as fh:
