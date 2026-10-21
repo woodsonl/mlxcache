@@ -2,6 +2,30 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.3.2 — 2026-10-21
+
+### Docs
+
+- README caught up with 0.2.2-0.3.1. The Streaming section documented the
+  wire shape from before the OpenAI chunk envelope (a bare leading mlxcache
+  frame and raw token/text frames); it now matches what the daemon actually
+  emits and what the API surface section already promised — OpenAI
+  chat.completion.chunk frames with the verdict riding as an extra on the
+  first chunk.
+- The Identity section now lists every key axis: engine domains (a blob
+  published through one engine is unreachable from another) and non-text
+  content digests (identical text with different media never shares a
+  checkpoint) joined the header-field list.
+- The wrapper section states its text-only boundary and documents its store
+  flags (--store-budget-bytes, --anchor-window-s, --trust-legacy, KV tier).
+- Measured points at the context-sweep probe as the re-measurement tool for
+  the flagged 8K decode figure; Building and testing gained the alloc-gate
+  invocation, the probes directory, and lost its two references to a CI
+  workflow main no longer carries.
+- Two daemon env vars the code reads but the table lacked:
+  MLXCACHE_STREAM_IDLE_TIMEOUT_S (60) and MLXCACHE_EVICT_ANCHOR_WINDOW_S
+  (900).
+
 ## 0.3.1 — 2026-10-20
 
 ### Added
