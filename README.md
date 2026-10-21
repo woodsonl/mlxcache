@@ -145,8 +145,9 @@ that publication's file — never a fresh republish that replaced it. A generic
 `500`/transport failure never retires a healthy checkpoint. Legacy
 version-1 blobs (written before digests existed) stay readable, unverified.
 
-**Identity.** A blob's header pins the model id, tokenizer hash, KV dtype,
-KV layout version, quantization tier AND cache composition — the ordered
+**Identity.** A blob's header pins the model id, engine id, tokenizer hash,
+KV dtype, KV layout version, quantization tier, a digest of any non-text
+prompt content, AND cache composition — the ordered
 tuple of cache-entry classes the engine builds for the model (a dense KV
 stack vs. a hybrid model's `CacheList`/`ArraysCache` recurrent state). Two
 architectures can agree on everything else while their payloads have
@@ -158,6 +159,13 @@ composition (legacy-to-legacy); the moment an engine knows its composition,
 those older blobs are unreachable and get rewritten on the next publish.
 Keys themselves are unchanged for the default engine and an unrecorded
 composition, so upgrading does not re-key an existing store.
+
+Engine domains are isolated: the engine id is part of the key, so a blob
+published through one engine is unreachable from another even if every
+other field agrees. Non-text prompt content (an image in a message) is
+hashed into the key too: two requests with identical text but different
+media never share a checkpoint, and an empty digest asserts "no media"
+rather than "unknown media."
 
 **Eviction.** A background reaper bounds the store. Every
 `MLXCACHE_EVICT_INTERVAL_S` (default 60s) it measures the published blobs and,
@@ -266,7 +274,11 @@ uv run python -m mlxcache_serve \
   --model mlx-community/Qwen2.5-7B-Instruct-4bit --port 8080
 ```
 
-Unknown flags pass through to `mlx_lm.server`. One extra endpoint rides
+Unknown flags pass through to `mlx_lm.server`. Store flags mirror the
+daemon's contract: `--store-budget-bytes` (default 32 GiB), `--anchor-window-s`
+(default 900), `--trust-legacy` (index digest-less v1 blobs), and
+`--kv-bits`/`--kv-group-size` (KV quantization tier — part of the fingerprint,
+so tiers never share blobs). One extra endpoint rides
 along:
 
 - `GET /mlxcache/stats` — the live cache's reuse counters:
@@ -275,12 +287,21 @@ along:
   response equality cannot prove the disk tier served a request; the counter
   can.
 
+The wrapper is text-only by construction: it wraps mlx-lm's server, which
+owns the request, so it never sees message JSON and every fingerprint it
+mints carries `content_digest=""` — the no-media claim, true for every model
+mlx-lm can load. Serving a multimodal model through it requires teaching that
+fingerprint a content-digest producer first.
+
 ## Streaming
 
-Set `"stream": true` and the daemon returns OpenAI-style SSE: a leading
-`data: {"mlxcache":{...}}` frame with the cache verdict, one
-`data: {"token":..,"text":..}` per generated token, then `data: [DONE]`. If the
-engine dies mid-stream the daemon emits a `data:
+Set `"stream": true` and the daemon returns the OpenAI SSE shape from
+[API surface](#api-surface): a leading `chat.completion.chunk` carrying the
+assistant role delta with the `mlxcache` verdict as a top-level extra, one
+valid `chat.completion.chunk` per generated token (`choices[0].delta.content`
+pieces, a `finish_reason` chunk last), then `data: [DONE]`. Point a stock
+OpenAI SDK at `base_url=http://127.0.0.1:8420/v1` with `stream=True` and the
+frames parse. If the engine dies mid-stream the daemon emits a `data:
 {"error":{"type":"upstream_error",...}}` frame before `[DONE]`, so a truncated
 answer is not mistaken for a finished one.
 
@@ -302,12 +323,14 @@ Daemon:
 | `MLXCACHE_SIDECAR_URL` | (unset) | sidecar base URL; unset = no adapter, requests 503 |
 | `MLXCACHE_BLOBS` | `/tmp/mlxcache-blobs` | where KV checkpoints are written |
 | `MLXCACHE_SIDECAR_TIMEOUT_S` | `120` | per-request sidecar timeout; must exceed the slowest prefill |
+| `MLXCACHE_STREAM_IDLE_TIMEOUT_S` | `60` | longest gap between bytes on a live generation stream before the sidecar is declared wedged |
 | `MLXCACHE_NATIVE_TOKENIZER` | (unset) | path to the engine's `tokenizer.json`; when set, the daemon tokenizes natively (no sidecar round-trip) after PROVING parity against the engine over an adversarial probe set — any mismatch fails closed (503) rather than risk mis-routing checkpoints |
 | `MLXCACHE_TRACE` | (unset) | capture one JSONL record per settled request (exact payload, verdict, covered KV); score and replay with `scripts/replay_trace.py` |
 | `MLXCACHE_SHUTDOWN_GRACE_S` | `30` | SIGTERM drain window for in-flight streams |
 | `MLXCACHE_EVICT_INTERVAL_S` | `60` | eviction sweep cadence; `0` disables the reaper |
 | `MLXCACHE_EVICT_MAX_BYTES` | 32 GiB | store byte budget, on by default — see [Storage](#storage-integrity-quarantine-and-eviction); `0` = unbounded |
 | `MLXCACHE_EVICT_MAX_ENTRIES` | `0` | entry cap on top of the byte budget; `0` = none |
+| `MLXCACHE_EVICT_ANCHOR_WINDOW_S` | `900` | how recently a checkpoint must have served to stay an eviction-protected anchor |
 
 Sidecar:
 
@@ -328,9 +351,11 @@ Sidecar:
 ## Building and testing
 
 ```bash
-uv sync --group dev                      # pytest, ruff (what CI installs)
-cargo fmt --all -- --check               # formatting gate (CI fails on drift)
-cargo test --workspace                   # Rust: core, daemon, chaos, e2e
+uv sync --group dev                      # pytest, ruff
+cargo fmt --all -- --check               # formatting gate
+cargo test --workspace                   # Rust: core, daemon, chaos, conformance, e2e
+cargo test -p mlxcache-daemon --test alloc_gate --release -- \
+  --test-threads=1 --include-ignored     # alloc gate: one allocation per token frame
 cargo clippy --workspace --all-targets -- -D warnings
 uv run pytest sidecar/tests/             # Python: sidecar, blob codec, roundtrip
 uv run pytest scripts/dedup/tests/       # Dedup: measurement invariants behind REPORT.md
@@ -346,6 +371,10 @@ never be quoted as cache-benefit evidence; `bench_prefix.py` is the
 real-engine prefix benchmark (premise-guarded, see
 [docs/benchmarks.md](docs/benchmarks.md)); `bench_wrapper.py`/`qa_wrapper.py`
 drive the wrapper path's own gates; `replay_trace.py` scores captured traces.
+Timing probes live in `sidecar/probes/` — the redacted smoke and context-sweep
+probes, the resume-budget probe, and the lock that serializes them on a
+checkpoint (two probes streaming the same weights measure the filesystem,
+not the model).
 
 The real mlx-lm round-trip gate (needs a downloaded model) is opt-in:
 
@@ -372,7 +401,13 @@ REDACTED-MODEL (`redacted-engine`, NVFP4, 48 GB machine, weights streamed from a
 is 7.8x the 2K figure while prefill at 8K is only 1.07x the 2K prefill, and a
 single decode step cannot cost 23% of the whole 8K prefill. That run had 10 GB
 of swap in use, so treat it as machine-state contamination and re-measure
-before quoting a long-context decode number. Checkpoint
+before quoting a long-context decode number. The re-measurement tool is in
+the tree: `sidecar/probes/redacted_context_sweep.py` measures each context
+length in its own process, refuses to overlap another probe on the checkpoint
+(two probes streaming the same 132.6 GB checkpoint swap the machine and
+measure the filesystem), and self-checks monotonicity, decode-vs-prefill
+ratios, repeatability, and swap growth, refusing a bad run rather than
+labelling it afterward. Checkpoint
 bytes: 132.4 MB at 256 tokens, 174.8 MB at 1K, 231.5 MB at 2K, 571.2 MB at 8K —
 a ≈110 MB fixed floor (36 GDN layers x 3.1 MB float32 recurrent state) plus
 ≈58 KB/token. Saving is 0.04-0.12 s and loading 17-90 ms at every size, so the
