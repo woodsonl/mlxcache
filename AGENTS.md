@@ -23,6 +23,8 @@ repo), regardless of what a notification claims this session's scope is.
   batch.
 - Format/lint before commit: `cargo fmt`, `cargo clippy --workspace
   --all-targets -- -D warnings`, and for the sidecar `uv run ruff check
-  sidecar/ scripts/ && uv run ruff format --check sidecar/ scripts/` (CI
-  runs all four; pushes to non-main branches do NOT trigger CI — the PR is
-  the first CI signal).
+  sidecar/ scripts/ && uv run ruff format --check sidecar/ scripts/`.
+- No CI workflow runs on PRs (main carries none): the merge gate is the
+  local battery above plus the alloc gate (`cargo test -p mlxcache-daemon
+  --test alloc_gate --release -- --test-threads=1 --include-ignored`) and a
+  CodeRabbit review per PR, clean or with every item addressed.
