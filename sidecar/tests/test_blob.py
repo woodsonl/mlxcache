@@ -137,7 +137,7 @@ def test_decode_accepts_daemon_blobs_with_cache_layout():
     # TypeError), and a header WITHOUT it must read as "" (unrecorded).
     rust_style = {
         "fingerprint": {
-            "model_id": "Qwen/REDACTED-MODEL",
+            "model_id": "mlx-community/Qwen2.5-7B-Instruct-4bit",
             "tokenizer_hash": "1a2b3c4d5e6f7081",
             "kv_dtype": "float16",
             "kv_layout_version": 1,
@@ -212,7 +212,7 @@ def test_decode_accepts_and_omits_content_digest():
     # what a pre-B2 header says by saying nothing — so it must not be emitted.
     rust_style = {
         "fingerprint": {
-            "model_id": "Qwen/REDACTED-MODEL",
+            "model_id": "mlx-community/Qwen2.5-7B-Instruct-4bit",
             "tokenizer_hash": "1a2b3c4d5e6f7081",
             "kv_dtype": "float16",
             "kv_layout_version": 1,

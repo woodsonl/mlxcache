@@ -540,8 +540,8 @@ impl Orchestrator {
                     // AND the engine domain: the index stores one entry per
                     // node per engine, so two publications at the same
                     // prefix must be reconciled here too, or both survive
-                    // selection and race for the node — but a redacted-engine blob
-                    // and an mlx-lm blob at the same tokens are DIFFERENT
+                    // selection and race for the node — but a `llama-cpp` blob
+                    // and an `mlx-lm` blob at the same tokens are DIFFERENT
                     // nodes and must never reconcile each other away. A
                     // missing engine_id normalizes to the default engine
                     // (legacy stores), matching the serde default.

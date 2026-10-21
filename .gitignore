@@ -27,5 +27,3 @@ bench/*.json
 # lane declarations are reviewed repo config, not tool output
 !.gstack/pregate.json
 
-# runtime flock target for timing probes; a stale pid inside is display-only
-probe.lock
