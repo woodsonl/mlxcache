@@ -20,10 +20,6 @@ __pycache__/
 .env
 bench/*.json
 
-# gstack tool output (QA and deploy reports); children, not the dir itself,
-# so reviewed config files can be re-included below
-.gstack/*
-
-# lane declarations are reviewed repo config, not tool output
-!.gstack/pregate.json
+# gstack tool output (QA and deploy reports)
+.gstack/
 
