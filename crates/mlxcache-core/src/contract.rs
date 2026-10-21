@@ -97,6 +97,22 @@ pub struct ModelFingerprint {
     /// unrecorded digest never matches a recorded one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content_digest: String,
+    /// Named KV persistence tier (the TurboQuant tiers, e.g. `tq-k3v4-g64`).
+    ///
+    /// The scalar `kv_bits`/`kv_group_size` pair cannot express the TQ tiers:
+    /// they are asymmetric (distinct key/value bit-widths) and their payload
+    /// is a codec-specific frame, not mlx-lm's quantized cache layout. The
+    /// tier label pins the format the same way the scalar pair pins q8 — two
+    /// tiers never cross-serve, and a TQ blob is unreachable from the
+    /// f16/q8 identities.
+    ///
+    /// Empty means "no named tier" (f16 or q8 via `kv_bits`), which is every
+    /// blob written before tiers existed. The same zero-byte rule as the
+    /// other defaulted fingerprint axes: empty contributes nothing to the
+    /// fold, so pre-existing keys are unchanged; non-empty folds as one more
+    /// length-prefixed field after `content_digest`, the last identity axis.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kv_tier: String,
 }
 
 /// Metadata header for a checkpoint blob. Stored alongside the KV tensors.

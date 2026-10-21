@@ -3,7 +3,7 @@
 Endpoints (daemon -> sidecar protocol):
 - POST /tokenize  {"prompt": str} -> {"tokens": [u32], "tokenizer_hash": str,
                    "kv_dtype": str, "kv_bits": int, "kv_group_size": int,
-                   "engine_id": str, "cache_layout": str}
+                   "engine_id": str, "cache_layout": str, "kv_tier": str}
 - POST /prefill   {"tokens": [u32], "ancestor_blob_path": str|null}
                    -> KV checkpoint payload (binary; EMPTY body = nothing
                    cacheable). 400 on bad input; 422 when a declared ancestor
@@ -283,6 +283,7 @@ def _settle_fingerprint(engine: object) -> object:
         kv_bits=int(getattr(engine, "kv_bits", 0) or 0),
         kv_group_size=int(getattr(engine, "kv_group_size", 0) or 0),
         cache_layout=str(getattr(engine, "cache_layout", "") or ""),
+        kv_tier=str(getattr(engine, "kv_tier", "") or ""),
     )
 
 
@@ -586,6 +587,28 @@ def read_wire_checkpoint(
     return meta, payload, True
 
 
+def _parse_kv_tier_env() -> str:
+    """MLXCACHE_KV_TIER → validated tier label ("" when unset).
+
+    Refuses at boot on anything ``parse_tier`` rejects and on a simultaneous
+    MLXCACHE_KV_BITS: the two knob families select different payload formats
+    for the SAME fingerprint axis, so an accidental double set would fingerprint
+    one tier and encode the other's bytes."""
+    from mlxcache_sidecar.tq import parse_tier  # noqa: PLC0415
+
+    tier = (os.environ.get("MLXCACHE_KV_TIER", "") or "").strip()
+    if not tier:
+        return ""
+    if os.environ.get("MLXCACHE_KV_BITS", "0") not in ("0", "", None):
+        raise ValueError(
+            "MLXCACHE_KV_TIER and MLXCACHE_KV_BITS are mutually exclusive: "
+            "they select different payload formats for the same fingerprint "
+            "axis. Set exactly one."
+        )
+    parse_tier(tier)  # raises ValueError with the exact reason on a bad label
+    return tier
+
+
 class SyntheticEngine:
     """Hermetic engine: deterministic tokens + KV bytes, no MLX dependency."""
 
@@ -625,6 +648,7 @@ class SyntheticEngine:
             # for the same operator config, breaking the synthetic engine's
             # own must-respond-exactly contract.
             self.kv_group_size = 64
+        self.kv_tier = _parse_kv_tier_env()
         # Test knob: emulate a tokenizer that grows a base prompt's tokens —
         # tokenize(base) is a strict token-prefix of tokenize(base + rest), so
         # daemon tests can exercise partial hits and delta prefill (which the
@@ -1003,6 +1027,13 @@ class MlxLmEngine:
         if self.kv_bits and not self.kv_group_size:
             # A group size is mandatory with quantization; 64 is the proven one.
             self.kv_group_size = 64
+        # Named persistence tier (TQ codecs): validated for the same reasons
+        # and mutually exclusive with the bits tier — see _parse_kv_tier_env.
+        self.kv_tier = _parse_kv_tier_env()
+        if self.kv_tier:
+            from mlxcache_sidecar.tq import parse_tier  # noqa: PLC0415
+
+            self._tq_params = parse_tier(self.kv_tier)
         # One cache construction serves BOTH boot checks below. It allocates
         # no arrays (state fills on the first forward), so probing every model
         # — quantized or not — is free. Composition must be signed for EVERY
@@ -1090,22 +1121,24 @@ class MlxLmEngine:
         return hashlib.sha256(names.encode()).hexdigest()[:16]
 
     def _assert_quantization_supported(self, cache) -> None:
-        """Boot-time guard for the T12 q8 tier: parity is proven for dense
-        attention stacks only. Hybrid caches (CacheList/ArraysCache entries
-        carrying linear-attention / SSM / GDN state) have no ``to_quantized``,
-        so _quantize_cache would crash on the first prefill; refuse at boot
-        with the fix in the message instead."""
-        if not self.kv_bits:
+        """Boot-time guard for the quantized tiers (q8 via kv_bits, TQ via
+        kv_tier): parity is proven for dense attention stacks only. Hybrid
+        caches (CacheList/ArraysCache entries carrying linear-attention /
+        SSM / GDN state) have no ``to_quantized`` and no TQ encoder path,
+        so both tiers would fail on the first prefill; refuse at boot with
+        the fix in the message instead."""
+        if not self.kv_bits and not getattr(self, "kv_tier", ""):
             return
         from mlx_lm.models.cache import KVCache  # noqa: PLC0415
 
         if not all(type(c) is KVCache for c in cache):
             raise ValueError(
-                "MLXCACHE_KV_BITS is set but this model's prompt cache is not "
-                "a dense KV stack (a hybrid architecture: linear attention, "
-                "SSM, or GDN layers). The q8 tier is parity-proven for dense "
-                "models only; hybrid checkpoints persist their state "
-                "unquantized. Restart with MLXCACHE_KV_BITS=0."
+                "A KV quantization tier is set but this model's prompt cache "
+                "is not a dense KV stack (a hybrid architecture: linear "
+                "attention, SSM, or GDN layers). Quantized tiers are "
+                "parity-proven for dense models only; hybrid checkpoints "
+                "persist their state unquantized. Restart with "
+                "MLXCACHE_KV_BITS=0 and MLXCACHE_KV_TIER unset."
             )
 
     def _kv_dtype(self) -> str:
@@ -1161,12 +1194,25 @@ class MlxLmEngine:
         return cache, logits
 
     def _load_cache_from_payload(self, payload: bytes):
-        """Load a prompt cache from an ALREADY-VALIDATED safetensors payload.
+        """Load a prompt cache from an ALREADY-VALIDATED payload.
 
         Delta prefill needs the same load the generate path does, but without a
         second disk read (the caller just validated the wire checkpoint). A
         pure-Python parse/schema failure is corruption → CheckpointRejectedError
-        (422/quarantine); OSError/RuntimeError stay transient (500)."""
+        (422/quarantine); OSError/RuntimeError stay transient (500).
+
+        The TQ tier decodes its own frame here: the engine's tier and the
+        blob's tier always agree (the daemon only routes same-tier blobs —
+        the fingerprint pins it), so the branch is sound."""
+        if getattr(self, "kv_tier", ""):
+            from mlxcache_sidecar.tq import decode_payload  # noqa: PLC0415
+
+            try:
+                return decode_payload(payload)
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+                raise CheckpointRejectedError(
+                    f"TQ checkpoint failed to decode: {type(exc).__name__}: {exc}"
+                ) from exc
         from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
 
         # Parse from memory: the daemon just sent this payload over the wire
@@ -1186,7 +1232,9 @@ class MlxLmEngine:
             ) from exc
 
     def _quantize_cache(self, cache):
-        """Apply the configured KV quantization (T12 tier). No-op at bits=0.
+        """Apply the configured bits-tier KV quantization (T12). No-op at
+        bits=0 and on the TQ tier (its compression happens in
+        ``_serialize_cache`` — the live cache is never quantized).
 
         A cache already holding QuantizedKVCache layers (a delta prefill that
         adopted a quantized ancestor) must NOT be re-quantized: to_quantized
@@ -1194,7 +1242,7 @@ class MlxLmEngine:
         corrupting the KV (the fingerprint pins kv_bits/kv_group_size, so an
         adoptable ancestor is always this same tier — skipping is exact).
         """
-        if not self.kv_bits:
+        if not self.kv_bits or getattr(self, "kv_tier", ""):
             return cache
         from mlx_lm.models.cache import QuantizedKVCache  # noqa: PLC0415
 
@@ -1205,9 +1253,27 @@ class MlxLmEngine:
             for c in cache
         ]
 
+    def _serialize_cache(self, cache) -> bytes:
+        """Persist the cache in the configured tier's payload format.
+
+        f16/q8: mlx-lm's own safetensors frame (via save_prompt_cache). TQ:
+        the compressed frame — the whole point of the tier, ~4x smaller
+        bytes at the cost of a bounded-distortion resume."""
+        import io  # noqa: PLC0415
+
+        if getattr(self, "kv_tier", ""):
+            from mlxcache_sidecar.tq import encode_cache  # noqa: PLC0415
+
+            key_bits, value_bits, group_size = self._tq_params
+            return encode_cache(cache, key_bits, value_bits, group_size)
+        from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
+
+        buf = io.BytesIO()
+        save_prompt_cache(buf, cache)
+        return buf.getvalue()
+
     def prefill(self, tokens: list[int], ancestor_blob_path: str | None = None) -> bytes:
         import mlx.core as mx  # noqa: PLC0415
-        from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
 
         self.prefill_count = getattr(self, "prefill_count", 0) + 1
         # Cache convention (pinned; verified by the R1-5 thesis guard): the saved
@@ -1260,16 +1326,15 @@ class MlxLmEngine:
         # could even publish) was pure TTFT tax with zero durability benefit
         # (performance review 2026-10-04). mx.save_safetensors — and thus
         # save_prompt_cache — accepts file objects.
-        # Quantize BEFORE save (T12 tier): the persisted blob holds the
-        # quantized state, so bytes/token drops ~47% at 8-bit g64. The
-        # fingerprint the daemon recorded already pins (kv_bits,
-        # kv_group_size) from /tokenize, so f16 and q8 never cross-serve.
+        # Quantize/persist BEFORE save (T12 tier): the persisted blob holds
+        # the quantized state, so bytes/token drops ~47% at 8-bit g64 (and
+        # ~4x further on the TQ tier's compressed frame). The fingerprint the
+        # daemon recorded already pins (kv_bits, kv_group_size, kv_tier) from
+        # /tokenize, so tiers never cross-serve.
         cache = self._quantize_cache(cache)
-        buf = io.BytesIO()
         t0 = time.perf_counter()
-        save_prompt_cache(buf, cache)
+        payload = self._serialize_cache(cache)
         _phase_add("cache_save", (time.perf_counter() - t0) * 1000)
-        payload = buf.getvalue()
         mx.clear_cache()
 
         # Return the raw safetensors payload. The daemon owns the checkpoint
@@ -1323,8 +1388,6 @@ class MlxLmEngine:
           else), so a shortened settle was dead work that still reported
           `written: true` — a report nothing downstream ever acted on.
         """
-        from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
-
         total = list(prompt_tokens) + list(generated)
         if not generated:
             return {"written": False, "tokens": len(total), "reason": "no_generated_tokens"}
@@ -1333,8 +1396,8 @@ class MlxLmEngine:
         if len(total) < 2:
             return {"written": False, "tokens": len(total), "reason": "too_short"}
         # Same tier as prefill persists: the header's fingerprint pins
-        # kv_bits/kv_group_size, so a settled blob must hold the same shape of
-        # state as a prefilled one for the two to be interchangeable.
+        # kv_bits/kv_group_size/kv_tier, so a settled blob must hold the same
+        # shape of state as a prefilled one for the two to be interchangeable.
         cache = self._quantize_cache(cache)
         positions = _cache_positions(cache)
         if positions is None:
@@ -1350,9 +1413,7 @@ class MlxLmEngine:
                 return {"written": False, "tokens": len(total), "reason": "untrimmable_cache"}
         elif positions < target:
             return {"written": False, "tokens": len(total), "reason": "shallow_cache"}
-        buf = io.BytesIO()
-        save_prompt_cache(buf, cache)
-        payload = buf.getvalue()
+        payload = self._serialize_cache(cache)
         return settle_checkpoint(self, settle_path, total, payload, covered=positions)
 
     def generate_with_text(
@@ -1834,6 +1895,9 @@ class Handler(BaseHTTPRequestHandler):
                         # the mlx-lm domain and an unknown composition.
                         "engine_id": getattr(self.engine, "engine_id", "mlx-lm"),
                         "cache_layout": getattr(self.engine, "cache_layout", ""),
+                        # Named KV persistence tier ("" = none): fingerprinted
+                        # like kv_bits so a TQ blob never cross-serves f16/q8.
+                        "kv_tier": getattr(self.engine, "kv_tier", ""),
                     },
                 )
             elif self.path == "/prefill":

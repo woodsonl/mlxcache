@@ -62,6 +62,14 @@ def build_parser() -> argparse.ArgumentParser:
         "partition this server reads/writes — mlx-lm's server itself serves f16",
     )
     p.add_argument("--kv-group-size", type=int, default=0, help="KV quantization group size")
+    p.add_argument(
+        "--kv-tier",
+        type=str,
+        default="",
+        help="named KV persistence tier (e.g. tq-k3v4-g64): the store "
+        "partition AND the payload format — unlike --kv-bits (a label only), "
+        "a tier actually compresses what this server persists",
+    )
     p.add_argument("-h", "--help", action="help", help="show this help message and exit")
     return p
 
@@ -102,12 +110,43 @@ def main(argv: list[str] | None = None) -> int:
     # strict parser would exit 2 on it. Strip exactly one separator of ours.
     if passthrough and passthrough[0] == "--":
         passthrough = passthrough[1:]
+    # A named tier owns the same fingerprint axis as the bits tier, and it
+    # changes the payload format for real (encode/decode below): an
+    # accidental double set would partition the store under one tier's key
+    # and write the other's bytes. Refuse before the server ever binds.
+    if args.kv_tier:
+        from mlxcache_sidecar.tq import parse_tier  # noqa: PLC0415
+
+        if args.kv_bits:
+            print("--kv-tier and --kv-bits are mutually exclusive", file=sys.stderr)
+            return 2
+        try:
+            _tq_params = parse_tier(args.kv_tier)
+        except ValueError as exc:
+            print(f"--kv-tier: {exc}", file=sys.stderr)
+            return 2
     store = Store(
         args.store_dir,
         byte_budget=args.store_budget_bytes,
         anchor_window_s=args.anchor_window_s,
         trust_legacy=args.trust_legacy,
     )
+
+    # A tier swaps the persistence codec (the bits label never did: mlx-lm's
+    # server serves f16 and --kv-bits only named the partition). The TQ
+    # codecs are best-effort here exactly like the rest of insert_cache: a
+    # hybrid model that cannot encode fails the persist, never the request.
+    save_fn = None
+    load_fn = None
+    if args.kv_tier:
+        from mlxcache_sidecar.tq import decode_payload, encode_cache  # noqa: PLC0415
+
+        key_bits, value_bits, group_size = _tq_params
+
+        def _tq_save(cache):
+            return encode_cache(cache, key_bits, value_bits, group_size)
+
+        save_fn, load_fn = _tq_save, decode_payload
 
     def fingerprint(model_key):
         # model_key is mlx-lm's (model_path, adapter_path, draft_model_path):
@@ -126,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
             model_key,
             kv_bits=args.kv_bits,
             kv_group_size=args.kv_group_size,
+            kv_tier=args.kv_tier,
         )
 
     import mlx_lm.server as mlx_server
@@ -135,7 +175,14 @@ def main(argv: list[str] | None = None) -> int:
     saved_argv = sys.argv
 
     def factory(max_size=10, max_bytes=1 << 63):
-        return PersistentPromptCache(store, fingerprint, max_size=max_size, max_bytes=max_bytes)
+        return PersistentPromptCache(
+            store,
+            fingerprint,
+            max_size=max_size,
+            max_bytes=max_bytes,
+            save_fn=save_fn,
+            load_fn=load_fn,
+        )
 
     def do_get(self):
         # A cache-reuse counter observable over HTTP. Without it a caller can

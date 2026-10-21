@@ -148,6 +148,46 @@ def test_content_digest_key_golden():
     assert f"{blob_key(FP_GOLDEN, None, tokens):032x}" == GOLDEN_KEY_8
 
 
+# --- named KV tiers (TQ) -----------------------------------------------------
+# Same fixture/golden values as the Rust twin (blob_key_kv_tier_golden in
+# http.rs): the tier folds only when present, LAST among fingerprint fields.
+TQ_K3V4 = Fingerprint("golden-model", "golden-tok", "f16", 1, kv_tier="tq-k3v4-g64")
+TQ_K3V2 = Fingerprint("golden-model", "golden-tok", "f16", 1, kv_tier="tq-k3v2-g64")
+GOLDEN_KEY_TQ_K3V4 = "65b2e486a06841393d8af583c8216377"
+GOLDEN_KEY_TQ_K3V2 = "80752b347268413990fcdfe3d6216377"
+
+
+def test_kv_tier_key_goldens():
+    tokens = list(range(1, 9))
+    assert f"{blob_key(TQ_K3V4, None, tokens):032x}" == GOLDEN_KEY_TQ_K3V4
+    assert f"{blob_key(TQ_K3V2, None, tokens):032x}" == GOLDEN_KEY_TQ_K3V2
+    # An empty tier contributes ZERO bytes: pre-tier keys are unchanged.
+    assert f"{blob_key(FP_GOLDEN, None, tokens):032x}" == GOLDEN_KEY_8
+
+
+def test_kv_tier_compatibility_rule():
+    plain = Fingerprint("m", "t", "f16", 1)
+    tier = Fingerprint("m", "t", "f16", 1, kv_tier="tq-k3v4-g64")
+    other = Fingerprint("m", "t", "f16", 1, kv_tier="tq-k3v2-g64")
+    assert identity_compatible(tier, tier)
+    # A tier is a payload format: it never cross-serves the untiered or the
+    # other tier, in either direction.
+    for a, b in ((plain, tier), (tier, plain), (other, tier), (tier, other)):
+        assert not identity_compatible(a, b)
+
+
+def test_store_never_cross_serves_kv_tiers(tmp_path):
+    s = Store(tmp_path, byte_budget=0)
+    tokens = [11, 22, 33]
+    s.put("mlx-lm", TQ_K3V4, tokens, b"tq-payload")
+    matched, ref = s.lookup("mlx-lm", Fingerprint("golden-model", "golden-tok", "f16", 1), tokens)
+    assert ref is None, "a TQ blob must not serve an untiered identity"
+    matched, ref = s.lookup("mlx-lm", TQ_K3V2, tokens)
+    assert ref is None, "two tiers never share a blob"
+    matched, ref = s.lookup("mlx-lm", TQ_K3V4, tokens)
+    assert ref is not None and matched == 3
+
+
 def test_content_digest_compatibility_rule():
     text = Fingerprint("m", "t", "f16", 1)
     image = Fingerprint("m", "t", "f16", 1, content_digest="abc")

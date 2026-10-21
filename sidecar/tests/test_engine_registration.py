@@ -82,6 +82,48 @@ def test_adopt_model_derives_the_kv_tier_from_env(monkeypatch):
     assert (engine.kv_bits, engine.kv_group_size) == (8, 64)
 
 
+def test_adopt_model_parses_a_named_tier(monkeypatch):
+    pytest.importorskip("mlx.core")
+    monkeypatch.delenv("MLXCACHE_KV_BITS", raising=False)
+    monkeypatch.setenv("MLXCACHE_KV_TIER", "tq-k3v4-g64")
+    engine = _Probe(_StubModel(), _StubTokenizer())
+    assert engine.kv_tier == "tq-k3v4-g64"
+    assert engine._tq_params == (3, 4, 64)
+    # The named tier owns the axis: the scalar pair stays f16.
+    assert (engine.kv_bits, engine.kv_group_size) == (0, 0)
+
+
+@pytest.mark.parametrize("tier", ["tq", "tq-k9v4-g64", "tq-k3v4", "nope-k3v4-g64", "tq-k3v4-g1"])
+def test_adopt_model_refuses_a_bad_named_tier(monkeypatch, tier):
+    pytest.importorskip("mlx.core")
+    monkeypatch.delenv("MLXCACHE_KV_BITS", raising=False)
+    monkeypatch.setenv("MLXCACHE_KV_TIER", tier)
+    with pytest.raises(ValueError):
+        _Probe(_StubModel(), _StubTokenizer())
+
+
+def test_named_tier_and_bits_are_mutually_exclusive(monkeypatch):
+    pytest.importorskip("mlx.core")
+    monkeypatch.setenv("MLXCACHE_KV_BITS", "8")
+    monkeypatch.setenv("MLXCACHE_KV_TIER", "tq-k3v4-g64")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _Probe(_StubModel(), _StubTokenizer())
+
+
+def test_adopt_model_refuses_a_named_tier_on_a_hybrid_cache(monkeypatch):
+    pytest.importorskip("mlx.core")
+    from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+    class _Hybrid(_Probe):
+        def _prompt_cache_probe(self):
+            return [KVCache(), CacheList(KVCache(), ArraysCache(size=2))]
+
+    monkeypatch.delenv("MLXCACHE_KV_BITS", raising=False)
+    monkeypatch.setenv("MLXCACHE_KV_TIER", "tq-k3v4-g64")
+    with pytest.raises(ValueError, match="not a dense KV stack"):
+        _Hybrid(_StubModel(), _StubTokenizer())
+
+
 def test_adopt_model_refuses_quantization_on_a_hybrid_cache(monkeypatch):
     pytest.importorskip("mlx.core")
     from mlx_lm.models.cache import ArraysCache, CacheList, KVCache

@@ -448,6 +448,7 @@ async fn chat_completions(
                         kv_group_size: r.kv_group_size,
                         engine_id: r.engine_id,
                         cache_layout: r.cache_layout,
+                        kv_tier: r.kv_tier,
                     },
                     r.tokens,
                 ),
@@ -507,6 +508,7 @@ async fn chat_completions(
         // still sees the messages: everything downstream carries token ids,
         // which cannot distinguish two images that render to the same ids.
         content_digest: content_digest(&req.messages),
+        kv_tier: identity.kv_tier,
     };
     let mut outcome = state
         .orchestrator
@@ -1253,7 +1255,8 @@ async fn publish_settled_blob(
         && meta.fingerprint.kv_bits == fingerprint.kv_bits
         && meta.fingerprint.kv_group_size == fingerprint.kv_group_size
         && meta.fingerprint.kv_layout_version == fingerprint.kv_layout_version
-        && meta.fingerprint.cache_layout == fingerprint.cache_layout;
+        && meta.fingerprint.cache_layout == fingerprint.cache_layout
+        && meta.fingerprint.kv_tier == fingerprint.kv_tier;
     if !same_shape {
         tracing::warn!("settle discarded: header identity does not match the request");
         return;
@@ -1518,6 +1521,10 @@ struct Identity {
     /// (and hence the key and the header) so a payload of one shape is never
     /// served to an engine that would deserialize it as another.
     cache_layout: String,
+    /// Named KV persistence tier (empty = none). Part of the fingerprint for
+    /// the same reason as `kv_bits`: a TQ blob and an f16/q8 blob of the same
+    /// prefix are mutually unloadable and must never share a key.
+    kv_tier: String,
 }
 
 /// T13 identity resolution: prove the native tokenizer IS the engine's, once,
@@ -1617,6 +1624,7 @@ async fn resolve_native_identity(
                 kv_group_size: reference.kv_group_size,
                 engine_id: reference.engine_id,
                 cache_layout: reference.cache_layout,
+                kv_tier: reference.kv_tier,
             });
         }
     }
@@ -1830,6 +1838,14 @@ pub fn blob_key(
     // not move.
     if !fingerprint.content_digest.is_empty() {
         put(&mut f, &fingerprint.content_digest);
+    }
+    // Named KV tier (the TQ codecs): folded only when present, the same
+    // zero-byte rule as the layout and digest, and folded LAST so the
+    // goldens for every earlier field do not move. A tier names a payload
+    // format the scalar kv_bits pair cannot express, so it must namespace
+    // the key exactly like kv_bits does for q8.
+    if !fingerprint.kv_tier.is_empty() {
+        put(&mut f, &fingerprint.kv_tier);
     }
     // Fold the fingerprint into the token hash: hash the fingerprint bytes into
     // both lanes first, then continue with the tokens.
@@ -3100,6 +3116,7 @@ mod tests {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: String::new(),
+            kv_tier: String::new(),
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "model-b".into(),
@@ -3110,6 +3127,7 @@ mod tests {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: String::new(),
+            kv_tier: String::new(),
         };
         assert_ne!(blob_key(&a, None, &tokens), blob_key(&b, None, &tokens));
         // Tokenizer-only difference must also separate.
@@ -3122,6 +3140,7 @@ mod tests {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: String::new(),
+            kv_tier: String::new(),
         };
         assert_ne!(blob_key(&a, None, &tokens), blob_key(&c, None, &tokens));
         // Deterministic and distinct from the bare token hash.
@@ -3147,6 +3166,7 @@ mod tests {
             kv_group_size: 0,
             cache_layout: layout.into(),
             content_digest: String::new(),
+            kv_tier: String::new(),
         };
         let tokens: Vec<u32> = (1..=8).collect();
         let dense = with_layout("KV-KV");
@@ -3188,6 +3208,7 @@ mod tests {
             kv_group_size: 0,
             cache_layout: format!("{}6:KV-KV", "0"),
             content_digest: String::new(),
+            kv_tier: String::new(),
         };
         assert_ne!(
             blob_key(&dense, None, &tokens),
@@ -3212,6 +3233,7 @@ mod tests {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: String::new(),
+            kv_tier: String::new(),
         };
         let tokens: Vec<u32> = (1..=8).collect();
         assert_eq!(
@@ -3261,12 +3283,71 @@ mod tests {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: "b1946ac92492d2347c6235b4d2611184".into(),
+            kv_tier: String::new(),
         };
         let tokens: Vec<u32> = (1..=8).collect();
         assert_eq!(
             format!("{:032x}", blob_key(&with_digest, None, &tokens)),
             "831a3b8ca657914f65c4de75cf8a4a61",
             "the digest fold must match the Python twin"
+        );
+    }
+
+    #[test]
+    fn blob_key_kv_tier_golden() {
+        // Shared verbatim with sidecar/tests/test_store.py: the named KV
+        // tier folds only when present, LAST among fingerprint fields (after
+        // the content digest), so pre-tier keys are byte-identical and the
+        // TQ tiers namespace their own blobs.
+        let base = |tier: &str| mlxcache_core::contract::ModelFingerprint {
+            model_id: "golden-model".into(),
+            tokenizer_hash: "golden-tok".into(),
+            kv_dtype: "f16".into(),
+            kv_layout_version: 1,
+            kv_bits: 0,
+            kv_group_size: 0,
+            cache_layout: String::new(),
+            content_digest: String::new(),
+            kv_tier: tier.into(),
+        };
+        let tokens: Vec<u32> = (1..=8).collect();
+        // Empty tier = zero fold bytes: identical to the pre-tier key. The
+        // value is the twin of sidecar/tests/test_store.py's base golden.
+        assert_eq!(
+            format!("{:032x}", blob_key(&base(""), None, &tokens)),
+            "2786690f2948dec17c5498a6267fc101",
+            "an empty tier must keep pre-tier keys byte-identical"
+        );
+        // GOLDEN pins for the normative tier fold, shared verbatim with the
+        // Python twin — one fold, two languages.
+        assert_eq!(
+            format!("{:032x}", blob_key(&base("tq-k3v4-g64"), None, &tokens)),
+            "65b2e486a06841393d8af583c8216377"
+        );
+        assert_eq!(
+            format!("{:032x}", blob_key(&base("tq-k3v2-g64"), None, &tokens)),
+            "80752b347268413990fcdfe3d6216377"
+        );
+        // Two tiers never share a blob file.
+        assert_ne!(
+            blob_key(&base("tq-k3v4-g64"), None, &tokens),
+            blob_key(&base("tq-k3v2-g64"), None, &tokens)
+        );
+        assert_ne!(
+            blob_key(&base("tq-k3v4-g64"), None, &tokens),
+            blob_key(&base(""), None, &tokens)
+        );
+        // The tier is length-prefixed like every other field: a stretched
+        // earlier field cannot swallow it to alias another key.
+        let stretched = mlxcache_core::contract::ModelFingerprint {
+            content_digest: format!("{}{}", "0", ""),
+            kv_tier: format!("{}6:tq-k3v4-g64", "0"),
+            ..base("")
+        };
+        assert_ne!(
+            blob_key(&stretched, None, &tokens),
+            blob_key(&base("tq-k3v4-g64"), None, &tokens),
+            "length prefixes must keep the tier field unambiguous"
         );
     }
 
@@ -3286,6 +3367,7 @@ mod tests {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: digest.into(),
+            kv_tier: String::new(),
         };
         assert_ne!(
             blob_key(&with_digest("image-a"), None, &tokens),
@@ -3303,6 +3385,7 @@ mod tests {
             blob_key(
                 &mlxcache_core::contract::ModelFingerprint {
                     content_digest: String::new(),
+                    kv_tier: String::new(),
                     ..with_digest("image-a")
                 },
                 None,
@@ -3452,6 +3535,7 @@ mod tests {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: String::new(),
+            kv_tier: String::new(),
         };
         let b = mlxcache_core::contract::ModelFingerprint {
             model_id: "m".into(),
@@ -3462,6 +3546,7 @@ mod tests {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: String::new(),
+            kv_tier: String::new(),
         };
         assert_ne!(blob_key(&a, None, &tokens), blob_key(&b, None, &tokens));
     }

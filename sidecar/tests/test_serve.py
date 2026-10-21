@@ -155,6 +155,10 @@ def test_fingerprint_determinism_and_inputs(tmp_path, tmp_path_factory):
     fq = fingerprint_for_model_dir(d1, kv_bits=8, kv_group_size=64)
     assert fq.kv_bits == 8 and fq != fa, "quantization tier namespaces the key"
 
+    ft = fingerprint_for_model_dir(d1, kv_tier="tq-k3v4-g64")
+    assert ft.kv_tier == "tq-k3v4-g64" and ft != fa and ft != fq
+    assert ft.tokenizer_hash == fa.tokenizer_hash, "the tier changes no identity field"
+
     fo = fingerprint_for_model_dir(d1, model_id_override="daemon-model")
     assert fo.model_id == "daemon-model"
 
