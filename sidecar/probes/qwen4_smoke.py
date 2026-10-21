@@ -32,6 +32,15 @@ def argmax_token(logits) -> int:
 
 
 def main() -> int:
+    from probe_lock import checkpoint_lock
+
+    # Two probes sharing the 132 GB checkpoint swap the machine, which turns
+    # every duration in this probe into a filesystem measurement.
+    with checkpoint_lock("qwen4_smoke"):
+        return _smoke()
+
+
+def _smoke() -> int:
     import mlx.core as mx
     from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
     from mlxcache_sidecar.engine_qwen4 import Qwen4ExpEngine
@@ -71,9 +80,12 @@ def main() -> int:
     print(f"resident after  {engine.loader.stats()}", flush=True)
 
     # The resume claim: serialize the cache and continue from the reloaded copy.
+    # The name must carry the `.safetensors` extension: `load_prompt_cache`
+    # dispatches on the file name, not on the payload, so a BufferIO named
+    # otherwise fails to reload even though the bytes are valid.
     t0 = time.perf_counter()
     buffer = io.BytesIO()
-    buffer.name = "smoke.ckpt"
+    buffer.name = "smoke.safetensors"
     save_prompt_cache(buffer, cache)
     save = time.perf_counter() - t0
     payload = buffer.getvalue()

@@ -112,6 +112,16 @@ def main(argv: list[str] | None = None) -> int:
     def fingerprint(model_key):
         # model_key is mlx-lm's (model_path, adapter_path, draft_model_path):
         # adapter + draft model fold into the model id (LoRA isolation).
+        #
+        # TEXT-ONLY BOUNDARY: this stack wraps mlx-lm's server, which is the
+        # request entry point — this wrapper never sees message JSON, so it
+        # cannot compute a content digest, and the fingerprints it mints
+        # carry content_digest="" (the "no media" claim) by construction.
+        # That claim is true for every model this CLI can serve: mlx-lm loads
+        # text checkpoints only. The moment a multimodal model ever loads here,
+        # the "" would stand in for "unknown" — a silent wrong-key — so the
+        # boundary lives here in writing: serving media through mlxcache_serve
+        # requires teaching THIS function a digest producer first.
         return default_fingerprint_for(
             model_key,
             kv_bits=args.kv_bits,

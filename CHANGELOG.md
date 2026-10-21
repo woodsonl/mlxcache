@@ -2,6 +2,45 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.3.1 — 2026-10-20
+
+### Added
+
+- **The measurement probes land**: the smoke probe names its cache buffer
+  `.safetensors` (the loader dispatches on the name, so the old `.ckpt`
+  buffer failed its own reload leg), the context sweep refuses to overlap
+  another measurement on the checkpoint instead of explaining the
+  contamination afterward, and each context length is measured in its own
+  process — MLX retains freed allocator memory, so one long-lived process
+  gave every row after the first less headroom than the row before it. One
+  process per row gives every measurement the same starting conditions; the
+  sweep runs descending after a leading control row, so the coldest SWEEP
+  run lands on the largest context and the before/after control pair bounds
+  the warm-up bias that ordering admits.
+
+### Fixed
+
+- **The settle publish guards are now e2e-covered end to end.** Three new
+  engine lie modes drive the three non-digest publish guards over the real
+  HTTP path: `tokens` (a header recording a sequence one token longer than
+  the engine reports), `identity[:field]` (a header claiming a foreign
+  value for ONE adapter-owned identity field, payload bytes untouched, so
+  only the same_shape conjunct under test can catch it), and `engine` (a
+  header stamped with a foreign engine domain, leaving identity intact).
+  Each guard was verified non-vacuous by mutation: disabling the guard
+  makes its test fail. Previously only the digest guards had knobs.
+- **Corrupted digest-bearing (v2) blobs are proven quarantined from disk.**
+  An e2e corrupts a published v2 payload AFTER publication and rebuilds the
+  index the way a restart does: the boot sweep reclaims the file (D1) and
+  the honest prefill prefix keeps serving. Previously only the
+  malformed-corpus parse tests covered the reader.
+- **The `mlxcache_serve` text-only boundary is now a written contract** at
+  the one place a future maintainer would touch: the wrapper never sees
+  message JSON (mlx-lm's server owns the request), so it cannot mint a
+  content digest and its fingerprints carry `""` = no media by construction
+  — true for every model this CLI can load. Serving media through it
+  requires teaching that fingerprint a digest producer first.
+
 ## 0.3.0 — 2026-10-20
 
 ### Added
