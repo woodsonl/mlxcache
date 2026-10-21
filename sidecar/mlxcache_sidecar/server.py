@@ -341,30 +341,9 @@ def settle_checkpoint(
     )
     wire = encode(meta, payload)
     digest = hashlib.sha256(payload).hexdigest()
-    # A unique sibling temp + os.replace keeps a concurrent reader (the daemon
-    # reading the staging file after this response) from ever seeing a torn
-    # write, without requiring the caller to coordinate a lock. mkstemp gives
-    # the uniqueness: a FIXED ".part" name would let two overlapping requests
-    # (a daemon retry racing an abandoned attempt) corrupt each other's temp.
-    tmp_path: str | None = None
     try:
-        fd, tmp_path = tempfile.mkstemp(
-            dir=os.path.dirname(settle_path) or ".",
-            prefix=os.path.basename(settle_path) + ".",
-            suffix=".part",
-        )
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(wire)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, settle_path)
+        _atomic_write(settle_path, wire)
     except OSError as exc:
-        # Leave nothing behind: a stranded temp in the blob dir would be
-        # invisible to every reader and accumulate per request. mkstemp can
-        # itself fail (a read-only blob dir), in which case there is no temp.
-        if tmp_path is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
         return {"written": False, "tokens": len(tokens), "reason": f"write_failed: {exc}"}
     return {
         "written": True,
@@ -373,6 +352,36 @@ def settle_checkpoint(
         "sha256": digest,
         "bytes": len(wire),
     }
+
+
+def _atomic_write(path: str, data: bytes) -> None:
+    """Write `data` to `path` so a concurrent reader (the daemon reading the
+    staging file after this response) never sees a torn write, without
+    requiring the caller to coordinate a lock. mkstemp gives the uniqueness:
+    a FIXED ".part" name would let two overlapping requests (a daemon retry
+    racing an abandoned attempt) corrupt each other's temp.
+
+    A failed write leaves nothing behind: a stranded temp in the blob dir
+    would be invisible to every reader and accumulate per request. mkstemp
+    can itself fail (a read-only blob dir), in which case there is no temp;
+    cleanup errors during that failure must not mask the original OSError."""
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".",
+            prefix=os.path.basename(path) + ".",
+            suffix=".part",
+        )
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except OSError:
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+        raise
 
 
 def _engine_id_meta(engine: object) -> str | None:
@@ -792,11 +801,95 @@ class SyntheticEngine:
         total = list(prompt_tokens) + list(generated)
         if not generated:
             return {"written": False, "tokens": len(total), "reason": "no_generated_tokens"}
-        report = settle_checkpoint(self, settle_path, total, self._kv_bytes(total))
+        lie = os.environ.get("MLXCACHE_SETTLE_LIE", "")
+        # The tokens/identity/engine lies must change the FILE, not the
+        # report: the daemon cross-checks the staged header against the
+        # request, so these write a checkpoint whose header disagrees with
+        # what the engine reports, the exact shape the publish guards reject.
+        # "identity:<field>" targets one same_shape conjunct individually;
+        # bare "identity" defaults to tokenizer_hash.
+        lie_field = None
+        if lie.startswith("identity"):
+            lie_field = lie.split(":", 1)[1] if ":" in lie else "tokenizer_hash"
+        lie_tokens = lie == "tokens"
+        lie_engine = lie == "engine"
+        written_tokens = list(total)
+        if lie_tokens and len(written_tokens) >= 2:
+            # Record a sequence one token LONGER than the one the engine
+            # reports: header tokens != request+generated.
+            written_tokens.append(written_tokens[-1] + 1)
+        report = settle_checkpoint(
+            self,
+            settle_path,
+            written_tokens,
+            self._kv_bytes(written_tokens),
+        )
+        if (lie_field or lie_engine) and report.get("written"):
+            # Rewrite the header so exactly ONE guard can catch it: the
+            # payload bytes are untouched (every digest check passes), and
+            # the forged value keeps the field's own type so the daemon's
+            # reader still parses the header — the lie is caught by the
+            # same_shape conjunct or the engine-domain check it targets,
+            # never by a serde rejection that would make the test pass
+            # vacuously.
+            import struct as _struct  # noqa: PLC0415
+
+            from .blob import CheckpointMeta, Fingerprint, encode  # noqa: PLC0415
+
+            # Only the fields the daemon's same_shape check actually compares
+            # (http.rs publish_settled_blob): a knob for any other field is a
+            # trap — model_id is never compared (publication proceeds, the
+            # test fails confusingly), and content_digest is OMITTED from the
+            # header when empty, so forging it KeyErrors out of the settle
+            # path as a 500 instead of a discard.
+            same_shape_fields = frozenset(
+                {
+                    "tokenizer_hash",
+                    "kv_dtype",
+                    "kv_bits",
+                    "kv_group_size",
+                    "kv_layout_version",
+                    "cache_layout",
+                }
+            )
+            if lie_field and lie_field not in same_shape_fields:
+                raise ValueError(f"identity lie targets unknown field {lie_field!r}")
+            try:
+                with open(settle_path, "rb") as fh:
+                    payload = fh.read()
+                (hlen,) = _struct.unpack_from("<I", payload)
+                meta = json.loads(payload[4 : 4 + hlen])
+                if lie_field:
+                    fp = dict(meta["fingerprint"])
+                    current = fp[lie_field]
+                    # Wrong VALUE, right TYPE: a str field gets a foreign
+                    # hash, an int field a foreign count.
+                    fp[lie_field] = "0" * 64 if isinstance(current, str) else current + 1
+                    meta["fingerprint"] = fp
+                else:
+                    # lie_engine: engine_id is a CheckpointMeta field, not a
+                    # fingerprint field — a foreign engine DOMAIN, so the
+                    # engine-domain guard fires while same_shape still
+                    # agrees.
+                    meta["engine_id"] = "llama-cpp"
+                fields = {k: v for k, v in meta.items() if k != "fingerprint"}
+                wire = encode(
+                    CheckpointMeta(fingerprint=Fingerprint(**meta["fingerprint"]), **fields),
+                    payload[4 + hlen :],
+                )
+                _atomic_write(settle_path, wire)
+            except OSError as exc:
+                # A rewrite that cannot complete is an unsuccessful settle —
+                # the same write_failed contract settle_checkpoint honors —
+                # never an exception through the generation path.
+                return {
+                    "written": False,
+                    "tokens": len(total),
+                    "reason": f"write_failed: {exc}",
+                }
         # Test knob (same family as MLXCACHE_GENERATE_FAIL): let a e2e spawn
         # an engine that lies about its digest, or omits it, so the daemon's
         # publish-time guards are exercised over the real HTTP path.
-        lie = os.environ.get("MLXCACHE_SETTLE_LIE", "")
         if lie and report.get("written"):
             if lie == "omit":
                 report.pop("sha256", None)

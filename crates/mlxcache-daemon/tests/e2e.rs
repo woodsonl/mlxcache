@@ -3319,3 +3319,164 @@ async fn a_digest_bearing_blob_survives_a_daemon_restart_rebuild() {
     child.kill().expect("kill sidecar");
     child.wait().expect("reap sidecar");
 }
+
+#[tokio::test]
+async fn a_settle_whose_header_records_the_wrong_tokens_is_discarded() {
+    // The header-token guard: the staged file must describe EXACTLY the
+    // sequence this request settled (request + generated), or the blob would
+    // key a prefix it does not cover. The lie writes a header one token
+    // longer than the engine reports; the response is unaffected and nothing
+    // beyond the honest prefill prefix publishes. Previously this guard had
+    // no e2e knob — only the digest guards were exercisable end to end.
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "tokens")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "lie about tokens").await;
+    assert_eq!(res["status"], "ok", "generation itself must not fail");
+
+    await_settle_publication(&state).await;
+    // The lying settle published nothing; only the prefill prefix survives.
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8],
+        "{:?}",
+        blob_coverages(&state)
+    );
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_settle_whose_header_claims_a_foreign_identity_is_discarded() {
+    // The identity guard: the staged header's adapter-owned fields must agree
+    // with the identity the daemon resolved for THIS request. The lie swaps
+    // the header's tokenizer hash while leaving the payload bytes untouched,
+    // so the digest checks all pass and only the identity guard can catch it.
+    // Previously this guard had no e2e knob.
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "identity")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "lie about identity").await;
+    assert_eq!(res["status"], "ok");
+
+    await_settle_publication(&state).await;
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8],
+        "{:?}",
+        blob_coverages(&state)
+    );
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_corrupted_v2_digest_blob_is_quarantined_by_the_rebuild() {
+    // The D1 disk-side gate for digest-bearing (v2) blobs: corrupt a payload
+    // AFTER publication, then rebuild the index from disk the way a restart
+    // does. The boot sweep must quarantine the corrupted blob (its recorded
+    // digest no longer matches its bytes) and the next identical request must
+    // re-prefill from scratch rather than resume from bad KV. Previously no
+    // e2e drove a corrupted DIGEST-BEARING header; only malformed-corpus
+    // parse tests covered the reader.
+    let (url, mut child) = spawn_sidecar().await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let first = post_prompt(state.clone(), "corrupt me after publish").await;
+    assert_eq!(first["mlxcache"]["verdict"], "miss");
+    await_settle_publication(&state).await;
+
+    // Flip one payload byte in the settled (72-token) blob on disk.
+    let settled = blob_with_coverage(&state, 72);
+    let mut bytes = std::fs::read(&settled).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xFF;
+    std::fs::write(&settled, &bytes).unwrap();
+
+    // Rebuild from disk: the corrupted v2 blob is quarantined, not indexed.
+    let rebuilt = app_state(&url, &blobs);
+    let report = rebuilt.orchestrator.rebuild_from_disk(&rebuilt.persistence);
+    assert!(
+        report.reclaimed_corrupt >= 1,
+        "the corrupted v2 blob must be reclaimed: {report:?}"
+    );
+    // The corrupted FILE is gone (reclaimed above), so nothing can resume
+    // from it. The honest 8-token prefill prefix remains and may serve a hit
+    // — that is correct reuse, not a resume from bad KV. prefill_from pins
+    // the distinction: the reclaimed 72-token blob would have resumed at 71.
+    assert!(
+        !settled.exists(),
+        "the corrupted v2 blob file must be deleted"
+    );
+    let after = post_prompt(rebuilt.clone(), "corrupt me after publish").await;
+    assert_eq!(after["status"], "ok");
+    // The field must exist before the comparison: a missing prefill_from
+    // would make as_i64() None, and None != Some(71) passes vacuously.
+    let prefill_from = after["mlxcache"]["prefill_from"].as_i64();
+    assert!(prefill_from.is_some(), "prefill_from missing: {after}");
+    assert_ne!(
+        prefill_from,
+        Some(71),
+        "the reclaimed 72-token checkpoint must not be resumed: {after}"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn a_settle_whose_header_claims_a_foreign_engine_is_discarded() {
+    // The engine-domain guard: the staged header's engine id must match the
+    // engine that served this request, or a blob from another engine's key
+    // domain would publish into this one's. The lie stamps "llama-cpp" into
+    // the header with the payload untouched. Previously this guard had no
+    // e2e knob — the debt the unit set out to close named three guards and
+    // landed two.
+    let (url, mut child) = spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "engine")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "lie about engine").await;
+    assert_eq!(res["status"], "ok");
+
+    await_settle_publication(&state).await;
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8],
+        "{:?}",
+        blob_coverages(&state)
+    );
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
+#[tokio::test]
+async fn the_identity_lie_targets_one_same_shape_conjunct() {
+    // The same_shape check is a conjunction of six adapter-owned fields; a
+    // lie that swaps all of them proves the branch fires but not that any
+    // SINGLE comparison is live. This drives the cache_layout conjunct —
+    // the one isolating the hybrid engine's KV from a dense model's.
+    let (url, mut child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_SETTLE_LIE", "identity:cache_layout")]).await;
+    let blobs = tempfile::tempdir().unwrap();
+    let state = app_state(&url, &blobs);
+
+    let res = post_prompt(state.clone(), "lie about cache_layout only").await;
+    assert_eq!(res["status"], "ok");
+
+    await_settle_publication(&state).await;
+    assert_eq!(
+        blob_coverages(&state),
+        vec![8],
+        "{:?}",
+        blob_coverages(&state)
+    );
+    assert!(!staging_files(blobs.path()));
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
