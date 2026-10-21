@@ -212,56 +212,7 @@ same path: mlx-lm's `save_prompt_cache`/`load_prompt_cache` are class-generic
 (they record each entry's cache class and rebuild it via `from_state`), so the
 adapter's capture path needs no per-architecture code. Verified
 token-identical on `mlx-community/Falcon-H1-0.5B-Instruct-4bit` (every layer a
-nested `CacheList(ArraysCache, KVCache)`) via the same R1-5 gate. Models
-mlx-lm has no module for are served by their own engine instead; see
-`redacted-engine` below.
-
-### REDACTED-MODEL (`redacted-engine`)
-
-`MLXCACHE_ENGINE=redacted-engine` serves a local `REDACTED-MODEL` NVFP4
-checkpoint (132.6 GB on disk) on one Apple Silicon machine through the same
-daemon, protocol, and store as mlx-lm. The engine is self-contained: the
-architecture port, the NVFP4 weight reader, and the PLE n-gram embedding
-table all live in this repo, and nothing depends on another repository. The
-checkpoint's bundled vision tower and MTP head are out of scope: neither
-contributes cache state.
-
-```bash
-MLXCACHE_ENGINE=redacted-engine \
-MLXCACHE_MODEL=/path/to/REDACTED-MODEL-NVFP4 \
-uv run python -m mlxcache_sidecar.server &
-
-MLXCACHE_MODELS=/path/to/REDACTED-MODEL-NVFP4 \
-MLXCACHE_SIDECAR_URL=http://127.0.0.1:8421 \
-./target/release/mlxcache-daemon
-```
-
-The checkpoint cannot be resident (132.6 GB of weights, 48 GB of RAM), so
-weights stream from disk and residency is a knob: `MLXCACHE_Q4_EXPERT_RESIDENT_N`
-(decoded experts kept per layer, default `0`) and `MLXCACHE_Q4_PLE_CACHE_MB`
-(byte budget for decoded PLE rows, default `512`). The memory accounting, the
-tradeoff each knob buys, and the thrashing failure mode are in
-[`docs/ops.md`](docs/ops.md#qwen38-flash-next-residency-redacted-engine).
-
-Status: the cache integration is the engine-generic path, so identity
-(`engine_id`, `cache_layout`, `content_digest`), persistence, digest checks, and delta
-resume apply unchanged. Measured on the real checkpoint (48 GB machine,
-NVFP4 on disk, no residency): boot 4.6 s, prefill 46.1-76.6 s across 256-8K
-tokens, decode 2.0-2.2 s/token through 2K, checkpoint ≈132 MB fixed GDN recurrent state
-plus ≈58 KB/token. The 2 s resume budget holds: loading a checkpoint takes
-17-90 ms at every measured context, so warm TTFT is dominated by the tokens
-the next turn adds, not by the restore. A served conversation settles a real
-checkpoint and resumes from it (verified end to end over HTTP: prefill 14
-tokens → generate 10 → settle 119 MB covering 25 positions → next turn
-answers from the settled blob without re-prefilling the prompt). The design
-record (scope boundary, checkpoint inventory, batch contracts) is
-[`docs/designs/redacted-engine-engine.md`](docs/designs/redacted-engine-engine.md).
-
-The knob's useful range is narrow and documented in
-[`docs/ops.md`](docs/ops.md#qwen38-flash-next-residency-redacted-engine): a decoded
-expert is three matrices (gate/up/down), and one decode step routes to
-`48 layers x top_k 10` of them, so anything below that working set produces no
-hits at all.
+nested `CacheList(ArraysCache, KVCache)`) via the same R1-5 gate.
 
 ## Wrapper server (mlx-lm, no daemon)
 
@@ -336,14 +287,12 @@ Sidecar:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MLXCACHE_ENGINE` | `synthetic` | `synthetic` (deterministic, no download), `mlx-lm`, or `redacted-engine` (local NVFP4 REDACTED-MODEL checkpoint) |
+| `MLXCACHE_ENGINE` | `synthetic` | `synthetic` (deterministic, no download) or `mlx-lm` |
 | `MLXCACHE_MODEL` | `synthetic-model` | model the sidecar loads (HF repo or local path) |
 | `MLXCACHE_SIDECAR_PORT` | `8421` | sidecar bind port |
 | `MLXCACHE_KV_BITS` | `0` | KV quantization tier: `0` = f16, `8` = q8 — the tier is folded into the fingerprint, so tiers never share blobs. Dense attention models only: a hybrid model (linear attention / SSM / GDN layers — e.g. Falcon-H1, Qwen3-Next, granite-hybrid) is refused at boot with this tier set; its state persists unquantized on the f16 tier |
 | `MLXCACHE_KV_GROUP_SIZE` | `0` | quantization group size; `0` with a nonzero `MLXCACHE_KV_BITS` resolves to `64` |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
-| `MLXCACHE_Q4_EXPERT_RESIDENT_N` | `0` | `redacted-engine` only: decoded experts per layer kept in an LRU. Larger = faster steady-state decode, more RAM |
-| `MLXCACHE_Q4_PLE_CACHE_MB` | `512` | `redacted-engine` only: byte budget for decoded PLE n-gram rows (rows are cached, never the 51.2 GB table) |
 | `MLXCACHE_METAL_CACHE_MB` | `1024` | MLX allocator cache limit; freed buffers beyond it return to the OS instead of pooling |
 | `MLXCACHE_SETTLE_MAX_TOKENS` | `32768` (unset) | cap on a settled checkpoint's token count; an explicit `0` refuses every settle rather than disabling the cap |
 | `MLXCACHE_SETTLE_MAX_BYTES` | `2 GiB` (unset) | cap on a settled checkpoint's payload bytes; an explicit `0` refuses every settle rather than disabling the cap |
@@ -371,10 +320,9 @@ never be quoted as cache-benefit evidence; `bench_prefix.py` is the
 real-engine prefix benchmark (premise-guarded, see
 [docs/benchmarks.md](docs/benchmarks.md)); `bench_wrapper.py`/`qa_wrapper.py`
 drive the wrapper path's own gates; `replay_trace.py` scores captured traces.
-Timing probes live in `sidecar/probes/` — the redacted smoke and context-sweep
-probes, the resume-budget probe, and the lock that serializes them on a
-checkpoint (two probes streaming the same weights measure the filesystem,
-not the model).
+Timing probes live in `sidecar/probes/`: mlx capability, quantized-KV
+persistence, decode A/B, and resume budget — each measures one question the
+cache's claims rest on.
 
 The real mlx-lm round-trip gate (needs a downloaded model) is opt-in:
 
@@ -393,40 +341,6 @@ serialize 20 ms, deserialize <1 ms. Qwen2.5-7B-Instruct-4bit: 57,344 bytes/token
 serialize 526 ms, deserialize <1 ms, prefill 10.2 s. Qwen3-32B-4bit: 262,150
 bytes/token, serialize 203 ms, deserialize 1 ms, prefill 11.1 s. A hit eliminates
 that prefill, and the 2 s TTFT resume budget holds with margin at every size.
-
-REDACTED-MODEL (`redacted-engine`, NVFP4, 48 GB machine, weights streamed from a
-132.6 GB checkpoint, residency `0`): boot 4.6 s; prefill 46.1 s at 256 tokens,
-53.0 s at 1K, 71.6 s at 2K, 76.6 s at 8K; decode 2.0 s/token at 256, 2.2 s at
-2K. Decode at 8K measured 17.3 s/token, which is NOT a clean scaling point: it
-is 7.8x the 2K figure while prefill at 8K is only 1.07x the 2K prefill, and a
-single decode step cannot cost 23% of the whole 8K prefill. That run had 10 GB
-of swap in use, so treat it as machine-state contamination and re-measure
-before quoting a long-context decode number. The re-measurement tool is in
-the tree: `sidecar/probes/redacted_context_sweep.py` measures each context
-length in its own process, refuses to overlap another probe on the checkpoint
-(two probes streaming the same 132.6 GB checkpoint swap the machine and
-measure the filesystem), and self-checks monotonicity, decode-vs-prefill
-ratios, repeatability, and swap growth, refusing a bad run rather than
-labelling it afterward. Checkpoint
-bytes: 132.4 MB at 256 tokens, 174.8 MB at 1K, 231.5 MB at 2K, 571.2 MB at 8K —
-a ≈110 MB fixed floor (36 GDN layers x 3.1 MB float32 recurrent state) plus
-≈58 KB/token. Saving is 0.04-0.12 s and loading 17-90 ms at every size, so the
-2 s resume budget holds up to 8K and is expected to hold at 20K: restore is two
-orders of magnitude under the budget, and the cost of a warm turn is the delta
-tokens the next turn adds.
-
-The design doc's 2 s budget for a 20K context is therefore met on restore. It is
-NOT met on a fully cold 20K prefill, which extrapolates to several minutes from
-the 8K measurement. A cold start of that length has no cache to hit; the budget
-describes a resume.
-
-`MLXCACHE_Q4_EXPERT_RESIDENT_N` measured on the same checkpoint, 16 decode steps
-after a 256-token prefill: `N=16` (157 MB) and `N=128` (1.3 GB) produce zero
-expert hits, `N=480` (4.7 GB) produces 5,931 hits but decodes slower (2.34 vs
-1.65 s/token) because the LRU's bookkeeping and the extra resident memory cost
-more than the 25% of reads it saves. The knob is correct and off by default for
-a reason; it is only worth setting above one decode step's working set
-(`layers x top_k` experts), which is 4.7 GB here.
 
 Restart resume (the claim that matters for a cache): a 19,847-token agent
 context on Qwen2.5-7B-Instruct-4bit goes 34.5 s cold → 1.56 s warm → **1.59 s
@@ -466,10 +380,11 @@ guard. Cache composition is part of every fingerprint (dense KV stack vs.
 hybrid recurrent state), so a payload of one shape is never served as
 another. The store is bounded by default (32 GiB eviction
 budget with anchor protection) and every checkpoint carries a sha256 payload
-digest verified at boot and first serve. The engine-agnostic contract has two
-adapters: mlx-lm, and `redacted-engine` (REDACTED-MODEL NVFP4, self-contained,
-weights streamed from disk). No license assigned — private build, all rights
-reserved.
+digest verified at boot and first serve. The engine-agnostic contract has one
+adapter today (mlx-lm), plus the hermetic synthetic engine the e2e suite
+drives; engine domains are isolated in the key space, so a future adapter
+cannot cross-serve another engine's checkpoints. No license assigned —
+private build, all rights reserved.
 
 The chunk-granularity question is answered: GO, with token-block/64 as the
 v1 codec ([REPORT.md](REPORT.md)).

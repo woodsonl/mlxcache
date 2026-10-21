@@ -40,7 +40,7 @@ JSON header fields `[CURRENT, plus B0.2 additions marked]`:
 | `tokens` | [u32] | the exact token-ID prefix this entry is keyed by `[CURRENT]` |
 | `format_version` | u32 | see §5 `[CURRENT]` |
 | `payload_sha256` | hex string | sha256 of the payload bytes `[CURRENT]` |
-| `engine_id` | string? | e.g. `"mlx-lm"`, `"llama-cpp"`, `"redacted-engine"`; absent ⇒ `"mlx-lm"` `[CURRENT]` |
+| `engine_id` | string? | e.g. `"mlx-lm"`, `"llama-cpp"`; absent ⇒ `"mlx-lm"` `[CURRENT]` |
 | `granularity` | u8? | 0 = `ANY_PREFIX` (default), 1 = `WHOLE_CONTEXT` `[CURRENT]` |
 
 `fingerprint.cache_layout` is a short, stable signature of the model's
@@ -224,9 +224,8 @@ own separator, two engines can never produce the same key for the same model
 and tokens, so a blob written by one engine is unreachable to the other
 regardless of how closely their fingerprints otherwise agree.
 
-Engine registry (maintained here): `"mlx-lm"` (the default),
-`"redacted-engine"` (the self-contained REDACTED-MODEL NVFP4 engine, which
-reports `engine_id = "redacted-engine"`), `"llama-cpp"` (reserved).
+Engine registry (maintained here): `"mlx-lm"` (the default) and
+`"llama-cpp"` (reserved).
 
 ## 5. Versioning
 
