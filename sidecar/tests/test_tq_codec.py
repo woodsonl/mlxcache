@@ -389,6 +389,23 @@ def test_encode_rejects_mismatched_key_value_head_dims():
         encode_cache([layers[0], second], 3, 4, 64)
 
 
+def test_decode_rejects_non_float_kv_dtype():
+    """A frame naming a non-floating dtype would decode into garbage KV
+    rather than erroring; the boundary rejects it before use."""
+    import io
+
+    payload = encode_cache(_cache(1, 20, seed=95), 3, 4, 64)
+    blob = io.BytesIO(payload)
+    blob.name = "x.safetensors"
+    arr, meta = mx.load(blob, return_metadata=True)
+    meta = dict(meta)
+    meta["kv_dtype"] = "uint8"
+    buf = io.BytesIO()
+    mx.save_safetensors(buf, arr, meta)
+    with pytest.raises(ValueError, match="floating dtype"):
+        decode_payload(buf.getvalue())
+
+
 def test_rotation_determinism_across_builds():
     """Same seed -> identical matrix across separate computations (the
     lru_cache hides this from every other test); different seed differs;

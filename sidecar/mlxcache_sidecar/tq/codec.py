@@ -42,6 +42,9 @@ FORMAT = "tq1"
 KEY_BITS_CHOICES = (2, 3, 4)
 VALUE_BITS_CHOICES = (2, 3, 4, 6, 8)
 DEFAULT_GROUP_SIZE = 64
+# The only dtypes a KV cache can hold; a frame naming anything else (uint8,
+# int64, ...) would decode "successfully" into garbage KV.
+FLOAT_DTYPES = ("float16", "bfloat16", "float32")
 
 
 def parse_tier(tier: str) -> tuple[int, int, int]:
@@ -190,7 +193,12 @@ def encode_cache(cache, key_bits: int, value_bits: int, group_size: int) -> byte
         head_dims.add(v.shape[-1])
         # str(dtype) is "mlx.core.float16"; store the bare name so decode can
         # getattr(mx, name) — the same normalization _kv_dtype() applies.
-        dtypes.add(str(k.dtype).replace("mlx.core.", ""))
+        # Floating dtypes only: a frame naming anything else would decode
+        # into garbage KV, so reject here and at the decode boundary.
+        dtype_name = str(k.dtype).replace("mlx.core.", "")
+        if dtype_name not in FLOAT_DTYPES:
+            raise ValueError(f"layer {i} caches in non-float dtype {dtype_name!r}")
+        dtypes.add(dtype_name)
     if len(offsets) != 1 or len(head_dims) != 1 or len(dtypes) != 1:
         raise ValueError(
             "TQ tier requires uniform offset/head_dim/dtype across layers "
@@ -274,8 +282,8 @@ def decode_payload(payload: bytes) -> list:
     if offset < 0:
         raise ValueError(f"frame offset {offset} must be >= 0")
     dtype_name = metadata.get("kv_dtype", "")
-    if not hasattr(mx, dtype_name):
-        raise ValueError(f"frame kv_dtype {dtype_name!r} is not an mlx dtype")
+    if dtype_name not in FLOAT_DTYPES:
+        raise ValueError(f"frame kv_dtype {dtype_name!r} is not a floating dtype")
     dtype = getattr(mx, dtype_name)
 
     rotations = {}

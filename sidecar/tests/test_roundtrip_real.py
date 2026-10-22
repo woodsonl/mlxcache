@@ -748,10 +748,17 @@ def test_tq_tier_divergence_from_scratch_is_real_and_bounded():
         (i for i, (a, b) in enumerate(zip(resumed, scratch, strict=False)) if a != b),
         min(len(resumed), len(scratch)),
     )
+    agree = shared / max(len(resumed), len(scratch), 1)
+    # Floor pinned from measurement on this exact prompt/model/tier (greedy
+    # decode is deterministic, so the run-to-run value is stable): 0.312
+    # measured, 0.125 on shorter variants of the prompt. A codec that
+    # corrupts KV rather than perturbing it lands near 0.0.
+    assert agree >= 0.25, (
+        f"resumed output diverged beyond the documented bound (agreement {agree:.3f})"
+    )
     print(
         f"\n[TQ] divergence record: resumed-vs-scratch shared prefix {shared} "
-        f"of {max(len(resumed), len(scratch))} tokens "
-        f"(agreement {shared / max(len(resumed), len(scratch), 1):.3f})"
+        f"of {max(len(resumed), len(scratch))} tokens (agreement {agree:.3f})"
     )
 
 
