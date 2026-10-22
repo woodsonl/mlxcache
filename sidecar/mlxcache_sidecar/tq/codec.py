@@ -252,14 +252,12 @@ def encode_cache(cache, key_bits: int, value_bits: int, group_size: int) -> byte
     return buf.getvalue()
 
 
-def decode_payload(payload: bytes) -> list:
-    """Rebuild a dense KVCache list from the compressed frame.
-
-    The result is a live, stock cache: offsets set from the tensor shapes,
-    ready for delta prefill. Structural corruption raises the same exception
-    family ``_load_cache_from_payload`` maps to CheckpointRejectedError."""
+def decode_frame(payload: bytes) -> tuple[dict, dict]:
+    """Validated tensors and metadata of a TQ frame, WITHOUT rebuilding a
+    cache — the live tier adopts the compressed tensors directly. Applies
+    every boundary check decode_payload applies, so callers can trust the
+    frame the same way."""
     import mlx.core as mx  # noqa: PLC0415
-    from mlx_lm.models.cache import KVCache  # noqa: PLC0415
 
     blob = io.BytesIO(payload)
     # mx.load infers safetensors from the extension and reads `.name`:
@@ -290,23 +288,46 @@ def decode_payload(payload: bytes) -> list:
     dtype_name = metadata.get("kv_dtype", "")
     if dtype_name not in FLOAT_DTYPES:
         raise ValueError(f"frame kv_dtype {dtype_name!r} is not a floating dtype")
-    dtype = getattr(mx, dtype_name)
+    # Five tensors name each layer (k.idx, k.norm, v.q, v.s, v.b). An EMPTY
+    # set passes a contiguity check trivially and would hand the model a
+    # zero-layer cache (mlx-lm zips layers with the cache, silently skipping
+    # every layer) — reject it as corruption, along with short or
+    # non-contiguous stacks: they fail past the 422 boundary and 500-loop
+    # while the daemon never quarantines them.
+    layer_ids = sorted({int(name.split(".")[1]) for name in arrays if name.startswith("layers.")})
+    if not layer_ids or layer_ids != list(range(len(layer_ids))):
+        raise ValueError(f"frame layer ids are empty or not contiguous from 0: {layer_ids}")
+    meta = {
+        "key_bits": key_bits,
+        "value_bits": value_bits,
+        "group_size": group_size,
+        "offset": offset,
+        "kv_dtype": getattr(mx, dtype_name),
+    }
+    return arrays, meta
+
+
+def decode_payload(payload: bytes) -> list:
+    """Rebuild a dense KVCache list from the compressed frame.
+
+    The result is a live, stock cache: offsets set from the tensor shapes,
+    ready for delta prefill. Structural corruption raises the same exception
+    family ``_load_cache_from_payload`` maps to CheckpointRejectedError."""
+    import mlx.core as mx  # noqa: PLC0415
+    from mlx_lm.models.cache import KVCache  # noqa: PLC0415
+
+    arrays, meta = decode_frame(payload)
+    key_bits = meta["key_bits"]
+    value_bits = meta["value_bits"]
+    group_size = meta["group_size"]
+    offset = meta["offset"]
+    dtype = meta["kv_dtype"]
 
     rotations = {}
     codebooks = {}
-    # Five tensors name each layer (k.idx, k.norm, v.q, v.s, v.b): collect ids
-    # as a set first, or each layer decodes five times. An EMPTY set passes
-    # the contiguity check trivially and would hand the model a zero-layer
-    # cache (mlx-lm zips layers with the cache, silently skipping every
-    # layer) — reject it as corruption.
+    # decode_frame already validated the layer-id set; collect ids once
+    # (each layer contributes five tensor names).
     layer_ids = sorted({int(name.split(".")[1]) for name in arrays if name.startswith("layers.")})
-    if not layer_ids or layer_ids != list(range(len(layer_ids))):
-        # A digest-consistent-but-planted frame could drop layer tensors; a
-        # short, empty, or non-contiguous stack would either IndexError
-        # inside model forward or silently skip layers via mlx-lm's zip —
-        # all past the 422 boundary — and 500 forever while the daemon never
-        # quarantines it. Reject here instead.
-        raise ValueError(f"frame layer ids are empty or not contiguous from 0: {layer_ids}")
     cache = []
     for i in layer_ids:
         k_idx = arrays[f"layers.{i}.k.idx"]

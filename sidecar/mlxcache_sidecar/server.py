@@ -1031,6 +1031,13 @@ class MlxLmEngine:
         # Named persistence tier (TQ codecs): validated for the same reasons
         # and mutually exclusive with the bits tier — see _parse_kv_tier_env.
         self.kv_tier, self._tq_params = _parse_kv_tier_env()
+        # The LIVE variant of a named tier: hold the compressed state as the
+        # engine's own cache (unified-memory savings) instead of compressing
+        # only at capture. Same tier label, same frame format, same
+        # fingerprint — a runtime memory trade, not a new format.
+        self.tq_live = self.kv_tier != "" and os.environ.get("MLXCACHE_TQ_LIVE") == "1"
+        if self.tq_live:
+            self._tq_basis = None  # built after the geometry probe fixes head_dim
         # One cache construction serves BOTH boot checks below. It allocates
         # no arrays (state fills on the first forward), so probing every model
         # — quantized or not — is free. Composition must be signed for EVERY
@@ -1043,6 +1050,19 @@ class MlxLmEngine:
         # layers silently (invalid output, no error) rather than 422.
         self._cache_layer_count = len(probe)
         self._assert_quantization_supported(probe)
+        if self.tq_live:
+            # The live tier's shared basis: one (rotation, codebook) pair per
+            # model, referenced by every layer's cache. The geometry guard
+            # above already materialized the uniform head_dim via its
+            # one-token forward.
+            from mlxcache_sidecar.tq.codebook import lloyd_max_codebook  # noqa: PLC0415
+            from mlxcache_sidecar.tq.rotation import build_rotation  # noqa: PLC0415
+
+            head_dim = probe[0].keys.shape[-1]
+            self._tq_basis = (
+                build_rotation(head_dim),
+                lloyd_max_codebook(head_dim, self._tq_params[0]),
+            )
         self.prefill_count = 0
         # Metal allocator hygiene: MLX pools freed GPU buffers by size-class
         # indefinitely (set_cache_limit defaults high). A day of mixed-leg
@@ -1228,9 +1248,8 @@ class MlxLmEngine:
         """Run tokens through the model filling a fresh prompt cache. Returns
         (cache, last_logits) with the KV state resident and evaluated."""
         import mlx.core as mx  # noqa: PLC0415
-        from mlx_lm.models.cache import make_prompt_cache  # noqa: PLC0415
 
-        cache = make_prompt_cache(self.model)
+        cache = self._new_cache()
         inp = mx.array(tokens)[None]
         logits = self.model(inp, cache=cache)
         mx.eval([c.state for c in cache], logits)
@@ -1246,16 +1265,49 @@ class MlxLmEngine:
 
         The TQ tier decodes its own frame here: the engine's tier and the
         blob's tier always agree (the daemon only routes same-tier blobs —
-        the fingerprint pins it), so the branch is sound. Both branches
-        verify the decoded cache has the layer count THIS model expects: a
-        short list makes mlx-lm zip() skip layers silently instead of
-        erroring."""
+        the fingerprint pins it), so the branch is sound. The LIVE variant
+        adopts the compressed tensors directly (no dequantize-requantize
+        round trip: the resident state IS the frame). Both branches verify
+        the decoded cache has the layer count THIS model expects: a short
+        list makes mlx-lm zip() skip layers silently instead of erroring."""
         cache = None
         if getattr(self, "kv_tier", ""):
-            from mlxcache_sidecar.tq import decode_payload  # noqa: PLC0415
-
             try:
-                cache = decode_payload(payload)
+                if getattr(self, "tq_live", False):
+                    from mlxcache_sidecar.tq.codec import decode_frame  # noqa: PLC0415
+                    from mlxcache_sidecar.tq.live import TurboQuantKVCache  # noqa: PLC0415
+
+                    arrays, meta = decode_frame(payload)
+                    d = arrays["layers.0.v.s"].shape[-1] * meta["group_size"]
+                    basis = (
+                        arrays[f"rot.{d}"],
+                        (
+                            arrays[f"cb.{d}.{meta['key_bits']}"].tolist(),
+                            (),
+                            0.0,
+                        ),
+                    )
+                    kb, vb, g = self._tq_params
+                    cache = []
+                    for i in sorted(
+                        {int(n.split(".")[1]) for n in arrays if n.startswith("layers.")}
+                    ):
+                        c = TurboQuantKVCache(kb, vb, g, basis=basis)
+                        c.adopt_state(
+                            arrays[f"layers.{i}.k.idx"],
+                            arrays[f"layers.{i}.k.norm"],
+                            arrays[f"layers.{i}.v.q"],
+                            arrays[f"layers.{i}.v.s"],
+                            arrays[f"layers.{i}.v.b"],
+                            meta["offset"],
+                            meta["kv_dtype"],
+                            basis,
+                        )
+                        cache.append(c)
+                else:
+                    from mlxcache_sidecar.tq import decode_payload  # noqa: PLC0415
+
+                    cache = decode_payload(payload)
             except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
                 raise CheckpointRejectedError(
                     f"TQ checkpoint failed to decode: {type(exc).__name__}: {exc}"
@@ -1319,6 +1371,13 @@ class MlxLmEngine:
             from mlxcache_sidecar.tq import encode_cache  # noqa: PLC0415
 
             key_bits, value_bits, group_size = self._tq_params
+            if getattr(self, "tq_live", False):
+                # The live cache IS the compressed state: serialize it
+                # directly (byte-identical to encode_cache over the same
+                # token stream — the equality test pins it).
+                from mlxcache_sidecar.tq.live import serialize_live  # noqa: PLC0415
+
+                return serialize_live(cache, key_bits, value_bits, group_size)
             return encode_cache(cache, key_bits, value_bits, group_size)
         from mlx_lm.models.cache import save_prompt_cache  # noqa: PLC0415
 
@@ -1414,7 +1473,19 @@ class MlxLmEngine:
         leaves nothing to settle: the post-generation KV would be unreachable
         from the request that produced it, and settling would be impossible
         without replaying generation.
+
+        The live TQ tier swaps the class: TurboQuantKVCache holds the
+        compressed state as THE cache (unified-memory savings), quantizing at
+        write and dequantizing on read — stock attention, no patches.
         """
+        if getattr(self, "tq_live", False):
+            from mlxcache_sidecar.tq.live import TurboQuantKVCache  # noqa: PLC0415
+
+            kb, vb, g = self._tq_params
+            return [
+                TurboQuantKVCache(kb, vb, g, basis=self._tq_basis)
+                for _ in range(self._cache_layer_count)
+            ]
         from mlx_lm.models.cache import make_prompt_cache  # noqa: PLC0415
 
         return make_prompt_cache(self.model)
