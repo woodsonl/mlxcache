@@ -874,6 +874,7 @@ class SyntheticEngine:
                     "kv_group_size",
                     "kv_layout_version",
                     "cache_layout",
+                    "kv_tier",
                 }
             )
             if lie_field and lie_field not in same_shape_fields:
@@ -1118,11 +1119,17 @@ class MlxLmEngine:
 
     def _assert_quantization_supported(self, cache) -> None:
         """Boot-time guard for the quantized tiers (q8 via kv_bits, TQ via
-        kv_tier): parity is proven for dense attention stacks only. Hybrid
-        caches (CacheList/ArraysCache entries carrying linear-attention /
-        SSM / GDN state) have no ``to_quantized`` and no TQ encoder path,
-        so both tiers would fail on the first prefill; refuse at boot with
-        the fix in the message instead."""
+        kv_tier): parity is proven for dense attention stacks only, and the
+        tier's format constraints must hold for THIS model before the first
+        request — a violation discovered at encode time is a 500 loop on
+        every cache-miss request, not a boot error.
+
+        Hybrid caches (CacheList/ArraysCache entries carrying linear-
+        attention / SSM / GDN state) have no ``to_quantized`` and no TQ
+        encoder path; uniform head_dim divisible by the group size is
+        required by both the TQ frame and mx.quantize. The probe cache
+        allocates no arrays until a forward runs, so one single-token
+        forward materializes the per-layer shapes the checks need."""
         if not self.kv_bits and not getattr(self, "kv_tier", ""):
             return
         from mlx_lm.models.cache import KVCache  # noqa: PLC0415
@@ -1135,6 +1142,38 @@ class MlxLmEngine:
                 "parity-proven for dense models only; hybrid checkpoints "
                 "persist their state unquantized. Restart with "
                 "MLXCACHE_KV_BITS=0 and MLXCACHE_KV_TIER unset."
+            )
+        self._assert_tier_geometry(cache)
+
+    def _assert_tier_geometry(self, cache) -> None:
+        """The tier's SHAPE constraints for this model, via one single-token
+        forward (the probe cache allocates no arrays until a forward runs,
+        so this is what materializes the per-layer head dims). A violation
+        discovered at encode time would be a 500 loop on every cache-miss
+        request; discovered here it is a boot error with the fix in the
+        message.
+
+        Covered by test_engine_registration's boot-refusal tests (real mx,
+        shape-real stubs); the cache-convention suite fakes the whole mlx
+        layer and bypasses this step."""
+        import mlx.core as mx  # noqa: PLC0415
+
+        logits = self.model(mx.array([[0]]), cache=cache)
+        mx.eval([c.state for c in cache], logits)
+        head_dims = {c.keys.shape[-1] for c in cache}
+        if len(head_dims) != 1:
+            raise ValueError(
+                f"A KV quantization tier requires a uniform head_dim across "
+                f"layers; this model mixes {sorted(head_dims)}. Restart with "
+                "MLXCACHE_KV_BITS=0 and MLXCACHE_KV_TIER unset."
+            )
+        d = head_dims.pop()
+        group = self.kv_group_size if self.kv_bits else self._tq_params[2]
+        if d % group:
+            raise ValueError(
+                f"A KV quantization tier is set but this model's head_dim "
+                f"{d} is not divisible by the group size {group}. Restart "
+                "with MLXCACHE_KV_BITS=0 and MLXCACHE_KV_TIER unset."
             )
 
     def _kv_dtype(self) -> str:

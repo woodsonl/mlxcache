@@ -208,8 +208,8 @@ def test_append_stability():
     a = tensors_of(encode_cache(short, 3, 4, 64))
     b = tensors_of(encode_cache(long_, 3, 4, 64))
     for name in a:
-        if name.startswith("rot."):
-            continue
+        if name.startswith(("rot.", "cb.")):
+            continue  # codec constants, not per-token tensors
         # Every per-token tensor carries S on axis 2 (the packed key indices,
         # the norms, and the group-quantized values alike).
         assert bool((a[name][:, :, :120] == b[name][:, :, :120]).all()), f"{name} not append-stable"
@@ -247,6 +247,43 @@ def test_decode_rejects_missing_rotation():
     buf = io.BytesIO()
     mx.save_safetensors(buf, arr, meta)
     with pytest.raises(ValueError, match="rotation"):
+        decode_payload(buf.getvalue())
+
+
+def test_decode_uses_the_frame_codebook_not_a_recomputed_one():
+    """The blob is self-describing: mutating the frame's embedded levels must
+    change the decoded keys. If decode recomputed the codebook this test
+    would fail silently on any future solver drift."""
+    import io
+
+    layers = _cache(1, 20, seed=52)
+    k0, _ = layers[0].state
+    payload = encode_cache(layers, 3, 4, 64)
+    blob = io.BytesIO(payload)
+    blob.name = "x.safetensors"
+    arr, meta = mx.load(blob, return_metadata=True)
+    arr["cb.128.3"] = arr["cb.128.3"] + 0.25  # shift every reconstruction level
+    buf = io.BytesIO()
+    mx.save_safetensors(buf, arr, meta)
+    (out,) = decode_payload(buf.getvalue())
+    k1, _ = out.state
+    assert _cos(k0, k1) < 0.999, "decode ignored the frame's codebook"
+
+
+def test_decode_rejects_a_non_contiguous_layer_set():
+    """A planted frame that drops a layer's tensors must 422 (quarantine),
+    not build a short stack that IndexErrors inside model forward."""
+    import io
+
+    payload = encode_cache(_cache(3, 20, seed=53), 3, 4, 64)
+    blob = io.BytesIO(payload)
+    blob.name = "x.safetensors"
+    arr, meta = mx.load(blob, return_metadata=True)
+    for name in [n for n in arr if n.startswith("layers.1.")]:
+        del arr[name]
+    buf = io.BytesIO()
+    mx.save_safetensors(buf, arr, meta)
+    with pytest.raises(ValueError, match="contiguous"):
         decode_payload(buf.getvalue())
 
 

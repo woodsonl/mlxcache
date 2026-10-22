@@ -102,7 +102,7 @@ def _unpack_indices(words, bits: int, d: int):
 
 
 def encode_keys(keys, codebook, rotation):
-    """(packed_idx u32 [B,H,S,W], norms f16 [B,H,S]) for one layer's keys.
+    """(packed_idx u32 [B,H,S,W], norms f32 [B,H,S]) for one layer's keys.
 
     `codebook` is (levels, boundaries) from ``codebook.lloyd_max_codebook``,
     in u-units (u = √d · coordinate of the rotated unit vector).
@@ -120,7 +120,11 @@ def encode_keys(keys, codebook, rotation):
     y = y * mx.sqrt(float(keys.shape[-1]))  # x-units -> u-units
     b = mx.array(boundaries, dtype=mx.float32)
     idx = (y[..., None] > b).sum(-1).astype(mx.uint32)
-    return _pack_indices(idx, bits), norms.astype(mx.float16)
+    # Norms in f32, not f16: a key whose elements sit near the f16 ceiling
+    # has ||k|| up to ~65504*sqrt(d), which overflows f16 storage and would
+    # reconstruct as inf. The 2 extra bytes per (head, token) are ~1% of the
+    # frame.
+    return _pack_indices(idx, bits), norms.astype(mx.float32)
 
 
 def decode_keys(packed, norms, d: int, codebook, rotation, dtype):
@@ -185,6 +189,12 @@ def encode_cache(cache, key_bits: int, value_bits: int, group_size: int) -> byte
     tensors: dict[str, mx.array] = {}
     rotation = build_rotation(d)
     codebook = lloyd_max_codebook(d, key_bits)
+    levels, _boundaries, _mse = codebook
+    # The codebook LEVELS travel in the frame alongside the rotation: decode
+    # must not recompute them (a future solver change would silently shift
+    # what every existing blob decodes to — the digest still matches, the
+    # KV silently changes). Boundaries are encode-only and stay out.
+    tensors[f"cb.{d}.{key_bits}"] = mx.array(levels, dtype=mx.float32)
     for i, c in enumerate(cache):
         k, v = c.state
         tensors[f"layers.{i}.k.idx"], tensors[f"layers.{i}.k.norm"] = encode_keys(
@@ -220,8 +230,6 @@ def decode_payload(payload: bytes) -> list:
     import mlx.core as mx  # noqa: PLC0415
     from mlx_lm.models.cache import KVCache  # noqa: PLC0415
 
-    from mlxcache_sidecar.tq.codebook import lloyd_max_codebook  # noqa: PLC0415
-
     blob = io.BytesIO(payload)
     # mx.load infers safetensors from the extension and reads `.name`:
     # a bare BytesIO raises AttributeError (the pinned landmine).
@@ -240,6 +248,12 @@ def decode_payload(payload: bytes) -> list:
     # Five tensors name each layer (k.idx, k.norm, v.q, v.s, v.b): collect ids
     # as a set first, or each layer decodes five times.
     layer_ids = sorted({int(name.split(".")[1]) for name in arrays if name.startswith("layers.")})
+    if layer_ids != list(range(len(layer_ids))):
+        # A digest-consistent-but-planted frame could drop layer tensors; a
+        # short or non-contiguous stack would IndexError inside model
+        # forward — past the 422 boundary — and 500 forever while the
+        # daemon never quarantines it. Reject here instead.
+        raise ValueError(f"frame layer ids are not contiguous from 0: {layer_ids}")
     cache = []
     for i in layer_ids:
         k_idx = arrays[f"layers.{i}.k.idx"]
@@ -252,8 +266,16 @@ def decode_payload(payload: bytes) -> list:
             rot_name = f"rot.{d}"
             if rot_name not in arrays:
                 raise ValueError(f"frame carries no rotation for head_dim {d}")
+            # The levels come from the FRAME, never recomputed: the blob is
+            # self-describing even if this process's solver drifts.
+            cb_name = f"cb.{d}.{key_bits}"
+            if cb_name not in arrays:
+                raise ValueError(f"frame carries no codebook for head_dim {d}")
+            levels = arrays[cb_name]
+            if levels.shape != (1 << key_bits,):
+                raise ValueError(f"codebook has {levels.shape[0]} levels for {key_bits} bits")
             rotations[d] = arrays[rot_name]
-            codebooks[d] = lloyd_max_codebook(d, key_bits)
+            codebooks[d] = (levels.tolist(), (), 0.0)
         k = decode_keys(k_idx, norms, d, codebooks[d], rotations[d], dtype)
         v = mx.dequantize(v_q, v_s, v_b, group_size=group_size, bits=value_bits).astype(dtype)
         if k.shape[2] != offset:

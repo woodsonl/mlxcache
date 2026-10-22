@@ -12,7 +12,8 @@ stock `KVCache` at adopt time. The engine never computes attention from
 compressed state — this is the paper's storage-side algorithm, not its
 live-compute path:
 
-- **Keys**: per-(token,head) L2 norm in f16 + a pinned random orthogonal
+- **Keys**: per-(token,head) L2 norm in f32 (f16 storage would overflow on
+  near-ceiling-magnitude keys) + a pinned random orthogonal
   rotation + a Lloyd-Max codebook on the rotated unit-vector coordinates
   (the paper's §3.1, solved for the exact Beta marginal; anchors match the
   paper: b=2 centroids ±0.453/±1.51, Theorem-1 MSE 0.36/0.117/0.03/0.009),
