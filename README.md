@@ -124,6 +124,19 @@ serving from scratch. `GET /healthz` is a dependency-free liveness probe
 
 ## Storage: integrity, quarantine, and eviction
 
+The store is CHUNKED by default (v0.7.0): a published checkpoint is a
+header-only file plus a content-addressed chunk manifest, with chunks
+packed into shared 64 MiB segments. The token-block/64 codec makes a
+shared token prefix yield byte-identical chunks, so a growing conversation
+pays for each turn's NEW tokens instead of re-storing its whole history —
+measured 2.2x on a 5-turn 7B conversation
+([docs/designs/../../REPORT.md](REPORT.md), the GO record). Every reader
+reassembles and verifies the same payload sha256, so corruption retires a
+chunked blob exactly like a whole-blob flip; a chunk leaves disk only when
+no live checkpoint references it.  on the daemon
+publishes whole-blob v2 instead (both layouts coexist and stay readable
+forever).
+
 Every published hit writes one KV checkpoint ("blob") — a safetensors payload
 behind a JSON header — to its own `{hash}-{generation}.ckpt` file, written to
 a temp name and atomically renamed. Blobs survive restarts; the daemon
@@ -285,6 +298,7 @@ Daemon:
 | `MLXCACHE_EVICT_MAX_BYTES` | 32 GiB | store byte budget, on by default — see [Storage](#storage-integrity-quarantine-and-eviction); `0` = unbounded |
 | `MLXCACHE_EVICT_MAX_ENTRIES` | `0` | entry cap on top of the byte budget; `0` = none |
 | `MLXCACHE_EVICT_ANCHOR_WINDOW_S` | `900` | how recently a checkpoint must have served to stay an eviction-protected anchor |
+| `MLXCACHE_CHUNK_STORE` | `1` | `0` publishes whole-blob v2 instead of chunked v3 (rollback knob). The chunked store dedups shared prefixes at the chunk level — the measured 2.2× on a 5-turn 7B conversation — with the same sha256 integrity contract over reassembled payloads; both layouts coexist in one directory and every reader handles both |
 
 Sidecar:
 

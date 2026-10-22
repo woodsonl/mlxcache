@@ -2,6 +2,40 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.7.0 — 2026-10-22
+
+### Added
+
+- **The chunked dedup store** (format_version 3): REPORT.md's GO decision
+  shipped. Blobs publish as a header-only `.ckpt` plus a chunk manifest and
+  content-addressed chunks packed into 64 MiB segments; the token-block/64
+  codec (identity = sha256 over the per-head slice concatenation per
+  64-position block) makes a shared token prefix produce byte-identical
+  chunks, so a growing conversation stores each prior turn's KV once.
+  Measured on Qwen2.5-7B-Instruct-4bit over a 5-turn conversation
+  (`scripts/dedup/chunk_e2e_real.py`): **2.2× dedup** (114.5 MB of logical
+  payloads in 52.2 MB of segments), 4/4 partial hits, byte-exact resume.
+  D1 integrity is unchanged: every reader reassembles and verifies the same
+  payload sha256 — corruption in a manifest or segment retires the blob
+  exactly like a whole-blob bit flip. Refcounts are derived at boot from
+  live checkpoint/manifest pairs; a chunk leaves disk only at refcount 0
+  (all-dead segments GC after eviction removals); crash orphans between the
+  manifest and checkpoint renames are reclaimed deterministically.
+- **Cross-language reader** (`mlxcache_store.chunks`): the sidecar adopts
+  chunked blobs through reassembly inside the same trust boundary (a bad
+  chunk is a 422 quarantine, not a 500), and the L1 store verifies them at
+  open and fetch. One chunk-format writer per directory (the daemon);
+  Python publishers stay whole-blob v2 and both layouts coexist
+  indefinitely. A committed fixture written by the Rust writer round-trips
+  through the Python reader — the format's cross-language pin.
+- **Eviction sees chunked bytes**: v3 blobs are ~500-byte headers, so the
+  reaper now sizes them by their manifest's chunk bytes (unique per blob
+  for ordering) plus the store's shared segment/manifest overhead counted
+  once per pass, and GCs dead segments after removals so the byte budget
+  actually falls.
+- `MLXCACHE_CHUNK_STORE=0` on the daemon rolls back to whole-blob v2
+  publication (both layouts stay readable).
+
 ## 0.6.0 — 2026-10-22
 
 ### Added
