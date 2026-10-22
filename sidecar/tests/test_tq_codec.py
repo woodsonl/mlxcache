@@ -438,7 +438,26 @@ def test_decode_rejects_key_value_shape_disagreement():
         arr[name] = arr[name][:, :, :18, ...]  # values claim 18 positions, offset 20
     buf = io.BytesIO()
     mx.save_safetensors(buf, arr, meta)
-    with pytest.raises(ValueError, match="cover the claimed offset|shapes disagree"):
+    with pytest.raises(ValueError, match="cover the claimed offset"):
+        decode_payload(buf.getvalue())
+
+
+def test_decode_rejects_value_leading_shape_disagreement():
+    """The shape-disagreement branch of the same boundary: values PADDED past
+    the keys' sequence length pass the coverage check and must die on the
+    leading-shape comparison instead (a regression here would let a planted
+    frame through to a broadcast failure inside model forward)."""
+    import io
+
+    payload = encode_cache(_cache(1, 20, seed=99), 3, 4, 64)
+    blob = io.BytesIO(payload)
+    blob.name = "x.safetensors"
+    arr, meta = mx.load(blob, return_metadata=True)
+    for name in ("layers.0.v.q", "layers.0.v.s", "layers.0.v.b"):
+        arr[name] = mx.pad(arr[name], [(0, 0), (0, 0), (0, 2), (0, 0)])  # 22 vs keys' 20
+    buf = io.BytesIO()
+    mx.save_safetensors(buf, arr, meta)
+    with pytest.raises(ValueError, match="shapes disagree"):
         decode_payload(buf.getvalue())
 
 

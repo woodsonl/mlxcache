@@ -145,7 +145,7 @@ Measured (Qwen2.5-7B, 2,000-token prefix, 32 decode tokens,
 | | f16 cache | live tq-k4v4-g64 | trade |
 |---|---:|---:|---|
 | resident KV | 117.4 MB | 32.1 MB | **3.66x smaller** |
-| decode speed | 48.8 tok/s | 41.2 tok/s | 0.843x (18% slower) |
+| decode throughput | 48.8 tok/s | 41.2 tok/s | 0.843x (16% fewer tokens/s; equivalently ~1.19x the per-token latency) |
 
 That is the paper's own hybrid-decode caveat, quantified on Metal: the
 per-step dequant costs real compute, bought back as unified memory. Capacity

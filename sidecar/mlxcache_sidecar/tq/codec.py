@@ -316,6 +316,14 @@ def decode_frame(payload: bytes) -> tuple[dict, dict]:
         # IndexError on the first live append — past the 422 boundary.
         if k_idx.ndim != 4 or v_q.ndim != 4 or norms.ndim != 3:
             raise ValueError(f"layer {i} tensor ranks are wrong")
+        # Scale/bias pair must be rank-4, identical to each other, and share
+        # the packed values' leading axes: the live path stores them raw and
+        # only touches them inside the model forward, where a mismatch is a
+        # 500 loop instead of a 422 quarantine.
+        if v_s.ndim != 4 or v_b.ndim != 4 or v_s.shape != v_b.shape:
+            raise ValueError(f"layer {i} value scale/bias tensors disagree")
+        if v_s.shape[:3] != v_q.shape[:3]:
+            raise ValueError(f"layer {i} value scale/bias leading axes disagree with v.q")
         if min(k_idx.shape[2], norms.shape[2], v_q.shape[2], v_s.shape[2], v_b.shape[2]) < offset:
             raise ValueError(f"layer {i} tensors do not cover the claimed offset {offset}")
         if k_idx.shape[:3] != v_q.shape[:3] or norms.shape[:3] != v_q.shape[:3]:
@@ -356,6 +364,9 @@ def frame_basis(arrays: dict, meta: dict):
     rot_name, cb_name = f"rot.{d}", f"cb.{d}.{meta['key_bits']}"
     if rot_name not in arrays or cb_name not in arrays:
         raise ValueError(f"frame carries no rotation/codebook for head_dim {d}")
+    rotation = arrays[rot_name]
+    if rotation.ndim != 2 or rotation.shape != (d, d):
+        raise ValueError(f"frame rotation is not [{d},{d}]: {tuple(rotation.shape)}")
     levels = arrays[cb_name]
     if levels.shape != (1 << meta["key_bits"],):
         raise ValueError(f"codebook has {levels.shape[0]} levels for {meta['key_bits']} bits")
@@ -363,7 +374,7 @@ def frame_basis(arrays: dict, meta: dict):
     boundaries = tuple(
         (a + b) / 2.0 for a, b in zip(level_values[:-1], level_values[1:], strict=True)
     )
-    return arrays[rot_name], (level_values, boundaries, 0.0)
+    return rotation, (level_values, boundaries, 0.0)
 
 
 def decode_payload(payload: bytes) -> list:
