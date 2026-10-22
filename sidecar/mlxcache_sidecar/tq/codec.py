@@ -191,14 +191,15 @@ def encode_cache(cache, key_bits: int, value_bits: int, group_size: int) -> byte
         # it here (uniform across layers and equal to each other).
         head_dims.add(k.shape[-1])
         head_dims.add(v.shape[-1])
-        # str(dtype) is "mlx.core.float16"; store the bare name so decode can
-        # getattr(mx, name) — the same normalization _kv_dtype() applies.
-        # Floating dtypes only: a frame naming anything else would decode
-        # into garbage KV, so reject here and at the decode boundary.
-        dtype_name = str(k.dtype).replace("mlx.core.", "")
-        if dtype_name not in FLOAT_DTYPES:
-            raise ValueError(f"layer {i} caches in non-float dtype {dtype_name!r}")
-        dtypes.add(dtype_name)
+        # One dtype for keys AND values per layer: the frame records a single
+        # kv_dtype, so a mixed f16-key/f32-value cache would silently downcast
+        # the values at decode. Record the KEY dtype (the one decode round-
+        # trips first) and require the value dtype to agree with it.
+        for name, tensor in (("key", k), ("value", v)):
+            dtype_name = str(tensor.dtype).replace("mlx.core.", "")
+            if dtype_name not in FLOAT_DTYPES:
+                raise ValueError(f"layer {i} {name}s cache in non-float dtype {dtype_name!r}")
+            dtypes.add(dtype_name)
     if len(offsets) != 1 or len(head_dims) != 1 or len(dtypes) != 1:
         raise ValueError(
             "TQ tier requires uniform offset/head_dim/dtype across layers "

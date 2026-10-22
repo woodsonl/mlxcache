@@ -406,6 +406,21 @@ def test_decode_rejects_non_float_kv_dtype():
         decode_payload(buf.getvalue())
 
 
+def test_encode_rejects_mixed_key_value_dtypes():
+    """A single kv_dtype field in the frame means a mixed f16-key/f32-value
+    cache would silently downcast the values at decode; refuse it."""
+    from mlx_lm.models.cache import KVCache  # noqa: PLC0415
+
+    layers = _cache(1, 20, seed=96)
+    other = _cache(1, 20, seed=97)[0]
+    k2, _ = other.state
+    v2 = other.state[1].astype(mx.float32)
+    second = KVCache()
+    second.state = (k2.astype(mx.float16), v2)
+    with pytest.raises(ValueError, match="uniform"):
+        encode_cache([layers[0], second], 3, 4, 64)
+
+
 def test_rotation_determinism_across_builds():
     """Same seed -> identical matrix across separate computations (the
     lru_cache hides this from every other test); different seed differs;
