@@ -349,9 +349,7 @@ impl Orchestrator {
         // slack (dead bytes awaiting GC) + shared chunks already counted in
         // one blob but resident regardless. Counted ONCE per pass, from the
         // store's physical truth.
-        if let Some(chunked_overhead) = persistence.chunked_overhead_bytes() {
-            total_bytes += chunked_overhead;
-        }
+        total_bytes += persistence.chunked_overhead_bytes();
         // Entry-cap semantics at the PASS level: `max_entries` is a hard cap,
         // 0 = allow zero published entries (evict everything evictable). The
         // "0 disables the knob" convention lives at the env layer (main.rs

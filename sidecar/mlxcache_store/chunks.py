@@ -46,15 +46,14 @@ class ChunkFormatError(ValueError):
     corruption taxonomy as a whole-blob digest mismatch."""
 
 
-def read_manifest(blob_path: str | Path) -> tuple[Path, Manifest]:
-    """The manifest for a v3 blob: (.ckm path, parsed manifest)."""
-    path = Path(blob_path)
-    ckm = path.with_suffix(".ckm")
+def read_manifest(blob_path: str | Path) -> Manifest:
+    """The parsed .ckm manifest for a v3 blob."""
+    ckm = Path(blob_path).with_suffix(".ckm")
     try:
         data = ckm.read_bytes()
     except OSError as exc:
         raise ChunkFormatError(f"chunk manifest unreadable: {exc}") from exc
-    return ckm, Manifest.decode(data)
+    return Manifest.decode(data)
 
 
 class ChunkRef:
@@ -159,25 +158,24 @@ class ChunkReader:
         # Read every needed segment region while the file is open — one
         # open per segment, no long-lived handles (the reader can sit on a
         # serving thread).
-        by_segment: dict[str, list[tuple[int, int]]] = {}
+        by_segment: dict[str, list[tuple[bytes, int, int]]] = {}
         for c in manifest.chunks:
             where = placement.get(c.digest)
             if where is None:
                 raise ChunkFormatError(f"chunk {c.digest[:8].hex()} missing from the store")
             name, offset, body_len = where
-            by_segment.setdefault(name, []).append((offset, body_len))
-        bodies: dict[tuple[str, int], bytes] = {}
+            by_segment.setdefault(name, []).append((c.digest, offset, body_len))
+        bodies: dict[bytes, bytes] = {}
         for name, regions in by_segment.items():
             with open(self.dir / "chunks" / name, "rb") as fh:
-                for offset, body_len in regions:
+                for digest, offset, body_len in regions:
                     fh.seek(offset)
                     body = fh.read(body_len)
                     if len(body) != body_len:
                         raise ChunkFormatError("segment truncated under a live chunk")
-                    bodies[(name, offset)] = body
+                    bodies[digest] = body
         for c in manifest.chunks:
-            name, offset, _len = placement[c.digest]
-            body = bodies[(name, offset)]
+            body = bodies[c.digest]
             for h in range(c.n_heads):
                 dst = c.first_off + h * c.head_stride
                 out[dst : dst + c.per_head_len] = body[
@@ -189,7 +187,7 @@ class ChunkReader:
         """The verified payload for a v3 blob: manifest + reassembly + the
         D1 digest check (never skipped — a v3 header without a digest is
         corrupt, same rule as v2)."""
-        _ckm, manifest = read_manifest(blob_path)
+        manifest = read_manifest(blob_path)
         payload = self.reassemble(manifest)
         if expected_sha256 is None:
             raise ChunkFormatError("format version 3 requires payload_sha256")
@@ -201,13 +199,12 @@ class ChunkReader:
         return payload
 
 
-def is_chunked_blob(header_bytes: bytes) -> bool:
-    """Peek a decoded CheckpointMeta's format_version without importing the
-    sidecar module (used by store.py's open scan before blob decode)."""
-    try:
-        import json
+def read_payload_v3(blob_dir: str | Path, blob_path: str | Path, expected_sha256: str) -> bytes:
+    """The verified payload of one v3 blob, from its store directory.
 
-        meta = json.loads(header_bytes)
-        return meta.get("format_version") == 3
-    except (ValueError, AttributeError):
-        return False
+    The single v3 read path: both the sidecar's checkpoint boundary and the
+    L1 store's open/fetch call this, so reassembly, the digest contract,
+    and the ChunkFormatError taxonomy have exactly one implementation per
+    language.
+    """
+    return ChunkReader(blob_dir).read_payload(blob_path, expected_sha256)

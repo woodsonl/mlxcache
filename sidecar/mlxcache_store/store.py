@@ -196,11 +196,11 @@ class Store:
             meta, payload = blob.decode(raw)
         except ValueError as exc:
             raise CorruptCache(getattr(exc, "kind", "header"), f"{ref}: {exc}") from exc
-        if meta.format_version == 3:
-            from .chunks import ChunkFormatError, ChunkReader  # noqa: PLC0415
+        if meta.format_version == blob.FORMAT_VERSION_CHUNKED:
+            from .chunks import ChunkFormatError, read_payload_v3  # noqa: PLC0415
 
             try:
-                return ChunkReader(self.dir).read_payload(path, meta.payload_sha256)
+                return read_payload_v3(self.dir, path, meta.payload_sha256)
             except ChunkFormatError as exc:
                 raise CorruptCache("digest", f"{ref}: {exc}") from exc
         if meta.payload_sha256 is None:

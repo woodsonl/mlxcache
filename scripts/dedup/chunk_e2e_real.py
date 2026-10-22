@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -60,7 +61,7 @@ def main() -> int:
         [f"{REPO}/.venv/bin/python", "-m", "mlxcache_sidecar.server"],
         cwd=REPO,
         env={
-            **__import__("os").environ,
+            **os.environ,
             "MLXCACHE_ENGINE": "mlx-lm",
             "MLXCACHE_MODEL": args.model,
             "MLXCACHE_SIDECAR_PORT": str(sc_port),
@@ -73,7 +74,7 @@ def main() -> int:
         [f"{REPO}/target/release/mlxcache-daemon"],
         cwd=REPO,
         env={
-            **__import__("os").environ,
+            **os.environ,
             "MLXCACHE_MODELS": args.model,
             "MLXCACHE_SIDECAR_URL": f"http://127.0.0.1:{sc_port}",
             "MLXCACHE_BLOBS": blobs,
@@ -121,7 +122,7 @@ def main() -> int:
         logical = 0
         ckpts = list(d.glob("*.ckpt"))
         for ckm in d.glob("*.ckm"):
-            logical += read_manifest(ckm)[1].payload_len
+            logical += read_manifest(ckm).payload_len
         seg_bytes = sum(p.stat().st_size for p in (d / "chunks").glob("*.seg"))
         print(
             json.dumps(

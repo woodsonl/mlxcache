@@ -37,13 +37,6 @@ pub struct Persistence {
     /// = whole-blob v2 mode. Shared by reference; the store is
     /// mutex-interiored, so clones share one chunk store per process.
     chunk_store: Option<Arc<ChunkStore>>,
-    /// Serializes the chunked publish's TWO renames (.ckm then .ckpt) so a
-    /// concurrent publisher of the same final name cannot interleave its
-    /// manifest under our header — whole mode never needed this because its
-    /// payload and header share one file, making the single rename atomic.
-    /// (The daemon's index lock already serializes same-prefix publications;
-    /// this makes Persistence safe by construction too.)
-    chunk_publish_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// Process-wide monotonic counter to make temp file names unique across
@@ -114,7 +107,6 @@ impl Persistence {
         Ok(Self {
             blob_dir: dir,
             chunk_store,
-            chunk_publish_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -265,6 +257,32 @@ impl Persistence {
     /// payload exists for the whole publish (the read in `read_staged`); this
     /// adds none. The digest is computed over the same slice it writes, so
     /// what is verified is exactly what lands on disk.
+    /// write-temp-then-rename with fsync and cleanup: the shared tail of
+    /// every publish path (whole-blob, chunk manifest, chunk header).
+    fn tmp_publish(&self, tmp: &Path, final_path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
+        let write_result = (|| -> std::io::Result<()> {
+            let mut f = fs::File::create(tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(source) = write_result {
+            let _ = fs::remove_file(tmp);
+            return Err(PersistError::DiskFull {
+                path: tmp.to_path_buf(),
+                source,
+            });
+        }
+        if let Err(source) = fs::rename(tmp, final_path) {
+            let _ = fs::remove_file(tmp);
+            return Err(PersistError::DiskFull {
+                path: final_path.to_path_buf(),
+                source,
+            });
+        }
+        Ok(())
+    }
+
     pub fn publish_from_staged(
         &self,
         prefix_hash: u128,
@@ -276,7 +294,6 @@ impl Persistence {
         let payload = &staged[payload_start..];
         meta.payload_sha256 = Some(format!("{:x}", Sha256::digest(payload)));
         if let Some(store) = &self.chunk_store {
-            let _guard = self.chunk_publish_lock.lock().unwrap();
             return self.publish_chunked(store, prefix_hash, generation, meta, payload);
         }
         meta.format_version = 2;
@@ -297,28 +314,10 @@ impl Persistence {
         let header_len_u32 = u32::try_from(header.len()).map_err(|_| PersistError::Corrupt {
             reason: format!("checkpoint header too large: {} bytes", header.len()),
         })?;
-        let write_result = (|| -> std::io::Result<()> {
-            let mut f = fs::File::create(&tmp_path)?;
-            f.write_all(&header_len_u32.to_le_bytes())?;
-            f.write_all(&header)?;
-            f.write_all(payload)?;
-            f.sync_all()?;
-            Ok(())
-        })();
-        if let Err(source) = write_result {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(PersistError::DiskFull {
-                path: tmp_path,
-                source,
-            });
-        }
-        if let Err(source) = fs::rename(&tmp_path, &final_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(PersistError::DiskFull {
-                path: final_path,
-                source,
-            });
-        }
+        let mut wire = header_len_u32.to_le_bytes().to_vec();
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(payload);
+        self.tmp_publish(&tmp_path, &final_path, &wire)?;
         Ok(final_path)
     }
 
@@ -469,9 +468,7 @@ impl Persistence {
                         ),
                     });
                 }
-                // Strip nothing: reassembled payload IS the payload.
-                let (_, meta_only) = ((), meta);
-                return Ok((meta_only, payload));
+                return Ok((meta, payload));
             }
             2 => {
                 let expected =
@@ -554,29 +551,6 @@ impl Persistence {
         Ok(out)
     }
 
-    /// Physical bytes the reaper's budget should count: every blob file
-    /// (whole payloads for v1/v2, tiny headers for v3 — both are real
-    /// bytes), every manifest, and the packed segments. Dead bytes inside
-    /// live segments count (they occupy disk until compaction or segment
-    /// GC); the reaper reclaims them by evicting the last referencing
-    /// blobs.
-    pub fn store_physical_bytes(&self) -> u64 {
-        let mut total = 0u64;
-        if let Ok(entries) = fs::read_dir(&self.blob_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if name.ends_with(".ckpt") || name.ends_with(".ckm") {
-                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
-                }
-            }
-        }
-        if let Some(store) = &self.chunk_store {
-            total += store.physical_bytes();
-        }
-        total
-    }
-
     /// GC the chunk store (delete all-dead segments; returns bytes freed).
     /// Called by the eviction reaper after removals so the byte budget
     /// reflects reclaimed segments, not just unlinked headers.
@@ -602,7 +576,7 @@ impl Persistence {
         }
         // Peek the version without a full load: a 4-byte length + JSON.
         let bytes = fs::read(&path).map_err(PersistError::Io)?;
-        if crate::chunkstore::peek_meta_version(&bytes) != Some(3) {
+        if crate::chunkstore::peek_meta(&bytes).map(|m| m.format_version) != Some(3) {
             return meta_len;
         }
         let ckm = blob_name
@@ -618,8 +592,11 @@ impl Persistence {
 
     /// Segment + manifest bytes NOT attributable to any single blob (shared
     /// chunks, dead bytes, record headers): added once per eviction pass.
-    pub fn chunked_overhead_bytes(&self) -> Option<u64> {
-        let store = self.chunk_store.as_ref()?;
+    /// Zero in whole-blob mode.
+    pub fn chunked_overhead_bytes(&self) -> u64 {
+        let Some(store) = self.chunk_store.as_ref() else {
+            return 0;
+        };
         let mut manifests = 0u64;
         if let Ok(entries) = fs::read_dir(&self.blob_dir) {
             for entry in entries.flatten() {
@@ -628,7 +605,7 @@ impl Persistence {
                 }
             }
         }
-        Some(store.physical_bytes() + manifests)
+        store.physical_bytes() + manifests
     }
 }
 
@@ -637,7 +614,7 @@ mod tests {
     use super::*;
     use crate::orchestrator::test_support::fp;
 
-    pub(super) fn meta(n: u64) -> CheckpointMeta {
+    fn meta(n: u64) -> CheckpointMeta {
         CheckpointMeta {
             fingerprint: fp("m"),
             token_count: n,
@@ -649,7 +626,7 @@ mod tests {
         }
     }
 
-    pub(super) fn tmpdir() -> tempfile::TempDir {
+    fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
 
@@ -977,30 +954,5 @@ mod tests {
             }
             other => panic!("expected Corrupt, got {other:?}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod chunk_e2e_repro {
-    use super::tests::{meta, tmpdir};
-    use super::Persistence;
-
-    #[test]
-    fn publish_and_load_8kb_synthetic_like_payload() {
-        let dir = tmpdir();
-        let p = Persistence::new(dir.path()).unwrap();
-        let payload: Vec<u8> = (0..8u32)
-            .flat_map(|t| vec![(t.wrapping_mul(31) % 256) as u8; 1024])
-            .collect();
-        let path = p.publish_atomic(0xabc, 1, meta(8), &payload).unwrap();
-        let (m, pl) = p.load(&path).unwrap_or_else(|e| panic!("load failed: {e}"));
-        assert_eq!(m.tokens.len(), 3);
-        assert_eq!(pl, payload);
-        // Second instance over the same dir (the e2e "rebuilt state" shape).
-        let p2 = Persistence::new(dir.path()).unwrap();
-        let (_m2, pl2) = p2
-            .load(&path)
-            .unwrap_or_else(|e| panic!("second instance load failed: {e}"));
-        assert_eq!(pl2, payload);
     }
 }

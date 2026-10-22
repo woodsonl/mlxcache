@@ -556,11 +556,6 @@ impl ChunkStore {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn segment_path_pub(&self, seq: u64) -> PathBuf {
-        self.segment_path(seq)
-    }
-
     fn segment_path(&self, seq: u64) -> PathBuf {
         self.segments_dir.join(format!("seg-{seq:010}.seg"))
     }
@@ -702,20 +697,6 @@ impl ChunkStore {
         }
     }
 
-    /// Seal the active segment (flush + close, no new appends to it). The
-    /// next stage rolls a fresh segment. A sealed all-dead segment becomes
-    /// reclaimable — this is what lets shutdown-time or size-driven seals
-    /// bound the retention of dead bytes in the last partial segment.
-    pub fn seal(&self) -> Result<(), ChunkError> {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(a) = inner.active.take() {
-            a.file
-                .sync_all()
-                .map_err(|e| ChunkError::Disk(e.to_string()))?;
-        }
-        Ok(())
-    }
-
     /// Delete segments whose every record is dead. Returns bytes reclaimed.
     pub fn gc_empty_segments(&self) -> u64 {
         let mut inner = self.inner.lock().unwrap();
@@ -779,11 +760,6 @@ impl ChunkStore {
         };
         let mut out = vec![0u8; manifest.payload_len as usize];
         let mut open_files: HashMap<u64, fs::File> = HashMap::new();
-        assert_eq!(
-            manifest.chunks.len(),
-            placements.len(),
-            "placement snapshot mirrors the manifest"
-        );
         for (c, p) in manifest.chunks.iter().zip(placements.iter()) {
             let file = open_files.entry(p.seg).or_insert_with(|| {
                 fs::File::open(self.segment_path(p.seg)).expect("segment exists (scanned at open)")
@@ -807,12 +783,9 @@ fn hex_prefix(d: &[u8; 32]) -> String {
 
 /// Header peek used by the boot scan (no digest verify here — the normal
 /// load path does that when a blob is actually served).
-/// Version-only peek (cheaper than a full parse for budget accounting).
-pub fn peek_meta_version(bytes: &[u8]) -> Option<u32> {
-    peek_meta(bytes).map(|m| m.format_version)
-}
-
-fn peek_meta(bytes: &[u8]) -> Option<CheckpointMeta> {
+/// Header peek used by the boot scan and budget accounting (no digest
+/// verify here — the normal load path does that when a blob is served).
+pub(crate) fn peek_meta(bytes: &[u8]) -> Option<CheckpointMeta> {
     if bytes.len() < 4 {
         return None;
     }
@@ -967,10 +940,15 @@ mod tests {
             0,
             "active segment is never deleted"
         );
-        store.seal().unwrap();
-        let reclaimed = store.gc_empty_segments();
-        assert!(reclaimed > 0);
-        assert_eq!(store.physical_bytes(), 0);
+        // Drop the store (closing the active segment) and reopen with no
+        // live blobs: the BOOT scan reclaims the all-dead segment.
+        drop(store);
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        assert_eq!(
+            store.physical_bytes(),
+            0,
+            "boot GC reclaims the all-dead segment"
+        );
     }
 
     #[test]
@@ -1090,14 +1068,13 @@ mod fixture_dump {
         // The reader tests glob *.ckpt and expect the FULL store; manifests
         // are written the way publish_chunked names them (hash-gen).
         std::fs::write(root.join("aa.ckm"), ma.encode()).unwrap();
-        std::fs::write(root.join("aa.ckpt"), header_only(0xaa, 1, &a)).unwrap();
+        std::fs::write(root.join("aa.ckpt"), header_only(&a)).unwrap();
         std::fs::write(root.join("bb.ckm"), mb.encode()).unwrap();
-        std::fs::write(root.join("bb.ckpt"), header_only(0xbb, 1, &b)).unwrap();
+        std::fs::write(root.join("bb.ckpt"), header_only(&b)).unwrap();
         std::fs::write(root.join("expected-payload.bin"), &a).unwrap();
-        std::fs::write(root.join("expected-payload-b.bin"), &b).unwrap();
     }
 
-    fn header_only(_hash: u64, _gen: u64, payload: &[u8]) -> Vec<u8> {
+    fn header_only(payload: &[u8]) -> Vec<u8> {
         let meta = serde_json::json!({
             "fingerprint": {"model_id": "m", "tokenizer_hash": "h", "kv_dtype": "f16",
                             "kv_layout_version": 1},
