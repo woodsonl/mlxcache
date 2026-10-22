@@ -14,15 +14,15 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   decode rebuilds a stock `KVCache`, so the engine never computes attention
   from compressed state. Measured on Qwen2.5-7B-Instruct-4bit
   ([docs/designs/tq-tier.md](docs/designs/tq-tier.md)): tq-k4v4-g64 stores
-  15,508 B/token (3.79x vs f16, per-layer cos 0.992) and strictly dominates
-  the plain q4 bits tier (16,138 B/token, 3.64x, 0.990); tq-k3v2-g64 reaches
-  10,580 B/token (5.55x) at cos 0.885; TQ decode at adopt is faster than the
-  f16 load (6.5 ms vs 11.1 ms at 1,500 tokens).
+  15,732 B/token (3.64x vs f16, per-layer cos 0.992) and strictly dominates
+  the plain q4 bits tier (16,138 B/token, 3.55x, 0.990); tq-k3v2-g64 reaches
+  10,804 B/token (5.31x) at cos 0.885; TQ decode at adopt is faster than the
+  f16 load (11.4 ms vs 14.3 ms at 1,500 tokens, both fully materialized).
 - **The bounded-distortion correctness class** for named tiers
   ([docs/contract-spec.md](docs/contract-spec.md) "Tier correctness
   classes"): same blob resumed twice is token-identical, per-layer fidelity
   floors are pinned by the real gate, divergence from scratch is documented
-  (greedy agreement 0.17/0.02/0.00 at k3v4), and the tier is
+  (greedy agreement 0.062/0.062/0.042 at k3v4), and the tier is
   fingerprint-isolated so a lossy blob can never serve an f16/q8 identity.
   Opt-in only; no default selects a tier.
 - **`kv_tier` fingerprint axis** through every binding: the daemon's
