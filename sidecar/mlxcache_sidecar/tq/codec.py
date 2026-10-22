@@ -297,14 +297,50 @@ def decode_frame(payload: bytes) -> tuple[dict, dict]:
     layer_ids = sorted({int(name.split(".")[1]) for name in arrays if name.startswith("layers.")})
     if not layer_ids or layer_ids != list(range(len(layer_ids))):
         raise ValueError(f"frame layer ids are empty or not contiguous from 0: {layer_ids}")
+    # Per-layer structural checks, run for EVERY consumer (the dense decode
+    # path and the live adopt path alike): tensors must cover the claimed
+    # offset, key and value tensors must agree on (batch, heads, sequence),
+    # and the packed widths must match the declared bits. Without these a
+    # planted frame either silently clamps to a short history or explodes
+    # inside model forward — past the 422 boundary, unretired.
+    for i in layer_ids:
+        k_idx = arrays.get(f"layers.{i}.k.idx")
+        norms = arrays.get(f"layers.{i}.k.norm")
+        v_q = arrays.get(f"layers.{i}.v.q")
+        v_s = arrays.get(f"layers.{i}.v.s")
+        v_b = arrays.get(f"layers.{i}.v.b")
+        if any(x is None for x in (k_idx, norms, v_q, v_s, v_b)):
+            raise ValueError(f"layer {i} is missing tensors")
+        if min(k_idx.shape[2], norms.shape[2], v_q.shape[2], v_s.shape[2], v_b.shape[2]) < offset:
+            raise ValueError(f"layer {i} tensors do not cover the claimed offset {offset}")
+        if k_idx.shape[:3] != v_q.shape[:3] or norms.shape[:3] != v_q.shape[:3]:
+            raise ValueError(
+                f"layer {i} key/value shapes disagree: {tuple(k_idx.shape)} vs {tuple(v_q.shape)}"
+            )
     meta = {
         "key_bits": key_bits,
         "value_bits": value_bits,
         "group_size": group_size,
         "offset": offset,
         "kv_dtype": getattr(mx, dtype_name),
+        "layer_ids": layer_ids,
     }
     return arrays, meta
+
+
+def frame_basis(arrays: dict, meta: dict):
+    """The (rotation, codebook) pair a frame carries, in the shape the
+    codec's encode/decode helpers expect. One source for both adopt paths.
+    The codebook LENGTH is pinned to the declared bits: a wrong-length
+    codebook silently changes the bit width derived from it."""
+    d = arrays[f"layers.{meta['layer_ids'][0]}.v.s"].shape[-1] * meta["group_size"]
+    rot_name, cb_name = f"rot.{d}", f"cb.{d}.{meta['key_bits']}"
+    if rot_name not in arrays or cb_name not in arrays:
+        raise ValueError(f"frame carries no rotation/codebook for head_dim {d}")
+    levels = arrays[cb_name]
+    if levels.shape != (1 << meta["key_bits"],):
+        raise ValueError(f"codebook has {levels.shape[0]} levels for {meta['key_bits']} bits")
+    return arrays[rot_name], (levels.tolist(), (), 0.0)
 
 
 def decode_payload(payload: bytes) -> list:

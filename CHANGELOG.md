@@ -23,11 +23,11 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   computed straight from the packed Lloyd-Max state — rotate the query
   once, gather-dot centroid values — numerically equal to
   dequantize-then-score, plus the paper's QJL residual correction,
-  measured to reduce score error. Persisted by nothing by default: the QJL
-  bits cost d bits/token and the correction O(S·d); the ~4x K-side
-  bandwidth win needs a fused kernel (plain MLX ops materialize an
-  intermediate larger than the f16 it replaces). The boundary is documented
-  with the numbers.
+  measured to remove the projected scores' systematic bias (its estimator
+  variance exceeds the bias for single-query scoring at d=128, so the
+  per-token error barely moves — the record says "unbiased, not cheaper",
+  and nothing persists the QJL bits). The ~4x K-side bandwidth win needs a
+  fused kernel; the boundary is documented with the numbers.
 
 ## 0.5.0 — 2026-10-22
 

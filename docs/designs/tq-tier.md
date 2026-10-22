@@ -167,15 +167,19 @@ one for the same input rows), and the tier's fidelity floors.
 computable straight from the packed state — rotate the query once, then a
 gather-dot over per-dimension centroid values — numerically equal to
 dequantize-then-score. The QJL residual correction (1 sign bit per
-dimension of the rotated residual) measurably reduces the score error and
-is implemented but persisted by nothing: it costs d bits/token (the frame
-grows ~a third at k3) and O(S·d) correction compute. The K-side bandwidth
-of packed state is ~4x smaller than f16, so a FUSED unpack-gather-dot
-kernel is the only way to realize a speed win — plain MLX ops materialize a
-[S, d] u32 intermediate larger than the f16 it replaces (the probe measures
-the tensor-op path anyway). Wiring any of this into the decode hot loop
-means a custom Metal kernel or cache-aware attention in mlx-lm itself; the
-math, its fidelity, and this boundary live measured in the module.
+dimension of the rotated residual plus its per-token norm) is implemented
+and measured: it removes the projected scores' systematic signed bias
+(pinned by test), but its estimator variance (≈ π/(2d)·‖Rq‖²‖r‖²) EXCEEDS
+the bias it removes for single-query attention scoring at d=128 — per-token
+absolute error barely moves (142.1 → 139.0 on the probe's real-KV arm).
+That is the honest answer to "should decode carry QJL bits": no, unless a
+future estimator amortizes the variance across queries. The K-side
+bandwidth of packed state is ~4x smaller than f16, so a FUSED
+unpack-gather-dot kernel is the only way to realize a speed win — plain MLX
+ops materialize a [S, d] u32 intermediate larger than the f16 it replaces.
+Wiring any of this into the decode hot loop means a custom Metal kernel or
+cache-aware attention in mlx-lm itself; the math, its fidelity, and this
+boundary live measured in the module.
 
 ## Provenance and invariants
 

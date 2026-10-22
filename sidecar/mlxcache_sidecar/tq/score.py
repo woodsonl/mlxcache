@@ -23,7 +23,13 @@ The honest compute accounting, because it decides the wiring question:
   it replaces), and MLX has no fused unpack-gather-reduce. The probe
   measures the tensor-op path anyway; the fusion boundary is real.
 - The QJL correction is O(S·d) on [S, d] sign bits — same complexity as
-  dense scoring; it buys unbiasedness, not speed.
+  dense scoring; it buys UNBIASEDNESS, not per-token accuracy. Measured at
+  d=128/k3: the projected scores' systematic bias is removed (mean signed
+  error toward zero, pinned by test), but the estimator's own variance
+  (≈ π/(2d)·‖Rq‖²‖‖r‖², ~0.5 here) EXCEEDS the bias it removes for
+  single-query attention scoring — per-token absolute error gets WORSE.
+  That is the honest answer to "should the decode path carry QJL bits":
+  no, unless a future estimator amortizes the variance across queries.
 
 So this module is the validated math plus the fidelity record; wiring it
 into the decode hot loop means either a custom Metal kernel (mx.fast) or a
@@ -35,7 +41,7 @@ from __future__ import annotations
 
 import functools
 
-SQRT_PI_OVER_2 = 0.8862269254527579  # √(π/2), the QJL dequantization scale
+SQRT_PI_OVER_2 = 1.2533141373155003  # √(π/2), the QJL dequantization scale
 
 
 @functools.lru_cache(maxsize=8)
@@ -73,39 +79,48 @@ def scores_from_packed(query, packed, norms, d: int, codebook, rotation):
     return (yhat * rq).sum(-1) * norms.astype(mx.float32) / mx.sqrt(float(d))
 
 
-def qjl_correction(query, residual_sign, rotation, head_dim: int, norms=None):
+def qjl_correction(query, residual_sign, residual_norms, rotation, head_dim: int, norms=None):
     """The unbiasedness term: E[<Rq, r>] estimated from stored sign bits.
 
     `residual_sign` int8 [B,H,S,d] holds sign(S·r) of the rotated residual
-    r = y − ĉ (computed at write time by `residual_signs_from_y`). Returns
-    [B,H,S]: √(π/2)/d · <S R q, z_s> per token, scaled by norms/√d when
-    `norms` [B,H,S] is given (the same unit conversion and per-token scaling
+    r = y − ĉ and `residual_norms` [B,H,S] its per-token norms, both
+    computed at write time by `residual_signs_from_y` — sign bits are
+    scale-invariant, so the estimator must carry ‖r‖ explicitly or it
+    under-corrects by exactly that factor. Returns [B,H,S]:
+    √(π/2)·‖r‖/d · <S R q, z_s> per token, scaled by key norms/√d when
+    `norms` [B,H,S] is given (the same unit conversion
     `scores_from_packed` applies) — add the result to the projected scores
     for the unbiased inner-product estimate."""
     import mlx.core as mx  # noqa: PLC0415
 
     rq = rotation @ query.astype(mx.float32)  # [d]
     sketched = _qjl_matrix(head_dim) @ rq  # [d]
-    correction = (residual_sign.astype(mx.float32) @ sketched) * (SQRT_PI_OVER_2 / head_dim)
+    correction = (
+        (residual_sign.astype(mx.float32) @ sketched)
+        * (SQRT_PI_OVER_2 / head_dim)
+        * residual_norms.astype(mx.float32)
+    )
     if norms is not None:
         correction = correction * norms.astype(mx.float32) / mx.sqrt(float(head_dim))
     return correction
 
 
 def residual_signs_from_y(y, idx, codebook, head_dim: int):
-    """sign(S·r) for tokens still in the encoder's hand: `y` is the
+    """sign(S·r) AND ‖r‖ for tokens still in the encoder's hand: `y` is the
     pre-quantization rotated unit vector in u-units [.., d] and `idx` the
-    just-computed centroid indices [.., d]. Returns int8 ±1, same shape.
+    just-computed centroid indices [.., d]. Returns (int8 ±1, f32 norms),
+    same leading shape.
 
     Storage: d bits per token per head (16 B at d=128 — the frame grows by
-    roughly a third at k3). Nothing persists these by default; the probe
-    computes them to measure what the correction buys before anyone pays
-    that cost."""
+    roughly a third at k3) plus the per-token norm. Nothing persists these
+    by default; the probe computes them to measure what the correction buys
+    before anyone pays that cost."""
     import mlx.core as mx  # noqa: PLC0415
 
     levels, _boundaries, _mse = codebook
     centroids = mx.array(levels, dtype=mx.float32)
     yhat = mx.take(centroids, idx.reshape(-1)).reshape(idx.shape)
     residual = y.astype(mx.float32) - yhat
+    r_norms = mx.sqrt(mx.sum(residual * residual, axis=-1))
     sketched = residual @ _qjl_matrix(head_dim).T  # S·r per row
-    return mx.where(sketched >= 0, 1, -1).astype(mx.int8)
+    return mx.where(sketched >= 0, 1, -1).astype(mx.int8), r_norms

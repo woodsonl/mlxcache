@@ -13,9 +13,8 @@ import pytest
 pytest.importorskip("mlx.core")
 
 import mlx.core as mx  # noqa: E402
-from mlxcache_sidecar.tq.codebook import lloyd_max_codebook  # noqa: E402
+from conftest import tq_basis  # noqa: E402
 from mlxcache_sidecar.tq.codec import _unpack_indices, encode_keys  # noqa: E402
-from mlxcache_sidecar.tq.rotation import build_rotation  # noqa: E402
 from mlxcache_sidecar.tq.score import (  # noqa: E402
     qjl_correction,
     residual_signs_from_y,
@@ -25,14 +24,10 @@ from mlxcache_sidecar.tq.score import (  # noqa: E402
 D = 128
 
 
-def _basis(bits=4):
-    return build_rotation(D), lloyd_max_codebook(D, bits)
-
-
 def test_scores_from_packed_equal_dequantized_scores():
     """The same quantity two ways: q @ dequantize(packed)ᵀ vs the packed
     gather-dot. Equal up to fp ordering (different op order)."""
-    rotation, codebook = _basis()
+    rotation, codebook = tq_basis(D)
     k = (mx.random.normal((1, 4, 40, D), key=mx.random.key(21)) / 17).astype(mx.float16)
     q = (mx.random.normal(shape=(D,), key=mx.random.key(22)) / 5).astype(mx.float16)
     packed, norms = encode_keys(k, codebook, rotation)
@@ -52,10 +47,14 @@ def test_scores_from_packed_equal_dequantized_scores():
 
 
 def test_qjl_correction_reduces_score_error_on_average():
-    """Empirical unbiasedness: the projected scores are biased low (centroid
-    shrinkage); adding the QJL residual estimate must reduce the mean score
-    error against the TRUE (pre-quantization) inner products."""
-    rotation, codebook = _basis(bits=3)
+    """The QJL paper's claim is UNBIASEDNESS, and that is what is asserted:
+    the projected scores carry a systematic signed bias (centroid
+    shrinkage); adding the QJL residual estimate drives the MEAN signed
+    error toward zero. Per-token ABSOLUTE error is a different quantity —
+    the estimator's own variance (≈ π/(2d)·‖Rq‖²‖r‖², ~0.5 at d=128) can
+    exceed the bias it removes for a single query, which is exactly why
+    the module records this trade instead of promising error reduction."""
+    rotation, codebook = tq_basis(D, bits=3)
     k = (mx.random.normal((1, 2, 64, D), key=mx.random.key(23)) / 17).astype(mx.float16)
     q = (mx.random.normal(shape=(D,), key=mx.random.key(24)) / 5).astype(mx.float16)
     packed, norms = encode_keys(k, codebook, rotation)
@@ -64,9 +63,9 @@ def test_qjl_correction_reduces_score_error_on_average():
     true_scores = mx.einsum("d,bhsd->bhs", q.astype(mx.float32), k.astype(mx.float32))
 
     projected = scores_from_packed(q, packed, norms, D, codebook, rotation)
-    err_before = mx.abs(projected - true_scores).mean()
+    signed_bias_before = float((true_scores - projected).mean())
 
-    # Residual signs from the encoder's own pre-quantization y.
+    # Residual signs and norms from the encoder's own pre-quantization y.
     levels, boundaries, _m = codebook
     k32 = k.astype(mx.float32)
     norms32 = mx.sqrt(mx.sum(k32 * k32, axis=-1))
@@ -75,11 +74,10 @@ def test_qjl_correction_reduces_score_error_on_average():
     idx = mx.zeros_like(y).astype(mx.uint32)
     for t in boundaries:
         idx = idx + (y > t).astype(mx.uint32)
-    signs = residual_signs_from_y(y, idx, codebook, D)
-    corrected = projected + qjl_correction(q, signs, rotation, D, norms=norms)
-    err_after = mx.abs(corrected - true_scores).mean()
+    signs, r_norms = residual_signs_from_y(y, idx, codebook, D)
+    corrected = projected + qjl_correction(q, signs, r_norms, rotation, D, norms=norms)
+    signed_bias_after = float((true_scores - corrected).mean())
 
-    assert float(err_after) < float(err_before), (
-        f"QJL correction did not reduce score error: {float(err_before):.4f} -> "
-        f"{float(err_after):.4f}"
+    assert abs(signed_bias_after) < abs(signed_bias_before) / 2, (
+        f"QJL did not remove the signed bias: {signed_bias_before:.4f} -> {signed_bias_after:.4f}"
     )

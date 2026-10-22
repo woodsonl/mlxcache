@@ -1036,8 +1036,6 @@ class MlxLmEngine:
         # only at capture. Same tier label, same frame format, same
         # fingerprint — a runtime memory trade, not a new format.
         self.tq_live = self.kv_tier != "" and os.environ.get("MLXCACHE_TQ_LIVE") == "1"
-        if self.tq_live:
-            self._tq_basis = None  # built after the geometry probe fixes head_dim
         # One cache construction serves BOTH boot checks below. It allocates
         # no arrays (state fills on the first forward), so probing every model
         # — quantized or not — is free. Composition must be signed for EVERY
@@ -1274,24 +1272,28 @@ class MlxLmEngine:
         if getattr(self, "kv_tier", ""):
             try:
                 if getattr(self, "tq_live", False):
-                    from mlxcache_sidecar.tq.codec import decode_frame  # noqa: PLC0415
+                    from mlxcache_sidecar.tq.codec import (  # noqa: PLC0415
+                        decode_frame,
+                        frame_basis,
+                    )
                     from mlxcache_sidecar.tq.live import TurboQuantKVCache  # noqa: PLC0415
 
                     arrays, meta = decode_frame(payload)
-                    d = arrays["layers.0.v.s"].shape[-1] * meta["group_size"]
-                    basis = (
-                        arrays[f"rot.{d}"],
-                        (
-                            arrays[f"cb.{d}.{meta['key_bits']}"].tolist(),
-                            (),
-                            0.0,
-                        ),
-                    )
+                    # The frame's declared format must equal the engine's
+                    # configured tier: _fetch dequantizes with the ENGINE's
+                    # bits/group and serialize_live re-labels the codebook
+                    # tensor with the engine's key bits, so a mismatching
+                    # frame would decode to silent garbage here (the dense
+                    # path is frame-consistent instead).
                     kb, vb, g = self._tq_params
+                    if (meta["key_bits"], meta["value_bits"], meta["group_size"]) != (kb, vb, g):
+                        raise ValueError(
+                            f"frame format {meta['key_bits']}/{meta['value_bits']}/"
+                            f"{meta['group_size']} != engine tier {kb}/{vb}/{g}"
+                        )
+                    basis = frame_basis(arrays, meta)
                     cache = []
-                    for i in sorted(
-                        {int(n.split(".")[1]) for n in arrays if n.startswith("layers.")}
-                    ):
+                    for i in meta["layer_ids"]:
                         c = TurboQuantKVCache(kb, vb, g, basis=basis)
                         c.adopt_state(
                             arrays[f"layers.{i}.k.idx"],
@@ -1301,7 +1303,6 @@ class MlxLmEngine:
                             arrays[f"layers.{i}.v.b"],
                             meta["offset"],
                             meta["kv_dtype"],
-                            basis,
                         )
                         cache.append(c)
                 else:

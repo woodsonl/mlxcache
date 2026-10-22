@@ -52,36 +52,26 @@ class TurboQuantKVCache:
     returns dequantized arrays shaped exactly like KVCache's slices.
     """
 
-    def __init__(self, key_bits: int, value_bits: int, group_size: int, basis=None):
+    def __init__(self, key_bits: int, value_bits: int, group_size: int, basis):
         self.key_bits = key_bits
         self.value_bits = value_bits
         self.group_size = group_size
-        self._basis = basis  # (rotation [d,d] f32, codebook tuple) or None
+        self._basis = basis  # (rotation [d,d] f32, codebook tuple), shared per model
         self.keys = None  # packed idx u32 [B,H,cap,W]
         self.norms = None  # f32 [B,H,cap]
         self.values = None  # (q u32 [B,H,cap,Wv], scales, biases)
         self.offset = 0
         self._kv_dtype = None
 
-    # -- basis ---------------------------------------------------------------
-
-    def _resolve_basis(self, head_dim: int):
-        if self._basis is None:
-            from mlxcache_sidecar.tq.codebook import lloyd_max_codebook  # noqa: PLC0415
-            from mlxcache_sidecar.tq.rotation import build_rotation  # noqa: PLC0415
-
-            self._basis = (build_rotation(head_dim), lloyd_max_codebook(head_dim, self.key_bits))
-        return self._basis
-
-    def adopt_state(self, packed, norms, v_q, v_s, v_b, offset, dtype, basis):
+    def adopt_state(self, packed, norms, v_q, v_s, v_b, offset, dtype):
         """Build from an already-decoded TQ frame (no dequantize-then-
-        requantize round trip: the resident state IS the frame's tensors)."""
+        requantize round trip: the resident state IS the frame's tensors;
+        the constructor's shared basis serves both runtimes)."""
         self.keys = packed
         self.norms = norms
         self.values = (v_q, v_s, v_b)
         self.offset = offset
         self._kv_dtype = dtype
-        self._basis = basis
 
     # -- mlx-lm cache protocol ----------------------------------------------
 
@@ -91,7 +81,7 @@ class TurboQuantKVCache:
         b, h, s, d = keys.shape
         v_dim = values.shape[-1]
         prev = self.offset
-        rotation, codebook = self._resolve_basis(d)
+        rotation, codebook = self._basis
 
         if self.keys is None:
             cap = ((s + STEP - 1) // STEP) * STEP
@@ -209,28 +199,28 @@ class TurboQuantKVCache:
 def serialize_live(cache: list, key_bits: int, value_bits: int, group_size: int) -> bytes:
     """Write a live stack's resident state as the standard TQ frame.
 
-    Byte-identical to `encode_cache` over the same token stream (same
-    elementwise quantizers applied to the same rows at write time), so a
-    blob written by a live-tier engine is indistinguishable from one written
-    by the persistence tier — one tier label, one format, two runtimes."""
+    Byte-identical to `encode_cache` over the same INPUT rows (same
+    elementwise quantizers, same insertion order). A live ENGINE's rows are
+    computed through quantized history, so its settled frame carries
+    different VALUES than a persistence capture of the same prompt — same
+    format, same tier label, different forward (see the module docstring).
+    """
     import mlx.core as mx  # noqa: PLC0415
 
     if not cache:
         raise ValueError("empty cache list")
+    # Engine-built stacks share one basis and one forward, so uniformity is
+    # by construction; keep the cheap refusal of a drifted stack (mixed
+    # offsets or dtypes) and skip re-deriving what the basis already pins.
     offsets = {c.offset for c in cache}
-    head_dims = {c._basis[0].shape[0] for c in cache}
-    dtypes = {
-        str(c._kv_dtype).replace("mlx.core.", "") if c._kv_dtype is not None else None
-        for c in cache
-    }
-    if len(offsets) != 1 or len(head_dims) != 1 or None in dtypes or len(dtypes) != 1:
-        raise ValueError(
-            f"live stack is not uniform (offsets={offsets}, head_dims={head_dims}, dtypes={dtypes})"
-        )
+    if len(offsets) != 1:
+        raise ValueError(f"live stack is not uniform (offsets={offsets})")
+    if cache[0]._kv_dtype is None or any(c._kv_dtype != cache[0]._kv_dtype for c in cache):
+        raise ValueError("live stack is not uniform (dtypes)")
     offset = offsets.pop()
-    d = head_dims.pop()
-    dtype = dtypes.pop()
+    dtype = str(cache[0]._kv_dtype).replace("mlx.core.", "")
     rotation, codebook = cache[0]._basis
+    d = rotation.shape[0]
     levels = mx.array(codebook[0], dtype=mx.float32)
 
     # Insertion order mirrors encode_cache exactly (codebook, per-layer

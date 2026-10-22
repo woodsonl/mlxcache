@@ -19,6 +19,8 @@ import pytest
 pytest.importorskip("mlx.core")
 
 import mlx.core as mx  # noqa: E402
+from conftest import tq_basis  # noqa: E402
+from conftest import tq_cos as _cos
 from mlxcache_sidecar.tq import decode_payload, encode_cache  # noqa: E402
 from mlxcache_sidecar.tq.live import TurboQuantKVCache, serialize_live  # noqa: E402
 
@@ -31,26 +33,13 @@ def _kv(seed: int, tokens: int):
     return k, v
 
 
-def _cos(a, b) -> float:
-    a32, b32 = a.astype(mx.float32), b.astype(mx.float32)
-    per = (a32 * b32).sum(-1) / ((a32 * a32).sum(-1).sqrt() * (b32 * b32).sum(-1).sqrt())
-    return float(per.mean())
-
-
-def _basis():
-    from mlxcache_sidecar.tq.codebook import lloyd_max_codebook  # noqa: PLC0415
-    from mlxcache_sidecar.tq.rotation import build_rotation  # noqa: PLC0415
-
-    return build_rotation(D), lloyd_max_codebook(D, 4)
-
-
 def test_update_and_fetch_tracks_the_f16_cache():
     """Feeding the same rows through the live cache and an f16 KVCache: the
     returned history must track the f16 rows within the tier's fidelity
     floor, and PRIOR rows must not change when later tokens arrive."""
     from mlx_lm.models.cache import KVCache  # noqa: PLC0415
 
-    live = TurboQuantKVCache(4, 4, 64, basis=_basis())
+    live = TurboQuantKVCache(4, 4, 64, basis=tq_basis(D))
     plain = KVCache()
     k1, v1 = _kv(11, 30)
     k2, v2 = _kv(12, 20)
@@ -78,7 +67,7 @@ def test_resident_state_is_compressed():
     boundary (STEP=256): capacity is step-rounded like mlx-lm's KVCache, so
     a short context carries rounded-up padding — the amortized ratio is what
     long contexts actually see."""
-    live = TurboQuantKVCache(4, 4, 64, basis=_basis())
+    live = TurboQuantKVCache(4, 4, 64, basis=tq_basis(D))
     k, v = _kv(13, 256)
     live.update_and_fetch(k, v)
     f16_bytes = 2 * B * H * 256 * D * 2
@@ -94,7 +83,7 @@ def test_serialize_live_equals_encode_cache_bytes():
     from mlx_lm.models.cache import KVCache  # noqa: PLC0415
 
     k, v = _kv(14, 80)
-    live = TurboQuantKVCache(4, 4, 64, basis=_basis())
+    live = TurboQuantKVCache(4, 4, 64, basis=tq_basis(D))
     live.update_and_fetch(k, v)
     plain = KVCache()
     plain.update_and_fetch(k, v)
@@ -105,7 +94,7 @@ def test_adopt_state_resumes_and_extends():
     """Adopting a frame's compressed tensors directly (no dequantize-
     requantize): the resumed cache keeps the adopted rows byte-identical and
     appends new quantized rows past them."""
-    basis = _basis()
+    basis = tq_basis(D)
     k, v = _kv(15, 40)
     src = TurboQuantKVCache(4, 4, 64, basis=basis)
     src.update_and_fetch(k, v)
@@ -125,7 +114,6 @@ def test_adopt_state_resumes_and_extends():
         arrays["layers.0.v.b"],
         meta["offset"],
         meta["kv_dtype"],
-        basis,
     )
     assert adopted.offset == 40
     before = adopted.state[0]
@@ -142,7 +130,7 @@ def test_live_frame_decodes_through_the_standard_path():
     decode_payload (the persistence adopt path) — same format, verified
     from the other side."""
     k, v = _kv(17, 50)
-    live = TurboQuantKVCache(4, 4, 64, basis=_basis())
+    live = TurboQuantKVCache(4, 4, 64, basis=tq_basis(D))
     live.update_and_fetch(k, v)
     frame = serialize_live([live], 4, 4, 64)
     (out,) = decode_payload(frame)
@@ -152,7 +140,7 @@ def test_live_frame_decodes_through_the_standard_path():
 
 
 def test_trim_size_empty_mask():
-    live = TurboQuantKVCache(4, 4, 64, basis=_basis())
+    live = TurboQuantKVCache(4, 4, 64, basis=tq_basis(D))
     assert live.empty() and live.size() == 0
     k, v = _kv(18, 20)
     live.update_and_fetch(k, v)
