@@ -1038,6 +1038,10 @@ class MlxLmEngine:
         # whose payload shape it cannot verify.
         probe = self._prompt_cache_probe()
         self.cache_layout = self._cache_layout_of(probe)
+        # The per-model layer count every adopted checkpoint must match: a
+        # short cache list makes mlx-lm's zip(model.layers, cache) skip
+        # layers silently (invalid output, no error) rather than 422.
+        self._cache_layer_count = len(probe)
         self._assert_quantization_supported(probe)
         self.prefill_count = 0
         # Metal allocator hygiene: MLX pools freed GPU buffers by size-class
@@ -1242,33 +1246,44 @@ class MlxLmEngine:
 
         The TQ tier decodes its own frame here: the engine's tier and the
         blob's tier always agree (the daemon only routes same-tier blobs —
-        the fingerprint pins it), so the branch is sound."""
+        the fingerprint pins it), so the branch is sound. Both branches
+        verify the decoded cache has the layer count THIS model expects: a
+        short list makes mlx-lm zip() skip layers silently instead of
+        erroring."""
+        cache = None
         if getattr(self, "kv_tier", ""):
             from mlxcache_sidecar.tq import decode_payload  # noqa: PLC0415
 
             try:
-                return decode_payload(payload)
+                cache = decode_payload(payload)
             except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
                 raise CheckpointRejectedError(
                     f"TQ checkpoint failed to decode: {type(exc).__name__}: {exc}"
                 ) from exc
-        from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
+        else:
+            from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
 
-        # Parse from memory: the daemon just sent this payload over the wire
-        # and validated it — a temp-file write + read doubled disk I/O per
-        # PARTIAL hit at GB scale (performance review 2026-10-04).
-        # load_prompt_cache forwards to mx.load WITHOUT a format argument, so
-        # mlx infers safetensors from the file EXTENSION and reads `.name` —
-        # a bare BytesIO raises AttributeError. Naming the buffer satisfies
-        # the inference; the data itself still never touches disk.
-        blob = io.BytesIO(payload)
-        blob.name = "checkpoint.safetensors"
-        try:
-            return load_prompt_cache(blob)
-        except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+            # Parse from memory: the daemon just sent this payload over the wire
+            # and validated it — a temp-file write + read doubled disk I/O per
+            # PARTIAL hit at GB scale (performance review 2026-10-04).
+            # load_prompt_cache forwards to mx.load WITHOUT a format argument, so
+            # mlx infers safetensors from the file EXTENSION and reads `.name` —
+            # a bare BytesIO raises AttributeError. Naming the buffer satisfies
+            # the inference; the data itself still never touches disk.
+            blob = io.BytesIO(payload)
+            blob.name = "checkpoint.safetensors"
+            try:
+                cache = load_prompt_cache(blob)
+            except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+                raise CheckpointRejectedError(
+                    f"checkpoint failed to load: {type(exc).__name__}: {exc}"
+                ) from exc
+        expected = getattr(self, "_cache_layer_count", None)
+        if expected is not None and len(cache) != expected:
             raise CheckpointRejectedError(
-                f"checkpoint failed to load: {type(exc).__name__}: {exc}"
-            ) from exc
+                f"checkpoint holds {len(cache)} cache entries; this model needs {expected}"
+            )
+        return cache
 
     def _quantize_cache(self, cache):
         """Apply the configured bits-tier KV quantization (T12). No-op at

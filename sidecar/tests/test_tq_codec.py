@@ -442,6 +442,40 @@ def test_decode_rejects_key_value_shape_disagreement():
         decode_payload(buf.getvalue())
 
 
+def test_decode_rejects_an_empty_layer_set():
+    """An empty layer set passed the contiguity check trivially (range(0))
+    and handed mlx-lm a zero-layer cache, which zip() accepts by skipping
+    every layer — invalid output, no error, no quarantine."""
+    import io
+
+    payload = encode_cache(_cache(2, 20, seed=99), 3, 4, 64)
+    blob = io.BytesIO(payload)
+    blob.name = "x.safetensors"
+    arr, meta = mx.load(blob, return_metadata=True)
+    arr = {k: v for k, v in arr.items() if not k.startswith("layers.")}
+    buf = io.BytesIO()
+    mx.save_safetensors(buf, arr, meta)
+    with pytest.raises(ValueError, match="empty or not contiguous"):
+        decode_payload(buf.getvalue())
+
+
+def test_load_cache_rejects_a_short_layer_count():
+    """The adapter's own trust boundary: a checkpoint whose cache entry
+    count disagrees with the model's layer count 422s instead of letting
+    mlx-lm's zip() silently skip layers. Uses the TQ branch via the real
+    engine path (MlxLmEngine._load_cache_from_payload)."""
+    pytest.importorskip("mlx.core")
+    from mlxcache_sidecar.server import CheckpointRejectedError, MlxLmEngine
+
+    engine = object.__new__(MlxLmEngine)
+    engine.kv_tier = "tq-k4v4-g64"
+    engine._cache_layer_count = 3
+    layers = _cache(2, 20, seed=100)
+    payload = encode_cache(layers, 3, 4, 64)
+    with pytest.raises(CheckpointRejectedError, match="cache entries"):
+        engine._load_cache_from_payload(payload)
+
+
 def test_rotation_determinism_across_builds():
     """Same seed -> identical matrix across separate computations (the
     lru_cache hides this from every other test); different seed differs;

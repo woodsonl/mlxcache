@@ -60,7 +60,10 @@ def _cos(a, b) -> float:
 
     a32, b32 = a.astype(mx.float32), b.astype(mx.float32)
     per = (a32 * b32).sum(-1) / ((a32 * a32).sum(-1).sqrt() * (b32 * b32).sum(-1).sqrt())
-    return float(per.mean())
+    finite = per[mx.isfinite(per)]
+    # A zero-norm row measures 0/0 = NaN; report it as 0 rather than
+    # writing an unquoted NaN into the JSON record (strict parsers reject).
+    return float(finite.mean()) if finite.size else 0.0
 
 
 def _per_layer_cos(orig, reco) -> list[float]:
@@ -70,10 +73,6 @@ def _per_layer_cos(orig, reco) -> list[float]:
         k1, v1 = r.state
         out.append(min(_cos(k0, k1), _cos(v0, v1)))
     return out
-
-
-def _f16_bytes(cache) -> int:
-    return sum(c.nbytes for c in cache)
 
 
 def _to_quantized(cache, bits: int, group: int = 64):
@@ -124,7 +123,16 @@ def main() -> int:
         "tq-k3v2-g64": ("tq", (3, 2, 64)),
         "tq-k4v4-g64": ("tq", (4, 4, 64)),
     }
-    f16_total = _f16_bytes(f16_cache)
+    # The f16 reference is the SERIALIZED frame, not KVCache.nbytes: nbytes
+    # counts step-rounded backing buffers (unused token slots), which would
+    # inflate x_vs_f16 for prefixes below an allocation boundary. The frame
+    # is also what the G2 load measurement reads, so build it once here.
+    from mlx_lm.models.cache import save_prompt_cache
+
+    f16_buf = io.BytesIO()
+    save_prompt_cache(f16_buf, f16_cache)
+    f16_payload = f16_buf.getvalue()
+    f16_total = len(f16_payload)
     for name, (kind, param) in arms.items():
         base = _prefill(model, tokens)  # fresh capture: caches are stateful
         if kind == "bits":
@@ -169,11 +177,6 @@ def main() -> int:
     import mlx.core as mx
     from mlx_lm.models.cache import load_prompt_cache
 
-    buf = io.BytesIO()
-    from mlx_lm.models.cache import save_prompt_cache
-
-    save_prompt_cache(buf, f16_cache)
-    f16_payload = buf.getvalue()
     t0 = time.perf_counter()
     loaded = load_prompt_cache(_named(io.BytesIO(f16_payload)))
     mx.eval([c.state for c in loaded])

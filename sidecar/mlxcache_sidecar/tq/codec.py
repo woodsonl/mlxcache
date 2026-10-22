@@ -121,8 +121,13 @@ def encode_keys(keys, codebook, rotation):
     u = k32 / mx.maximum(norms, 1e-12)[..., None]
     y = u @ rotation.T
     y = y * mx.sqrt(float(keys.shape[-1]))  # x-units -> u-units
-    b = mx.array(boundaries, dtype=mx.float32)
-    idx = (y[..., None] > b).sum(-1).astype(mx.uint32)
+    # One threshold per pass rather than a [B,H,S,D,k-1] broadcast: MLX does
+    # not fuse elementwise into reductions on Metal, so the broadcast would
+    # materialize ~768 MB of transient bool at 50K tokens, k=16. The running
+    # sum computes the identical bucket index.
+    idx = mx.zeros_like(y).astype(mx.uint32)
+    for t in boundaries:
+        idx = idx + (y > t).astype(mx.uint32)
     # Compensate the stored norm for the reconstructed direction's scale:
     # the dequantized unit vector has norm s = ||levels[idx]||/sqrt(d) < 1
     # (a centroid shrinks toward the mean), so storing ||k|| verbatim would
@@ -290,14 +295,18 @@ def decode_payload(payload: bytes) -> list:
     rotations = {}
     codebooks = {}
     # Five tensors name each layer (k.idx, k.norm, v.q, v.s, v.b): collect ids
-    # as a set first, or each layer decodes five times.
+    # as a set first, or each layer decodes five times. An EMPTY set passes
+    # the contiguity check trivially and would hand the model a zero-layer
+    # cache (mlx-lm zips layers with the cache, silently skipping every
+    # layer) — reject it as corruption.
     layer_ids = sorted({int(name.split(".")[1]) for name in arrays if name.startswith("layers.")})
-    if layer_ids != list(range(len(layer_ids))):
+    if not layer_ids or layer_ids != list(range(len(layer_ids))):
         # A digest-consistent-but-planted frame could drop layer tensors; a
-        # short or non-contiguous stack would IndexError inside model
-        # forward — past the 422 boundary — and 500 forever while the
-        # daemon never quarantines it. Reject here instead.
-        raise ValueError(f"frame layer ids are not contiguous from 0: {layer_ids}")
+        # short, empty, or non-contiguous stack would either IndexError
+        # inside model forward or silently skip layers via mlx-lm's zip —
+        # all past the 422 boundary — and 500 forever while the daemon never
+        # quarantines it. Reject here instead.
+        raise ValueError(f"frame layer ids are empty or not contiguous from 0: {layer_ids}")
     cache = []
     for i in layer_ids:
         k_idx = arrays[f"layers.{i}.k.idx"]
