@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import struct
 
+import pytest
 from mlxcache_sidecar import blob
 
 
@@ -83,7 +84,58 @@ def test_decode_accepts_t12_daemon_blobs_with_kv_tier_fields():
     meta, _payload = blob.decode(blob_bytes)
     assert meta.fingerprint.kv_bits == 8
     assert meta.fingerprint.kv_group_size == 64
+    assert meta.fingerprint.kv_tier == ""
     assert meta.tokens == [10, 11, 12, 13, 14, 15, 16, 17]
+
+
+def test_kv_tier_wire_roundtrip_and_omission():
+    # A named tier rides the fingerprint both ways; an EMPTY tier is omitted
+    # from the wire entirely (a pre-tier header says nothing about tiers), so
+    # the two forms stay byte-identical to what older readers pinned.
+    tiered = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="m",
+            tokenizer_hash="h",
+            kv_dtype="f16",
+            kv_layout_version=1,
+            kv_tier="tq-k3v4-g64",
+        ),
+        token_count=3,
+        tokens=[1, 2, 3],
+    )
+    wire = blob.encode(tiered, b"KV")
+    meta, _ = blob.decode(wire)
+    assert meta.fingerprint.kv_tier == "tq-k3v4-g64"
+    assert b'"kv_tier":"tq-k3v4-g64"' in wire
+    # The empty-tier wire carries no kv_tier key at all.
+    plain = blob.CheckpointMeta(
+        fingerprint=blob.Fingerprint(
+            model_id="m", tokenizer_hash="h", kv_dtype="f16", kv_layout_version=1
+        ),
+        token_count=3,
+        tokens=[1, 2, 3],
+    )
+    assert b"kv_tier" not in blob.encode(plain, b"KV")
+
+
+def test_decode_rejects_non_string_kv_tier():
+    rust_style = {
+        "fingerprint": {
+            "model_id": "m",
+            "tokenizer_hash": "h",
+            "kv_dtype": "f16",
+            "kv_layout_version": 1,
+            "kv_bits": 0,
+            "kv_group_size": 0,
+            "kv_tier": 3,
+        },
+        "token_count": 3,
+        "tokens": [1, 2, 3],
+        "format_version": 1,
+    }
+    header = json.dumps(rust_style).encode()
+    with pytest.raises(blob.HeaderRejected, match="fingerprint field types"):
+        blob.decode(struct.pack("<I", len(header)) + header + b"KV")
 
 
 def test_decode_drops_unknown_fingerprint_fields():

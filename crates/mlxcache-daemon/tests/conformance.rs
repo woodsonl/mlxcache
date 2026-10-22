@@ -19,6 +19,7 @@ fn golden_meta() -> CheckpointMeta {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: String::new(),
+            kv_tier: String::new(),
         },
         token_count: 4,
         tokens: vec![1, 2, 3, 4],

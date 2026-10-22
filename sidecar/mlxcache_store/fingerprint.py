@@ -71,6 +71,7 @@ def identity_compatible(entry: Fingerprint, request: Fingerprint) -> bool:
         and entry.kv_group_size == request.kv_group_size
         and cache_layout_compatible(entry.cache_layout, request.cache_layout)
         and content_digest_compatible(entry.content_digest, request.content_digest)
+        and entry.kv_tier == request.kv_tier
     )
 
 
@@ -134,6 +135,12 @@ def blob_key(fp: Fingerprint, engine_id: str | None, tokens: list[int]) -> int:
     # keys byte-identical to the pre-digest fold.
     if fp.content_digest:
         fields.append(fp.content_digest)
+    # Named KV tier, folded only when present and LAST among fingerprint
+    # fields (the same position as the Rust fold): an empty tier adds zero
+    # bytes, keeping pre-tier keys byte-identical; a TQ tier namespaces its
+    # own blobs.
+    if fp.kv_tier:
+        fields.append(fp.kv_tier)
     words.extend(_chunks_of_concat(fields))
     words.append(_DOMAIN_SEP)
     words.extend(t & 0xFFFFFFFF for t in tokens)

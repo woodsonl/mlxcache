@@ -51,6 +51,14 @@ class Fingerprint:
     # the fields above: defaulted, omitted from the wire when empty, zero fold
     # bytes — and only ever served across an EXACTLY equal value.
     content_digest: str = ""
+    # Named KV persistence tier (the TurboQuant codecs, e.g. "tq-k3v4-g64"):
+    # `""` = no named tier, the f16/q8 identities pinned by kv_bits alone.
+    # The scalar pair cannot express the TQ tiers (asymmetric key/value
+    # widths, codec-specific frame), so the tier label namespaces them the
+    # same way kv_bits namespaces q8. Same forward-compat rule: defaulted,
+    # omitted from the wire when empty, zero fold bytes, exact-equality
+    # serving only.
+    kv_tier: str = ""
 
 
 def _known_fields(data: dict) -> dict:
@@ -92,6 +100,10 @@ def encode(meta: CheckpointMeta, payload: bytes) -> bytes:
     # content", which a pre-digest header states by saying nothing.
     if not fp.get("content_digest"):
         fp.pop("content_digest", None)
+    # And for the named KV tier: empty means "no named tier", which a
+    # pre-tier header states by saying nothing.
+    if not fp.get("kv_tier"):
+        fp.pop("kv_tier", None)
     raw["fingerprint"] = fp
     header = json.dumps(raw, separators=(",", ":")).encode()
     return struct.pack("<I", len(header)) + header + payload
@@ -148,6 +160,7 @@ def decode_header(header: bytes) -> CheckpointMeta:
         or type(fp.kv_group_size) is not int
         or not isinstance(fp.cache_layout, str)
         or not isinstance(fp.content_digest, str)
+        or not isinstance(fp.kv_tier, str)
     ):
         # The dataclass does not enforce types; a non-str field would
         # explode later in the fold (.encode()) outside every guarded
