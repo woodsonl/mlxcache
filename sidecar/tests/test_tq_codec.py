@@ -331,5 +331,82 @@ def test_zero_norm_rows_are_safe():
     assert float(mx.abs(k1[:, 2]).max()) == pytest.approx(0.0, abs=1e-6)
 
 
+def test_key_norms_survive_chained_decode_encode_cycles():
+    """Regression: the stored norm used to be ||k|| verbatim, but the
+    dequantized direction has norm s < 1, so every decode->encode cycle
+    (delta prefill adopting an ancestor, settle of a resumed cache) shrank
+    the oldest keys by another factor of s — ~1.5% per turn at k3, invisible
+    to cosine (scale-invariant). The compensated norm must keep per-row
+    magnitudes stable across five chained cycles."""
+    import mlx.core as mx
+
+    layers = _cache(1, 40, seed=91)
+    k0, _ = layers[0].state
+    orig_norms = mx.sqrt(mx.sum(k0.astype(mx.float32) ** 2, axis=-1))
+    cache = layers
+    for _cycle in range(5):
+        cache = decode_payload(encode_cache(cache, 3, 4, 64))
+    k5, _ = cache[0].state
+    final_norms = mx.sqrt(mx.sum(k5.astype(mx.float32) ** 2, axis=-1))
+    ratio = final_norms / orig_norms
+    assert float(ratio.min()) > 0.999 and float(ratio.max()) < 1.001, (
+        f"norms drifted after 5 cycles: min={float(ratio.min()):.5f} max={float(ratio.max()):.5f}"
+    )
+
+
+def test_decode_rejects_out_of_range_metadata():
+    """key_bits=0 must die as ValueError (422/quarantine), not as an
+    uncaught ZeroDivisionError that 500s forever while the poison stays
+    selectable."""
+    import io
+
+    payload = encode_cache(_cache(1, 20, seed=92), 3, 4, 64)
+    blob = io.BytesIO(payload)
+    blob.name = "x.safetensors"
+    arr, meta = mx.load(blob, return_metadata=True)
+    meta = dict(meta)
+    meta["key_bits"] = "0"
+    arr = {"cb.128.0": arr.pop("cb.128.3"), **dict(arr)}
+    buf = io.BytesIO()
+    mx.save_safetensors(buf, arr, meta)
+    with pytest.raises(ValueError, match="key_bits"):
+        decode_payload(buf.getvalue())
+
+
+def test_encode_rejects_mismatched_key_value_head_dims():
+    """An architecture with kdim != vdim would encode (frame names derive
+    from the key dim) and then fail to decode (d re-derived from the value
+    scales): refuse at encode."""
+    from mlx_lm.models.cache import KVCache  # noqa: PLC0415
+
+    layers = _cache(1, 20, seed=93)
+    other = _cache(1, 20, seed=94)[0]
+    k2, v2 = other.state
+    v2 = v2[..., :64]  # value head_dim 64 != key head_dim 128
+    second = KVCache()
+    second.state = (k2, v2)
+    with pytest.raises(ValueError, match="head_dim"):
+        encode_cache([layers[0], second], 3, 4, 64)
+
+
+def test_rotation_determinism_across_builds():
+    """Same seed -> identical matrix across separate computations (the
+    lru_cache hides this from every other test); different seed differs;
+    both orthogonal."""
+    from mlxcache_sidecar.tq.rotation import PINNED_SEED, build_rotation  # noqa: PLC0415
+
+    build_rotation.cache_clear()
+    a = build_rotation(64)
+    build_rotation.cache_clear()
+    b = build_rotation(64)
+    assert bool((a == b).all()), "same seed rebuilt a different rotation"
+    build_rotation.cache_clear()
+    c = build_rotation(64, seed=PINNED_SEED + 1)
+    assert not bool((a == c).all()), "different seeds built the same rotation"
+    for m in (a, c):
+        err = float(mx.abs(m.T @ m - mx.eye(64, dtype=mx.float32)).max())
+        assert err < 1e-4
+
+
 def test_format_constant():
     assert FORMAT == "tq1"

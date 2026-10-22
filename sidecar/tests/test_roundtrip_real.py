@@ -708,10 +708,13 @@ def test_tq_tier_contract_determinism_fidelity_compression():
 
 
 def test_tq_tier_divergence_from_scratch_is_real_and_bounded():
-    """The honest disclosure: TQ resume diverges from an f16 scratch run.
-    Divergence must OCCUR (the tier is lossy — a silent identity pass would
-    mean the codec is dead code) and the outputs must stay finite/parseable
-    (bounded, not corrupt)."""
+    """Record the tier's quality disclosure: greedy decode from a TQ-resumed
+    cache MAY diverge from an f16 scratch run (lossy by design — token
+    identity is explicitly NOT asserted; resume determinism is pinned by the
+    contract test above). What this test enforces is shape-boundedness: both
+    outputs are non-empty, in-range token streams from the real tokenizer —
+    divergence is a different continuation, never garbage or a crash. The
+    agreement fraction is printed for the record."""
     tq = _tq_engine()
     tokens = tq.tokenize("Explain the radix-tree prefix index in detail. " * 40)[:800]
 
@@ -741,6 +744,15 @@ def test_tq_tier_divergence_from_scratch_is_real_and_bounded():
             )
         resumed = tq.generate_from_blob(tokens, path, max_tokens=16)
     assert resumed and all(0 <= t < 2**31 for t in resumed), "resumed output is not token-shaped"
+    shared = next(
+        (i for i, (a, b) in enumerate(zip(resumed, scratch, strict=False)) if a != b),
+        min(len(resumed), len(scratch)),
+    )
+    print(
+        f"\n[TQ] divergence record: resumed-vs-scratch shared prefix {shared} "
+        f"of {max(len(resumed), len(scratch))} tokens "
+        f"(agreement {shared / max(len(resumed), len(scratch), 1):.3f})"
+    )
 
 
 def engine_module_ref():

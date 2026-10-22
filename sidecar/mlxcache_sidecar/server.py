@@ -1160,7 +1160,11 @@ class MlxLmEngine:
 
         logits = self.model(mx.array([[0]]), cache=cache)
         mx.eval([c.state for c in cache], logits)
-        head_dims = {c.keys.shape[-1] for c in cache}
+        # Key AND value head dims: the TQ frame derives its tensor names from
+        # the key dim and decode re-derives from the value scales, so
+        # kdim != vdim must refuse at boot; mx.quantize needs divisibility
+        # on both.
+        head_dims = {c.keys.shape[-1] for c in cache} | {c.values.shape[-1] for c in cache}
         if len(head_dims) != 1:
             raise ValueError(
                 f"A KV quantization tier requires a uniform head_dim across "

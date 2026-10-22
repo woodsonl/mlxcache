@@ -120,6 +120,18 @@ def encode_keys(keys, codebook, rotation):
     y = y * mx.sqrt(float(keys.shape[-1]))  # x-units -> u-units
     b = mx.array(boundaries, dtype=mx.float32)
     idx = (y[..., None] > b).sum(-1).astype(mx.uint32)
+    # Compensate the stored norm for the reconstructed direction's scale:
+    # the dequantized unit vector has norm s = ||levels[idx]||/sqrt(d) < 1
+    # (a centroid shrinks toward the mean), so storing ||k|| verbatim would
+    # scale the decoded row to ||k||*s — and every decode->encode cycle
+    # (delta prefill adopting an ancestor, settle of a resumed cache) would
+    # multiply another factor of s, shrinking the oldest keys ~1.5% per turn
+    # at k3. Dividing by s makes decode return ||k|| exactly, and chains
+    # converge (re-quantizing an already-quantized direction re-selects the
+    # same centroid).
+    recon = mx.take(mx.array(levels, dtype=mx.float32), idx.reshape(-1)).reshape(idx.shape)
+    s = mx.sqrt(mx.sum(recon * recon, axis=-1)) / mx.sqrt(float(keys.shape[-1]))
+    norms = norms / mx.maximum(s, 1e-12)
     # Norms in f32, not f16: a key whose elements sit near the f16 ceiling
     # has ||k|| up to ~65504*sqrt(d), which overflows f16 storage and would
     # reconstruct as inf. The 2 extra bytes per (head, token) are ~1% of the
@@ -168,9 +180,14 @@ def encode_cache(cache, key_bits: int, value_bits: int, group_size: int) -> byte
             )
         if c.keys is None:
             raise ValueError(f"layer {i} holds no state (empty cache)")
-        k, _ = c.state
+        k, v = c.state
         offsets.add(k.shape[2])
+        # Key AND value head dims: the frame names rot.{d}/cb.{d} by the KEY
+        # dim while decode derives d from the VALUE scales — an architecture
+        # with kdim != vdim would encode and then fail to decode, so refuse
+        # it here (uniform across layers and equal to each other).
         head_dims.add(k.shape[-1])
+        head_dims.add(v.shape[-1])
         # str(dtype) is "mlx.core.float16"; store the bare name so decode can
         # getattr(mx, name) — the same normalization _kv_dtype() applies.
         dtypes.add(str(k.dtype).replace("mlx.core.", ""))
@@ -237,11 +254,29 @@ def decode_payload(payload: bytes) -> list:
     arrays, metadata = mx.load(blob, return_metadata=True)
     if not metadata or metadata.get("format") != FORMAT:
         raise ValueError("not a TurboQuant frame (missing format metadata)")
-    key_bits = int(metadata["key_bits"])
-    value_bits = int(metadata["value_bits"])
-    group_size = int(metadata["group_size"])
-    offset = int(metadata["offset"])
-    dtype = getattr(mx, metadata["kv_dtype"])
+    try:
+        key_bits = int(metadata["key_bits"])
+        value_bits = int(metadata["value_bits"])
+        group_size = int(metadata["group_size"])
+        offset = int(metadata["offset"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"frame metadata invalid: {exc}") from exc
+    # Range-check at the boundary: an out-of-range value (e.g. key_bits=0)
+    # would otherwise surface as ZeroDivisionError deep in _unpack_indices —
+    # outside the ValueError family the adapter maps to a 422 quarantine, so
+    # the daemon would 500-loop on a poison frame instead of retiring it.
+    if key_bits not in KEY_BITS_CHOICES:
+        raise ValueError(f"frame key_bits {key_bits} not in {KEY_BITS_CHOICES}")
+    if value_bits not in VALUE_BITS_CHOICES:
+        raise ValueError(f"frame value_bits {value_bits} not in {VALUE_BITS_CHOICES}")
+    if group_size < 2:
+        raise ValueError(f"frame group_size {group_size} must be >= 2")
+    if offset < 0:
+        raise ValueError(f"frame offset {offset} must be >= 0")
+    dtype_name = metadata.get("kv_dtype", "")
+    if not hasattr(mx, dtype_name):
+        raise ValueError(f"frame kv_dtype {dtype_name!r} is not an mlx dtype")
+    dtype = getattr(mx, dtype_name)
 
     rotations = {}
     codebooks = {}

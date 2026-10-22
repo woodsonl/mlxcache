@@ -175,11 +175,13 @@ def main() -> int:
     save_prompt_cache(buf, f16_cache)
     f16_payload = buf.getvalue()
     t0 = time.perf_counter()
-    load_prompt_cache(_named(io.BytesIO(f16_payload)))
+    loaded = load_prompt_cache(_named(io.BytesIO(f16_payload)))
+    mx.eval([c.state for c in loaded])
     f16_load_ms = (time.perf_counter() - t0) * 1000
     tq_payload = encode_cache(_prefill(model, tokens), 3, 4, 64)
     t0 = time.perf_counter()
-    decode_payload(tq_payload)
+    decoded = decode_payload(tq_payload)
+    mx.eval([c.state for c in decoded])
     tq_decode_ms = (time.perf_counter() - t0) * 1000
     report["adopt_budget_ms"] = {
         "f16_load": round(f16_load_ms, 1),
@@ -189,17 +191,26 @@ def main() -> int:
     }
 
     # --- G4: append stability on real KV -----------------------------------
-    short_tokens, long_tokens = tokens[:1000], tokens[:1500]
+    # Two DISTINCT lengths, or the gate would compare an empty append; with
+    # a short --tokens budget, halve it rather than aliasing the two sides.
+    short_len = min(1000, max(2, len(tokens) // 2))
+    long_len = len(tokens)
+    if short_len >= long_len:
+        raise SystemExit(f"--tokens {len(tokens)} leaves no room for an append")
+    short_tokens, long_tokens = tokens[:short_len], tokens[:long_len]
     a = encode_cache(_prefill(model, short_tokens), 3, 4, 64)
     b = encode_cache(_prefill(model, long_tokens), 3, 4, 64)
     ta, _ = mx.load(_named(io.BytesIO(a)), return_metadata=True)
     tb, _ = mx.load(_named(io.BytesIO(b)), return_metadata=True)
+    # Only layers.* tensors carry the token axis; rot.*/cb.* are frame
+    # constants (comparing those on axis 2 would raise).
     stable = all(
-        bool((ta[n][:, :, :1000] == tb[n][:, :, :1000]).all())
+        bool((ta[n][:, :, :short_len] == tb[n][:, :, :short_len]).all())
         for n in ta
-        if not n.startswith("rot.")
+        if n.startswith("layers.")
     )
-    report["append_stable_real_kv"] = stable
+    constants_stable = all(bool((ta[n] == tb[n]).all()) for n in ta if not n.startswith("layers."))
+    report["append_stable_real_kv"] = stable and constants_stable
 
     # --- G3: greedy agreement, scratch vs TQ-resumed -----------------------
     prompts = [
@@ -214,8 +225,14 @@ def main() -> int:
         tq_payload = encode_cache(_prefill(model, p[:-1]), 3, 4, 64)
         resumed = decode_payload(tq_payload)
         resumed_out = _greedy(model, tokenizer, p[-1:], resumed, args.gen_tokens)
-        same = [x == y for x, y in zip(scratch_out, resumed_out, strict=False)]
-        agreements.append(sum(same) / max(len(same), 1))
+        # Compare through the LONGER output: an early EOS on one side is
+        # itself divergence, and strict=False would silently drop it.
+        n = max(len(scratch_out), len(resumed_out))
+        same = [
+            (i < len(scratch_out) and i < len(resumed_out) and scratch_out[i] == resumed_out[i])
+            for i in range(n)
+        ]
+        agreements.append(sum(same) / max(n, 1))
         k = next((i for i, s in enumerate(same) if not s), None)
         first_div.append(k)
     report["generation_greedy_k3v4"] = {
