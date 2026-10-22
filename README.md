@@ -321,8 +321,8 @@ real-engine prefix benchmark (premise-guarded, see
 [docs/benchmarks.md](docs/benchmarks.md)); `bench_wrapper.py`/`qa_wrapper.py`
 drive the wrapper path's own gates; `replay_trace.py` scores captured traces.
 Timing probes live in `sidecar/probes/`: mlx capability, quantized-KV
-persistence, decode A/B, and resume budget — each measures one question the
-cache's claims rest on.
+persistence, decode A/B, context sweep, and resume budget — each measures
+one question the cache's claims rest on.
 
 The real mlx-lm round-trip gate (needs a downloaded model) is opt-in:
 
@@ -341,6 +341,22 @@ serialize 20 ms, deserialize <1 ms. Qwen2.5-7B-Instruct-4bit: 57,344 bytes/token
 serialize 526 ms, deserialize <1 ms, prefill 10.2 s. Qwen3-32B-4bit: 262,150
 bytes/token, serialize 203 ms, deserialize 1 ms, prefill 11.1 s. A hit eliminates
 that prefill, and the 2 s TTFT resume budget holds with margin at every size.
+
+Long-context cost curve on the reference model (Qwen2.5-7B-Instruct-4bit,
+context sweep — one process per size, self-checked for monotonicity,
+decode/prefill ratio, repeatability, and swap): prefill runs 0.39 s at 256
+tokens to 66.2 s at 32K — 1.5 ms/token at the small end growing to
+2.0 ms/token as the attention history lengthens — while decode stays flat
+at 13-21 ms/token across every size (largest/smallest ratio 1.40x), so a
+long context taxes the prefill you pay once, not the decode you pay per
+token. Checkpoints scale 15.1 MB → 1.88 GB at 56-58 KB/token, matching the
+per-token figure above. The 32K prefill reproduced at 64.7 s in an
+independent run (2.3% apart); the curve interpolates to the 19,847-token
+restart test's 34.5 s cold prefill within 5%. The sweep refused its own
+first run on a 2.8 GB swap rise while the 32K row's ~7 GB working set
+arrived (unrelated cold pages displaced; the clock was clean); the re-run
+from a quiet machine passed every check. The probe is
+`sidecar/probes/context_sweep.py`.
 
 Restart resume (the claim that matters for a cache): a 19,847-token agent
 context on Qwen2.5-7B-Instruct-4bit goes 34.5 s cold → 1.56 s warm → **1.59 s

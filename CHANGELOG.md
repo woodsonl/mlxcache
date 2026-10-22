@@ -18,6 +18,15 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   (bypass: MLXCACHE_PROBE_LOCK=off). 13 hermetic tests pin the check math —
   including the inverted-monotonicity regression that once flagged every
   healthy run — and the lock's refusal/release/bypass behavior.
+- **The long-context cost curve is back, on the supported path.** Measured
+  on Qwen2.5-7B-Instruct-4bit (256 to 32K tokens): prefill 0.39 s to 66.2 s
+  (1.5 to 2.0 ms/token), decode flat at 13-21 ms/token at every size,
+  checkpoints 15.1 MB to 1.88 GB at 56-58 KB/token. The 32K row reproduced
+  across independent runs 2.3% apart, and the curve interpolates to the
+  19,847-token restart test's 34.5 s cold prefill within 5%. The first
+  sweep run refused itself on a 2.8 GB swap rise (cold-page displacement as
+  the 32K working set arrived; clock clean) and the re-run passed every
+  check — the refusal is recorded in README's Measured section.
 ## 0.4.0 — 2026-10-21
 
 ### Removed
