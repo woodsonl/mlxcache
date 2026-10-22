@@ -60,10 +60,15 @@ def _cos(a, b) -> float:
 
     a32, b32 = a.astype(mx.float32), b.astype(mx.float32)
     per = (a32 * b32).sum(-1) / ((a32 * a32).sum(-1).sqrt() * (b32 * b32).sum(-1).sqrt())
-    finite = per[mx.isfinite(per)]
-    # A zero-norm row measures 0/0 = NaN; report it as 0 rather than
-    # writing an unquoted NaN into the JSON record (strict parsers reject).
-    return float(finite.mean()) if finite.size else 0.0
+    # A zero-norm row measures 0/0 = NaN; report the finite mean rather
+    # than writing an unquoted NaN into the JSON record (strict parsers
+    # reject). mx.where, not boolean indexing: MLX does not support
+    # boolean-mask READS (raises "boolean indices are not yet supported").
+    finite = mx.isfinite(per)
+    count = int(finite.sum())
+    if count == 0:
+        return 0.0
+    return float(mx.where(finite, per, 0.0).sum() / count)
 
 
 def _per_layer_cos(orig, reco) -> list[float]:
