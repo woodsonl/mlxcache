@@ -150,3 +150,66 @@ def test_trim_size_empty_mask():
     # make_mask delegates to mlx-lm's causal mask with our offset
     m = live.make_mask(4, return_array=True)
     assert m is not None
+
+
+def test_adopted_live_cache_encodes_appends_with_the_frames_codebook():
+    """Regression: frame_basis used to return EMPTY bucketing boundaries, so
+    a cache adopted from a frame encoded every appended key coordinate as
+    index 0 — silent corruption of delta prefill. An adopted cache must
+    quantize appended rows identically to a from-scratch cache."""
+    basis = tq_basis(D)
+    k, v = _kv(41, 30)
+    src = TurboQuantKVCache(4, 4, 64, basis=basis)
+    src.update_and_fetch(k, v)
+    frame = serialize_live([src], 4, 4, 64)
+
+    from mlxcache_sidecar.tq.codec import decode_frame, frame_basis  # noqa: PLC0415
+
+    arrays, meta = decode_frame(frame)
+    adopted_basis = frame_basis(arrays, meta)
+    adopted = TurboQuantKVCache(4, 4, 64, basis=adopted_basis)
+    adopted.adopt_state(
+        arrays["layers.0.k.idx"],
+        arrays["layers.0.k.norm"],
+        arrays["layers.0.v.q"],
+        arrays["layers.0.v.s"],
+        arrays["layers.0.v.b"],
+        meta["offset"],
+        meta["kv_dtype"],
+    )
+    k2, v2 = _kv(42, 10)
+    adopted.update_and_fetch(k2, v2)
+
+    scratch = TurboQuantKVCache(4, 4, 64, basis=tq_basis(D))
+    scratch.update_and_fetch(k, v)
+    scratch.update_and_fetch(k2, v2)
+    assert bool((adopted.keys[..., 30:40, :] == scratch.keys[..., 30:40, :]).all()), (
+        "adopted cache encoded appended rows differently than a fresh cache"
+    )
+    # The reconstructed boundaries match the solver's fixed point to f32
+    # storage precision (the frame carries the levels as f32; the solver's
+    # midpoints are float64 — identical bucketing, last-ulp differences).
+    for got, want in zip(adopted_basis[1][1], tq_basis(D)[1][1], strict=True):
+        assert abs(got - want) < 1e-5
+
+
+def test_decode_rejects_rank3_packed_keys():
+    """Regression: a rank-3 k.idx passed the [:3] shape checks and only
+    exploded as IndexError on the first live append — a 500 loop, not a 422
+    quarantine."""
+    import io
+
+    from mlx_lm.models.cache import KVCache  # noqa: PLC0415
+
+    k0, v0 = _kv(43, 20)
+    plain = KVCache()
+    plain.update_and_fetch(k0, v0)
+    payload = encode_cache([plain], 3, 4, 64)
+    blob = io.BytesIO(payload)
+    blob.name = "x.safetensors"
+    arr, meta = mx.load(blob, return_metadata=True)
+    arr["layers.0.k.idx"] = arr["layers.0.k.idx"][:, :, 0, :]  # rank 3
+    buf = io.BytesIO()
+    mx.save_safetensors(buf, arr, meta)
+    with pytest.raises(ValueError, match="ranks are wrong"):
+        decode_payload(buf.getvalue())

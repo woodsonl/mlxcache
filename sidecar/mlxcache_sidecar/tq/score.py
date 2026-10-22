@@ -106,10 +106,12 @@ def qjl_correction(query, residual_sign, residual_norms, rotation, head_dim: int
 
 
 def residual_signs_from_y(y, idx, codebook, head_dim: int):
-    """sign(S·r) AND ‖r‖ for tokens still in the encoder's hand: `y` is the
-    pre-quantization rotated unit vector in u-units [.., d] and `idx` the
-    just-computed centroid indices [.., d]. Returns (int8 ±1, f32 norms),
-    same leading shape.
+    """sign(S·r̃) AND ‖r̃‖ for tokens still in the encoder's hand, where the
+    coherent residual is r̃ = s·y − ŷ: the compensated-norm score computes
+    (n/s)·<Rq, ŷ>/√d against the true n·<Rq, y>/√d, so the missing term is
+    exactly (n/s)·<Rq, s·y − ŷ>/√d with s = ‖ŷ‖/√d per row. `y` is the
+    pre-quantization rotated unit vector in u-units [.., d], `idx` the
+    just-computed centroid indices [.., d]. Returns (int8 ±1, f32 norms).
 
     Storage: d bits per token per head (16 B at d=128 — the frame grows by
     roughly a third at k3) plus the per-token norm. Nothing persists these
@@ -120,7 +122,8 @@ def residual_signs_from_y(y, idx, codebook, head_dim: int):
     levels, _boundaries, _mse = codebook
     centroids = mx.array(levels, dtype=mx.float32)
     yhat = mx.take(centroids, idx.reshape(-1)).reshape(idx.shape)
-    residual = y.astype(mx.float32) - yhat
+    s_row = mx.sqrt(mx.sum(yhat * yhat, axis=-1)) / mx.sqrt(float(head_dim))
+    residual = s_row[..., None] * y.astype(mx.float32) - yhat
     r_norms = mx.sqrt(mx.sum(residual * residual, axis=-1))
-    sketched = residual @ _qjl_matrix(head_dim).T  # S·r per row
+    sketched = residual @ _qjl_matrix(head_dim).T  # S·r̃ per row
     return mx.where(sketched >= 0, 1, -1).astype(mx.int8), r_norms

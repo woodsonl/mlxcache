@@ -311,11 +311,26 @@ def decode_frame(payload: bytes) -> tuple[dict, dict]:
         v_b = arrays.get(f"layers.{i}.v.b")
         if any(x is None for x in (k_idx, norms, v_q, v_s, v_b)):
             raise ValueError(f"layer {i} is missing tensors")
+        # Rank first: a rank-3 k.idx passes the [:3] comparisons below (a
+        # rank-4 value tensor shares its leading axes) and only explodes as
+        # IndexError on the first live append — past the 422 boundary.
+        if k_idx.ndim != 4 or v_q.ndim != 4 or norms.ndim != 3:
+            raise ValueError(f"layer {i} tensor ranks are wrong")
         if min(k_idx.shape[2], norms.shape[2], v_q.shape[2], v_s.shape[2], v_b.shape[2]) < offset:
             raise ValueError(f"layer {i} tensors do not cover the claimed offset {offset}")
         if k_idx.shape[:3] != v_q.shape[:3] or norms.shape[:3] != v_q.shape[:3]:
             raise ValueError(
                 f"layer {i} key/value shapes disagree: {tuple(k_idx.shape)} vs {tuple(v_q.shape)}"
+            )
+        # Packed widths must match the declared bits: a width mismatch would
+        # either unpack garbage indices or misalign the group-quantized rows.
+        d = v_s.shape[-1] * group_size
+        expected_k_w = -(-d // (32 // key_bits)) if key_bits else 0
+        expected_v_w = -(-d * value_bits // 32)
+        if k_idx.shape[-1] != expected_k_w or v_q.shape[-1] != expected_v_w:
+            raise ValueError(
+                f"layer {i} packed widths {k_idx.shape[-1]}/{v_q.shape[-1]} do not match "
+                f"bits {key_bits}/{value_bits} for head_dim {d}"
             )
     meta = {
         "key_bits": key_bits,
@@ -331,8 +346,12 @@ def decode_frame(payload: bytes) -> tuple[dict, dict]:
 def frame_basis(arrays: dict, meta: dict):
     """The (rotation, codebook) pair a frame carries, in the shape the
     codec's encode/decode helpers expect. One source for both adopt paths.
-    The codebook LENGTH is pinned to the declared bits: a wrong-length
-    codebook silently changes the bit width derived from it."""
+    The codebook LENGTH is pinned to the declared bits, and the bucketing
+    boundaries are RECONSTRUCTED from the frame's own levels (the solver's
+    fixed point makes boundaries the midpoints of adjacent centroids —
+    pinned by test_fixed_point_optimality), so an adopted live cache
+    quantizes appended tokens with the frame's exact codebook instead of an
+    empty-boundary book that would encode every coordinate as index 0."""
     d = arrays[f"layers.{meta['layer_ids'][0]}.v.s"].shape[-1] * meta["group_size"]
     rot_name, cb_name = f"rot.{d}", f"cb.{d}.{meta['key_bits']}"
     if rot_name not in arrays or cb_name not in arrays:
@@ -340,7 +359,11 @@ def frame_basis(arrays: dict, meta: dict):
     levels = arrays[cb_name]
     if levels.shape != (1 << meta["key_bits"],):
         raise ValueError(f"codebook has {levels.shape[0]} levels for {meta['key_bits']} bits")
-    return arrays[rot_name], (levels.tolist(), (), 0.0)
+    level_values = levels.tolist()
+    boundaries = tuple(
+        (a + b) / 2.0 for a, b in zip(level_values[:-1], level_values[1:], strict=True)
+    )
+    return arrays[rot_name], (level_values, boundaries, 0.0)
 
 
 def decode_payload(payload: bytes) -> list:
