@@ -101,6 +101,33 @@ The opt-in real gate (`test_roundtrip_real.py`, TQ arm) pins: codec
 determinism, resume determinism, >3× compression vs f16, and the k4v4
 per-layer fidelity floor (0.985, margin under the measured 0.992).
 
+## Live-run disclosures (QA, real daemon + 7B)
+
+Two behaviors of the lossy tier that the exact tiers do not have, both
+verified on a live daemon (`tq-k4v4-g64`):
+
+1. **The publishing request's own generation is a lossy continuation.** The
+   daemon's design resumes /generate from the checkpoint the request just
+   published (single-flight followers need this). On the TQ tier that means
+   the FIRST request's output continues from quantize→dequantize KV —
+   deterministic and reproducible (an identical re-request replays the same
+   tokens from the same blob), but not bit-equal to the same prompt served
+   without the daemon. A scratch retry that bypasses the blob (e.g. after a
+   quarantine) can therefore generate a different tail than the blob-adopted
+   run, and its settle lands under a different key (same fingerprint,
+   different generated tokens).
+2. **A quarantined entry costs one extra miss before the cache heals.** On
+   f16 the scratch retry regenerates identical tokens and republishes under
+   the original key immediately; on TQ the retry's divergent tail publishes
+   a sibling entry instead, so the NEXT request takes an honest miss and
+   republishes the shared-prefix node itself. Responses stay correct
+   throughout; only hit rate dips once.
+
+Neither is a correctness break — both follow from bounded distortion plus
+the daemon's resume-from-own-checkpoint design — but an operator comparing
+TQ outputs against a no-daemon run should expect token-level differences
+with equivalent meaning.
+
 ## Provenance and invariants
 
 - Codebooks are DERIVED (Max-Lloyd on the paper's Lemma-1 density) and
