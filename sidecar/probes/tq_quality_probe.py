@@ -80,10 +80,6 @@ def _to_quantized(cache, bits: int, group: int = 64):
     return [c.to_quantized(group_size=group, bits=bits) for c in cache]
 
 
-def _q_state_bytes(quant_cache) -> int:
-    return sum(c.nbytes for c in quant_cache)
-
-
 def _greedy(model, tokenizer, prompt_tokens, cache, max_tokens: int) -> list[int]:
     import mlx.core as mx
     from mlx_lm import stream_generate
@@ -148,7 +144,6 @@ def main() -> int:
                 c = KVCache()
                 c.state = (kd, vd)
                 reco.append(c)
-            payload_bytes = _q_state_bytes(quant)
             # the wire payload is the safetensors frame, not the raw tensors
             from mlx_lm.models.cache import save_prompt_cache
 

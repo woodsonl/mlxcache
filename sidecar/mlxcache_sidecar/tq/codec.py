@@ -44,18 +44,12 @@ VALUE_BITS_CHOICES = (2, 3, 4, 6, 8)
 DEFAULT_GROUP_SIZE = 64
 
 
-def tier_string(key_bits: int, value_bits: int, group_size: int = DEFAULT_GROUP_SIZE) -> str:
-    """Canonical fingerprint tier label, e.g. ``tq-k3v4-g64``.
-
-    The group size is always spelled out: two group sizes are two formats
-    for R1-1 purposes, exactly like ``kv_group_size`` on the q8 tier.
-    """
-    return f"tq-k{key_bits}v{value_bits}-g{group_size}"
-
-
 def parse_tier(tier: str) -> tuple[int, int, int]:
-    """Inverse of ``tier_string``. Raises ValueError on anything unknown —
-    a typo'd env var must refuse to boot, not silently fall back to f16."""
+    """Parse a tier label like ``tq-k3v4-g64`` into (key_bits, value_bits,
+    group_size). Raises ValueError on anything unknown — a typo'd env var
+    must refuse to boot, not silently fall back to f16. The label grammar is
+    pinned by the golden tests' literals; there is no formatter because
+    nothing in production composes labels, operators spell them."""
     parts = tier.split("-")
     if len(parts) != 3 or parts[0] != "tq":
         raise ValueError(f"unknown kv tier {tier!r} (expected e.g. 'tq-k3v4-g64')")
@@ -232,11 +226,7 @@ def decode_payload(payload: bytes) -> list:
     # mx.load infers safetensors from the extension and reads `.name`:
     # a bare BytesIO raises AttributeError (the pinned landmine).
     blob.name = "checkpoint.safetensors"
-    try:
-        arrays, metadata = mx.load(blob, return_metadata=True)
-    except AttributeError:
-        arrays = mx.load(blob)
-        metadata = None
+    arrays, metadata = mx.load(blob, return_metadata=True)
     if not metadata or metadata.get("format") != FORMAT:
         raise ValueError("not a TurboQuant frame (missing format metadata)")
     key_bits = int(metadata["key_bits"])

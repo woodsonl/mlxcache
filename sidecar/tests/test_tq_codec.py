@@ -26,7 +26,6 @@ from mlxcache_sidecar.tq import (  # noqa: E402
     decode_payload,
     encode_cache,
     parse_tier,
-    tier_string,
 )
 from mlxcache_sidecar.tq.codec import _pack_indices, _unpack_indices  # noqa: E402
 
@@ -98,9 +97,8 @@ def _worst(a, b) -> float:
         ("tq-k4v4-g32", (4, 4, 32)),
     ],
 )
-def test_tier_roundtrip(tier, expected):
+def test_tier_parse(tier, expected):
     assert parse_tier(tier) == expected
-    assert tier_string(*expected) == tier
 
 
 @pytest.mark.parametrize(
@@ -112,8 +110,11 @@ def test_tier_rejects_unknown(bad):
 
 
 def test_default_group_is_pinned():
+    # The canonical labels the README documents parse to the documented
+    # parameters; 64 is the group size every shipped label carries.
     assert DEFAULT_GROUP_SIZE == 64
-    assert parse_tier(tier_string(3, 4)) == (3, 4, 64)
+    assert parse_tier("tq-k4v4-g64") == (4, 4, 64)
+    assert parse_tier("tq-k3v2-g64") == (3, 2, 64)
 
 
 # --- bit packing ----------------------------------------------------------

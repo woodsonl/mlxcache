@@ -587,26 +587,26 @@ def read_wire_checkpoint(
     return meta, payload, True
 
 
-def _parse_kv_tier_env() -> str:
-    """MLXCACHE_KV_TIER → validated tier label ("" when unset).
+def _parse_kv_tier_env() -> tuple[str, tuple[int, int, int] | None]:
+    """MLXCACHE_KV_TIER → (tier label, parsed (key_bits, value_bits,
+    group_size)); ("", None) when unset.
 
     Refuses at boot on anything ``parse_tier`` rejects and on a simultaneous
     MLXCACHE_KV_BITS: the two knob families select different payload formats
-    for the SAME fingerprint axis, so an accidental double set would fingerprint
-    one tier and encode the other's bytes."""
+    for the SAME fingerprint axis, so an accidental double set would
+    fingerprint one tier and encode the other's bytes."""
     from mlxcache_sidecar.tq import parse_tier  # noqa: PLC0415
 
     tier = (os.environ.get("MLXCACHE_KV_TIER", "") or "").strip()
     if not tier:
-        return ""
+        return "", None
     if os.environ.get("MLXCACHE_KV_BITS", "0") not in ("0", "", None):
         raise ValueError(
             "MLXCACHE_KV_TIER and MLXCACHE_KV_BITS are mutually exclusive: "
             "they select different payload formats for the same fingerprint "
             "axis. Set exactly one."
         )
-    parse_tier(tier)  # raises ValueError with the exact reason on a bad label
-    return tier
+    return tier, parse_tier(tier)
 
 
 class SyntheticEngine:
@@ -648,7 +648,7 @@ class SyntheticEngine:
             # for the same operator config, breaking the synthetic engine's
             # own must-respond-exactly contract.
             self.kv_group_size = 64
-        self.kv_tier = _parse_kv_tier_env()
+        self.kv_tier, self._tq_params = _parse_kv_tier_env()
         # Test knob: emulate a tokenizer that grows a base prompt's tokens —
         # tokenize(base) is a strict token-prefix of tokenize(base + rest), so
         # daemon tests can exercise partial hits and delta prefill (which the
@@ -1029,11 +1029,7 @@ class MlxLmEngine:
             self.kv_group_size = 64
         # Named persistence tier (TQ codecs): validated for the same reasons
         # and mutually exclusive with the bits tier — see _parse_kv_tier_env.
-        self.kv_tier = _parse_kv_tier_env()
-        if self.kv_tier:
-            from mlxcache_sidecar.tq import parse_tier  # noqa: PLC0415
-
-            self._tq_params = parse_tier(self.kv_tier)
+        self.kv_tier, self._tq_params = _parse_kv_tier_env()
         # One cache construction serves BOTH boot checks below. It allocates
         # no arrays (state fills on the first forward), so probing every model
         # — quantized or not — is free. Composition must be signed for EVERY
