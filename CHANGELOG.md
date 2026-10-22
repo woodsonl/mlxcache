@@ -2,6 +2,22 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.4.1 — 2026-10-22
+
+### Added
+
+- **The context sweep probe** (`sidecar/probes/context_sweep.py`): prefill,
+  decode, and checkpoint-byte cost as context grows, measured on any mlx-lm
+  model through the adapter's own calls. Rebuilds the long-context
+  measurement capability the qwen4-exp removal took, on the supported path.
+  One process per context length; a warmup leg absorbs the resident model's
+  one-time cold page-cache (a leading control paid 45% extra without it,
+  measured); a control pair brackets the sweep so repeatability is observed;
+  monotonicity, decode/prefill-ratio, and swap checks refuse a contaminated
+  run rather than labelling it afterward. One sweep at a time via flock
+  (bypass: MLXCACHE_PROBE_LOCK=off). 13 hermetic tests pin the check math —
+  including the inverted-monotonicity regression that once flagged every
+  healthy run — and the lock's refusal/release/bypass behavior.
 ## 0.4.0 — 2026-10-21
 
 ### Removed
