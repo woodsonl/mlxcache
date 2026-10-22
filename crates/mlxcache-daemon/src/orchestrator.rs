@@ -336,14 +336,22 @@ impl Orchestrator {
             .map(|c| {
                 (
                     c.blob_path.clone(),
-                    std::fs::metadata(persistence.blob_dir.join(&c.blob_path))
-                        .map(|m| m.len())
-                        .unwrap_or(0),
+                    // v3 blobs are header-only files (~500B): their real
+                    // footprint is their chunks. The eviction budget must
+                    // see chunked bytes or a chunked store never binds.
+                    persistence.blob_disk_bytes(&c.blob_path).unwrap_or(0),
                 )
             })
             .collect();
         let size_of = |name: &str| -> u64 { sizes.get(name).copied().unwrap_or(0) };
-        let total_bytes: u64 = sizes.values().sum();
+        let mut total_bytes: u64 = sizes.values().sum();
+        // Chunked overhead the blob sizes cannot see: manifests + segment
+        // slack (dead bytes awaiting GC) + shared chunks already counted in
+        // one blob but resident regardless. Counted ONCE per pass, from the
+        // store's physical truth.
+        if let Some(chunked_overhead) = persistence.chunked_overhead_bytes() {
+            total_bytes += chunked_overhead;
+        }
         // Entry-cap semantics at the PASS level: `max_entries` is a hard cap,
         // 0 = allow zero published entries (evict everything evictable). The
         // "0 disables the knob" convention lives at the env layer (main.rs
@@ -403,6 +411,9 @@ impl Orchestrator {
                 remaining_bytes = remaining_bytes.saturating_sub(*size);
             }
         }
+        // Chunked stores only reclaim disk when segments empty out: GC after
+        // removals so the byte budget actually falls this pass.
+        persistence.gc_chunked();
         if max_bytes > 0 && remaining_bytes > max_bytes {
             // All that is left is anchors (or races): the budget is a
             // best-effort cap that never breaks the anchor contract.
@@ -801,7 +812,14 @@ mod tests {
         // read_dir fails and list_blobs errors.
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("blobs");
-        let missing = crate::persistence::Persistence::new(&dir).unwrap();
+        // Whole mode: the chunk store would create blobs/chunks/ inside
+        // the dir this test then needs to replace with a file; the scan
+        // failure path under test is layout-independent.
+        let missing = crate::persistence::Persistence::new_with_mode(
+            &dir,
+            crate::persistence::ChunkMode::Whole,
+        )
+        .unwrap();
         std::fs::remove_dir(&dir).unwrap();
         std::fs::write(&dir, b"x").unwrap();
         let report = orch.rebuild_from_disk(&missing);

@@ -196,6 +196,13 @@ class Store:
             meta, payload = blob.decode(raw)
         except ValueError as exc:
             raise CorruptCache(getattr(exc, "kind", "header"), f"{ref}: {exc}") from exc
+        if meta.format_version == 3:
+            from .chunks import ChunkFormatError, ChunkReader  # noqa: PLC0415
+
+            try:
+                return ChunkReader(self.dir).read_payload(path, meta.payload_sha256)
+            except ChunkFormatError as exc:
+                raise CorruptCache("digest", f"{ref}: {exc}") from exc
         if meta.payload_sha256 is None:
             return payload  # v1 legacy: readable, never verified (§5)
         if hashlib.sha256(payload).hexdigest() != meta.payload_sha256:
@@ -325,6 +332,15 @@ class Store:
                 total += path.stat().st_size
             except OSError:
                 continue  # raced unlink: not present, not counted
+        # Chunked (v3) footprint: manifests beside the tiny headers, and
+        # the packed segments under chunks/. The daemon is the chunk writer;
+        # this store still budgets what its directory actually occupies.
+        for pattern in ("*.ckm", "chunks/*.seg"):
+            for path in self.dir.glob(pattern):
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    continue
         return total
 
     def _enforce_budget(self) -> None:
