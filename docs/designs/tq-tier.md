@@ -46,33 +46,35 @@ ever selects one.
 ## Measured: the bake-off (G1, G5)
 
 `sidecar/probes/tq_quality_probe.py`, Qwen2.5-7B-Instruct-4bit, 1,500-token
-prefix of the pinned T22 corpus. Fidelity = per-layer cosine of
+prefix of the pinned T22 corpus, run against the FINAL shipped codec (f32
+norms, norm compensation, codebook-in-frame). Fidelity = per-layer cosine of
 quantize→dequantize KV against the f16 cache the engine actually held
-(min over layers of min(cos_K, cos_V)); bytes = the wire payload.
+(min over layers of min(cos_K, cos_V)); bytes = the wire payload; the f16
+reference is the SERIALIZED frame (57,292 B/token), not allocation bytes.
 
 | Tier | B/token | × vs f16 | min layer cos | mean layer cos |
 |---|---:|---:|---:|---:|
-| f16 (reference) | 58,760 | 1.00 | 1.0 | 1.0 |
-| q8 (bits) | 30,474 | 1.93 | 0.99995 | 0.99997 |
-| **tq-k4v4-g64** | **15,508** | **3.79** | **0.99234** | **0.99470** |
-| q4 (bits) | 16,138 | 3.64 | 0.98995 | 0.99195 |
-| tq-k3v4-g64 | 14,164 | 4.15 | 0.98106 | 0.98303 |
-| q3 (bits) | 12,554 | 4.68 | 0.95983 | 0.96585 |
-| tq-k3v2-g64 | 10,580 | 5.55 | 0.88506 | 0.90426 |
-| q2 (bits) | 8,970 | 6.55 | 0.84858 | 0.87061 |
+| f16 (reference) | 57,292 | 1.00 | 1.0 | 1.0 |
+| q8 (bits) | 30,474 | 1.88 | 0.99995 | 0.99997 |
+| **tq-k4v4-g64** | **15,732** | **3.64** | **0.99234** | **0.99470** |
+| q4 (bits) | 16,138 | 3.55 | 0.98995 | 0.99195 |
+| tq-k3v4-g64 | 14,388 | 3.98 | 0.98106 | 0.98303 |
+| q3 (bits) | 12,554 | 4.57 | 0.95983 | 0.96585 |
+| tq-k3v2-g64 | 10,804 | 5.31 | 0.88506 | 0.90426 |
+| q2 (bits) | 8,970 | 6.39 | 0.84858 | 0.87061 |
 
 Readings that shaped the decision:
 
-1. **tq-k4v4 strictly dominates q4** — smaller (3.79× vs 3.64×) AND more
-   faithful (0.992 vs 0.990). The port earns its place at the quality end of
-   the frontier; tq-k4v4-g64 is the recommended default when a named tier is
-   selected at all.
+1. **tq-k4v4 strictly dominates q4** — smaller (15,732 vs 16,138 B/token)
+   AND more faithful (0.992 vs 0.990). The port earns its place at the
+   quality end of the frontier; tq-k4v4-g64 is the recommended default when
+   a named tier is selected at all.
 2. **The rotation buys fidelity, the uniform grid buys bytes.** At every
    matched compression band the TQ arm sits above the same-size bits arm on
    fidelity (k4v4 > q4, k3v4 > q3, k3v2 > q2), and the bits arms sit above
-   on compression at the low end (q2 6.55× is the smallest payload
-   measured). Both families are Pareto-frontier members; the tiers are
-   complements, not replacements.
+   on compression at the low end (q2 is the smallest payload measured).
+   Both families are Pareto-frontier members; the tiers are complements,
+   not replacements.
 3. Real keys are slightly HARDER than the paper's worst case (iid): k3 keys
    measure 0.981–0.983 against the theoretical 0.985 floor — some layers'
    keys are less isotropic than random vectors. The probe's per-layer min is
@@ -80,18 +82,18 @@ Readings that shaped the decision:
 
 ## Measured: the remaining gates
 
-- **G2 adopt budget** — TQ decode 6.5 ms vs mlx-lm f16 load 11.1 ms at the
-  1,500-token prefix: decode is FASTER than the f16 path (fewer bytes to
-  marshal). The R1-5 2 s budget holds with two orders of magnitude of
-  headroom at this scale.
+- **G2 adopt budget** — TQ decode 11.4 ms vs mlx-lm f16 load 14.3 ms at the
+  1,500-token prefix (both sides force full materialization): decode is
+  faster than the f16 path. The R1-5 2 s budget holds with two orders of
+  magnitude of headroom at this scale.
 - **G4 append stability (real KV)** — encode(A) vs encode(A+B) over real
   engine caches: every prior token's packed bytes identical (element-wise
   codecs; proven again on the real tensors, not just synthetic ones). The
   future chunked store's block-identity property survives the tier.
 - **G3 divergence (disclosure, not a pass/fail)** — greedy decode from a
   tq-k3v4-resumed cache vs scratch on three summarization prompts:
-  agreement 0.167/0.021/0.0, first divergence at position 8/1/0 of 48. A
-  lossy tier diverges from scratch EARLY; bounded-distortion is the
+  agreement 0.062/0.062/0.042, first divergence at position 3/2/0 of 48.
+  A lossy tier diverges from scratch EARLY; bounded-distortion is the
   contract, and the codec is deterministic so the divergence is stable
   across resumes of the same blob. If a workload needs token-exact resume,
   it must stay on f16/q8 — that is why the tier is opt-in and isolated in
