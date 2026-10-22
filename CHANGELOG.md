@@ -2,6 +2,52 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.5.0 — 2026-10-22
+
+### Added
+
+- **Named KV persistence tiers (TurboQuant codecs)**: opt-in compressed
+  checkpoint formats implemented from arXiv:2504.19874 (no third-party code;
+  their license is GPL-3.0). `MLXCACHE_KV_TIER=tq-k4v4-g64` on the sidecar,
+  `--kv-tier` on the wrapper. Rotated Lloyd-Max keys + group-quantized
+  values in a safetensors frame that carries its own rotation and codebook;
+  decode rebuilds a stock `KVCache`, so the engine never computes attention
+  from compressed state. Measured on Qwen2.5-7B-Instruct-4bit
+  ([docs/designs/tq-tier.md](docs/designs/tq-tier.md)): tq-k4v4-g64 stores
+  15,508 B/token (3.79x vs f16, per-layer cos 0.992) and strictly dominates
+  the plain q4 bits tier (16,138 B/token, 3.64x, 0.990); tq-k3v2-g64 reaches
+  10,580 B/token (5.55x) at cos 0.885; TQ decode at adopt is faster than the
+  f16 load (6.5 ms vs 11.1 ms at 1,500 tokens).
+- **The bounded-distortion correctness class** for named tiers
+  ([docs/contract-spec.md](docs/contract-spec.md) "Tier correctness
+  classes"): same blob resumed twice is token-identical, per-layer fidelity
+  floors are pinned by the real gate, divergence from scratch is documented
+  (greedy agreement 0.17/0.02/0.00 at k3v4), and the tier is
+  fingerprint-isolated so a lossy blob can never serve an f16/q8 identity.
+  Opt-in only; no default selects a tier.
+- **`kv_tier` fingerprint axis** through every binding: the daemon's
+  `/tokenize` identity, `ModelFingerprint`, `same_shape` settle guard, the
+  blob-key fold (zero bytes when empty, so pre-tier keys are unchanged;
+  goldens shared verbatim across Rust and Python), `identity_compatible` in
+  core and the store client, and the wrapper's fingerprint source.
+- Boot-time geometry guard for every quantized tier: one single-token
+  forward materializes per-layer head dims and refuses non-divisible or
+  mixed geometry at boot (previously a head_dim-96 model under g64 booted
+  green and 500-looped every cache-miss request; covers the q8 tier's
+  latent instance of the same class).
+- Real-path fixes surfaced by the opt-in gate: `MlxLmEngine.generate()` and
+  `generate_from_blob()` no longer crash on a legitimately uncacheable blob
+  (they construct a fresh cache instead of passing `cache=None` into the
+  streaming loop's trim probe); delta-prefill loads through the shared
+  tier-aware loader so the TQ decode path has exactly one implementation.
+
+### Changed
+
+- `--kv-bits` on the wrapper remains a partition label; the new `--kv-tier`
+  actually swaps the persistence codec (encode at insert, decode at fetch,
+  best-effort on both paths).
+- The quantization boot guard's error message names both knobs.
+
 ## 0.4.0 — 2026-10-21
 
 ### Removed

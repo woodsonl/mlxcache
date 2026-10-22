@@ -35,7 +35,15 @@ class _StubTokenizer:
 
 
 class _StubModel:
-    """Stands in for any architecture: `_adopt_model` must not care which."""
+    """Stands in for any architecture: `_adopt_model` must not care which.
+    The forward is shape-real enough for the quantization boot guard (which
+    runs one token to materialize per-layer head dims)."""
+
+    head_dim = 128
+
+    def __init__(self, head_dim=None):
+        if head_dim is not None:
+            self.head_dim = head_dim
 
     def parameters(self):
         import mlx.core as mx
@@ -46,6 +54,14 @@ class _StubModel:
         from mlx_lm.models.cache import KVCache
 
         return [KVCache()]
+
+    def __call__(self, inputs, cache=None):
+        import mlx.core as mx
+
+        for c in cache or []:
+            shape = (1, 1, inputs.shape[1], self.head_dim)
+            c.update_and_fetch(mx.zeros(shape, dtype=mx.float16), mx.zeros(shape, dtype=mx.float16))
+        return mx.zeros((1, inputs.shape[1], 2))
 
 
 class _Probe(server.MlxLmEngine):
@@ -80,6 +96,63 @@ def test_adopt_model_derives_the_kv_tier_from_env(monkeypatch):
     engine = _Probe(_StubModel(), _StubTokenizer())
     # The documented default group size for the proven q8 tier.
     assert (engine.kv_bits, engine.kv_group_size) == (8, 64)
+
+
+def test_adopt_model_parses_a_named_tier(monkeypatch):
+    pytest.importorskip("mlx.core")
+    monkeypatch.delenv("MLXCACHE_KV_BITS", raising=False)
+    monkeypatch.setenv("MLXCACHE_KV_TIER", "tq-k3v4-g64")
+    engine = _Probe(_StubModel(), _StubTokenizer())
+    assert engine.kv_tier == "tq-k3v4-g64"
+    assert engine._tq_params == (3, 4, 64)
+    # The named tier owns the axis: the scalar pair stays f16.
+    assert (engine.kv_bits, engine.kv_group_size) == (0, 0)
+
+
+@pytest.mark.parametrize("tier", ["tq", "tq-k9v4-g64", "tq-k3v4", "nope-k3v4-g64", "tq-k3v4-g1"])
+def test_adopt_model_refuses_a_bad_named_tier(monkeypatch, tier):
+    pytest.importorskip("mlx.core")
+    monkeypatch.delenv("MLXCACHE_KV_BITS", raising=False)
+    monkeypatch.setenv("MLXCACHE_KV_TIER", tier)
+    with pytest.raises(ValueError):
+        _Probe(_StubModel(), _StubTokenizer())
+
+
+def test_named_tier_and_bits_are_mutually_exclusive(monkeypatch):
+    pytest.importorskip("mlx.core")
+    monkeypatch.setenv("MLXCACHE_KV_BITS", "8")
+    monkeypatch.setenv("MLXCACHE_KV_TIER", "tq-k3v4-g64")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _Probe(_StubModel(), _StubTokenizer())
+
+
+def test_adopt_model_refuses_a_named_tier_on_a_hybrid_cache(monkeypatch):
+    pytest.importorskip("mlx.core")
+    from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+    class _Hybrid(_Probe):
+        def _prompt_cache_probe(self):
+            return [KVCache(), CacheList(KVCache(), ArraysCache(size=2))]
+
+    monkeypatch.delenv("MLXCACHE_KV_BITS", raising=False)
+    monkeypatch.setenv("MLXCACHE_KV_TIER", "tq-k3v4-g64")
+    with pytest.raises(ValueError, match="not a dense KV stack"):
+        _Hybrid(_StubModel(), _StubTokenizer())
+
+
+def test_quantized_tiers_refuse_indivisible_head_dim_at_boot(monkeypatch):
+    """head_dim % group_size is a boot error, not a first-prefill 500 loop:
+    a model like phi-3 (head_dim 96) under g64 must refuse with the fix in
+    the message before the server ever binds."""
+    pytest.importorskip("mlx.core")
+    monkeypatch.delenv("MLXCACHE_KV_TIER", raising=False)
+    monkeypatch.setenv("MLXCACHE_KV_BITS", "8")
+    with pytest.raises(ValueError, match="not divisible"):
+        _Probe(_StubModel(head_dim=96), _StubTokenizer())
+    monkeypatch.delenv("MLXCACHE_KV_BITS", raising=False)
+    monkeypatch.setenv("MLXCACHE_KV_TIER", "tq-k3v4-g64")
+    with pytest.raises(ValueError, match="not divisible"):
+        _Probe(_StubModel(head_dim=96), _StubTokenizer())
 
 
 def test_adopt_model_refuses_quantization_on_a_hybrid_cache(monkeypatch):

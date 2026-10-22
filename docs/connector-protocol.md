@@ -35,7 +35,7 @@ JSON header fields `[CURRENT, plus B0.2 additions marked]`:
 
 | field | type | notes |
 |---|---|---|
-| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size`, `cache_layout`, `content_digest` `[CURRENT]`. `tokenizer_hash` is engine-specific, and an unavailable tokenizer fails CLOSED everywhere (the literal `"missing"` sentinel disables persistence — lookup and publication — rather than pinning an unverifiable identity). **Wrapper (L1, `mlxcache_serve`)**: sha256 of the model's `tokenizer.json` bytes, read symlink-safely: HF-cache snapshot symlinks are followed only while the target resolves inside the model dir or its own `blobs/` storage (fail-closed otherwise, directories read as absent), and the opened file's inode is reconciled against the checked path. **Sidecar connector (`mlxcache_sidecar`)**: canonically the UTF-8 SHA-256 digest of `repr(sorted(tokenizer.get_vocab().items()))`, truncated to the first 16 hexadecimal characters — implementations must reproduce this exact representation and truncation to produce compatible fingerprints and reuse checkpoints (an alternate serialization or truncation length yields a different hash and silently forfeits reuse); when `get_vocab()` is unavailable the hash is the `"missing"` sentinel and the sidecar refuses to settle (the daemon likewise refuses to publish under it) |
+| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size`, `cache_layout`, `content_digest`, `kv_tier` `[CURRENT]`. `tokenizer_hash` is engine-specific, and an unavailable tokenizer fails CLOSED everywhere (the literal `"missing"` sentinel disables persistence — lookup and publication — rather than pinning an unverifiable identity). **Wrapper (L1, `mlxcache_serve`)**: sha256 of the model's `tokenizer.json` bytes, read symlink-safely: HF-cache snapshot symlinks are followed only while the target resolves inside the model dir or its own `blobs/` storage (fail-closed otherwise, directories read as absent), and the opened file's inode is reconciled against the checked path. **Sidecar connector (`mlxcache_sidecar`)**: canonically the UTF-8 SHA-256 digest of `repr(sorted(tokenizer.get_vocab().items()))`, truncated to the first 16 hexadecimal characters — implementations must reproduce this exact representation and truncation to produce compatible fingerprints and reuse checkpoints (an alternate serialization or truncation length yields a different hash and silently forfeits reuse); when `get_vocab()` is unavailable the hash is the `"missing"` sentinel and the sidecar refuses to settle (the daemon likewise refuses to publish under it) |
 | `token_count` | u64 | cross-checked against `len(tokens)` at read `[CURRENT]` |
 | `tokens` | [u32] | the exact token-ID prefix this entry is keyed by `[CURRENT]` |
 | `format_version` | u32 | see §5 `[CURRENT]` |
@@ -204,13 +204,21 @@ The fold is **normative by reference and by construction**:
   `fingerprint.content_digest` folds as the LAST length-prefixed field,
   after `cache_layout`. Empty contributes ZERO bytes, so text-only keys are
   unchanged.
+- **Named KV tier** `[CURRENT]`: a NON-EMPTY `fingerprint.kv_tier`
+  (e.g. `tq-k3v4-g64`) folds as the last length-prefixed fingerprint field,
+  after `content_digest`. Empty contributes ZERO bytes, so pre-tier keys
+  are unchanged. A tier labels a payload format the scalar `kv_bits` pair
+  cannot express (the TurboQuant codecs: asymmetric key/value widths, a
+  codec-specific frame), so it namespaces exactly like `kv_bits` does for
+  q8 and is compared with EXACT equality — never cross-served against the
+  untiered identity or another tier.
 
 Full order, with `?` marking the fields that fold only when non-default:
 
 ```
 engine_chunks? ‖ SEP ‖ model_id ‖ tokenizer_hash ‖ kv_dtype
                        ‖ kv_layout_version ‖ kv_bits ‖ kv_group_size
-                       ‖ cache_layout? ‖ content_digest? ‖ SEP ‖ tokens
+                       ‖ cache_layout? ‖ content_digest? ‖ kv_tier? ‖ SEP ‖ tokens
 ```
 
 Every field is length-prefixed, so no field's bytes can be re-split across

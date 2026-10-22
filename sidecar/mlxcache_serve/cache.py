@@ -138,12 +138,15 @@ def fingerprint_for_model_dir(
     kv_bits: int = 0,
     kv_group_size: int = 0,
     model_id_override: str | None = None,
+    kv_tier: str = "",
 ) -> Fingerprint:
     """Deterministic fingerprint for an mlx-lm model directory.
 
     ``model_id`` is the REALPATH of the model directory (stable across
     restarts and ~ vs absolute invocations). The tokenizer hash reads the
     artifact bytes without following a symlink that escapes the model tree.
+    ``kv_tier`` names a persistence tier the scalar bits pair cannot express
+    (the TQ codecs); empty = none.
     """
     p = Path(model_path)
     payload = _artifact_bytes(p / "tokenizer.json")
@@ -155,15 +158,20 @@ def fingerprint_for_model_dir(
         kv_layout_version=1,
         kv_bits=kv_bits,
         kv_group_size=kv_group_size,
+        kv_tier=kv_tier,
     )
 
 
 def _memoized_dir_fingerprint(
-    model_path: str, kv_bits: int, kv_group_size: int, model_id_override: str | None
+    model_path: str,
+    kv_bits: int,
+    kv_group_size: int,
+    model_id_override: str | None,
+    kv_tier: str,
 ) -> Fingerprint:
     """Cache per (path, tier): tokenizer.json re-reads cost milliseconds per
     REQUEST on the serving thread otherwise (multi-MB sha256 each call)."""
-    key = (model_path, kv_bits, kv_group_size, model_id_override)
+    key = (model_path, kv_bits, kv_group_size, model_id_override, kv_tier)
     fp = _FP_CACHE.get(key)
     if fp is None:
         fp = fingerprint_for_model_dir(
@@ -171,6 +179,7 @@ def _memoized_dir_fingerprint(
             kv_bits=kv_bits,
             kv_group_size=kv_group_size,
             model_id_override=model_id_override,
+            kv_tier=kv_tier,
         )
         _FP_CACHE[key] = fp
     return fp
@@ -323,7 +332,7 @@ def _resolve_snapshot(raw: str, marker: str | None = "config.json") -> str:
     return ""
 
 
-def default_fingerprint_for(model_key, kv_bits: int = 0, kv_group_size: int = 0):
+def default_fingerprint_for(model_key, kv_bits: int = 0, kv_group_size: int = 0, kv_tier: str = ""):
     """Default fingerprint source: model dir realpath + tokenizer bytes,
     with the ADAPTER and DRAFT MODEL folded into the model id (upstream's
     memory trie keys the full triple — a LoRA or draft-model switch must
@@ -356,8 +365,11 @@ def default_fingerprint_for(model_key, kv_bits: int = 0, kv_group_size: int = 0)
             kv_bits=kv_bits,
             kv_group_size=kv_group_size,
             cache_layout="",
+            kv_tier=kv_tier,
         )
     adapter = os.path.realpath(adapter) if adapter else ""
     draft = os.path.realpath(draft) if draft else ""
     model_id = "|".join((os.path.realpath(model), adapter, draft))
-    return _memoized_dir_fingerprint(os.path.realpath(model), kv_bits, kv_group_size, model_id)
+    return _memoized_dir_fingerprint(
+        os.path.realpath(model), kv_bits, kv_group_size, model_id, kv_tier
+    )

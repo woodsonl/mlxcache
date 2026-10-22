@@ -867,6 +867,11 @@ def test_quantization_guard_allows_dense_cache_and_skips_f16(monkeypatch):
     # the cache_layout signature, and a model whose composition is unrecorded
     # could be served a payload of the wrong shape. See
     # test_cache_layout_is_signed_for_every_model.
+    #
+    # The GEOMETRY half of the guard (one-token forward, head_dim checks) is
+    # bypassed here: this suite fakes the whole mlx layer, so no shapes
+    # exist. It is covered by test_engine_registration's boot-refusal tests,
+    # which run real mx against shape-real stubs.
     _install_fake_mlx(monkeypatch)
     import sys
 
@@ -875,6 +880,7 @@ def test_quantization_guard_allows_dense_cache_and_skips_f16(monkeypatch):
     cache_mod.KVCache = kv_cls
 
     eng = _engine()
+    eng._assert_tier_geometry = lambda cache: None
     eng.kv_bits = 8
     eng.kv_group_size = 64
     eng._assert_quantization_supported([kv_cls(), kv_cls()])  # dense: no raise

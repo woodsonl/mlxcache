@@ -62,7 +62,8 @@ CheckpointBlob = {
 }
 CheckpointMeta = {
   fingerprint: { model_id, tokenizer_hash, kv_dtype, kv_layout_version,
-                 kv_bits, kv_group_size, cache_layout, content_digest },
+                 kv_bits, kv_group_size, cache_layout, content_digest,
+                 kv_tier },
   token_count: u64,
   tokens: [u32],         // the token-ID prefix this blob covers; makes the blob
                          // self-describing so the index is rebuildable after a
@@ -70,6 +71,28 @@ CheckpointMeta = {
   format_version: u32,   // bump on any layout change; R1-1 quarantines old versions
 }
 ```
+
+### Tier correctness classes (named tiers amend R1-5)
+
+The f16 and q8 tiers carry the exact-resume contract: generation resumed
+from a checkpoint is token-for-token identical to a scratch run, and the
+round-trip gate (`test_roundtrip_real.py`) enforces it. A **named tier**
+(`kv_tier` non-empty, e.g. the TurboQuant codecs) is lossy by design: its
+contract is a *bounded-distortion* class instead —
+
+- **Determinism**: the same blob resumed twice produces identical tokens
+  (the codec is a deterministic function of the payload).
+- **Fidelity bound**: quantize→dequantize cosine per layer ≥ the tier's
+  pinned threshold (measured on a representative model; the probe is the
+  record).
+- **Documented divergence**: greedy decode from a tier-resumed cache may
+  diverge from scratch; the measured agreement fraction is the tier's
+  quality disclosure, not a failure.
+- **Isolation**: the tier is part of the fingerprint (exact-equality
+  serving), so a lossy blob can never serve an f16/q8 identity — R1-1
+  holds unchanged.
+
+A named tier is opt-in: no daemon or wrapper default ever selects one.
 
 ## Prefix index
 
