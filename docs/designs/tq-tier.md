@@ -130,6 +130,53 @@ the daemon's resume-from-own-checkpoint design — but an operator comparing
 TQ outputs against a no-daemon run should expect token-level differences
 with equivalent meaning.
 
+## The live variant (phase 4): compressed-resident KV during decode
+
+`MLXCACHE_TQ_LIVE=1` (sidecar engine, requires `MLXCACHE_KV_TIER`) swaps the
+engine's own cache for `TurboQuantKVCache`: the RESIDENT state is the
+compressed tier state; `update_and_fetch` quantizes new rows in place and
+returns the dequantized history, so stock attention runs unchanged (the
+cache-class API is the extension point — still no mlx-lm patches, and the
+wrapper keeps its no-patch property).
+
+Measured (Qwen2.5-7B, 2,000-token prefix, 32 decode tokens,
+`sidecar/probes/tq_live_probe.py`):
+
+| | f16 cache | live tq-k4v4-g64 | trade |
+|---|---:|---:|---|
+| resident KV | 117.4 MB | 32.1 MB | **3.66x smaller** |
+| decode speed | 48.8 tok/s | 41.2 tok/s | 0.843x (18% slower) |
+
+That is the paper's own hybrid-decode caveat, quantified on Metal: the
+per-step dequant costs real compute, bought back as unified memory. Capacity
+is step-rounded (256 positions) like mlx-lm's KVCache, so short contexts
+carry rounded-up padding; long contexts see the full ratio.
+
+**What the live tier does not promise** (measured, not assumed): token
+identity with the persistence tier. Quantizing during the forward changes
+the computation itself — every position's keys are computed attending
+through quantize-then-dequantize history, recursively — while the
+persistence tier's blob was computed by an f16 prefill and quantized
+afterward. On the gate prompt the first token is a near-tie that flips
+between the tiers, and the two quantized continuations then converge onto
+the same stream. The pinned guarantees are per-run determinism, frame
+standardness (a live-written blob is byte-identical to a persistence-written
+one for the same input rows), and the tier's fidelity floors.
+
+**Scoring from compressed keys** (`tq/score.py`): attention scores are
+computable straight from the packed state — rotate the query once, then a
+gather-dot over per-dimension centroid values — numerically equal to
+dequantize-then-score. The QJL residual correction (1 sign bit per
+dimension of the rotated residual) measurably reduces the score error and
+is implemented but persisted by nothing: it costs d bits/token (the frame
+grows ~a third at k3) and O(S·d) correction compute. The K-side bandwidth
+of packed state is ~4x smaller than f16, so a FUSED unpack-gather-dot
+kernel is the only way to realize a speed win — plain MLX ops materialize a
+[S, d] u32 intermediate larger than the f16 it replaces (the probe measures
+the tensor-op path anyway). Wiring any of this into the decode hot loop
+means a custom Metal kernel or cache-aware attention in mlx-lm itself; the
+math, its fidelity, and this boundary live measured in the module.
+
 ## Provenance and invariants
 
 - Codebooks are DERIVED (Max-Lloyd on the paper's Lemma-1 density) and
