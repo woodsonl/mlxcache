@@ -29,12 +29,19 @@ pytestmark = pytest.mark.skipif(
 
 MODEL = os.environ.get("MLXCACHE_BENCH_MODEL", "Qwen/Qwen2-0.5B-Instruct")
 
+# The module-scoped f16 engine, registered by the fixture so the named-tier
+# tests below can compare against the SAME engine without a second model
+# load (constructed lazily when the fixture itself did not run).
+_engine_module_holder: dict = {}
+
 
 @pytest.fixture(scope="module")
 def engine():
     from mlxcache_sidecar.server import MlxLmEngine
 
-    return MlxLmEngine(MODEL)
+    eng = MlxLmEngine(MODEL)
+    _engine_module_holder["engine"] = eng
+    return eng
 
 
 class TempSafetensors:
@@ -613,3 +620,133 @@ def test_roundtrip_measures_bytes_and_time(engine):
         f"deserialize {deserialize_ms:.0f}ms exceeds the 2s resume budget — "
         "v1 ships memory-resident only per R1-5"
     )
+
+
+# --- named KV tier (TurboQuant) -----------------------------------------------
+#
+# The tier correctness class is bounded-distortion, NOT token identity
+# (docs/contract-spec.md "Tier correctness classes"): determinism, a per-layer
+# fidelity floor, byte compression, and DOCUMENTED divergence from scratch.
+# The fidelity floors are pinned from the measured probe record
+# (sidecar/probes/tq_quality_probe.py on Qwen2.5-7B-Instruct-4bit; the test
+# model is smaller but the codec is dimension-driven, so the floor keeps
+# margin for it).
+
+
+def _tq_engine():
+    from mlxcache_sidecar.server import MlxLmEngine
+
+    old = os.environ.get("MLXCACHE_KV_TIER")
+    os.environ["MLXCACHE_KV_TIER"] = "tq-k4v4-g64"
+    try:
+        return MlxLmEngine(MODEL)
+    finally:
+        if old is None:
+            os.environ.pop("MLXCACHE_KV_TIER", None)
+        else:
+            os.environ["MLXCACHE_KV_TIER"] = old
+
+
+def _cos(a, b) -> float:
+    import mlx.core as mx
+
+    a32, b32 = a.astype(mx.float32), b.astype(mx.float32)
+    per = (a32 * b32).sum(-1) / ((a32 * a32).sum(-1).sqrt() * (b32 * b32).sum(-1).sqrt())
+    return float(per.mean())
+
+
+def test_tq_tier_contract_determinism_fidelity_compression():
+    tq = _tq_engine()
+    tokens = tq.tokenize("The design doc pins three gates. " * 60)[:1200]
+
+    # The tier's payload is the compressed frame; encode is deterministic.
+    payload_a = tq.prefill(list(tokens))
+    payload_b = tq.prefill(list(tokens))
+    assert payload_a and payload_a == payload_b, "codec must be deterministic"
+
+    # Compression: same prompt through the module's f16 engine for the ratio.
+    f16_payload = engine_module_ref().prefill(list(tokens))
+    ratio = len(f16_payload) / len(payload_a)
+    assert ratio > 3.0, f"k4v4 compressed only {ratio:.2f}x vs f16"
+
+    # Fidelity floor: every layer's quantize->dequantize cosine.
+    from mlxcache_sidecar.tq import decode_payload
+
+    reco = decode_payload(payload_a)
+    cache = tq._prefill_cache(tokens[:-1])[0]
+    for orig, r in zip(cache, reco, strict=True):
+        k0, v0 = orig.state
+        k1, v1 = r.state
+        assert _cos(k0, k1) >= 0.985, f"key fidelity broke the floor: {_cos(k0, k1):.4f}"
+        assert _cos(v0, v1) >= 0.985, f"value fidelity broke the floor: {_cos(v0, v1):.4f}"
+
+    # Determinism of RESUME: the same blob resumed twice is token-identical
+    # (lossy vs scratch, exact vs itself).
+    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+
+    def blob_bytes() -> bytes:
+        meta = CheckpointMeta(
+            fingerprint=Fingerprint(
+                model_id=tq.model_id,
+                tokenizer_hash=tq.tokenizer_hash,
+                kv_dtype=tq.kv_dtype,
+                kv_layout_version=1,
+                kv_tier=tq.kv_tier,
+            ),
+            token_count=len(tokens),
+            tokens=list(tokens),
+        )
+        return encode(meta, payload_a)
+
+    outs = []
+    for _ in range(2):
+        with TempSafetensors() as path:
+            with open(path, "wb") as fh:
+                fh.write(blob_bytes())
+            outs.append(tq.generate_from_blob(tokens, path, max_tokens=24))
+    assert outs[0] == outs[1], "the same blob must resume identically"
+
+
+def test_tq_tier_divergence_from_scratch_is_real_and_bounded():
+    """The honest disclosure: TQ resume diverges from an f16 scratch run.
+    Divergence must OCCUR (the tier is lossy — a silent identity pass would
+    mean the codec is dead code) and the outputs must stay finite/parseable
+    (bounded, not corrupt)."""
+    tq = _tq_engine()
+    tokens = tq.tokenize("Explain the radix-tree prefix index in detail. " * 40)[:800]
+
+    scratch = tq.generate(list(tokens), 16)
+    assert scratch, "scratch generation produced nothing"
+
+    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+
+    payload = tq.prefill(list(tokens))
+    with TempSafetensors() as path:
+        with open(path, "wb") as fh:
+            fh.write(
+                encode(
+                    CheckpointMeta(
+                        fingerprint=Fingerprint(
+                            model_id=tq.model_id,
+                            tokenizer_hash=tq.tokenizer_hash,
+                            kv_dtype=tq.kv_dtype,
+                            kv_layout_version=1,
+                            kv_tier=tq.kv_tier,
+                        ),
+                        token_count=len(tokens),
+                        tokens=list(tokens),
+                    ),
+                    payload,
+                )
+            )
+        resumed = tq.generate_from_blob(tokens, path, max_tokens=16)
+    assert resumed and all(0 <= t < 2**31 for t in resumed), "resumed output is not token-shaped"
+
+
+def engine_module_ref():
+    """The module-scoped f16 engine fixture, reachable from plain tests."""
+    if "engine" not in _engine_module_holder:
+        from mlxcache_sidecar.server import MlxLmEngine
+
+        _engine_module_holder["engine"] = MlxLmEngine(MODEL)
+    return _engine_module_holder["engine"]

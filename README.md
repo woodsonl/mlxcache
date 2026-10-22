@@ -229,8 +229,11 @@ Unknown flags pass through to `mlx_lm.server`. Store flags mirror the
 daemon's contract: `--store-budget-bytes` (default 32 GiB), `--anchor-window-s`
 (default 900), `--trust-legacy` (index digest-less v1 blobs), and
 `--kv-bits`/`--kv-group-size` (KV quantization tier — part of the fingerprint,
-so tiers never share blobs). One extra endpoint rides
-along:
+so tiers never share blobs). `--kv-tier` names a TurboQuant persistence
+codec (`tq-k4v4-g64` and friends) that actually compresses what the wrapper
+persists — unlike `--kv-bits`, which only labels the partition; the measured
+bake-off lives in [docs/designs/tq-tier.md](docs/designs/tq-tier.md). One
+extra endpoint rides along:
 
 - `GET /mlxcache/stats` — the live cache's reuse counters:
   `{"disk_hits": .., "persisted": .., "reuse_errors": .., "persist_errors": ..}`.
@@ -292,6 +295,7 @@ Sidecar:
 | `MLXCACHE_SIDECAR_PORT` | `8421` | sidecar bind port |
 | `MLXCACHE_KV_BITS` | `0` | KV quantization tier: `0` = f16, `8` = q8 — the tier is folded into the fingerprint, so tiers never share blobs. Dense attention models only: a hybrid model (linear attention / SSM / GDN layers — e.g. Falcon-H1, Qwen3-Next, granite-hybrid) is refused at boot with this tier set; its state persists unquantized on the f16 tier |
 | `MLXCACHE_KV_GROUP_SIZE` | `0` | quantization group size; `0` with a nonzero `MLXCACHE_KV_BITS` resolves to `64` |
+| `MLXCACHE_KV_TIER` | (unset) | named KV persistence tier (TurboQuant codecs, from arXiv:2504.19874): `tq-k4v4-g64` (recommended: 3.8× smaller than f16, per-layer cos ≥ 0.992), `tq-k3v4-g64` (4.2×), `tq-k3v2-g64` (5.6×, lossy). Compresses the persisted checkpoint — the live engine stays f16. LOSSY BY DESIGN: resume is deterministic but diverges from a scratch run (bounded-distortion contract, [docs/designs/tq-tier.md](docs/designs/tq-tier.md)); opt-in and fingerprint-isolated, so it never serves the f16/q8 tiers. Mutually exclusive with `MLXCACHE_KV_BITS`; dense models only |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
 | `MLXCACHE_METAL_CACHE_MB` | `1024` | MLX allocator cache limit; freed buffers beyond it return to the OS instead of pooling |
 | `MLXCACHE_SETTLE_MAX_TOKENS` | `32768` (unset) | cap on a settled checkpoint's token count; an explicit `0` refuses every settle rather than disabling the cap |
@@ -363,6 +367,12 @@ once pressure binds; anchor chains delay but do not prevent it. An earlier
 prefix (a guessed divisor benchmarked ~3,250 tokens under a 2,000-token
 knob). Methodology, guards, and the full grid:
 [docs/benchmarks.md](docs/benchmarks.md).
+
+Named-tier bake-off (same 7B model, 1,500-token prefix): the TurboQuant
+persistence tiers and the plain bits tiers measured head-to-head —
+`tq-k4v4-g64` at 15.5 KB/token (3.79× vs f16, per-layer cos 0.992) strictly
+dominates `q4` (16.1 KB/token, 3.64×, 0.990); the full frontier table and
+the divergence disclosure are in [docs/designs/tq-tier.md](docs/designs/tq-tier.md).
 
 ## Operating it
 

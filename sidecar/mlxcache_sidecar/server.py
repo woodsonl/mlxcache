@@ -1343,13 +1343,14 @@ class MlxLmEngine:
         return payload
 
     def generate(self, tokens: list[int], max_tokens: int) -> list[int]:
-        """Generate continuing from an optional persisted cache.
+        """Generate from scratch over `tokens` (no persisted cache).
 
-        When the daemon supplies a blob the KV cache is loaded from it and the
-        uncovered tail is prefilled; otherwise generation runs from scratch. The
-        daemon supplies the blob via the /generate request body; see the handler.
+        A FRESH cache is constructed here — passing None down used to crash
+        the first trim probe in the streaming loop, and a scratch run needs a
+        real cache object anyway (the settle path captures it). The blob-
+        resuming variants are generate_from_blob / generate_collect.
         """
-        return self._generate_with_cache(tokens, max_tokens, cache=None)
+        return self._generate_with_cache(tokens, max_tokens, cache=self._new_cache())
 
     def _new_cache(self):
         """A fresh prompt cache owned by the caller, so generation mutates it in
@@ -1624,27 +1625,21 @@ class MlxLmEngine:
         (see prefill), so the delta is exactly the tokens the cache does not
         cover: tokens[covered:]. Uniform for every prompt length, including a
         one-token prompt whose cache covers 0 tokens (delta = the whole prompt)."""
-        from mlx_lm.models.cache import load_prompt_cache  # noqa: PLC0415
-
         meta, payload, usable = read_wire_checkpoint(blob_path, tokens)
         if not usable:
             return None, tokens
         covered = len(meta.tokens) - 1
-        # From-memory load — same rationale and same named-buffer requirement
-        # as _load_cache_from_payload (performance review 2026-10-04).
+        # From-memory load via the shared tier-aware loader — same rationale
+        # and same named-buffer requirement as _load_cache_from_payload
+        # (performance review 2026-10-04), and one place that knows the
+        # configured tier's payload format.
         # A pure-Python parse/schema failure is corruption: reject so the
         # daemon retires it. MemoryError, OSError, and RuntimeError are
         # transient (a real OOM, a disk fault; MLX's native reader raises
         # RuntimeError on an OS read failure): let them propagate as a 500 so
         # a healthy checkpoint is not retired.
-        blob = io.BytesIO(payload)
-        blob.name = "checkpoint.safetensors"
-        try:
-            return load_prompt_cache(blob), tokens[covered:]
-        except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
-            raise CheckpointRejectedError(
-                f"checkpoint failed to load: {type(exc).__name__}: {exc}"
-            ) from exc
+        cache = self._load_cache_from_payload(payload)
+        return cache, tokens[covered:]
 
     def generate_from_blob(self, tokens: list[int], blob_path: str, max_tokens: int) -> list[int]:
         """Resume generation from a persisted wire-format checkpoint (a cache
@@ -1653,10 +1648,17 @@ class MlxLmEngine:
         The checkpoint holds KV for a token prefix; the delta (uncached tail)
         is what the model still needs to see. We pass the tail so the cache
         supplies the cached prefix and generation continues identically to a
-        scratch run over the full prompt (thesis guard, T2)."""
+        scratch run over the full prompt (thesis guard, T2).
+
+        A legitimately uncacheable blob (a prefix shorter than 2 tokens)
+        falls back to a FRESH cache over the whole prompt — the same contract
+        `prepare_stream` applies on the streaming path. Passing cache=None on
+        used to crash the first trim probe; an uncacheable hit is a scratch
+        run, not an error."""
         cache, prompt = self._load_cache_delta(tokens, blob_path)
         if cache is None:
-            return self._generate_with_cache(tokens, max_tokens, cache=None)
+            cache = self._new_cache()
+            prompt = tokens
         return self._generate_with_cache(prompt, max_tokens, cache)
 
 

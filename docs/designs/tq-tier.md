@@ -1,0 +1,123 @@
+# The named KV tiers (TurboQuant persistence codecs)
+
+Status: SHIPPED (opt-in). Implemented from arXiv:2504.19874 only — no code
+from any third-party TurboQuant repository (GPL-3.0; this repo carries no
+license and must stay uncontaminated).
+
+## What the tier is
+
+A named persistence tier (`MLXCACHE_KV_TIER` on the sidecar, `--kv-tier` on
+the wrapper) compresses the KV checkpoint at capture time and rebuilds a
+stock `KVCache` at adopt time. The engine never computes attention from
+compressed state — this is the paper's storage-side algorithm, not its
+live-compute path:
+
+- **Keys**: per-(token,head) L2 norm in f16 + a pinned random orthogonal
+  rotation + a Lloyd-Max codebook on the rotated unit-vector coordinates
+  (the paper's §3.1, solved for the exact Beta marginal; anchors match the
+  paper: b=2 centroids ±0.453/±1.51, Theorem-1 MSE 0.36/0.117/0.03/0.009),
+  bit-packed ⌊32/b⌋ indices per u32 word.
+- **Values**: stock `mx.quantize` group quantization (the same mechanism
+  `QuantizedKVCache` uses).
+- **QJL residual sign bits: not included.** They exist to score attention
+  directly from compressed keys; adopt always dequantizes, so the estimator
+  has nothing to add on this tier.
+
+The rotation matrix and codebook parameters travel inside every frame, so a
+decoded cache depends on nothing but the frame itself. The frame is ordinary
+safetensors: the existing structural validation and sha256 integrity
+stampings apply unchanged.
+
+## The correctness contract
+
+Named tiers amend R1-5's exact-resume contract (see
+[contract-spec.md](../contract-spec.md) "Tier correctness classes"):
+determinism (same blob → identical tokens), a per-layer fidelity floor,
+documented divergence from scratch, and fingerprint isolation — the tier
+label is part of the fingerprint with exact-equality serving, so a lossy
+blob can never serve an f16/q8 identity.
+
+The f16 and q8 tiers keep the exact contract; q4/q3/q2 are reachable through
+the existing `MLXCACHE_KV_BITS` plumbing with zero port cost and inherit
+whatever parity the bits tiers carry. Named tiers are opt-in: no default
+ever selects one.
+
+## Measured: the bake-off (G1, G5)
+
+`sidecar/probes/tq_quality_probe.py`, Qwen2.5-7B-Instruct-4bit, 1,500-token
+prefix of the pinned T22 corpus. Fidelity = per-layer cosine of
+quantize→dequantize KV against the f16 cache the engine actually held
+(min over layers of min(cos_K, cos_V)); bytes = the wire payload.
+
+| Tier | B/token | × vs f16 | min layer cos | mean layer cos |
+|---|---:|---:|---:|---:|
+| f16 (reference) | 58,760 | 1.00 | 1.0 | 1.0 |
+| q8 (bits) | 30,474 | 1.93 | 0.99995 | 0.99997 |
+| **tq-k4v4-g64** | **15,508** | **3.79** | **0.99234** | **0.99470** |
+| q4 (bits) | 16,138 | 3.64 | 0.98995 | 0.99195 |
+| tq-k3v4-g64 | 14,164 | 4.15 | 0.98106 | 0.98303 |
+| q3 (bits) | 12,554 | 4.68 | 0.95983 | 0.96585 |
+| tq-k3v2-g64 | 10,580 | 5.55 | 0.88506 | 0.90426 |
+| q2 (bits) | 8,970 | 6.55 | 0.84858 | 0.87061 |
+
+Readings that shaped the decision:
+
+1. **tq-k4v4 strictly dominates q4** — smaller (3.79× vs 3.64×) AND more
+   faithful (0.992 vs 0.990). The port earns its place at the quality end of
+   the frontier; tq-k4v4-g64 is the recommended default when a named tier is
+   selected at all.
+2. **The rotation buys fidelity, the uniform grid buys bytes.** At every
+   matched compression band the TQ arm sits above the same-size bits arm on
+   fidelity (k4v4 > q4, k3v4 > q3, k3v2 > q2), and the bits arms sit above
+   on compression at the low end (q2 6.55× is the smallest payload
+   measured). Both families are Pareto-frontier members; the tiers are
+   complements, not replacements.
+3. Real keys are slightly HARDER than the paper's worst case (iid): k3 keys
+   measure 0.981–0.983 against the theoretical 0.985 floor — some layers'
+   keys are less isotropic than random vectors. The probe's per-layer min is
+   the number to watch per model.
+
+## Measured: the remaining gates
+
+- **G2 adopt budget** — TQ decode 6.5 ms vs mlx-lm f16 load 11.1 ms at the
+  1,500-token prefix: decode is FASTER than the f16 path (fewer bytes to
+  marshal). The R1-5 2 s budget holds with two orders of magnitude of
+  headroom at this scale.
+- **G4 append stability (real KV)** — encode(A) vs encode(A+B) over real
+  engine caches: every prior token's packed bytes identical (element-wise
+  codecs; proven again on the real tensors, not just synthetic ones). The
+  future chunked store's block-identity property survives the tier.
+- **G3 divergence (disclosure, not a pass/fail)** — greedy decode from a
+  tq-k3v4-resumed cache vs scratch on three summarization prompts:
+  agreement 0.167/0.021/0.0, first divergence at position 8/1/0 of 48. A
+  lossy tier diverges from scratch EARLY; bounded-distortion is the
+  contract, and the codec is deterministic so the divergence is stable
+  across resumes of the same blob. If a workload needs token-exact resume,
+  it must stay on f16/q8 — that is why the tier is opt-in and isolated in
+  the key space.
+
+The opt-in real gate (`test_roundtrip_real.py`, TQ arm) pins: codec
+determinism, resume determinism, >3× compression vs f16, and the k4v4
+per-layer fidelity floor (0.985, margin under the measured 0.992).
+
+## Provenance and invariants
+
+- Codebooks are DERIVED (Max-Lloyd on the paper's Lemma-1 density) and
+  validated against the paper's own published anchors in
+  `test_tq_codebook.py`. No codebook files or code were taken from any
+  third-party implementation.
+- The rotation seed is pinned (`rotation.PINNED_SEED`) so every blob this
+  process writes uses one canonical basis; the matrix itself travels in the
+  frame, so decode never depends on regenerating it. A future MLX whose RNG
+  or QR differs only changes the bytes of NEW blobs, never their meaning.
+- 3-bit key indices pack 10 per u32 word (2 bits wasted per word): the
+  straddle-free layout keeps pack/unpack pure shift/mask tensor ops. b=2 and
+  b=4 pack exactly.
+- Dense KVCache stacks only (the same boot guard as the bits tiers; hybrid
+  compositions refuse at boot on the sidecar and fail the persist
+  best-effort on the wrapper).
+- The tier namespaces the blob key (folded last, zero bytes when empty —
+  see connector-protocol §4) and is compared with exact equality on every
+  serving path (core `identity_compatible`, daemon `same_shape`, store
+  client `identity_compatible`). Cross-tier serving is impossible by
+  construction and covered by tests on both sides of the wire.
