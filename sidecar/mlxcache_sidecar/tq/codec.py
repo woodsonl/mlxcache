@@ -324,5 +324,13 @@ def decode_payload(payload: bytes) -> list:
         v = mx.dequantize(v_q, v_s, v_b, group_size=group_size, bits=value_bits).astype(dtype)
         if k.shape[2] != offset:
             raise ValueError(f"layer {i} offset {k.shape[2]} != frame offset {offset}")
+        # Key/value shapes must AGREE per layer (batch, heads, sequence): a
+        # planted frame with mismatched heads passes KVCache.from_state and
+        # then explodes inside update_and_fetch on the first resume — past
+        # the 422 boundary, so the poison would 500-loop unretired.
+        if k.shape[:3] != v.shape[:3]:
+            raise ValueError(
+                f"layer {i} key/value shapes disagree: {tuple(k.shape)} vs {tuple(v.shape)}"
+            )
         cache.append(KVCache.from_state((k, v), ""))
     return cache
