@@ -90,6 +90,35 @@ def test_ratio_summary_reports_no_decode_ratio_when_decode_is_disabled():
     assert decode_ratio is None  # 0/0 must not masquerade as a ratio
 
 
+def test_ratio_bound_fails_when_decode_outgrows_prefill():
+    # The pin for the check that caught a contaminated 8K figure (decode
+    # 7.8x while prefill grew 1.07x): decode growing proportionally more
+    # than prefill between the same two sizes is contention, not scaling.
+    contaminated = [
+        {"tokens": 8192, "prefill_s": 2.14, "decode_s": 0.60},
+        {"tokens": 1024, "prefill_s": 2.0, "decode_s": 0.08},
+    ]
+    failures = context_sweep.ratio_failures(contaminated)
+    assert len(failures) == 1
+    assert "under contention" in failures[0]
+
+
+def test_ratio_bound_passes_when_decode_stays_under_prefill():
+    healthy = [
+        {"tokens": 32768, "prefill_s": 66.23, "decode_s": 0.021},
+        {"tokens": 256, "prefill_s": 0.39, "decode_s": 0.015},
+    ]
+    assert context_sweep.ratio_failures(healthy) == []
+
+
+def test_ratio_bound_skips_when_decode_unmeasured():
+    rows = [
+        {"tokens": 8192, "prefill_s": 60.0, "decode_s": 0.0},
+        {"tokens": 256, "prefill_s": 2.0, "decode_s": 0.0},
+    ]
+    assert context_sweep.ratio_failures(rows) == []
+
+
 def test_repeatability_within_tolerance_passes():
     rows = [{"tokens": 256, "prefill_s": 2.0}, {"tokens": 256, "prefill_s": 2.4}]
     assert context_sweep.repeatability_failure(rows, tolerance=0.25) is None
@@ -117,8 +146,17 @@ def test_validate_row_rejects_wrong_size_and_missing_swap():
     assert context_sweep.validate_row({"tokens": 512}, 512) is not None
     swapless = {"tokens": 512, "swap_before_mb": None, "swap_after_mb": 1.0}
     assert "swap" in context_sweep.validate_row(swapless, 512)
-    good = {"tokens": 512, "swap_before_mb": 0.0, "swap_after_mb": 0.0}
+    good = {"tokens": 512, "prefill_s": 0.68, "swap_before_mb": 0.0, "swap_after_mb": 0.0}
     assert context_sweep.validate_row(good, 512) is None
+
+
+def test_validate_row_rejects_a_prefill_below_the_clock():
+    # A sub-5 ms prefill rounds to 0.0 and would divide-by-zero the ratios
+    # downstream; the refusal names it instead of crashing.
+    row = {"tokens": 8, "prefill_s": 0.0, "swap_before_mb": 0.0, "swap_after_mb": 0.0}
+    reason = context_sweep.validate_row(row, 8)
+    assert reason is not None
+    assert "below the clock" in reason
 
 
 def _holder_script(lock_path: str) -> str:

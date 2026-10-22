@@ -74,7 +74,9 @@ SEED = (
 
 
 def machine_state() -> dict[str, object]:
-    """Swap and load: the two signals that make a timing untrustworthy."""
+    """Swap is the guarded signal (paging live weights out is the proven
+    contamination mode). Load is recorded for context only — a load check
+    would flag the measured child's own CPU."""
     state: dict[str, object] = {}
     try:
         out = subprocess.run(
@@ -224,6 +226,14 @@ def validate_row(row: dict, size: int) -> str | None:
         return f"the {size}-token run reported {row.get('tokens')} tokens"
     if row.get("swap_before_mb") is None or row.get("swap_after_mb") is None:
         return f"the {size}-token run could not read swap state; the swap guard cannot vouch for it"
+    prefill = row.get("prefill_s")
+    if not isinstance(prefill, (int, float)) or prefill <= 0:
+        # Below the clock's resolution (a sub-5 ms prefill rounds to 0.0);
+        # the ratios would divide by zero downstream.
+        return (
+            f"the {size}-token run's prefill is unmeasurable ({prefill!r}); "
+            "sizes this small are below the clock"
+        )
     return None
 
 
@@ -253,6 +263,22 @@ def ratio_summary(sweep_rows: list[dict]) -> tuple[float, float | None]:
     return prefill_ratio, decode_ratio
 
 
+def ratio_failures(sweep_rows: list[dict]) -> list[str]:
+    """A decode step's attention is bounded by the prefill's over the same
+    positions: decode growing proportionally MORE than prefill between the
+    same two sizes means the decode numbers were taken under contention.
+    This is the check that caught a contaminated 8K figure at 7.8x its 2K
+    value while prefill had grown only 1.07x."""
+    prefill_ratio, decode_ratio = ratio_summary(sweep_rows)
+    if decode_ratio is not None and decode_ratio > prefill_ratio:
+        return [
+            f"decode grew {decode_ratio:.2f}x but prefill only {prefill_ratio:.2f}x. "
+            "Attention over the same positions cannot be the cause; the decode "
+            "numbers were taken under contention."
+        ]
+    return []
+
+
 def repeatability_failure(control_rows: list[dict], tolerance: float) -> str | None:
     if len(control_rows) != 2:
         return None
@@ -267,6 +293,12 @@ def repeatability_failure(control_rows: list[dict], tolerance: float) -> str | N
 
 
 def swap_failures(rows: list[dict], limit_mb: float = 256.0) -> list[str]:
+    """Growth only: paging LIVE WEIGHTS out while the clock runs is the
+    proven contamination mode (a streamed-engine era run measured 3.5x its
+    neighbor's step time while swap grew). Decreases are not flagged —
+    paging already-freed pages back in has no observed latency effect (the
+    32K row agreed 2.3% across runs that saw +2.8 GB out and -1.1 GB in) —
+    so the guard states its scope instead of pretending symmetry."""
     failures = []
     for row in rows:
         grew = row["swap_after_mb"] - row["swap_before_mb"]
@@ -322,7 +354,14 @@ def main() -> int:
             "--model",
             args.model,
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+        except subprocess.TimeoutExpired:
+            # A hung child (model fetch stalled, Metal wedged) must not
+            # wedge the sweep with it; 20 min exceeds the slowest planned
+            # row by an order of magnitude.
+            print(f"REFUSING: the {size}-token run did not finish (child hung).", flush=True)
+            return 2
         line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("ROW ")), None)
         if line is None:
             print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
@@ -363,12 +402,7 @@ def main() -> int:
     print(f"\n{head}")
 
     failures = monotonicity_failures(sweep_rows)
-    if decode_ratio is not None and decode_ratio > prefill_ratio:
-        failures.append(
-            f"decode grew {decode_ratio:.2f}x but prefill only {prefill_ratio:.2f}x. "
-            "Attention over the same positions cannot be the cause; the decode "
-            "numbers were taken under contention."
-        )
+    failures.extend(ratio_failures(sweep_rows))
     repeat = repeatability_failure(control_rows, args.tolerance)
     if repeat is not None:
         failures.append(repeat)

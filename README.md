@@ -349,13 +349,14 @@ tokens to 66.2 s at 32K — 1.5 ms/token at the small end growing to
 2.0 ms/token as the attention history lengthens — while decode stays flat
 at 13-21 ms/token across every size (largest/smallest ratio 1.40x), so a
 long context taxes the prefill you pay once, not the decode you pay per
-token. Checkpoints scale 15.1 MB → 1.88 GB at 56-58 KB/token, matching the
-per-token figure above. The 32K prefill reproduced at 64.7 s in an
-independent run (2.3% apart); the curve interpolates to the 19,847-token
-restart test's 34.5 s cold prefill within 5%. The sweep refused its own
-first run on a 2.8 GB swap rise while the 32K row's ~7 GB working set
-arrived (unrelated cold pages displaced; the clock was clean); the re-run
-from a quiet machine passed every check. The probe is
+token. Checkpoints scale 15.1 MB → 1.88 GB at 56-58 KiB/token (57,344-59,156
+bytes), bracketing the per-token figure above. The refused first run's 32K
+row — taken before its swap guard tripped, every other row identical to the
+passing run's — agrees with the passing run's 66.2 s within 2.3%; the curve
+interpolates to the 19,847-token restart test's 34.5 s cold prefill within
+5%. The sweep refused its own first run on a 2.8 GB swap rise while the 32K
+row's ~7 GB working set arrived (unrelated cold pages displaced; the clock
+was clean); the re-run from a quiet machine passed every check. The probe is
 `sidecar/probes/context_sweep.py`.
 
 Restart resume (the claim that matters for a cache): a 19,847-token agent
