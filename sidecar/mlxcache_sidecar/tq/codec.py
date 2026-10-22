@@ -252,14 +252,12 @@ def encode_cache(cache, key_bits: int, value_bits: int, group_size: int) -> byte
     return buf.getvalue()
 
 
-def decode_payload(payload: bytes) -> list:
-    """Rebuild a dense KVCache list from the compressed frame.
-
-    The result is a live, stock cache: offsets set from the tensor shapes,
-    ready for delta prefill. Structural corruption raises the same exception
-    family ``_load_cache_from_payload`` maps to CheckpointRejectedError."""
+def decode_frame(payload: bytes) -> tuple[dict, dict]:
+    """Validated tensors and metadata of a TQ frame, WITHOUT rebuilding a
+    cache — the live tier adopts the compressed tensors directly. Applies
+    every boundary check decode_payload applies, so callers can trust the
+    frame the same way."""
     import mlx.core as mx  # noqa: PLC0415
-    from mlx_lm.models.cache import KVCache  # noqa: PLC0415
 
     blob = io.BytesIO(payload)
     # mx.load infers safetensors from the extension and reads `.name`:
@@ -290,23 +288,116 @@ def decode_payload(payload: bytes) -> list:
     dtype_name = metadata.get("kv_dtype", "")
     if dtype_name not in FLOAT_DTYPES:
         raise ValueError(f"frame kv_dtype {dtype_name!r} is not a floating dtype")
-    dtype = getattr(mx, dtype_name)
+    # Five tensors name each layer (k.idx, k.norm, v.q, v.s, v.b). An EMPTY
+    # set passes a contiguity check trivially and would hand the model a
+    # zero-layer cache (mlx-lm zips layers with the cache, silently skipping
+    # every layer) — reject it as corruption, along with short or
+    # non-contiguous stacks: they fail past the 422 boundary and 500-loop
+    # while the daemon never quarantines them.
+    layer_ids = sorted({int(name.split(".")[1]) for name in arrays if name.startswith("layers.")})
+    if not layer_ids or layer_ids != list(range(len(layer_ids))):
+        raise ValueError(f"frame layer ids are empty or not contiguous from 0: {layer_ids}")
+    # Per-layer structural checks, run for EVERY consumer (the dense decode
+    # path and the live adopt path alike): tensors must cover the claimed
+    # offset, key and value tensors must agree on (batch, heads, sequence),
+    # and the packed widths must match the declared bits. Without these a
+    # planted frame either silently clamps to a short history or explodes
+    # inside model forward — past the 422 boundary, unretired.
+    for i in layer_ids:
+        k_idx = arrays.get(f"layers.{i}.k.idx")
+        norms = arrays.get(f"layers.{i}.k.norm")
+        v_q = arrays.get(f"layers.{i}.v.q")
+        v_s = arrays.get(f"layers.{i}.v.s")
+        v_b = arrays.get(f"layers.{i}.v.b")
+        if any(x is None for x in (k_idx, norms, v_q, v_s, v_b)):
+            raise ValueError(f"layer {i} is missing tensors")
+        # Rank first: a rank-3 k.idx passes the [:3] comparisons below (a
+        # rank-4 value tensor shares its leading axes) and only explodes as
+        # IndexError on the first live append — past the 422 boundary.
+        if k_idx.ndim != 4 or v_q.ndim != 4 or norms.ndim != 3:
+            raise ValueError(f"layer {i} tensor ranks are wrong")
+        # Scale/bias pair must be rank-4, identical to each other, and share
+        # the packed values' leading axes: the live path stores them raw and
+        # only touches them inside the model forward, where a mismatch is a
+        # 500 loop instead of a 422 quarantine.
+        if v_s.ndim != 4 or v_b.ndim != 4 or v_s.shape != v_b.shape:
+            raise ValueError(f"layer {i} value scale/bias tensors disagree")
+        if v_s.shape[:3] != v_q.shape[:3]:
+            raise ValueError(f"layer {i} value scale/bias leading axes disagree with v.q")
+        if min(k_idx.shape[2], norms.shape[2], v_q.shape[2], v_s.shape[2], v_b.shape[2]) < offset:
+            raise ValueError(f"layer {i} tensors do not cover the claimed offset {offset}")
+        if k_idx.shape[:3] != v_q.shape[:3] or norms.shape[:3] != v_q.shape[:3]:
+            raise ValueError(
+                f"layer {i} key/value shapes disagree: {tuple(k_idx.shape)} vs {tuple(v_q.shape)}"
+            )
+        # Packed widths must match the declared bits: a width mismatch would
+        # either unpack garbage indices or misalign the group-quantized rows.
+        d = v_s.shape[-1] * group_size
+        expected_k_w = -(-d // (32 // key_bits)) if key_bits else 0
+        expected_v_w = -(-d * value_bits // 32)
+        if k_idx.shape[-1] != expected_k_w or v_q.shape[-1] != expected_v_w:
+            raise ValueError(
+                f"layer {i} packed widths {k_idx.shape[-1]}/{v_q.shape[-1]} do not match "
+                f"bits {key_bits}/{value_bits} for head_dim {d}"
+            )
+    meta = {
+        "key_bits": key_bits,
+        "value_bits": value_bits,
+        "group_size": group_size,
+        "offset": offset,
+        "kv_dtype": getattr(mx, dtype_name),
+        "layer_ids": layer_ids,
+    }
+    return arrays, meta
+
+
+def frame_basis(arrays: dict, meta: dict):
+    """The (rotation, codebook) pair a frame carries, in the shape the
+    codec's encode/decode helpers expect. One source for both adopt paths.
+    The codebook LENGTH is pinned to the declared bits, and the bucketing
+    boundaries are RECONSTRUCTED from the frame's own levels (the solver's
+    fixed point makes boundaries the midpoints of adjacent centroids —
+    pinned by test_fixed_point_optimality), so an adopted live cache
+    quantizes appended tokens with the frame's exact codebook instead of an
+    empty-boundary book that would encode every coordinate as index 0."""
+    d = arrays[f"layers.{meta['layer_ids'][0]}.v.s"].shape[-1] * meta["group_size"]
+    rot_name, cb_name = f"rot.{d}", f"cb.{d}.{meta['key_bits']}"
+    if rot_name not in arrays or cb_name not in arrays:
+        raise ValueError(f"frame carries no rotation/codebook for head_dim {d}")
+    rotation = arrays[rot_name]
+    if rotation.ndim != 2 or rotation.shape != (d, d):
+        raise ValueError(f"frame rotation is not [{d},{d}]: {tuple(rotation.shape)}")
+    levels = arrays[cb_name]
+    if levels.shape != (1 << meta["key_bits"],):
+        raise ValueError(f"codebook has {levels.shape[0]} levels for {meta['key_bits']} bits")
+    level_values = levels.tolist()
+    boundaries = tuple(
+        (a + b) / 2.0 for a, b in zip(level_values[:-1], level_values[1:], strict=True)
+    )
+    return rotation, (level_values, boundaries, 0.0)
+
+
+def decode_payload(payload: bytes) -> list:
+    """Rebuild a dense KVCache list from the compressed frame.
+
+    The result is a live, stock cache: offsets set from the tensor shapes,
+    ready for delta prefill. Structural corruption raises the same exception
+    family ``_load_cache_from_payload`` maps to CheckpointRejectedError."""
+    import mlx.core as mx  # noqa: PLC0415
+    from mlx_lm.models.cache import KVCache  # noqa: PLC0415
+
+    arrays, meta = decode_frame(payload)
+    key_bits = meta["key_bits"]
+    value_bits = meta["value_bits"]
+    group_size = meta["group_size"]
+    offset = meta["offset"]
+    dtype = meta["kv_dtype"]
 
     rotations = {}
     codebooks = {}
-    # Five tensors name each layer (k.idx, k.norm, v.q, v.s, v.b): collect ids
-    # as a set first, or each layer decodes five times. An EMPTY set passes
-    # the contiguity check trivially and would hand the model a zero-layer
-    # cache (mlx-lm zips layers with the cache, silently skipping every
-    # layer) — reject it as corruption.
+    # decode_frame already validated the layer-id set; collect ids once
+    # (each layer contributes five tensor names).
     layer_ids = sorted({int(name.split(".")[1]) for name in arrays if name.startswith("layers.")})
-    if not layer_ids or layer_ids != list(range(len(layer_ids))):
-        # A digest-consistent-but-planted frame could drop layer tensors; a
-        # short, empty, or non-contiguous stack would either IndexError
-        # inside model forward or silently skip layers via mlx-lm's zip —
-        # all past the 422 boundary — and 500 forever while the daemon never
-        # quarantines it. Reject here instead.
-        raise ValueError(f"frame layer ids are empty or not contiguous from 0: {layer_ids}")
     cache = []
     for i in layer_ids:
         k_idx = arrays[f"layers.{i}.k.idx"]

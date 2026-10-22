@@ -2,6 +2,33 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.6.0 — 2026-10-22
+
+### Added
+
+- **The live TQ tier**: `MLXCACHE_TQ_LIVE=1` (with `MLXCACHE_KV_TIER` set)
+  makes the engine's own prompt cache hold the COMPRESSED state during
+  decode — `TurboQuantKVCache` quantizes keys/values at write and returns
+  the dequantized history on read, so stock mlx-lm attention runs unchanged
+  (the cache-class API is the extension point; still no mlx-lm patches).
+  Measured on Qwen2.5-7B at a 2,000-token prefix
+  ([docs/designs/tq-tier.md](docs/designs/tq-tier.md)): 3.66x smaller
+  resident KV (117.4 → 32.1 MB) at 0.843x decode speed (48.8 → 41.2 tok/s).
+  Same tier label, same frame format, same fingerprint — a runtime memory
+  trade, not a new tier. Outputs are deterministic per run and diverge from
+  both f16 and persistence-tier runs (quantizing during the forward changes
+  the computation recursively); a live-written blob is byte-identical to a
+  persistence-written one for the same input rows.
+- **Scoring from compressed keys** (`tq/score.py`): attention scores
+  computed straight from the packed Lloyd-Max state — rotate the query
+  once, gather-dot centroid values — numerically equal to
+  dequantize-then-score, plus the paper's QJL residual correction,
+  measured to remove the projected scores' systematic bias (its estimator
+  variance exceeds the bias for single-query scoring at d=128, so the
+  per-token error barely moves — the record says "unbiased, not cheaper",
+  and nothing persists the QJL bits). The ~4x K-side bandwidth win needs a
+  fused kernel; the boundary is documented with the numbers.
+
 ## 0.5.0 — 2026-10-22
 
 ### Added

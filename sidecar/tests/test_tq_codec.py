@@ -423,11 +423,11 @@ def test_encode_rejects_mixed_key_value_dtypes():
 
 def test_decode_rejects_key_value_shape_disagreement():
     """A planted frame whose value tensors cover a different sequence length
-    than its keys would pass KVCache.from_state and explode inside
+    than its keys/offset would pass KVCache.from_state and explode inside
     update_and_fetch on the first resume — past the 422 boundary. (Batch and
     head mismatches already die during decode as mx broadcast ValueErrors,
-    which the adapter maps to 422; the sequence mismatch is the case that
-    slips to from_state.) Reject at decode instead."""
+    which the adapter maps to 422; the value-side sequence mismatch is the
+    case that slips to from_state.) Reject at decode instead."""
     import io
 
     payload = encode_cache(_cache(1, 20, seed=98), 3, 4, 64)
@@ -435,7 +435,26 @@ def test_decode_rejects_key_value_shape_disagreement():
     blob.name = "x.safetensors"
     arr, meta = mx.load(blob, return_metadata=True)
     for name in ("layers.0.v.q", "layers.0.v.s", "layers.0.v.b"):
-        arr[name] = arr[name][:, :, :18, ...]  # values claim 18 positions, keys 20
+        arr[name] = arr[name][:, :, :18, ...]  # values claim 18 positions, offset 20
+    buf = io.BytesIO()
+    mx.save_safetensors(buf, arr, meta)
+    with pytest.raises(ValueError, match="cover the claimed offset"):
+        decode_payload(buf.getvalue())
+
+
+def test_decode_rejects_value_leading_shape_disagreement():
+    """The shape-disagreement branch of the same boundary: values PADDED past
+    the keys' sequence length pass the coverage check and must die on the
+    leading-shape comparison instead (a regression here would let a planted
+    frame through to a broadcast failure inside model forward)."""
+    import io
+
+    payload = encode_cache(_cache(1, 20, seed=99), 3, 4, 64)
+    blob = io.BytesIO(payload)
+    blob.name = "x.safetensors"
+    arr, meta = mx.load(blob, return_metadata=True)
+    for name in ("layers.0.v.q", "layers.0.v.s", "layers.0.v.b"):
+        arr[name] = mx.pad(arr[name], [(0, 0), (0, 0), (0, 2), (0, 0)])  # 22 vs keys' 20
     buf = io.BytesIO()
     mx.save_safetensors(buf, arr, meta)
     with pytest.raises(ValueError, match="shapes disagree"):

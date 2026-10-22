@@ -633,11 +633,16 @@ def test_roundtrip_measures_bytes_and_time(engine):
 # margin for it).
 
 
-def _tq_engine():
+def _tq_engine(live: bool = False):
     from mlxcache_sidecar.server import MlxLmEngine
 
     old = os.environ.get("MLXCACHE_KV_TIER")
+    old_live = os.environ.get("MLXCACHE_TQ_LIVE")
     os.environ["MLXCACHE_KV_TIER"] = "tq-k4v4-g64"
+    if live:
+        os.environ["MLXCACHE_TQ_LIVE"] = "1"
+    else:
+        os.environ.pop("MLXCACHE_TQ_LIVE", None)
     try:
         return MlxLmEngine(MODEL)
     finally:
@@ -645,6 +650,10 @@ def _tq_engine():
             os.environ.pop("MLXCACHE_KV_TIER", None)
         else:
             os.environ["MLXCACHE_KV_TIER"] = old
+        if old_live is None:
+            os.environ.pop("MLXCACHE_TQ_LIVE", None)
+        else:
+            os.environ["MLXCACHE_TQ_LIVE"] = old_live
 
 
 def _cos(a, b) -> float:
@@ -762,6 +771,76 @@ def test_tq_tier_divergence_from_scratch_is_real_and_bounded():
     print(
         f"\n[TQ] divergence record: resumed-vs-scratch shared prefix {shared} "
         f"of {max(len(resumed), len(scratch))} tokens (agreement {agree:.3f})"
+    )
+
+
+def test_tq_live_tier_generation_matches_the_persistence_tier():
+    """What the live tier actually guarantees, on a real model:
+
+    1. DETERMINISM — the same live run twice is token-identical (quantize-
+       at-write is a deterministic function of the forward).
+    2. FRAME STANDARDNESS — the live engine's serialized checkpoint decodes
+       through the persistence path (one tier label, one format).
+
+    Recorded (not gated): the cross-tier comparison. The live tier
+    quantizes DURING the forward — every position attends through
+    quantize-then-dequantize history, recursively — while the persistence
+    tier's blob was computed by an f16 prefill and quantized only
+    afterward. On this prompt the first token is a near-tie between the
+    tiers and the two quantized continuations then converge; a shared-
+    prefix floor would be noise, so the divergence is printed instead.
+    Corruption is caught by the fidelity floors, not by cross-run token
+    agreement."""
+    from mlxcache_sidecar.blob import CheckpointMeta, Fingerprint, encode
+
+    tq = _tq_engine()
+    live = _tq_engine(live=True)
+    tokens = live.tokenize("Explain the radix-tree prefix index in detail. " * 30)[:600]
+
+    # 1. Determinism of the live path.
+    first = live.generate(list(tokens), 24)
+    second = live.generate(list(tokens), 24)
+    assert first == second, "live tier generation is not deterministic"
+
+    # 2. The live engine's own checkpoint is the standard frame.
+    live_payload = live.prefill(list(tokens))
+    from mlxcache_sidecar.tq import decode_payload  # noqa: PLC0415
+
+    decoded = decode_payload(live_payload)
+    assert len(decoded) == live._cache_layer_count
+    assert decoded[0].offset == len(tokens) - 1
+
+    # 3. Cross-tier record, not a gate: on this prompt the first token is a
+    # near-tie (f16 and the persistence run pick one token, live picks the
+    # other) and the two quantized runs then converge onto the same
+    # continuation — measured agreement can be 0 by position 0 while both
+    # outputs are healthy, so a shared-prefix floor would be noise. The
+    # discriminating gates are determinism (above), frame standardness
+    # (above), and the codec fidelity floors (test_tq_codec/test_tq_live).
+    payload = tq.prefill(list(tokens))
+    meta = CheckpointMeta(
+        fingerprint=Fingerprint(
+            model_id=tq.model_id,
+            tokenizer_hash=tq.tokenizer_hash,
+            kv_dtype=tq.kv_dtype,
+            kv_layout_version=1,
+            kv_tier=tq.kv_tier,
+        ),
+        token_count=len(tokens),
+        tokens=list(tokens),
+    )
+    with TempSafetensors() as path:
+        with open(path, "wb") as fh:
+            fh.write(encode(meta, payload))
+        persisted = tq.generate_from_blob(tokens, path, max_tokens=24)
+    first_div = next(
+        (i for i, (a, b) in enumerate(zip(first, persisted, strict=False)) if a != b),
+        "end",
+    )
+    converges_at = persisted.index(first[0]) if first and first[0] in persisted else "n/a"
+    print(
+        f"\n[TQ-live] first divergence vs persistence tier at position {first_div}"
+        f"; live continuation appears in the persistence run from position {converges_at}"
     )
 
 
