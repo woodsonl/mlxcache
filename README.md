@@ -132,7 +132,11 @@ measured 2.2x on a 5-turn 7B conversation
 ([REPORT.md](REPORT.md), the GO record). Every reader
 reassembles and verifies the same payload sha256, so corruption retires a
 chunked blob exactly like a whole-blob flip; a chunk leaves disk only when
-no live checkpoint references it. Setting `MLXCACHE_CHUNK_STORE=0` on the daemon publishes whole-blob v2
+no live checkpoint references it. Empty segments delete on the eviction
+sweep; a PARTIALLY-dead segment (live chunks sandwiching dead ones) is
+rewritten by segment compaction — the live records move to a fresh segment
+and the old file deletes, so dead bytes leave disk instead of squatting
+between live chunks. Setting `MLXCACHE_CHUNK_STORE=0` on the daemon publishes whole-blob v2
 instead (both layouts coexist and stay readable forever).
 
 Every published hit writes one KV checkpoint ("blob") — a safetensors payload
@@ -297,6 +301,10 @@ Daemon:
 | `MLXCACHE_EVICT_MAX_ENTRIES` | `0` | entry cap on top of the byte budget; `0` = none |
 | `MLXCACHE_EVICT_ANCHOR_WINDOW_S` | `900` | how recently a checkpoint must have served to stay an eviction-protected anchor |
 | `MLXCACHE_CHUNK_STORE` | `1` | `0` publishes whole-blob v2 instead of chunked v3 (rollback knob). The chunked store dedups shared prefixes at the chunk level — the measured 2.2× on a 5-turn 7B conversation — with the same sha256 integrity contract over reassembled payloads; both layouts coexist in one directory and every reader handles both |
+| `MLXCACHE_COMPACT` | `1` | `0` disables segment compaction (the sweep that rewrites partially-dead segments so dead bytes between live chunks leave disk; `/stats` reports the dead-byte total as `chunk_store.dead_bytes`) |
+| `MLXCACHE_COMPACT_RATIO` | `0.5` | a segment compacts when at least this fraction of its record bytes is dead |
+| `MLXCACHE_COMPACT_MIN_BYTES` | `16777216` | dead-byte floor per segment; below it the sweep leaves the segment alone (no churn on small fragments) |
+| `MLXCACHE_COMPACT_MAX_SEGMENTS` | `2` | segments rewritten per sweep — the pacing that bounds each pass's I/O |
 
 Sidecar:
 

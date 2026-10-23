@@ -2,6 +2,31 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.8.0 — 2026-10-23
+
+### Added
+
+- **Segment compaction** for the chunked dedup store: dead bytes trapped
+  between live chunks inside a 64 MiB segment now leave disk. The
+  eviction sweep rewrites partially-dead segments (live records copied to
+  a fresh fsynced segment, placements swapped, old file deleted);
+  threshold-gated by `MLXCACHE_COMPACT_RATIO` (default 0.5),
+  `MLXCACHE_COMPACT_MIN_BYTES` (16 MiB), `MLXCACHE_COMPACT_MAX_SEGMENTS`
+  (2 per pass), and disabled with `MLXCACHE_COMPACT=0`.
+- `/stats` now reports the chunk store's fragmentation as
+  `chunk_store: {record_bytes, dead_bytes, partial_segments}`.
+
+### Changed
+
+- Boot resolution order for duplicate digests across segments is now
+  **highest-seq first-wins** (newest copy wins), in both the Rust boot
+  scan and the Python reader. Duplicates only arise from a compaction
+  crash (new segment durable, old not yet deleted); newest-wins makes
+  that crash self-healing — the old segment accounts fully dead at scan
+  time and reclaims on the next GC pass. Losing duplicate records are
+  counted dead on their own segment during the scan.
+
+
 ## 0.7.1 — 2026-10-23
 
 ### Added

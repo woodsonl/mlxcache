@@ -46,6 +46,16 @@ class ChunkFormatError(ValueError):
     corruption taxonomy as a whole-blob digest mismatch."""
 
 
+class _SegmentVanishedError(Exception):
+    """Internal: a segment disappeared between scan and open (a daemon
+    compaction sweep re-homed its records). Signals a rescan; never
+    escapes this module."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.name = name
+
+
 def read_manifest(blob_path: str | Path) -> Manifest:
     """The parsed .ckm manifest for a v3 blob."""
     ckm = Path(blob_path).with_suffix(".ckm")
@@ -197,21 +207,34 @@ class ChunkReader:
                 continue
         # Pass 2: derive digest -> placement from the cached digests. The
         # placement offsets are implied by the record layout: walk each
-        # segment's digests reconstructing offsets.
+        # segment's digests reconstructing offsets. HIGHEST seq first, so
+        # the first-wins rule (setdefault) keeps the NEWEST copy of a
+        # duplicate digest — the same resolution order as the Rust boot
+        # scan. Duplicates only exist after a compaction crash (new segment
+        # durable, old not yet deleted); both readers must agree on the
+        # new segment so the old one is fully reclaimable.
         placement: dict[bytes, tuple[str, int, int]] = {}
-        for name, (_size, digests) in sorted(cache.items()):
+        for name, (_size, digests) in sorted(cache.items(), reverse=True):
             at = _HEADER_BYTES
             for digest in digests:
                 body_start = at + _RECORD_HEADER.size
                 body_len = None
                 # body length is not cached; re-read just the 4-byte header
                 # of each record to recover offsets exactly.
-                with open(chunks_dir / name, "rb") as fh:
-                    fh.seek(at)
-                    raw = fh.read(4)
-                    if len(raw) < 4:
-                        break
-                    body_len = struct.unpack("<I", raw)[0]
+                try:
+                    with open(chunks_dir / name, "rb") as fh:
+                        fh.seek(at)
+                        raw = fh.read(4)
+                except FileNotFoundError as exc:
+                    # Deleted between Pass 1 and this open (a sweep
+                    # re-homed the records): the caller must rescan, so
+                    # the fresh pass sees the replacement segment —
+                    # raising a raw FileNotFoundError here would bypass
+                    # the retry and reject a healthy checkpoint.
+                    raise _SegmentVanishedError(name) from exc
+                if len(raw) < 4:
+                    break
+                body_len = struct.unpack("<I", raw)[0]
                 placement.setdefault(digest, (name, body_start, body_len))
                 at = body_start + body_len
         return placement
@@ -222,8 +245,25 @@ class ChunkReader:
 
     def reassemble(self, manifest: Manifest) -> bytes:
         """The blob's payload bytes, scattered from the segments."""
+        # A daemon compaction sweep can delete a segment between this
+        # scan and the opens below (it moves live records to a new
+        # segment first). Rescan and retry — bounded, because a sweep
+        # moves each digest at most once; a segment still missing after
+        # that is real corruption.
+        last_vanished: _SegmentVanishedError | None = None
+        for _ in range(3):
+            try:
+                return self._reassemble_from(manifest, self.placement)
+            except _SegmentVanishedError as exc:
+                last_vanished = exc
+        raise ChunkFormatError(
+            f"segment {last_vanished.name} vanished under a live placement"
+        ) from last_vanished
+
+    def _reassemble_from(
+        self, manifest: Manifest, placement: dict[bytes, tuple[str, int, int]]
+    ) -> bytes:
         out = bytearray(manifest.payload_len)
-        placement = self.placement
         # Read every needed segment region while the file is open — one
         # open per segment, no long-lived handles (the reader can sit on a
         # serving thread).
@@ -236,13 +276,18 @@ class ChunkReader:
             by_segment.setdefault(name, []).append((c.digest, offset, body_len))
         bodies: dict[bytes, bytes] = {}
         for name, regions in by_segment.items():
-            with open(self.dir / "chunks" / name, "rb") as fh:
-                for digest, offset, body_len in regions:
-                    fh.seek(offset)
-                    body = fh.read(body_len)
-                    if len(body) != body_len:
-                        raise ChunkFormatError("segment truncated under a live chunk")
-                    bodies[digest] = body
+            try:
+                with open(self.dir / "chunks" / name, "rb") as fh:
+                    for digest, offset, body_len in regions:
+                        fh.seek(offset)
+                        body = fh.read(body_len)
+                        if len(body) != body_len:
+                            raise ChunkFormatError("segment truncated under a live chunk")
+                        bodies[digest] = body
+            except FileNotFoundError as exc:
+                # The segment vanished between scan and open (a sweep
+                # deleted it after re-homing its records): rescan.
+                raise _SegmentVanishedError(name) from exc
         for c in manifest.chunks:
             body = bodies[c.digest]
             if len(body) != c.body_len:
