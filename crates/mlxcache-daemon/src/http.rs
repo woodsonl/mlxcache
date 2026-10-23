@@ -2762,6 +2762,14 @@ async fn stream_response(
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let s = state.stats.snapshot();
+    // The chunk-store totals sit behind the store's std Mutex, which a
+    // compaction sweep can hold across segment copies: read them on the
+    // blocking pool so a stats request never parks a runtime worker.
+    let persistence = state.persistence.clone();
+    let (chunk_total, chunk_dead, chunk_partial) =
+        tokio::task::spawn_blocking(move || persistence.chunked_fragmentation())
+            .await
+            .unwrap_or((0, 0, 0));
     Json(serde_json::json!({
         "requests": s.requests,
         "hits": s.hits,
@@ -2777,6 +2785,11 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "checkpoints_published": state.orchestrator.published_count(),
         "checkpoints_quarantined": state.orchestrator.quarantined_count(),
         "evictions": s.evictions,
+        "chunk_store": {
+            "record_bytes": chunk_total,
+            "dead_bytes": chunk_dead,
+            "partial_segments": chunk_partial,
+        },
     }))
 }
 
@@ -3594,6 +3607,14 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         let stats: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(stats["requests"], 0, "404s must not enter the cache stats");
+        // The chunk-store block is part of the stats contract: dead bytes
+        // and partial-segment count drive the compaction knobs.
+        assert!(
+            stats["chunk_store"]["record_bytes"].is_u64(),
+            "stats: {stats}"
+        );
+        assert!(stats["chunk_store"]["dead_bytes"].is_u64());
+        assert!(stats["chunk_store"]["partial_segments"].is_u64());
     }
 
     #[test]

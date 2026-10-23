@@ -47,6 +47,68 @@ pub struct Persistence {
     /// Persistence safe by construction, verified by the concurrent
     /// same-name test.)
     chunk_publish_lock: Arc<std::sync::Mutex<()>>,
+    /// Compaction knobs (env-read once at construction; tests override via
+    /// `set_compact_config` instead of racing `set_var` under parallel
+    /// test threads). Interior mutability because Persistence is shared
+    /// as an Arc across the reaper and request paths.
+    compact: std::sync::Arc<std::sync::RwLock<CompactConfig>>,
+}
+
+/// Segment-compaction knobs. Defaults compact a segment when at least half
+/// its record bytes are dead and the dead set is at least 16 MiB, two
+/// segments per sweep (the reaper-cadence pacing).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactConfig {
+    pub enabled: bool,
+    pub ratio: f64,
+    pub min_dead_bytes: u64,
+    pub max_segments: usize,
+}
+
+impl Default for CompactConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ratio: 0.5,
+            min_dead_bytes: 16 << 20,
+            max_segments: 2,
+        }
+    }
+}
+
+impl CompactConfig {
+    /// The daemon boot path: read `MLXCACHE_COMPACT*` from the process env.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Pure parser (unit-tested without touching the process env):
+    /// `MLXCACHE_COMPACT=0|false` disables; `MLXCACHE_COMPACT_RATIO`
+    /// (0..=1), `MLXCACHE_COMPACT_MIN_BYTES`, and
+    /// `MLXCACHE_COMPACT_MAX_SEGMENTS` override the defaults; an
+    /// unparseable value falls back to the default for that knob.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let mut cfg = Self::default();
+        if let Some(v) = lookup("MLXCACHE_COMPACT").as_deref() {
+            if v == "0" || v == "false" {
+                cfg.enabled = false;
+            }
+        }
+        if let Some(v) = lookup("MLXCACHE_COMPACT_RATIO").and_then(|v| v.parse::<f64>().ok()) {
+            if (0.0..=1.0).contains(&v) {
+                cfg.ratio = v;
+            }
+        }
+        if let Some(v) = lookup("MLXCACHE_COMPACT_MIN_BYTES").and_then(|v| v.parse::<u64>().ok()) {
+            cfg.min_dead_bytes = v;
+        }
+        if let Some(v) =
+            lookup("MLXCACHE_COMPACT_MAX_SEGMENTS").and_then(|v| v.parse::<usize>().ok())
+        {
+            cfg.max_segments = v;
+        }
+        cfg
+    }
 }
 
 /// Process-wide monotonic counter to make temp file names unique across
@@ -121,6 +183,7 @@ impl Persistence {
             chunk_store,
             mode,
             chunk_publish_lock: Arc::new(std::sync::Mutex::new(())),
+            compact: std::sync::Arc::new(std::sync::RwLock::new(CompactConfig::from_env())),
         })
     }
 
@@ -672,6 +735,45 @@ impl Persistence {
             .unwrap_or(0)
     }
 
+    /// Compact fragmented segments (threshold-gated by the store's
+    /// config, read once at construction — see `CompactConfig`). Returns
+    /// (segments, bytes reclaimed).
+    pub fn compact_chunked(&self) -> (usize, u64) {
+        let Some(store) = self.chunk_store.as_ref() else {
+            return (0, 0);
+        };
+        let cfg = *self.compact.read().unwrap();
+        if !cfg.enabled {
+            return (0, 0);
+        }
+        match store.compact_segments(cfg.ratio, cfg.min_dead_bytes, cfg.max_segments) {
+            Ok((0, _)) => (0, 0),
+            Ok((segments, bytes)) => {
+                tracing::info!(segments, bytes, "segment compaction reclaimed dead bytes");
+                (segments, bytes)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "segment compaction pass failed");
+                (0, 0)
+            }
+        }
+    }
+
+    /// Override the compaction knobs (tests inject scale here instead of
+    /// mutating process-global env while parallel tests run).
+    pub fn set_compact_config(&self, cfg: CompactConfig) {
+        *self.compact.write().unwrap() = cfg;
+    }
+
+    /// Fragmentation accounting for /stats: (total record bytes, dead record
+    /// bytes, partially-dead segment count). Zeroes in whole-blob mode.
+    pub fn chunked_fragmentation(&self) -> (u64, u64, usize) {
+        self.chunk_store
+            .as_ref()
+            .map(|s| s.fragmentation())
+            .unwrap_or((0, 0, 0))
+    }
+
     /// One blob's eviction-budget footprint. v1/v2: the file's size. v3:
     /// the manifest's gross chunk bytes (shared chunks count once per
     /// referencing blob, which is what eviction ordering wants — evicting
@@ -1132,7 +1234,7 @@ mod chunk_rollback_tests {
 #[cfg(test)]
 mod is_chunked_probe {
     use super::tests::{meta, tmpdir};
-    use super::Persistence;
+    use super::{CompactConfig, Persistence};
 
     #[test]
     fn is_chunked_blob_is_true_for_v3_and_false_for_v2() {
@@ -1144,6 +1246,93 @@ mod is_chunked_probe {
         let v2 = p2.publish_atomic(0xb, 1, meta(9), &payload).unwrap();
         assert!(p.is_chunked_blob(v3.file_name().unwrap().to_str().unwrap()));
         assert!(!p.is_chunked_blob(v2.file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    fn compact_chunked_sweep_and_env_knobs() {
+        // Three v3 blobs in one segment; retiring one leaves dead bytes the
+        // empty-segment GC cannot touch (the segment still has live
+        // records). The config-gated persistence sweep must rewrite it and
+        // keep the survivors loadable. Knobs arrive via set_compact_config
+        // (NOT env mutation — parallel tests call evict paths that read the
+        // same keys).
+        let dir = tmpdir();
+        let mut keep = Vec::new();
+        {
+            let p = Persistence::new(dir.path()).unwrap();
+            for (hash, seed) in [(0x11u128, 1u8), (0x12, 2), (0x13, 3)] {
+                let path = p
+                    .publish_atomic(hash, 1, meta(64), &vec![seed; 4096])
+                    .unwrap();
+                keep.push((path, seed));
+            }
+            let (victim, _) = keep.pop().unwrap();
+            let name = victim.file_name().unwrap().to_string_lossy().into_owned();
+            p.remove(&name).unwrap();
+        }
+        // Reopen: the segment is sealed and refs re-derive from live pairs.
+        let p = Persistence::new(dir.path()).unwrap();
+        let (_, dead, partial) = p.chunked_fragmentation();
+        assert!(dead > 0, "the retired blob's chunks are dead: {dead}");
+        assert_eq!(partial, 1);
+        // Defaults (ratio 0.5, floor 16 MiB) sit above this tiny dead set:
+        // the sweep must no-op without test-scale knobs.
+        assert_eq!(p.compact_chunked(), (0, 0));
+        // Disabled outright.
+        let off = CompactConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        p.set_compact_config(off);
+        assert_eq!(p.compact_chunked(), (0, 0));
+        // Test-scale knobs: compact.
+        let small = CompactConfig {
+            ratio: 0.0,
+            min_dead_bytes: 1,
+            ..Default::default()
+        };
+        p.set_compact_config(small);
+        let (n, reclaimed) = p.compact_chunked();
+        assert_eq!(n, 1);
+        assert!(reclaimed > 0);
+        let (_, dead2, _) = p.chunked_fragmentation();
+        assert_eq!(dead2, 0, "the rewrite leaves no dead records");
+        // Survivors load through the swapped placements, digest-verified.
+        for (path, seed) in &keep {
+            let (m, payload) = p.load(path).unwrap();
+            assert_eq!(m.format_version, 3);
+            assert_eq!(payload, vec![*seed; 4096]);
+        }
+    }
+
+    #[test]
+    fn compact_config_parses_env_and_rejects_garbage() {
+        // The env parser is pure (from_lookup): no set_var races under
+        // parallel test threads.
+        let base = |k: &str| -> Option<String> {
+            match k {
+                "MLXCACHE_COMPACT" => Some("0".into()),
+                "MLXCACHE_COMPACT_RATIO" => Some("0.25".into()),
+                "MLXCACHE_COMPACT_MIN_BYTES" => Some("4096".into()),
+                "MLXCACHE_COMPACT_MAX_SEGMENTS" => Some("7".into()),
+                _ => None,
+            }
+        };
+        let cfg = CompactConfig::from_lookup(base);
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.ratio, 0.25);
+        assert_eq!(cfg.min_dead_bytes, 4096);
+        assert_eq!(cfg.max_segments, 7);
+        // Garbage and out-of-range values fall back to that knob's default.
+        let junk = |k: &str| -> Option<String> {
+            match k {
+                "MLXCACHE_COMPACT_RATIO" => Some("two".into()),
+                "MLXCACHE_COMPACT_MIN_BYTES" => Some("-1".into()),
+                _ => None,
+            }
+        };
+        let cfg = CompactConfig::from_lookup(junk);
+        assert_eq!(cfg, CompactConfig::default());
     }
 }
 

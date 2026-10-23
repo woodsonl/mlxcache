@@ -234,6 +234,125 @@ async fn eviction_reaper_unlinks_and_stats_and_next_request_misses() {
     child.wait().expect("reap sidecar");
 }
 
+#[tokio::test]
+async fn compaction_reclaims_dead_bytes_and_the_survivor_still_serves() {
+    // The compaction e2e: publish a chain (prefix + settled), "restart"
+    // (fresh AppState; the active segment becomes a sealed, compactable
+    // one), evict the settled blob through the real reaper path, and the
+    // pass's compaction must rewrite the partially-dead segment. /stats
+    // shows the reclamation, and the surviving prefix must still serve
+    // from the NEW placement (the reassemble-under-lock contract).
+    let (sidecar_url, mut child) = spawn_sidecar().await;
+    let blobs = tempfile::tempdir().unwrap();
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "evict me"}],
+        "stream": false,
+    })
+    .to_string();
+    let stats_json = |state: Arc<AppState>| async move {
+        let res = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+
+    // Turn 1 on the first process: publishes the prefill prefix and the
+    // settled checkpoint, sharing the prefix chunks.
+    {
+        let state = app_state(&sidecar_url, &blobs);
+        let res = router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        await_settle_publication(&state).await;
+        await_settle_publication(&state).await;
+        assert_eq!(state.orchestrator.published_count(), 2);
+        await_settle_publication(&state).await;
+        assert_eq!(blob_coverages(&state), vec![8, 72]);
+    }
+    // AppState dropped = the active segment is sealed for the next open.
+    let state = app_state(&sidecar_url, &blobs);
+    state.orchestrator.rebuild_from_disk(&state.persistence);
+    let before = stats_json(state.clone()).await;
+    let r1 = before["chunk_store"]["record_bytes"].as_u64().unwrap();
+    assert!(r1 > 0, "both blobs' chunks are accounted: {before}");
+    assert_eq!(before["chunk_store"]["dead_bytes"], 0);
+
+    // Test-scale compaction knobs via config injection (env mutation would
+    // race the parallel e2e tests' eviction passes).
+    let small = mlxcache_daemon::persistence::CompactConfig {
+        ratio: 0.0,
+        min_dead_bytes: 1,
+        ..Default::default()
+    };
+    state.persistence.set_compact_config(small);
+    // One reaper pass: the settled blob reaps (the prefix is its anchor),
+    // its UNIQUE chunks die inside a segment that still holds the live
+    // prefix — the compaction case gc_empty cannot touch.
+    let evicted = state.evict_pass(0, 0, std::time::Duration::ZERO);
+    state.persistence.set_compact_config(Default::default());
+    assert_eq!(
+        evicted, 1,
+        "the settled blob reaps; the anchored prefix stays"
+    );
+    await_settle_publication(&state).await;
+
+    let after = stats_json(state.clone()).await;
+    assert_eq!(after["chunk_store"]["dead_bytes"], 0, "stats: {after}");
+    assert_eq!(after["chunk_store"]["partial_segments"], 0);
+    let r2 = after["chunk_store"]["record_bytes"].as_u64().unwrap();
+    assert!(
+        r2 < r1,
+        "the settled blob's unique chunks left disk: {r1} -> {r2}"
+    );
+    // One sealed rewrite remains; the original segment file is gone.
+    let segs: Vec<_> = std::fs::read_dir(blobs.path().join("chunks"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".seg"))
+        .collect();
+    assert_eq!(segs.len(), 1, "the rewrite replaced the fragmented segment");
+
+    // The surviving prefix serves from the NEW placement.
+    let res = router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_ne!(
+        v["mlxcache"]["verdict"], "miss",
+        "the compacted prefix must still serve: {v}"
+    );
+
+    child.kill().expect("kill sidecar");
+    child.wait().expect("reap sidecar");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
