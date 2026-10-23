@@ -2,6 +2,23 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.8.1 — 2026-10-23
+
+### Added
+
+- **The 32K point, certified.** One passing run on a machine with true
+  headroom closes the curve the 0.7.1 unit left withheld: prefill
+  0.36 s at 256 tokens to 63.7 s at 32K (1.4 to 1.9 ms/token), decode
+  13 ms/token at 256 to 21 ms at 32K (ratio 1.62x), checkpoints
+  14.6 MB to 1.88 GB at 55.8-56.0 KiB/token — every self-check green,
+  zero swap displacement on every row. Nine attempts produced it: seven
+  curve-consistent runs (63.7-68.3 s) refused on the 1-3.4 GB
+  displacement a shared machine takes as the row's ~8 GB working set
+  arrives (the KV lives in Metal allocator memory the process RSS cannot
+  see, so the footprint bound undercounts), one 12.3 GB thrash (79.9 s)
+  refused and excluded, and the ninth — on freed memory — certified.
+  The guard's boundary is documented where the check lives; the README's
+  Measured section carries the certified curve and the trail.
 ## 0.8.0 — 2026-10-23
 
 ### Added
