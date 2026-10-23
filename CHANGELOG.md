@@ -15,7 +15,7 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   measured); a control pair brackets the sweep so repeatability is observed;
   monotonicity, decode/prefill-ratio, and swap checks refuse a contaminated
   run rather than labelling it afterward. One sweep at a time via flock
-  (bypass: MLXCACHE_PROBE_LOCK=off). 13 hermetic tests pin the check math —
+  (bypass: MLXCACHE_PROBE_LOCK=off). 19 hermetic tests pin the check math —
   including the inverted-monotonicity regression that once flagged every
   healthy run — and the lock's refusal/release/bypass behavior.
 - **The long-context cost curve is back, on the supported path.** Measured

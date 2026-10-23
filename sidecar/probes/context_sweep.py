@@ -109,10 +109,13 @@ def machine_state() -> dict[str, object]:
 
 
 def build_tokens(tokenizer, size: int) -> list[int]:
-    """Exactly `size` tokens of varied prose, so no position is a degenerate repeat."""
+    """Exactly `size` tokens of varied prose, so no position is a degenerate
+    repeat. The corpus doubles per iteration (one append-one-SEED per loop
+    re-encodes the whole text quadratically and dominates startup at 32K),
+    then one final encode truncates to size."""
     text = SEED
     while len(tokenizer.encode(text)) < size:
-        text += SEED
+        text += text
     return tokenizer.encode(text)[:size]
 
 
@@ -376,6 +379,10 @@ def main() -> int:
     # in, and this sweep's next child would then be refused by a lock it
     # itself held a moment ago — losing every row already measured.
     with sweep_lock(f"context_sweep[{args.sizes}]"):
+        # A refused run must not leave a PREVIOUS run's report sitting at
+        # --out, where it reads as this run's result.
+        if args.out and os.path.exists(args.out):
+            os.unlink(args.out)
         print(
             f"\n{'tokens':>7} {'prefill_s':>10} {'ttft_s':>8} {'decode_s/tok':>13} "
             f"{'blob_MB':>8} {'swap_delta_MB':>13}",
