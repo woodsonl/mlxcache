@@ -37,7 +37,8 @@ Self-checks, all refusing (exit 2, no JSON):
   * row sanity — a missing or unreadable row (child died mid-write, swap
     read failed) is a refusal, never a skipped row.
 
-One sweep at a time: an flock on ~/.mlxcache/probe-sweep.lock (override with
+One sweep at a time: the PARENT process holds an flock on
+~/.mlxcache/probe-sweep.lock for the entire plan (override with
 MLXCACHE_PROBE_LOCK_PATH, bypass with MLXCACHE_PROBE_LOCK=off — bypassing
 admits contaminated timings on purpose). flock is released by the OS if the
 probe is killed; the in-file holder text is display-only.
@@ -80,11 +81,24 @@ def machine_state() -> dict[str, object]:
     state: dict[str, object] = {}
     try:
         out = subprocess.run(
-            ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, check=True
+            ["sysctl", "-n", "vm.swapusage"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
         ).stdout
         used = out.split("used =")[1].split("M")[0].strip()
         state["swap_used_mb"] = float(used)
-    except (subprocess.CalledProcessError, IndexError, ValueError):
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        IndexError,
+        ValueError,
+        OSError,
+    ):
+        # A missing or wedged sysctl must degrade to the None that
+        # validate_row turns into a clean refusal, never a traceback out
+        # of a child that holds no context for the error.
         state["swap_used_mb"] = None
     try:
         state["load_1m"] = round(os.getloadavg()[0], 2)
@@ -122,6 +136,16 @@ def measure_one(model_id: str, size: int, decode_steps: int) -> dict[str, float]
     mx.eval([c.state for c in cache], logits)
     prefill = time.perf_counter() - t0
 
+    # The checkpoint is captured HERE, exactly as the adapter's publish
+    # path captures it: the prompt-only cache, before any generated token
+    # mutates it. Saving after decode would fold the generated positions
+    # into blob_bytes and overstate the checkpoint size.
+    blob = io.BytesIO()
+    # load_prompt_cache dispatches on the name; keep the extension it reads.
+    blob.name = "sweep.safetensors"
+    save_prompt_cache(blob, cache)
+    payload = blob.getvalue()
+
     # TTFT adds the one step that consumes the final prompt token, kept
     # separate so `prefill_s` stays the comparable figure.
     t0 = time.perf_counter()
@@ -137,12 +161,6 @@ def measure_one(model_id: str, size: int, decode_steps: int) -> dict[str, float]
         prev = int(mx.argmax(logits[0, -1]).item())
         step_times.append(time.perf_counter() - t0)
     decode = statistics.median(step_times) if step_times else 0.0
-
-    blob = io.BytesIO()
-    # load_prompt_cache dispatches on the name; keep the extension it reads.
-    blob.name = "sweep.safetensors"
-    save_prompt_cache(blob, cache)
-    payload = blob.getvalue()
 
     row = {
         "tokens": size,
@@ -311,9 +329,10 @@ def swap_failures(rows: list[dict], limit_mb: float = 256.0) -> list[str]:
 
 
 def _child(args: argparse.Namespace) -> int:
-    """Entry point for the per-size subprocess."""
-    with sweep_lock(f"context_sweep[{args.only_size}]"):
-        row = measure_one(args.model, args.only_size, args.decode)
+    """Entry point for the per-size subprocess. The PARENT holds the sweep
+    lock for the whole plan; a child never needs it (and taking it would
+    refuse against the parent's own hold)."""
+    row = measure_one(args.model, args.only_size, args.decode)
     print("ROW " + json.dumps(row), flush=True)
     return 0
 
@@ -338,58 +357,63 @@ def main() -> int:
         return 2
 
     rows: list[dict[str, float]] = []
-    print(
-        f"\n{'tokens':>7} {'prefill_s':>10} {'ttft_s':>8} {'decode_s/tok':>13} "
-        f"{'blob_MB':>8} {'swap_delta_MB':>13}",
-        flush=True,
-    )
-    for size, phase in plan:
-        cmd = [
-            sys.executable,
-            os.path.abspath(__file__),
-            "--only-size",
-            str(size),
-            "--decode",
-            str(args.decode),
-            "--model",
-            args.model,
-        ]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-        except subprocess.TimeoutExpired:
-            # A hung child (model fetch stalled, Metal wedged) must not
-            # wedge the sweep with it; 20 min exceeds the slowest planned
-            # row by an order of magnitude.
-            print(f"REFUSING: the {size}-token run did not finish (child hung).", flush=True)
-            return 2
-        line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("ROW ")), None)
-        if line is None:
-            print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
-            print(f"REFUSING: the {size}-token run produced no measurement.", flush=True)
-            return 2
-        # A child killed mid-write (OOM inside the ROW print) or emitting
-        # garbage after "ROW " is a refusal, not a traceback: one bad child
-        # must not lose the measurements already collected.
-        try:
-            row = json.loads(line[4:])
-        except json.JSONDecodeError:
-            print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
-            print(f"REFUSING: the {size}-token run produced an unreadable row.", flush=True)
-            return 2
-        bad = validate_row(row, size)
-        if bad is not None:
-            print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
-            print(f"REFUSING: {bad}.", flush=True)
-            return 2
-        row["phase"] = phase
-        rows.append(row)
-        delta = row["swap_after_mb"] - row["swap_before_mb"]
-        label = {"warmup": "+", "control": "*", "sweep": ""}[phase]
+    # The lock is held by the PARENT for the whole sweep: per-child locking
+    # would leave gaps between rows where a concurrent sweep's child slips
+    # in, and this sweep's next child would then be refused by a lock it
+    # itself held a moment ago — losing every row already measured.
+    with sweep_lock(f"context_sweep[{args.sizes}]"):
         print(
-            f"{(str(size) + label):>7} {row['prefill_s']:>10.2f} {row['ttft_s']:>8.2f} "
-            f"{row['decode_s']:>13.2f} {row['blob_bytes'] / 1e6:>8.1f} {delta:>13.0f}",
+            f"\n{'tokens':>7} {'prefill_s':>10} {'ttft_s':>8} {'decode_s/tok':>13} "
+            f"{'blob_MB':>8} {'swap_delta_MB':>13}",
             flush=True,
         )
+        for size, phase in plan:
+            cmd = [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--only-size",
+                str(size),
+                "--decode",
+                str(args.decode),
+                "--model",
+                args.model,
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+            except subprocess.TimeoutExpired:
+                # A hung child (model fetch stalled, Metal wedged) must not
+                # wedge the sweep with it; 20 min exceeds the slowest planned
+                # row by an order of magnitude.
+                print(f"REFUSING: the {size}-token run did not finish (child hung).", flush=True)
+                return 2
+            line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("ROW ")), None)
+            if line is None:
+                print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
+                print(f"REFUSING: the {size}-token run produced no measurement.", flush=True)
+                return 2
+            # A child killed mid-write (OOM inside the ROW print) or emitting
+            # garbage after "ROW " is a refusal, not a traceback: one bad child
+            # must not lose the measurements already collected.
+            try:
+                row = json.loads(line[4:])
+            except json.JSONDecodeError:
+                print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
+                print(f"REFUSING: the {size}-token run produced an unreadable row.", flush=True)
+                return 2
+            bad = validate_row(row, size)
+            if bad is not None:
+                print(proc.stdout, proc.stderr, file=sys.stderr, flush=True)
+                print(f"REFUSING: {bad}.", flush=True)
+                return 2
+            row["phase"] = phase
+            rows.append(row)
+            delta = row["swap_after_mb"] - row["swap_before_mb"]
+            label = {"warmup": "+", "control": "*", "sweep": ""}[phase]
+            print(
+                f"{(str(size) + label):>7} {row['prefill_s']:>10.2f} {row['ttft_s']:>8.2f} "
+                f"{row['decode_s']:>13.2f} {row['blob_bytes'] / 1e6:>8.1f} {delta:>13.0f}",
+                flush=True,
+            )
 
     sweep_rows = [r for r in rows if r["phase"] == "sweep"]
     control_rows = [r for r in rows if r["phase"] == "control"]
@@ -406,7 +430,10 @@ def main() -> int:
     repeat = repeatability_failure(control_rows, args.tolerance)
     if repeat is not None:
         failures.append(repeat)
-    failures.extend(swap_failures(rows))
+    # The warmup row is excluded from every check, the swap guard included:
+    # the cold first load legitimately displaces pages, and its timing is
+    # never quoted.
+    failures.extend(swap_failures([r for r in rows if r["phase"] != "warmup"]))
 
     if failures:
         for f in failures:
