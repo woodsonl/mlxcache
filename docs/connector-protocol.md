@@ -77,6 +77,52 @@ parsing quarantined every healthy ancestor when a newer daemon added a
 field.) `[CURRENT: blob.py _known_fields strips unknowns; Rust serde
 ignores unknown fields]`
 
+### Chunked payloads (`format_version` 3) `[CURRENT]`
+
+A v3 blob is a HEADER-ONLY `.ckpt` (the u32+JSON header above, no payload
+bytes) plus two siblings, all written temp-then-rename with the `.ckpt`
+rename as the visibility point:
+
+- `{stem}.ckm` — a binary chunk manifest: magic `MCKM` + u16 version, u64
+  `payload_len`, u64 `chunk_count`, then 56-byte records
+  `digest[32] ‖ per_head_len u32 ‖ n_heads u32 ‖ first_off u64 ‖
+  head_stride u64`. A chunk's body is the per-head slice concatenation (head
+  order); reassembly scatters `per_head_len` bytes at
+  `first_off + h·head_stride` per head.
+- `chunks/seg-{seq:010}.seg` — immutable packed segments shared by every
+  v3 blob in the store: magic `MCSG` + u16 version + 2 reserved bytes, then
+  records `body_len u32 ‖ digest[32] ‖ body`. Chunk bodies are
+  content-addressed (sha256); a digest already present is never re-written.
+  A truncated tail record (crash mid-append) ends a segment scan cleanly.
+
+The chunk codec is **token-block/64**: per safetensors tensor, blocks of 64
+covered positions; a block's identity is the sha256 over the concatenation
+of each KV head's byte slice for those positions (the head-major layout
+makes those slices append-stable, so a shared token prefix yields
+byte-identical chunks — the dedup the format exists for). Bytes no tensor
+claims (the safetensors JSON header, inter-tensor gaps) and non-safetensors
+payloads fall back to whole-scope single chunks: identity and reassembly
+stay exact; byte-identical payloads still dedup.
+
+`payload_sha256` covers the REASSEMBLED payload and is verified by every
+reader (the D1 contract unchanged): corruption in a manifest or segment
+produces wrong bytes and a digest mismatch — the same retire path as a
+whole-blob flip. Refcounts are DERIVED at open from live `.ckpt`↔`.ckm`
+pairs (never trusted from disk); a segment leaves disk only when every
+record in it is unreferenced, and a crash between the two renames leaves
+reclaimable orphans.
+
+**Writer discipline**: ONE chunk-format writer per store directory — the
+Rust daemon. The Python bindings READ v3 (the sidecar adopts chunked blobs
+through the same reassembly; the L1 store verifies them at open and fetch)
+but keep PUBLISHING whole-blob v2. Both layouts coexist in one directory
+indefinitely; v1/v2 readers see a v3 blob as an uninterpretable version and
+retire it loudly rather than misread it (mixed-version rollout means
+upgrading the daemon and its sidecar together, which is how they ship).
+
+`MLXCACHE_CHUNK_STORE=0` on the daemon disables v3 publication (rollback
+knob; reads still understand both).
+
 ## 3. Operations (L1)
 
 Any store implementation MUST expose `[B0.2 for the standalone client;
@@ -241,8 +287,12 @@ Engine registry (maintained here): `"mlx-lm"` (the default) and
 
 - `1` — legacy, pre-digest. Readable, NEVER verified. Writers MUST NOT
   emit it.
-- `2` — current. `payload_sha256` REQUIRED; a v2 header without it is
-  `CorruptCache(version)`.
+- `2` — whole-blob current. `payload_sha256` REQUIRED; a v2 header without
+  it is `CorruptCache(version)`.
+- `3` — chunked (§2 "Chunked payloads"): header-only `.ckpt`, payload in
+  the chunk store, `payload_sha256` REQUIRED and verified over the
+  REASSEMBLED bytes. Pre-v3 readers refuse loudly (a v3 blob is a foreign
+  layout to them, never a misread).
 - anything else — refuse with a reason naming the version. Never
   interpret a foreign layout.
 
