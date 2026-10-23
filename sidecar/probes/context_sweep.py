@@ -332,7 +332,18 @@ def swap_failures(rows: list[dict], base_limit_mb: float = 256.0) -> list[str]:
     is the streamed-engine failure mode: swap growth while live weights
     thrash, which lands FAR beyond the row's own footprint (a 3.5x
     step-time blowup in the era that motivated this check). The half
-    factor is the conservative side of the boundary: prefer refusing."""
+    factor is the conservative side of the boundary: prefer refusing.
+
+    Known boundary, stated rather than patched: MLX allocates KV through
+    the Metal allocator, which the process's ru_maxrss cannot see, so the
+    footprint proxy undercounts rows whose KV is large relative to the
+    weights — a 32K row (1.9 GB KV on 4.4 GB weights) on a shared machine
+    can displace 1-3.4 GB with a clean clock (seven runs spanning
+    63.7-68.3 s, decode flat) and still refuse. The guard stays strict;
+    the honest publish path for such a row is cross-run consensus with the
+    refusals disclosed — a machine with true headroom certifies a single
+    run (observed once: 63.65 s at 32K with zero displacement, after
+    seven refusing attempts) — never a loosened constant."""
     failures = []
     for row in rows:
         grew = row["swap_after_mb"] - row["swap_before_mb"]
