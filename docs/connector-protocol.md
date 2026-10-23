@@ -112,6 +112,22 @@ pairs (never trusted from disk); a segment leaves disk only when every
 record in it is unreferenced, and a crash between the two renames leaves
 reclaimable orphans.
 
+**Segment compaction and duplicate resolution** (v0.8.0): retiring a blob
+kills only its UNIQUE chunks — chunks shared with survivors stay live, so
+a segment can end up partially dead (live records with dead bytes
+trapped between them). The daemon's eviction sweep rewrites such a
+segment: live records are copied to a fresh segment (higher `seq`), the
+new file is fsynced, placements move, and only then does the old file
+delete. A crash between fsync and delete strands the same digest in TWO
+segments; readers resolve duplicates by **highest seq first-wins** (the
+Rust boot scan and the Python reader both scan newest-first), which makes
+the crash self-healing: the old segment's records all lose placement,
+count as dead at scan time, and its file reclaims on the next GC pass.
+Knobs: `MLXCACHE_COMPACT=0` disables; `MLXCACHE_COMPACT_RATIO` (default
+0.5) is the dead-byte fraction that qualifies a segment;
+`MLXCACHE_COMPACT_MIN_BYTES` (default 16 MiB) keeps small fragments from
+churning; `MLXCACHE_COMPACT_MAX_SEGMENTS` (default 2) bounds each pass.
+
 **Writer discipline**: ONE chunk-format writer per store directory — the
 Rust daemon. The Python bindings READ v3 (the sidecar adopts chunked blobs
 through the same reassembly; the L1 store verifies them at open and fetch)
