@@ -321,9 +321,12 @@ def repeatability_failure(control_rows: list[dict], tolerance: float) -> str | N
 
 
 def swap_failures(rows: list[dict], base_limit_mb: float = 256.0) -> list[str]:
-    """Growth beyond half the row's own high-water memory is the refusal
-    signal; growth within it is the arriving working set displacing idle
-    pages and is not.
+    """Growth beyond max(256 MB, half the row's own high-water memory) is
+    the refusal signal; growth within that bound is the arriving working
+    set displacing idle pages and is not. The floor matters for small
+    rows: 220 MB of growth on a 400 MB row exceeds half its footprint but
+    stays under the floor and passes — small rows are held to the tighter
+    absolute bound, not their own tiny fraction.
 
     Four calibration runs earned this boundary: the 32K row's prefill held
     a 5.4% span across swap deltas of +2.8 GB, -1.1 GB, +12.3 GB, and
