@@ -123,6 +123,17 @@ serving from scratch. `GET /healthz` is a dependency-free liveness probe
 (`{"status":"ok"}`); cache and adapter state live in `/stats`.
 
 ## Storage: integrity, quarantine, and eviction
+The store is CHUNKED by default (v0.7.0): a published checkpoint is a
+header-only file plus a content-addressed chunk manifest, with chunks
+packed into shared 64 MiB segments. The token-block/64 codec makes a
+shared token prefix yield byte-identical chunks, so a growing conversation
+pays for each turn's NEW tokens instead of re-storing its whole history —
+measured 2.2x on a 5-turn 7B conversation
+([REPORT.md](REPORT.md), the GO record). Every reader
+reassembles and verifies the same payload sha256, so corruption retires a
+chunked blob exactly like a whole-blob flip; a chunk leaves disk only when
+no live checkpoint references it. Setting `MLXCACHE_CHUNK_STORE=0` on the daemon publishes whole-blob v2
+instead (both layouts coexist and stay readable forever).
 
 Every published hit writes one KV checkpoint ("blob") — a safetensors payload
 behind a JSON header — to its own `{hash}-{generation}.ckpt` file, written to
@@ -229,8 +240,11 @@ Unknown flags pass through to `mlx_lm.server`. Store flags mirror the
 daemon's contract: `--store-budget-bytes` (default 32 GiB), `--anchor-window-s`
 (default 900), `--trust-legacy` (index digest-less v1 blobs), and
 `--kv-bits`/`--kv-group-size` (KV quantization tier — part of the fingerprint,
-so tiers never share blobs). One extra endpoint rides
-along:
+so tiers never share blobs). `--kv-tier` names a TurboQuant persistence
+codec (`tq-k4v4-g64` and friends) that actually compresses what the wrapper
+persists — unlike `--kv-bits`, which only labels the partition; the measured
+bake-off lives in [docs/designs/tq-tier.md](docs/designs/tq-tier.md). One
+extra endpoint rides along:
 
 - `GET /mlxcache/stats` — the live cache's reuse counters:
   `{"disk_hits": .., "persisted": .., "reuse_errors": .., "persist_errors": ..}`.
@@ -282,6 +296,7 @@ Daemon:
 | `MLXCACHE_EVICT_MAX_BYTES` | 32 GiB | store byte budget, on by default — see [Storage](#storage-integrity-quarantine-and-eviction); `0` = unbounded |
 | `MLXCACHE_EVICT_MAX_ENTRIES` | `0` | entry cap on top of the byte budget; `0` = none |
 | `MLXCACHE_EVICT_ANCHOR_WINDOW_S` | `900` | how recently a checkpoint must have served to stay an eviction-protected anchor |
+| `MLXCACHE_CHUNK_STORE` | `1` | `0` publishes whole-blob v2 instead of chunked v3 (rollback knob). The chunked store dedups shared prefixes at the chunk level — the measured 2.2× on a 5-turn 7B conversation — with the same sha256 integrity contract over reassembled payloads; both layouts coexist in one directory and every reader handles both |
 
 Sidecar:
 
@@ -292,6 +307,8 @@ Sidecar:
 | `MLXCACHE_SIDECAR_PORT` | `8421` | sidecar bind port |
 | `MLXCACHE_KV_BITS` | `0` | KV quantization tier: `0` = f16, `8` = q8 — the tier is folded into the fingerprint, so tiers never share blobs. Dense attention models only: a hybrid model (linear attention / SSM / GDN layers — e.g. Falcon-H1, Qwen3-Next, granite-hybrid) is refused at boot with this tier set; its state persists unquantized on the f16 tier |
 | `MLXCACHE_KV_GROUP_SIZE` | `0` | quantization group size; `0` with a nonzero `MLXCACHE_KV_BITS` resolves to `64` |
+| `MLXCACHE_KV_TIER` | (unset) | named KV persistence tier (TurboQuant codecs, from arXiv:2504.19874): `tq-k4v4-g64` (recommended: 3.6× smaller than f16, per-layer cos ≥ 0.992), `tq-k3v4-g64` (4.0×), `tq-k3v2-g64` (5.3×, lossy). Compresses the persisted checkpoint; the live engine stays f16 unless `MLXCACHE_TQ_LIVE=1` swaps it too. LOSSY BY DESIGN: resume is deterministic but diverges from a scratch run (bounded-distortion contract, [docs/designs/tq-tier.md](docs/designs/tq-tier.md)); opt-in and fingerprint-isolated, so it never serves the f16/q8 tiers. Mutually exclusive with `MLXCACHE_KV_BITS`; dense models only |
+| `MLXCACHE_TQ_LIVE` | (unset) | with `MLXCACHE_KV_TIER` set, `1` makes the engine's own cache hold the COMPRESSED state during decode (TurboQuantKVCache): 3.66× smaller resident KV at 0.843× decode throughput (16% fewer tok/s, ~1.19× per-token latency) on the 7B (measured in the design doc). Same tier label, same frame format — a runtime memory trade, not a new tier; outputs diverge from both f16 and persistence-tier runs (quantizing during the forward changes the computation) but are deterministic per run |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
 | `MLXCACHE_METAL_CACHE_MB` | `1024` | MLX allocator cache limit; freed buffers beyond it return to the OS instead of pooling |
 | `MLXCACHE_SETTLE_MAX_TOKENS` | `32768` (unset) | cap on a settled checkpoint's token count; an explicit `0` refuses every settle rather than disabling the cap |
@@ -321,8 +338,8 @@ real-engine prefix benchmark (premise-guarded, see
 [docs/benchmarks.md](docs/benchmarks.md)); `bench_wrapper.py`/`qa_wrapper.py`
 drive the wrapper path's own gates; `replay_trace.py` scores captured traces.
 Timing probes live in `sidecar/probes/`: mlx capability, quantized-KV
-persistence, decode A/B, context sweep, and resume budget — each measures
-one question the cache's claims rest on.
+persistence, decode A/B, context sweep, resume budget, and the two TQ
+tier probes — each measures one question the cache's claims rest on.
 
 The real mlx-lm round-trip gate (needs a downloaded model) is opt-in:
 
@@ -386,6 +403,12 @@ once pressure binds; anchor chains delay but do not prevent it. An earlier
 prefix (a guessed divisor benchmarked ~3,250 tokens under a 2,000-token
 knob). Methodology, guards, and the full grid:
 [docs/benchmarks.md](docs/benchmarks.md).
+
+Named-tier bake-off (same 7B model, 1,500-token prefix): the TurboQuant
+persistence tiers and the plain bits tiers measured head-to-head —
+`tq-k4v4-g64` at 15.7 KB/token (3.64× vs f16, per-layer cos 0.992) strictly
+dominates `q4` (16.1 KB/token, 3.55×, 0.990); the full frontier table and
+the divergence disclosure are in [docs/designs/tq-tier.md](docs/designs/tq-tier.md).
 
 ## Operating it
 

@@ -66,6 +66,7 @@ pub fn identity_compatible(entry: &ModelFingerprint, request: &ModelFingerprint)
         && entry.kv_group_size == request.kv_group_size
         && cache_layout_compatible(&entry.cache_layout, &request.cache_layout)
         && content_digest_compatible(&entry.content_digest, &request.content_digest)
+        && entry.kv_tier == request.kv_tier
 }
 
 /// Classification of a lookup against the index + fingerprint rules (R1-1).
@@ -197,6 +198,34 @@ mod tests {
             content_digest: digest.into(),
             ..fp("m")
         }
+    }
+
+    fn fp_with_tier(tier: &str) -> ModelFingerprint {
+        ModelFingerprint {
+            kv_tier: tier.into(),
+            ..fp("m")
+        }
+    }
+
+    #[test]
+    fn same_tokens_different_kv_tier_is_a_miss() {
+        // A tier names a payload format the scalar bits pair cannot express.
+        // Two tiers' blobs are mutually unloadable, so a tier mismatch at the
+        // same tokens must classify as a miss in every direction — including
+        // against the untiered identity.
+        let tq = fp_with_tier("tq-k3v4-g64");
+        let tq_other = fp_with_tier("tq-k3v2-g64");
+        let plain = fp_with_tier("");
+        assert_eq!(
+            classify(Some(5), 5, Some(&tq), &tq_other),
+            CacheVerdict::Miss
+        );
+        assert_eq!(classify(Some(5), 5, Some(&tq), &plain), CacheVerdict::Miss);
+        assert_eq!(classify(Some(5), 5, Some(&plain), &tq), CacheVerdict::Miss);
+        assert_eq!(
+            classify(Some(5), 5, Some(&tq), &fp_with_tier("tq-k3v4-g64")),
+            CacheVerdict::Hit
+        );
     }
 
     #[test]

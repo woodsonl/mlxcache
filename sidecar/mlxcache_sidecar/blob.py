@@ -14,6 +14,8 @@ FORMAT_VERSION = 1
 # D1 integrity: version 2 adds payload_sha256 (written by the daemon at
 # publish, verified at load). Version 1 blobs predate it and stay readable.
 FORMAT_VERSION_D1 = 2
+#: v3: header-only .ckpt; payload in the chunk store (mlxcache_store.chunks).
+FORMAT_VERSION_CHUNKED = 3
 
 
 @dataclass
@@ -51,6 +53,14 @@ class Fingerprint:
     # the fields above: defaulted, omitted from the wire when empty, zero fold
     # bytes — and only ever served across an EXACTLY equal value.
     content_digest: str = ""
+    # Named KV persistence tier (the TurboQuant codecs, e.g. "tq-k3v4-g64"):
+    # `""` = no named tier, the f16/q8 identities pinned by kv_bits alone.
+    # The scalar pair cannot express the TQ tiers (asymmetric key/value
+    # widths, codec-specific frame), so the tier label namespaces them the
+    # same way kv_bits namespaces q8. Same forward-compat rule: defaulted,
+    # omitted from the wire when empty, zero fold bytes, exact-equality
+    # serving only.
+    kv_tier: str = ""
 
 
 def _known_fields(data: dict) -> dict:
@@ -92,6 +102,10 @@ def encode(meta: CheckpointMeta, payload: bytes) -> bytes:
     # content", which a pre-digest header states by saying nothing.
     if not fp.get("content_digest"):
         fp.pop("content_digest", None)
+    # And for the named KV tier: empty means "no named tier", which a
+    # pre-tier header states by saying nothing.
+    if not fp.get("kv_tier"):
+        fp.pop("kv_tier", None)
     raw["fingerprint"] = fp
     header = json.dumps(raw, separators=(",", ":")).encode()
     return struct.pack("<I", len(header)) + header + payload
@@ -148,6 +162,7 @@ def decode_header(header: bytes) -> CheckpointMeta:
         or type(fp.kv_group_size) is not int
         or not isinstance(fp.cache_layout, str)
         or not isinstance(fp.content_digest, str)
+        or not isinstance(fp.kv_tier, str)
     ):
         # The dataclass does not enforce types; a non-str field would
         # explode later in the fold (.encode()) outside every guarded
@@ -172,13 +187,20 @@ def decode_header(header: bytes) -> CheckpointMeta:
     if meta.payload_sha256 is not None and not isinstance(meta.payload_sha256, str):
         raise HeaderRejected("header", "payload_sha256 must be a string")
     # Version policy mirrors the daemon's load(): 1 = legacy (no digest
-    # field), 2 = current (D1 digest contract; the digest is REQUIRED —
-    # serving a v2 header without one would be unverified). Anything else
-    # is a layout this reader must not interpret.
-    if meta.format_version not in (1, FORMAT_VERSION_D1):
+    # field), 2 = whole-blob (D1 digest contract; the digest is REQUIRED —
+    # serving a v2 header without one would be unverified), 3 = chunked
+    # (header-only .ckpt; the payload lives in the chunk store — the
+    # READER assembles it, see mlxcache_store.chunks). Anything else is a
+    # layout this reader must not interpret.
+    if meta.format_version not in (1, FORMAT_VERSION_D1, FORMAT_VERSION_CHUNKED):
         raise HeaderRejected("version", f"format version {meta.format_version}")
-    if meta.format_version == FORMAT_VERSION_D1 and meta.payload_sha256 is None:
-        raise HeaderRejected("version", "format version 2 requires payload_sha256")
+    if (
+        meta.format_version in (FORMAT_VERSION_D1, FORMAT_VERSION_CHUNKED)
+        and meta.payload_sha256 is None
+    ):
+        raise HeaderRejected(
+            "version", f"format version {meta.format_version} requires payload_sha256"
+        )
     return meta
 
 

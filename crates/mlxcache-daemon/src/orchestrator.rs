@@ -336,14 +336,24 @@ impl Orchestrator {
             .map(|c| {
                 (
                     c.blob_path.clone(),
-                    std::fs::metadata(persistence.blob_dir.join(&c.blob_path))
-                        .map(|m| m.len())
-                        .unwrap_or(0),
+                    // v3 blobs are header-only files (~500B): their real
+                    // footprint is their chunks. The eviction budget must
+                    // see chunked bytes or a chunked store never binds.
+                    persistence.blob_disk_bytes(&c.blob_path).unwrap_or(0),
                 )
             })
             .collect();
         let size_of = |name: &str| -> u64 { sizes.get(name).copied().unwrap_or(0) };
-        let total_bytes: u64 = sizes.values().sum();
+        // BUDGET TRUTH IS PHYSICAL, from the first check to every
+        // recount: one directory walk (whole-blob payloads + v3 headers +
+        // manifests + segments). Per-blob v3 sizes drive NOTHING in the
+        // total — shared chunks counted per referencing blob would make an
+        // N-turn conversation look ~(N+1)/2x its real disk. A GC pass
+        // first: quarantine removals since the last pass can have left
+        // all-dead segments that hold the budget up with no candidate able
+        // to fix it.
+        persistence.gc_chunked();
+        let total_bytes: u64 = persistence.store_physical_bytes();
         // Entry-cap semantics at the PASS level: `max_entries` is a hard cap,
         // 0 = allow zero published entries (evict everything evictable). The
         // "0 disables the knob" convention lives at the env layer (main.rs
@@ -376,7 +386,7 @@ impl Orchestrator {
         let total_entries = scored.len();
         let mut evicted = 0usize;
         let mut remaining_bytes = total_bytes;
-        for (score, size, cand) in &scored {
+        for (score, _size, cand) in &scored {
             let over_entries = total_entries - evicted > max_entries;
             let over_bytes = max_bytes > 0 && remaining_bytes > max_bytes;
             if !over_entries && !over_bytes {
@@ -400,7 +410,13 @@ impl Orchestrator {
                     );
                 }
                 evicted += 1;
-                remaining_bytes = remaining_bytes.saturating_sub(*size);
+                // Physical truth after this removal: GC empty segments,
+                // then recount. A chunked blob frees disk only when it was
+                // the LAST referencing blob of its chunks, so the per-blob
+                // `size` (gross manifest bytes) must never be subtracted
+                // directly — the recount is the only honest bookkeeping.
+                persistence.gc_chunked();
+                remaining_bytes = persistence.store_physical_bytes();
             }
         }
         if max_bytes > 0 && remaining_bytes > max_bytes {
@@ -801,7 +817,14 @@ mod tests {
         // read_dir fails and list_blobs errors.
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("blobs");
-        let missing = crate::persistence::Persistence::new(&dir).unwrap();
+        // Whole mode: the chunk store would create blobs/chunks/ inside
+        // the dir this test then needs to replace with a file; the scan
+        // failure path under test is layout-independent.
+        let missing = crate::persistence::Persistence::new_with_mode(
+            &dir,
+            crate::persistence::ChunkMode::Whole,
+        )
+        .unwrap();
         std::fs::remove_dir(&dir).unwrap();
         std::fs::write(&dir, b"x").unwrap();
         let report = orch.rebuild_from_disk(&missing);
@@ -947,8 +970,19 @@ mod tests {
         // drives the pass. Scores tie (3 tokens each), so the invariant
         // asserted is the budget itself, not which name went.
         let orch = Orchestrator::new();
-        let persistence = persist();
-        let names = ["small", "mid", "big"];
+        // Whole mode: this test hand-writes the blob files and asserts the
+        // budget against their bytes; the chunked store's physical-recount
+        // semantics have their own coverage in persistence/chunkstore tests.
+        let dir = tempfile::tempdir().unwrap().keep();
+        let persistence = crate::persistence::Persistence::new_with_mode(
+            &dir,
+            crate::persistence::ChunkMode::Whole,
+        )
+        .unwrap();
+        // .ckpt names: the physical-recount budget walks the directory's
+        // published-blob names, and production blob paths always carry the
+        // extension.
+        let names = ["small.ckpt", "mid.ckpt", "big.ckpt"];
         for ((i, name), size) in names.iter().enumerate().zip([1024, 2048, 4096]) {
             std::fs::write(persistence.blob_dir.join(name), vec![0u8; size]).unwrap();
             let t = (i + 1) as u32;

@@ -2,7 +2,7 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
-## 0.4.1 — 2026-10-22
+## 0.7.1 — 2026-10-23
 
 ### Added
 
@@ -32,6 +32,117 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   with a TTFT step 20x its normal cost), against the 64.7-68.3 s consensus
   of the runs whose rows sat on the curve — the refusal is the
   methodology working, and the run logs are archived with the evidence.
+## 0.7.0 — 2026-10-22
+
+### Added
+
+- **The chunked dedup store** (format_version 3): REPORT.md's GO decision
+  shipped. Blobs publish as a header-only `.ckpt` plus a chunk manifest and
+  content-addressed chunks packed into 64 MiB segments; the token-block/64
+  codec (identity = sha256 over the per-head slice concatenation per
+  64-position block) makes a shared token prefix produce byte-identical
+  chunks, so a growing conversation stores each prior turn's KV once.
+  Measured on Qwen2.5-7B-Instruct-4bit over a 5-turn conversation
+  (`scripts/dedup/chunk_e2e_real.py`): **2.2× dedup** (114.5 MB of logical
+  payloads in 52.2 MB of segments), 4/4 partial hits, byte-exact resume.
+  D1 integrity is unchanged: every reader reassembles and verifies the same
+  payload sha256 — corruption in a manifest or segment retires the blob
+  exactly like a whole-blob bit flip. Refcounts are derived at boot from
+  live checkpoint/manifest pairs; a chunk leaves disk only at refcount 0
+  (all-dead segments GC after eviction removals); crash orphans between the
+  manifest and checkpoint renames are reclaimed deterministically.
+- **Cross-language reader** (`mlxcache_store.chunks`): the sidecar adopts
+  chunked blobs through reassembly inside the same trust boundary (a bad
+  chunk is a 422 quarantine, not a 500), and the L1 store verifies them at
+  open and fetch. One chunk-format writer per directory (the daemon);
+  Python publishers stay whole-blob v2 and both layouts coexist
+  indefinitely. A committed fixture written by the Rust writer round-trips
+  through the Python reader — the format's cross-language pin.
+- **Eviction sees chunked bytes**: v3 blobs are ~500-byte headers, so the
+  reaper now sizes them by their manifest's chunk bytes (unique per blob
+  for ordering) plus the store's shared segment/manifest overhead counted
+  once per pass, and GCs dead segments after removals so the byte budget
+  actually falls.
+- `MLXCACHE_CHUNK_STORE=0` on the daemon rolls back to whole-blob v2
+  publication (both layouts stay readable).
+- Scope note versus REPORT.md's GO: the CDC fallback codec was NOT ported —
+  non-safetensors payloads use a whole-scope single-chunk fallback (exact,
+  dedups byte-identical payloads; no production engine emits opaque bytes).
+  The deviation and the port path are recorded in
+  docs/connector-protocol.md §2.
+
+## 0.6.0 — 2026-10-22
+
+### Added
+
+- **The live TQ tier**: `MLXCACHE_TQ_LIVE=1` (with `MLXCACHE_KV_TIER` set)
+  makes the engine's own prompt cache hold the COMPRESSED state during
+  decode — `TurboQuantKVCache` quantizes keys/values at write and returns
+  the dequantized history on read, so stock mlx-lm attention runs unchanged
+  (the cache-class API is the extension point; still no mlx-lm patches).
+  Measured on Qwen2.5-7B at a 2,000-token prefix
+  ([docs/designs/tq-tier.md](docs/designs/tq-tier.md)): 3.66x smaller
+  resident KV (117.4 → 32.1 MB) at 0.843x decode speed (48.8 → 41.2 tok/s).
+  Same tier label, same frame format, same fingerprint — a runtime memory
+  trade, not a new tier. Outputs are deterministic per run and diverge from
+  both f16 and persistence-tier runs (quantizing during the forward changes
+  the computation recursively); a live-written blob is byte-identical to a
+  persistence-written one for the same input rows.
+- **Scoring from compressed keys** (`tq/score.py`): attention scores
+  computed straight from the packed Lloyd-Max state — rotate the query
+  once, gather-dot centroid values — numerically equal to
+  dequantize-then-score, plus the paper's QJL residual correction,
+  measured to remove the projected scores' systematic bias (its estimator
+  variance exceeds the bias for single-query scoring at d=128, so the
+  per-token error barely moves — the record says "unbiased, not cheaper",
+  and nothing persists the QJL bits). The ~4x K-side bandwidth win needs a
+  fused kernel; the boundary is documented with the numbers.
+
+## 0.5.0 — 2026-10-22
+
+### Added
+
+- **Named KV persistence tiers (TurboQuant codecs)**: opt-in compressed
+  checkpoint formats implemented from arXiv:2504.19874 (no third-party code;
+  their license is GPL-3.0). `MLXCACHE_KV_TIER=tq-k4v4-g64` on the sidecar,
+  `--kv-tier` on the wrapper. Rotated Lloyd-Max keys + group-quantized
+  values in a safetensors frame that carries its own rotation and codebook;
+  decode rebuilds a stock `KVCache`, so the engine never computes attention
+  from compressed state. Measured on Qwen2.5-7B-Instruct-4bit
+  ([docs/designs/tq-tier.md](docs/designs/tq-tier.md)): tq-k4v4-g64 stores
+  15,732 B/token (3.64x vs f16, per-layer cos 0.992) and strictly dominates
+  the plain q4 bits tier (16,138 B/token, 3.55x, 0.990); tq-k3v2-g64 reaches
+  10,804 B/token (5.31x) at cos 0.885; TQ decode at adopt is faster than the
+  f16 load (11.4 ms vs 14.3 ms at 1,500 tokens, both fully materialized).
+- **The bounded-distortion correctness class** for named tiers
+  ([docs/contract-spec.md](docs/contract-spec.md) "Tier correctness
+  classes"): same blob resumed twice is token-identical, per-layer fidelity
+  floors are pinned by the real gate, divergence from scratch is documented
+  (greedy agreement 0.062/0.062/0.042 at k3v4), and the tier is
+  fingerprint-isolated so a lossy blob can never serve an f16/q8 identity.
+  Opt-in only; no default selects a tier.
+- **`kv_tier` fingerprint axis** through every binding: the daemon's
+  `/tokenize` identity, `ModelFingerprint`, `same_shape` settle guard, the
+  blob-key fold (zero bytes when empty, so pre-tier keys are unchanged;
+  goldens shared verbatim across Rust and Python), `identity_compatible` in
+  core and the store client, and the wrapper's fingerprint source.
+- Boot-time geometry guard for every quantized tier: one single-token
+  forward materializes per-layer head dims and refuses non-divisible or
+  mixed geometry at boot (previously a head_dim-96 model under g64 booted
+  green and 500-looped every cache-miss request; covers the q8 tier's
+  latent instance of the same class).
+- Real-path fixes surfaced by the opt-in gate: `MlxLmEngine.generate()` and
+  `generate_from_blob()` no longer crash on a legitimately uncacheable blob
+  (they construct a fresh cache instead of passing `cache=None` into the
+  streaming loop's trim probe); delta-prefill loads through the shared
+  tier-aware loader so the TQ decode path has exactly one implementation.
+
+### Changed
+
+- `--kv-bits` on the wrapper remains a partition label; the new `--kv-tier`
+  actually swaps the persistence codec (encode at insert, decode at fetch,
+  best-effort on both paths).
+- The quantization boot guard's error message names both knobs.
 
 ## 0.4.0 — 2026-10-21
 

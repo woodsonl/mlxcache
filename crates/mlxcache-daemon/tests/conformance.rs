@@ -5,7 +5,7 @@
 //! concurrency) land with the L1 client in B1.1.
 
 use mlxcache_core::contract::CheckpointMeta;
-use mlxcache_daemon::persistence::Persistence;
+use mlxcache_daemon::persistence::{ChunkMode, Persistence};
 use sha2::{Digest, Sha256};
 
 fn golden_meta() -> CheckpointMeta {
@@ -19,6 +19,7 @@ fn golden_meta() -> CheckpointMeta {
             kv_group_size: 0,
             cache_layout: String::new(),
             content_digest: String::new(),
+            kv_tier: String::new(),
         },
         token_count: 4,
         tokens: vec![1, 2, 3, 4],
@@ -37,7 +38,10 @@ fn golden_meta() -> CheckpointMeta {
 #[test]
 fn golden_blob_bytes_match_the_python_writer() {
     let dir = tempfile::tempdir().unwrap();
-    let p = Persistence::new(dir.path()).unwrap();
+    // Wire-contract tests pin the WHOLE-BLOB layout: the wire bytes crossing
+    // the daemon↔sidecar boundary are layout-independent, but these tests
+    // read the published FILE directly, so they run in whole mode.
+    let p = Persistence::new_with_mode(dir.path(), ChunkMode::Whole).unwrap();
     let path = p
         .publish_atomic(0xC0FFE, 1, golden_meta(), b"conformance-payload")
         .unwrap();
@@ -59,7 +63,10 @@ fn golden_blob_bytes_match_the_python_writer() {
 #[test]
 fn unknown_header_field_is_ignored_not_corruption() {
     let dir = tempfile::tempdir().unwrap();
-    let p = Persistence::new(dir.path()).unwrap();
+    // Wire-contract tests pin the WHOLE-BLOB layout: the wire bytes crossing
+    // the daemon↔sidecar boundary are layout-independent, but these tests
+    // read the published FILE directly, so they run in whole mode.
+    let p = Persistence::new_with_mode(dir.path(), ChunkMode::Whole).unwrap();
     let path = p.publish_atomic(0x1, 1, golden_meta(), b"kv").unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
     // Splice `"future_field":42,` into the header JSON right after the
@@ -85,7 +92,10 @@ fn unknown_header_field_is_ignored_not_corruption() {
 #[test]
 fn engine_id_and_granularity_round_trip_on_the_wire() {
     let dir = tempfile::tempdir().unwrap();
-    let p = Persistence::new(dir.path()).unwrap();
+    // Wire-contract tests pin the WHOLE-BLOB layout: the wire bytes crossing
+    // the daemon↔sidecar boundary are layout-independent, but these tests
+    // read the published FILE directly, so they run in whole mode.
+    let p = Persistence::new_with_mode(dir.path(), ChunkMode::Whole).unwrap();
     let mut meta = golden_meta();
     meta.engine_id = Some("llama-cpp".into());
     meta.granularity = Some(1);

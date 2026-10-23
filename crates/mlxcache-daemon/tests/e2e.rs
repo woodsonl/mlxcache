@@ -1376,6 +1376,104 @@ async fn q8_and_f16_blobs_never_share_a_file() {
 }
 
 #[tokio::test]
+async fn kv_tiers_never_share_a_file_with_each_other_or_the_bits_tiers() {
+    // The named-tier axis (TQ codecs): two tiers that differ ONLY in the
+    // label — same model, same tokens, same kv_bits 0 — must publish to
+    // different blob files and never serve each other (R1-1: the tier is a
+    // payload format the scalar pair cannot express). Three sidecars over
+    // one blob dir: tq-k3v4, tq-k3v2, and knobless f16.
+    let (tq34_url, mut tq34_child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_KV_TIER", "tq-k3v4-g64")]).await;
+    let (tq32_url, mut tq32_child) =
+        spawn_sidecar_with_env(&[("MLXCACHE_KV_TIER", "tq-k3v2-g64")]).await;
+    let (f16_url, mut f16_child) = spawn_sidecar_with_env(&[]).await;
+    let blobs = tempfile::tempdir().unwrap();
+
+    let body = serde_json::json!({
+        "model": "e2e-model",
+        "messages": [{"role": "user", "content": "named tier"}],
+        "stream": false,
+    })
+    .to_string();
+    let state = |url: String| {
+        Arc::new(AppState {
+            settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
+            )),
+            orchestrator: Orchestrator::new(),
+            singleflight: SingleFlight::new(),
+            stats: Arc::new(mlxcache_daemon::http::Stats::default()),
+            served_models: vec!["e2e-model".into()],
+            sidecar: Some(SidecarClient::new(SidecarConfig::new(url, "e2e-model".into())).unwrap()),
+            persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
+            trace: None,
+        })
+    };
+    let post = |state: Arc<AppState>, body: String| async move {
+        router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    let blob_names = || {
+        std::fs::read_dir(blobs.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".ckpt"))
+            .collect::<Vec<_>>()
+    };
+
+    // Each tier publishes its own pair of checkpoints (prefill + settle) and
+    // none of them collide: 3 tiers x 2 = 6 files. The states are KEPT: the
+    // in-memory radix index lives in the orchestrator, so the repeat loop
+    // below must reuse the same AppStates (a fresh state starts with an
+    // empty index and would honestly miss its own on-disk blobs).
+    let mut first_states = Vec::new();
+    for url in [tq34_url.clone(), tq32_url.clone(), f16_url.clone()] {
+        let s = state(url);
+        let res = post(s.clone(), body.clone()).await;
+        assert_eq!(res.status(), 200);
+        await_settle_publication(&s).await;
+        assert_eq!(
+            s.orchestrator.published_count(),
+            2,
+            "every tier publishes its own prefill + settle"
+        );
+        first_states.push(s);
+    }
+    let names = blob_names();
+    assert_eq!(
+        names.len(),
+        6,
+        "three tiers x two coverage nodes = six blob files; any shared name would overwrite another tier: {names:?}"
+    );
+
+    // A repeat request through each tier still HITS its own checkpoint.
+    for s in &first_states {
+        let res = post(s.clone(), body.clone()).await;
+        assert_eq!(res.status(), 200);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mlxcache"]["verdict"], "hit", "same tier must hit");
+    }
+
+    tq34_child.kill().expect("kill tq34 sidecar");
+    tq34_child.wait().expect("reap tq34 sidecar");
+    tq32_child.kill().expect("kill tq32 sidecar");
+    tq32_child.wait().expect("reap tq32 sidecar");
+    f16_child.kill().expect("kill f16 sidecar");
+    f16_child.wait().expect("reap f16 sidecar");
+}
+
+#[tokio::test]
 async fn concurrent_identical_requests_share_one_prefill() {
     // The core R1-3 promise: N identical uncached requests must trigger ONE
     // prefill, and every follower must still be served (from the leader's

@@ -54,6 +54,11 @@ pub struct TokenizeResponse {
     /// serves legacy-to-legacy only (see `mlxcache_core::policy`).
     #[serde(default)]
     pub cache_layout: String,
+    /// Named KV persistence tier (e.g. `tq-k3v4-g64`), for tiers the scalar
+    /// `kv_bits`/`kv_group_size` pair cannot express. Empty = no named tier.
+    /// Defaults keep older sidecars compatible (they predate named tiers).
+    #[serde(default)]
+    pub kv_tier: String,
 }
 
 fn default_kv_dtype() -> String {

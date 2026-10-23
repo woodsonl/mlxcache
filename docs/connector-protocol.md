@@ -35,7 +35,7 @@ JSON header fields `[CURRENT, plus B0.2 additions marked]`:
 
 | field | type | notes |
 |---|---|---|
-| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size`, `cache_layout`, `content_digest` `[CURRENT]`. `tokenizer_hash` is engine-specific, and an unavailable tokenizer fails CLOSED everywhere (the literal `"missing"` sentinel disables persistence — lookup and publication — rather than pinning an unverifiable identity). **Wrapper (L1, `mlxcache_serve`)**: sha256 of the model's `tokenizer.json` bytes, read symlink-safely: HF-cache snapshot symlinks are followed only while the target resolves inside the model dir or its own `blobs/` storage (fail-closed otherwise, directories read as absent), and the opened file's inode is reconciled against the checked path. **Sidecar connector (`mlxcache_sidecar`)**: canonically the UTF-8 SHA-256 digest of `repr(sorted(tokenizer.get_vocab().items()))`, truncated to the first 16 hexadecimal characters — implementations must reproduce this exact representation and truncation to produce compatible fingerprints and reuse checkpoints (an alternate serialization or truncation length yields a different hash and silently forfeits reuse); when `get_vocab()` is unavailable the hash is the `"missing"` sentinel and the sidecar refuses to settle (the daemon likewise refuses to publish under it) |
+| `fingerprint` | object | `model_id`, `tokenizer_hash`, `kv_dtype`, `kv_layout_version`, `kv_bits`, `kv_group_size`, `cache_layout`, `content_digest`, `kv_tier` `[CURRENT]`. `tokenizer_hash` is engine-specific, and an unavailable tokenizer fails CLOSED everywhere (the literal `"missing"` sentinel disables persistence — lookup and publication — rather than pinning an unverifiable identity). **Wrapper (L1, `mlxcache_serve`)**: sha256 of the model's `tokenizer.json` bytes, read symlink-safely: HF-cache snapshot symlinks are followed only while the target resolves inside the model dir or its own `blobs/` storage (fail-closed otherwise, directories read as absent), and the opened file's inode is reconciled against the checked path. **Sidecar connector (`mlxcache_sidecar`)**: canonically the UTF-8 SHA-256 digest of `repr(sorted(tokenizer.get_vocab().items()))`, truncated to the first 16 hexadecimal characters — implementations must reproduce this exact representation and truncation to produce compatible fingerprints and reuse checkpoints (an alternate serialization or truncation length yields a different hash and silently forfeits reuse); when `get_vocab()` is unavailable the hash is the `"missing"` sentinel and the sidecar refuses to settle (the daemon likewise refuses to publish under it) |
 | `token_count` | u64 | cross-checked against `len(tokens)` at read `[CURRENT]` |
 | `tokens` | [u32] | the exact token-ID prefix this entry is keyed by `[CURRENT]` |
 | `format_version` | u32 | see §5 `[CURRENT]` |
@@ -76,6 +76,66 @@ fingerprint object (defaulted, omitted when empty). (Precedent: the T12 incident
 parsing quarantined every healthy ancestor when a newer daemon added a
 field.) `[CURRENT: blob.py _known_fields strips unknowns; Rust serde
 ignores unknown fields]`
+
+### Chunked payloads (`format_version` 3) `[CURRENT]`
+
+A v3 blob is a HEADER-ONLY `.ckpt` (the u32+JSON header above, no payload
+bytes) plus two siblings, all written temp-then-rename with the `.ckpt`
+rename as the visibility point:
+
+- `{stem}.ckm` — a binary chunk manifest: magic `MCKM` + u16 version, u64
+  `payload_len`, u64 `chunk_count`, then 56-byte records
+  `digest[32] ‖ per_head_len u32 ‖ n_heads u32 ‖ first_off u64 ‖
+  head_stride u64`. A chunk's body is the per-head slice concatenation (head
+  order); reassembly scatters `per_head_len` bytes at
+  `first_off + h·head_stride` per head.
+- `chunks/seg-{seq:010}.seg` — immutable packed segments shared by every
+  v3 blob in the store: magic `MCSG` + u16 version + 2 reserved bytes, then
+  records `body_len u32 ‖ digest[32] ‖ body`. Chunk bodies are
+  content-addressed (sha256); a digest already present is never re-written.
+  A truncated tail record (crash mid-append) ends a segment scan cleanly.
+
+The chunk codec is **token-block/64**: per safetensors tensor, blocks of 64
+covered positions; a block's identity is the sha256 over the concatenation
+of each KV head's byte slice for those positions (the head-major layout
+makes those slices append-stable, so a shared token prefix yields
+byte-identical chunks — the dedup the format exists for). Bytes no tensor
+claims (the safetensors JSON header, inter-tensor gaps) and non-safetensors
+payloads fall back to whole-scope single chunks: identity and reassembly
+stay exact; byte-identical payloads still dedup.
+
+`payload_sha256` covers the REASSEMBLED payload and is verified by every
+reader (the D1 contract unchanged): corruption in a manifest or segment
+produces wrong bytes and a digest mismatch — the same retire path as a
+whole-blob flip. Refcounts are DERIVED at open from live `.ckpt`↔`.ckm`
+pairs (never trusted from disk); a segment leaves disk only when every
+record in it is unreferenced, and a crash between the two renames leaves
+reclaimable orphans.
+
+**Writer discipline**: ONE chunk-format writer per store directory — the
+Rust daemon. The Python bindings READ v3 (the sidecar adopts chunked blobs
+through the same reassembly; the L1 store verifies them at open and fetch)
+but keep PUBLISHING whole-blob v2. Both layouts coexist in one directory
+indefinitely; v1/v2 readers see a v3 blob as an uninterpretable version and
+retire it loudly rather than misread it (mixed-version rollout means
+upgrading the daemon and its sidecar together, which is how they ship).
+
+**Deviation from REPORT.md's GO recommendation, recorded**: the GO decision
+kept CDC (gear, 16 KiB, head scope) as the fallback codec for engines that
+hand over opaque bytes. This build ships a **whole-scope single-chunk
+fallback** instead: a payload that is not framing-valid safetensors becomes
+one chunk covering its full length. Rationale: no production engine produces
+opaque bytes (mlx-lm always emits safetensors; the only opaque producer is
+the test-only synthetic engine), Python publishers stay whole-blob v2, and a
+dead codec path is untested surface. The whole-scope fallback is exact and
+still dedups byte-identical payloads (REPORT.md P2's cold-twice
+determinism). If an engine that cannot report a tensor grid ever ships, CDC
+remains the recorded design for it — port `chunk_stream`/`apply_envelope`
+from `scripts/dedup/chunk_sim.py`, measured there at 5.6%/9.5% new bytes
+per turn (f16/q8) against token-block's 5.3%/5.2%.
+
+`MLXCACHE_CHUNK_STORE=0` on the daemon disables v3 publication (rollback
+knob; reads still understand both).
 
 ## 3. Operations (L1)
 
@@ -204,13 +264,21 @@ The fold is **normative by reference and by construction**:
   `fingerprint.content_digest` folds as the LAST length-prefixed field,
   after `cache_layout`. Empty contributes ZERO bytes, so text-only keys are
   unchanged.
+- **Named KV tier** `[CURRENT]`: a NON-EMPTY `fingerprint.kv_tier`
+  (e.g. `tq-k3v4-g64`) folds as the last length-prefixed fingerprint field,
+  after `content_digest`. Empty contributes ZERO bytes, so pre-tier keys
+  are unchanged. A tier labels a payload format the scalar `kv_bits` pair
+  cannot express (the TurboQuant codecs: asymmetric key/value widths, a
+  codec-specific frame), so it namespaces exactly like `kv_bits` does for
+  q8 and is compared with EXACT equality — never cross-served against the
+  untiered identity or another tier.
 
 Full order, with `?` marking the fields that fold only when non-default:
 
 ```
 engine_chunks? ‖ SEP ‖ model_id ‖ tokenizer_hash ‖ kv_dtype
                        ‖ kv_layout_version ‖ kv_bits ‖ kv_group_size
-                       ‖ cache_layout? ‖ content_digest? ‖ SEP ‖ tokens
+                       ‖ cache_layout? ‖ content_digest? ‖ kv_tier? ‖ SEP ‖ tokens
 ```
 
 Every field is length-prefixed, so no field's bytes can be re-split across
@@ -233,8 +301,12 @@ Engine registry (maintained here): `"mlx-lm"` (the default) and
 
 - `1` — legacy, pre-digest. Readable, NEVER verified. Writers MUST NOT
   emit it.
-- `2` — current. `payload_sha256` REQUIRED; a v2 header without it is
-  `CorruptCache(version)`.
+- `2` — whole-blob current. `payload_sha256` REQUIRED; a v2 header without
+  it is `CorruptCache(version)`.
+- `3` — chunked (§2 "Chunked payloads"): header-only `.ckpt`, payload in
+  the chunk store, `payload_sha256` REQUIRED and verified over the
+  REASSEMBLED bytes. Pre-v3 readers refuse loudly (a v3 blob is a foreign
+  layout to them, never a misread).
 - anything else — refuse with a reason naming the version. Never
   interpret a foreign layout.
 
