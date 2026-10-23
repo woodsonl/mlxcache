@@ -412,11 +412,16 @@ impl Orchestrator {
                 }
                 evicted += 1;
                 // Physical truth after this removal: GC empty segments,
-                // then recount. A chunked blob frees disk only when it was
-                // the LAST referencing blob of its chunks, so the per-blob
-                // `size` (gross manifest bytes) must never be subtracted
-                // directly — the recount is the only honest bookkeeping.
+                // compact fragmented ones, then recount. A chunked blob
+                // frees disk only when it was the LAST referencing blob of
+                // its chunks, so the per-blob `size` (gross manifest
+                // bytes) must never be subtracted directly — the recount
+                // is the only honest bookkeeping. Compaction belongs here
+                // too (not just at pass start): without it, dead bytes
+                // THIS pass created would read as budget pressure and
+                // evict candidates that the next pass would have kept.
                 persistence.gc_chunked();
+                persistence.compact_chunked();
                 remaining_bytes = persistence.store_physical_bytes();
             }
         }
