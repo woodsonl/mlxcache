@@ -108,29 +108,50 @@ class Manifest:
         return cls(payload_len, chunks)
 
 
+_INDEX_CACHE: dict[Path, tuple[tuple, dict[bytes, tuple[str, int, int]]]] = {}
+"""dir -> (segment (name, size) signature, digest -> (seg, offset, len)).
+
+Per-directory, process-lifetime cache. The signature is the sorted
+(name, size) pairs of the segment files — appends change a size, GC/rolls
+change the set — so concurrent writers invalidate it correctly.
+"""
+
+
 class ChunkReader:
     """Reads chunked payloads from one blob directory.
 
-    The segment index is built lazily on first use and cached: a boot-time
-    scan of every segment is the same cost class the daemon pays, and the
-    reader is per-process.
+    The segment index is shared per directory and cached process-wide,
+    keyed by the segment files' (name, size) signature: a re-scan happens
+    only when the set changes (a segment rolls or GC deletes one). Without
+    the cache every v3 read would re-scan every segment byte — GBs on a
+    serving hot path.
     """
 
     def __init__(self, blob_dir: str | Path):
         self.dir = Path(blob_dir)
-        self._placement: dict[bytes, tuple[str, int, int]] | None = (
-            None  # digest -> (seg name, offset, len)
-        )
 
     def _scan_segments(self) -> dict[bytes, tuple[str, int, int]]:
         chunks_dir = self.dir / "chunks"
-        placement: dict[bytes, tuple[str, int, int]] = {}
         if not chunks_dir.is_dir():
-            return placement
+            return {}
+        sig = tuple(
+            sorted(
+                (seg.name, seg.stat().st_size)
+                for seg in chunks_dir.glob("seg-*.seg")
+                if seg.is_file()
+            )
+        )
+        cached = _INDEX_CACHE.get(self.dir)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        placement: dict[bytes, tuple[str, int, int]] = {}
         for seg in sorted(chunks_dir.glob("seg-*.seg")):
             data = seg.read_bytes()
             if len(data) < _HEADER_BYTES or data[0:4] != SEGMENT_MAGIC:
-                raise ChunkFormatError(f"{seg.name}: bad segment magic")
+                # A crash between create and header-write strands a short
+                # file; a foreign file is not ours. Both are skipped: the
+                # manifest digest check stays the correctness guard.
+                continue
             version = struct.unpack_from("<H", data, 4)[0]
             if version != FORMAT_VERSION:
                 raise ChunkFormatError(f"{seg.name}: segment version {version}")
@@ -143,13 +164,12 @@ class ChunkReader:
                     break  # truncated tail: dead bytes, stop cleanly
                 placement.setdefault(digest, (seg.name, body_start, body_len))
                 at = body_end
+        _INDEX_CACHE[self.dir] = (sig, placement)
         return placement
 
     @property
     def placement(self) -> dict[bytes, tuple[str, int, int]]:
-        if self._placement is None:
-            self._placement = self._scan_segments()
-        return self._placement
+        return self._scan_segments()
 
     def reassemble(self, manifest: Manifest) -> bytes:
         """The blob's payload bytes, scattered from the segments."""
@@ -176,6 +196,13 @@ class ChunkReader:
                     bodies[digest] = body
         for c in manifest.chunks:
             body = bodies[c.digest]
+            if len(body) != c.body_len:
+                # Manifest geometry disagrees with the stored record (bit
+                # rot): wrong bytes for the digest to catch, never an
+                # uncontrolled ValueError from the slice assign below.
+                raise ChunkFormatError(
+                    f"chunk {c.digest[:8].hex()} geometry disagrees with the stored record"
+                )
             for h in range(c.n_heads):
                 dst = c.first_off + h * c.head_stride
                 out[dst : dst + c.per_head_len] = body[

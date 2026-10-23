@@ -107,8 +107,13 @@ def main() -> int:
                     out["mlxcache"]["tokens_total"],
                 )
             )
-            # Append the ASSISTANT reply verbatim: turn r's tokens become an
-            # exact prefix of turn r+1's request.
+            # Append the ASSISTANT reply verbatim. The JSON of [u1,a1,u2]
+            # is NOT a byte-prefix of [u1]'s (they diverge at the closing
+            # bracket), but the tokens[:-1] settle convention trims exactly
+            # that divergent tail, so turn r's blob tokens ARE a prefix of
+            # turn r+1's request — and even a full-miss turn re-prefills
+            # the identical prefix deterministically, so the chunks dedup
+            # either way (REPORT P2).
             messages.append(
                 {"role": "assistant", "content": out["choices"][0]["message"]["content"]}
             )

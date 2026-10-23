@@ -202,7 +202,7 @@ class Store:
             try:
                 return read_payload_v3(self.dir, path, meta.payload_sha256)
             except ChunkFormatError as exc:
-                raise CorruptCache("digest", f"{ref}: {exc}") from exc
+                raise CorruptCache("chunk", f"{ref}: {exc}") from exc
         if meta.payload_sha256 is None:
             return payload  # v1 legacy: readable, never verified (§5)
         if hashlib.sha256(payload).hexdigest() != meta.payload_sha256:

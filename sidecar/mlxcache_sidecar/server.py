@@ -531,7 +531,11 @@ def read_wire_checkpoint(
                 payload = ChunkReader(Path(blob_path).parent).read_payload(
                     blob_path, meta.payload_sha256
                 )
-            except ChunkFormatError as exc:
+            except (ChunkFormatError, FileNotFoundError) as exc:
+                # FileNotFoundError: a segment vanished mid-read (eviction GC
+                # racing this adopt) — the blob is gone either way, retire
+                # it. Other OSErrors (EMFILE, EIO) are TRANSIENT: rejecting
+                # would quarantine a healthy checkpoint.
                 raise CheckpointRejectedError(str(exc)) from exc
         # The JSON header is untrusted: a field of the wrong type (e.g.
         # "tokens":123) must be rejected here, inside the boundary. Letting

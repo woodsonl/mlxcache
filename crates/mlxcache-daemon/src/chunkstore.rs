@@ -207,14 +207,25 @@ fn safetensors_spans(payload: &[u8]) -> Option<Vec<(String, TensorSpan)>> {
         let spec = spec.as_object()?;
         let shape = spec.get("shape")?.as_array()?;
         let offs = spec.get("data_offsets")?.as_array()?;
-        if offs.len() != 2 || shape.len() < 2 {
+        if offs.len() != 2 {
             return None;
         }
         let begin = offs[0].as_u64()?;
         let end = offs[1].as_u64()?;
-        let n_heads = shape[1].as_u64()?;
+        // Rank < 2 tensors (the TQ frame's rank-1 codebook) have no head
+        // axis to grid over: span them with n_heads = 1 so the per-tensor
+        // fallback chunks them whole instead of aborting the grid for the
+        // entire payload.
+        let n_heads = if shape.len() < 2 {
+            1
+        } else {
+            shape[1].as_u64()?
+        };
         if n_heads == 0 || end < begin || data_start as u64 + end > payload.len() as u64 {
             return None;
+        }
+        if end == begin {
+            return None; // empty tensor: no bytes, no span (skipped below)
         }
         out.push((
             name.clone(),
@@ -239,7 +250,8 @@ fn safetensors_spans(payload: &[u8]) -> Option<Vec<(String, TensorSpan)>> {
 fn chunk_payload(payload: &[u8], positions: u64) -> Manifest {
     let fallback = |first_off: u64, len: u64| ChunkRef {
         digest: Sha256::digest(&payload[first_off as usize..(first_off + len) as usize]).into(),
-        per_head_len: u32::try_from(len).unwrap_or(u32::MAX),
+        per_head_len: u32::try_from(len)
+            .expect("chunk scope exceeds u32; the settle byte cap bounds payloads below this"),
         n_heads: 1,
         first_off,
         head_stride: 0,
@@ -526,8 +538,12 @@ impl ChunkStore {
                 // The blob is corrupt (manifest lost); load() will say so.
                 continue;
             };
-            let manifest = Manifest::decode(&mbytes).map_err(ChunkError::Corrupt)?;
-            out.push(manifest);
+            // An undecodable manifest is BLOB corruption (load() says
+            // Corrupt → the rebuild quarantines that one blob), never a
+            // boot failure for the whole store.
+            if let Ok(manifest) = Manifest::decode(&mbytes) {
+                out.push(manifest);
+            }
         }
         Ok(out)
     }
@@ -564,6 +580,19 @@ impl ChunkStore {
     /// segment (fsync before returning), and write the manifest atomically.
     /// Returns the manifest; the CALLER then publishes the .ckpt (the
     /// visibility point) and registers refs.
+    /// Stage + register under one lock: the atomic unit a publication needs
+    /// (see publish_chunked). A crash after this leaks refs until the next
+    /// boot replay — bounded, never a lost publication.
+    pub fn stage_and_register(
+        &self,
+        payload: &[u8],
+        positions: u64,
+    ) -> Result<Manifest, ChunkError> {
+        let manifest = self.stage_chunks(payload, positions)?;
+        self.register(&manifest);
+        Ok(manifest)
+    }
+
     pub fn stage_chunks(&self, payload: &[u8], positions: u64) -> Result<Manifest, ChunkError> {
         let manifest = chunk_payload(payload, positions);
         let mut inner = self.inner.lock().unwrap();
@@ -610,7 +639,7 @@ impl ChunkStore {
                 inner.segments.insert(seq, SegmentStat::default());
                 inner.active = Some(ActiveSegment { seq, file, len: 8 });
             }
-            let (seq, data_off) = {
+            let attempt = {
                 let a = inner
                     .active
                     .as_mut()
@@ -626,11 +655,24 @@ impl ChunkStore {
                         &payload[base as usize..(base + c.per_head_len as u64) as usize],
                     );
                 }
-                a.file
-                    .write_all(&record)
-                    .map_err(|e| ChunkError::Disk(e.to_string()))?;
-                a.len += record.len() as u64;
-                (a.seq, a.len - body_len)
+                match a.file.write_all(&record) {
+                    Ok(()) => {
+                        a.len += record.len() as u64;
+                        Ok((a.seq, a.len - body_len))
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            let (seq, data_off) = match attempt {
+                Ok(v) => v,
+                Err(e) => {
+                    // A partial write left garbage at the OS offset that the
+                    // in-memory length no longer models: drop the active
+                    // segment so the next append starts a fresh one and no
+                    // placement ever points into the gap.
+                    inner.active = None;
+                    return Err(ChunkError::Disk(e.to_string()));
+                }
             };
             inner
                 .segments
@@ -715,9 +757,13 @@ impl ChunkStore {
             let stat = inner.segments.remove(&seq).expect("checked above");
             let path = self.segment_path(seq);
             match fs::remove_file(&path) {
-                Ok(()) => reclaimed += stat.total,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    inner.segments.insert(seq, stat);
+                Ok(()) => {
+                    // The segment's placements are GONE with the file: a
+                    // later re-publish of the same content must re-append
+                    // (not skip on a stale placement hit that now points
+                    // into a deleted file — the C1 bug).
+                    inner.placement.retain(|_, p| p.seg != seq);
+                    reclaimed += stat.total;
                 }
                 Err(_) => {
                     inner.segments.insert(seq, stat); // retry next sweep
@@ -731,8 +777,18 @@ impl ChunkStore {
     /// manifests. Blob files are accounted by the caller (whole payloads
     /// for v1/v2, tiny headers for v3 — both are real file bytes).
     pub fn physical_bytes(&self) -> u64 {
-        let inner = self.inner.lock().unwrap();
-        inner.segments.values().map(|s| s.total).sum::<u64>()
+        // File-stat truth, not in-memory accounting: the accounting map
+        // excludes each segment's 8-byte header and any incomplete tail
+        // (crash garbage), and a budget recount must never undercount.
+        let mut total = 0u64;
+        if let Ok(entries) = fs::read_dir(&self.segments_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(".seg") {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        total
     }
 
     /// Reassemble a payload from its manifest. Byte-exact by construction;

@@ -344,12 +344,22 @@ impl Orchestrator {
             })
             .collect();
         let size_of = |name: &str| -> u64 { sizes.get(name).copied().unwrap_or(0) };
-        let mut total_bytes: u64 = sizes.values().sum();
-        // Chunked overhead the blob sizes cannot see: manifests + segment
-        // slack (dead bytes awaiting GC) + shared chunks already counted in
-        // one blob but resident regardless. Counted ONCE per pass, from the
-        // store's physical truth.
-        total_bytes += persistence.chunked_overhead_bytes();
+        // BUDGET TRUTH IS PHYSICAL: whole-blob file bytes + the chunk
+        // store's segments/manifests, counted once. Per-blob v3 sizes (the
+        // gross manifest bytes in `sizes`) drive NOTHING in the total —
+        // shared chunks counted per referencing blob would make an N-turn
+        // conversation look ~(N+1)/2x its real disk and evict healthy
+        // entries early. After each removal the loop re-derives the
+        // physical total (GC first, so empty segments actually leave disk).
+        let total_bytes: u64 = sizes
+            .iter()
+            .filter(|(name, _)| {
+                // v3 entries contribute via the chunk store, not their file
+                !persistence.is_chunked_blob(name)
+            })
+            .map(|(_, v)| *v)
+            .sum::<u64>()
+            + persistence.chunked_overhead_bytes();
         // Entry-cap semantics at the PASS level: `max_entries` is a hard cap,
         // 0 = allow zero published entries (evict everything evictable). The
         // "0 disables the knob" convention lives at the env layer (main.rs
@@ -382,7 +392,7 @@ impl Orchestrator {
         let total_entries = scored.len();
         let mut evicted = 0usize;
         let mut remaining_bytes = total_bytes;
-        for (score, size, cand) in &scored {
+        for (score, _size, cand) in &scored {
             let over_entries = total_entries - evicted > max_entries;
             let over_bytes = max_bytes > 0 && remaining_bytes > max_bytes;
             if !over_entries && !over_bytes {
@@ -406,12 +416,15 @@ impl Orchestrator {
                     );
                 }
                 evicted += 1;
-                remaining_bytes = remaining_bytes.saturating_sub(*size);
+                // Physical truth after this removal: GC empty segments,
+                // then recount. A chunked blob frees disk only when it was
+                // the LAST referencing blob of its chunks, so the per-blob
+                // `size` (gross manifest bytes) must never be subtracted
+                // directly — the recount is the only honest bookkeeping.
+                persistence.gc_chunked();
+                remaining_bytes = persistence.store_physical_bytes();
             }
         }
-        // Chunked stores only reclaim disk when segments empty out: GC after
-        // removals so the byte budget actually falls this pass.
-        persistence.gc_chunked();
         if max_bytes > 0 && remaining_bytes > max_bytes {
             // All that is left is anchors (or races): the budget is a
             // best-effort cap that never breaks the anchor contract.
@@ -963,8 +976,19 @@ mod tests {
         // drives the pass. Scores tie (3 tokens each), so the invariant
         // asserted is the budget itself, not which name went.
         let orch = Orchestrator::new();
-        let persistence = persist();
-        let names = ["small", "mid", "big"];
+        // Whole mode: this test hand-writes the blob files and asserts the
+        // budget against their bytes; the chunked store's physical-recount
+        // semantics have their own coverage in persistence/chunkstore tests.
+        let dir = tempfile::tempdir().unwrap().keep();
+        let persistence = crate::persistence::Persistence::new_with_mode(
+            &dir,
+            crate::persistence::ChunkMode::Whole,
+        )
+        .unwrap();
+        // .ckpt names: the physical-recount budget walks the directory's
+        // published-blob names, and production blob paths always carry the
+        // extension.
+        let names = ["small.ckpt", "mid.ckpt", "big.ckpt"];
         for ((i, name), size) in names.iter().enumerate().zip([1024, 2048, 4096]) {
             std::fs::write(persistence.blob_dir.join(name), vec![0u8; size]).unwrap();
             let t = (i + 1) as u32;
