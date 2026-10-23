@@ -63,6 +63,7 @@ import resource
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 DEFAULT_MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
@@ -436,40 +437,51 @@ def main() -> int:
                 flush=True,
             )
 
-    sweep_rows = [r for r in rows if r["phase"] == "sweep"]
-    control_rows = [r for r in rows if r["phase"] == "control"]
-    prefill_ratio, decode_ratio = ratio_summary(sweep_rows)
-    head = f"{sweep_rows[0]['tokens']} vs {sweep_rows[-1]['tokens']}: prefill {prefill_ratio:.2f}x"
-    if decode_ratio is not None:
-        head += f", decode {decode_ratio:.2f}x"
-    else:
-        head += ", decode n/a (disabled or below the clock)"
-    print(f"\n{head}")
+        sweep_rows = [r for r in rows if r["phase"] == "sweep"]
+        control_rows = [r for r in rows if r["phase"] == "control"]
+        prefill_ratio, decode_ratio = ratio_summary(sweep_rows)
+        head = (
+            f"{sweep_rows[0]['tokens']} vs {sweep_rows[-1]['tokens']}: prefill {prefill_ratio:.2f}x"
+        )
+        if decode_ratio is not None:
+            head += f", decode {decode_ratio:.2f}x"
+        else:
+            head += ", decode n/a (disabled or below the clock)"
+        print(f"\n{head}")
 
-    failures = monotonicity_failures(sweep_rows)
-    failures.extend(ratio_failures(sweep_rows))
-    repeat = repeatability_failure(control_rows, args.tolerance)
-    if repeat is not None:
-        failures.append(repeat)
-    # The warmup row is excluded from every check, the swap guard included:
-    # the cold first load legitimately displaces pages, and its timing is
-    # never quoted.
-    failures.extend(swap_failures([r for r in rows if r["phase"] != "warmup"]))
+        failures = monotonicity_failures(sweep_rows)
+        failures.extend(ratio_failures(sweep_rows))
+        repeat = repeatability_failure(control_rows, args.tolerance)
+        if repeat is not None:
+            failures.append(repeat)
+        # The warmup row is excluded from every check, the swap guard included:
+        # the cold first load legitimately displaces pages, and its timing is
+        # never quoted.
+        failures.extend(swap_failures([r for r in rows if r["phase"] != "warmup"]))
 
-    if failures:
-        for f in failures:
-            print(f"SELF-CHECK FAILED: {f}", flush=True)
-        print("No timing from this run is usable.", flush=True)
-        return 2
-    print("self-check -> PASS", flush=True)
+        if failures:
+            for f in failures:
+                print(f"SELF-CHECK FAILED: {f}", flush=True)
+            print("No timing from this run is usable.", flush=True)
+            return 2
+        print("self-check -> PASS", flush=True)
 
-    report = {"model": args.model, "rows": rows, "machine_after": machine_state()}
-    if args.out:
-        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        with open(args.out, "w") as fh:
-            json.dump(report, fh, indent=2)
-        print(f"json -> {args.out}")
-    return 0
+        report = {"model": args.model, "rows": rows, "machine_after": machine_state()}
+        if args.out:
+            # Written INSIDE the lock, and atomically: a concurrent sweep
+            # sharing this path can neither observe a half-written report nor
+            # have its own report clobbered by this one.
+            os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                dir=os.path.dirname(args.out) or ".",
+                prefix=os.path.basename(args.out) + ".",
+                suffix=".part",
+            )
+            with os.fdopen(fd, "w") as fh:
+                json.dump(report, fh, indent=2)
+            os.replace(tmp, args.out)
+            print(f"json -> {args.out}")
+        return 0
 
 
 if __name__ == "__main__":
