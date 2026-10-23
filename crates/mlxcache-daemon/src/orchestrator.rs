@@ -344,22 +344,16 @@ impl Orchestrator {
             })
             .collect();
         let size_of = |name: &str| -> u64 { sizes.get(name).copied().unwrap_or(0) };
-        // BUDGET TRUTH IS PHYSICAL: whole-blob file bytes + the chunk
-        // store's segments/manifests, counted once. Per-blob v3 sizes (the
-        // gross manifest bytes in `sizes`) drive NOTHING in the total —
-        // shared chunks counted per referencing blob would make an N-turn
-        // conversation look ~(N+1)/2x its real disk and evict healthy
-        // entries early. After each removal the loop re-derives the
-        // physical total (GC first, so empty segments actually leave disk).
-        let total_bytes: u64 = sizes
-            .iter()
-            .filter(|(name, _)| {
-                // v3 entries contribute via the chunk store, not their file
-                !persistence.is_chunked_blob(name)
-            })
-            .map(|(_, v)| *v)
-            .sum::<u64>()
-            + persistence.chunked_overhead_bytes();
+        // BUDGET TRUTH IS PHYSICAL, from the first check to every
+        // recount: one directory walk (whole-blob payloads + v3 headers +
+        // manifests + segments). Per-blob v3 sizes drive NOTHING in the
+        // total — shared chunks counted per referencing blob would make an
+        // N-turn conversation look ~(N+1)/2x its real disk. A GC pass
+        // first: quarantine removals since the last pass can have left
+        // all-dead segments that hold the budget up with no candidate able
+        // to fix it.
+        persistence.gc_chunked();
+        let total_bytes: u64 = persistence.store_physical_bytes();
         // Entry-cap semantics at the PASS level: `max_entries` is a hard cap,
         // 0 = allow zero published entries (evict everything evictable). The
         // "0 disables the knob" convention lives at the env layer (main.rs

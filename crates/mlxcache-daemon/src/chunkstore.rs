@@ -132,6 +132,7 @@ impl Manifest {
         }
         let mut chunks = Vec::with_capacity(count);
         let mut at = 22;
+        let mut max_end = 0u64;
         for _ in 0..count {
             let mut digest = [0u8; 32];
             digest.copy_from_slice(&bytes[at..at + 32]);
@@ -154,6 +155,7 @@ impl Manifest {
             if end > payload_len {
                 return Err(bad("placement exceeds payload"));
             }
+            max_end = max_end.max(end);
             chunks.push(ChunkRef {
                 digest,
                 per_head_len,
@@ -161,6 +163,13 @@ impl Manifest {
                 first_off,
                 head_stride,
             });
+        }
+        // The chunker guarantees chunks cover the whole payload: the max
+        // chunk end IS payload_len (0 for an empty one). A bit flip in the
+        // high bytes of payload_len would otherwise decode fine and make
+        // reassemble allocate attacker-sized memory.
+        if max_end != payload_len && !(payload_len == 0 && chunks.is_empty()) {
+            return Err(bad("payload_len does not match chunk coverage"));
         }
         Ok(Manifest {
             payload_len,
@@ -224,9 +233,6 @@ fn safetensors_spans(payload: &[u8]) -> Option<Vec<(String, TensorSpan)>> {
         if n_heads == 0 || end < begin || data_start as u64 + end > payload.len() as u64 {
             return None;
         }
-        if end == begin {
-            return None; // empty tensor: no bytes, no span (skipped below)
-        }
         out.push((
             name.clone(),
             TensorSpan {
@@ -248,13 +254,25 @@ fn safetensors_spans(payload: &[u8]) -> Option<Vec<(String, TensorSpan)>> {
 /// the per-head slice concatenation); anything else becomes one
 /// whole-scope chunk. The returned refs are in deterministic order.
 fn chunk_payload(payload: &[u8], positions: u64) -> Manifest {
-    let fallback = |first_off: u64, len: u64| ChunkRef {
-        digest: Sha256::digest(&payload[first_off as usize..(first_off + len) as usize]).into(),
-        per_head_len: u32::try_from(len)
-            .expect("chunk scope exceeds u32; the settle byte cap bounds payloads below this"),
-        n_heads: 1,
-        first_off,
-        head_stride: 0,
+    // Whole-scope fallback chunks, split at u32::MAX so no record length
+    // can overflow the segment format (an operator raising the settle byte
+    // cap past 4 GiB must not turn a publish into a panic).
+    let fallback = |chunks: &mut Vec<ChunkRef>, first_off: u64, len: u64| {
+        const MAX: u64 = u32::MAX as u64;
+        let mut off = first_off;
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(MAX);
+            chunks.push(ChunkRef {
+                digest: Sha256::digest(&payload[off as usize..(off + n) as usize]).into(),
+                per_head_len: n as u32,
+                n_heads: 1,
+                first_off: off,
+                head_stride: 0,
+            });
+            off += n;
+            left -= n;
+        }
     };
     let mut chunks = Vec::new();
     let mut covered: Vec<(u64, u64)> = Vec::new();
@@ -263,18 +281,19 @@ fn chunk_payload(payload: &[u8], positions: u64) -> Manifest {
     } else {
         None
     };
-    let Some(spans) = spans else {
+    let Some(mut spans) = spans else {
         // Not safetensors (the synthetic engine's deterministic bytes) or a
         // degenerate grid: the whole payload is one chunk. Byte-identical
         // payloads still dedup; only layout-level sharing is lost.
         if !payload.is_empty() {
-            chunks.push(fallback(0, payload.len() as u64));
+            fallback(&mut chunks, 0, payload.len() as u64);
         }
         return Manifest {
             payload_len: payload.len() as u64,
             chunks,
         };
     };
+    spans.retain(|(_, t)| t.end > t.begin); // empty tensors: no bytes, no chunks
     for (_name, t) in spans {
         let nbytes = t.end - t.begin;
         let hsz = nbytes / t.n_heads;
@@ -283,7 +302,7 @@ fn chunk_payload(payload: &[u8], positions: u64) -> Manifest {
             && usize::try_from(hsz).is_ok()
             && usize::try_from(t.n_heads).is_ok();
         if !exact {
-            chunks.push(fallback(t.begin, nbytes));
+            fallback(&mut chunks, t.begin, nbytes);
             covered.push((t.begin, t.end));
             continue;
         }
@@ -319,7 +338,7 @@ fn chunk_payload(payload: &[u8], positions: u64) -> Manifest {
         payload.len() as u64,
     ))) {
         if *begin > cursor {
-            chunks.push(fallback(cursor, *begin - cursor));
+            fallback(&mut chunks, cursor, *begin - cursor);
         }
         cursor = cursor.max(*end);
     }
@@ -588,8 +607,26 @@ impl ChunkStore {
         payload: &[u8],
         positions: u64,
     ) -> Result<Manifest, ChunkError> {
+        // ONE lock across append + refcount increment: two separate locks
+        // left a window where the eviction thread could GC a sealed
+        // all-dead segment (this payload's chunks not yet referenced, the
+        // last OTHER referencing blob just removed) out from under the
+        // publication — a published blob whose chunks are gone.
         let manifest = self.stage_chunks(payload, positions)?;
-        self.register(&manifest);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            for c in &manifest.chunks {
+                let prev = *inner.refs.entry(c.digest).or_insert(0);
+                inner.refs.insert(c.digest, prev + 1);
+                if prev == 0 {
+                    if let Some(p) = inner.placement.get(&c.digest).copied() {
+                        if let Some(stat) = inner.segments.get_mut(&p.seg) {
+                            stat.dead = stat.dead.saturating_sub(36 + p.len);
+                        }
+                    }
+                }
+            }
+        }
         Ok(manifest)
     }
 
@@ -674,11 +711,17 @@ impl ChunkStore {
                     return Err(ChunkError::Disk(e.to_string()));
                 }
             };
-            inner
-                .segments
-                .get_mut(&seq)
-                .expect("stat tracks active segment")
-                .total += 36 + body_len;
+            {
+                let stat = inner
+                    .segments
+                    .get_mut(&seq)
+                    .expect("stat tracks active segment");
+                stat.total += 36 + body_len;
+                // Appended = unreferenced until register flips it live;
+                // counting it dead here keeps register's subtraction exact
+                // (it can no longer steal other records' dead bytes).
+                stat.dead += 36 + body_len;
+            }
             inner.placement.insert(
                 c.digest,
                 Placement {
@@ -839,6 +882,10 @@ fn hex_prefix(d: &[u8; 32]) -> String {
 
 /// Header peek used by the boot scan (no digest verify here — the normal
 /// load path does that when a blob is actually served).
+/// Cap for header-prefix peeks: a v3 header is a few hundred bytes; a
+/// length field beyond this is foreign data, not one of our blobs.
+pub(crate) const MAX_HEADER_READ: usize = 1 << 20;
+
 /// Header peek used by the boot scan and budget accounting (no digest
 /// verify here — the normal load path does that when a blob is served).
 pub(crate) fn peek_meta(bytes: &[u8]) -> Option<CheckpointMeta> {
@@ -859,17 +906,14 @@ mod tests {
     /// Deterministic safetensors payload builder (mirrored byte-for-byte
     /// by the Python golden test — the digest list is the cross-language
     /// pin).
-    pub fn fake_payload_pub(
+    #[allow(dead_code)]
+    pub(super) fn fake_payload(
         tokens: usize,
         heads: usize,
         dim: usize,
         layers: usize,
         seed: u8,
     ) -> Vec<u8> {
-        fake_payload(tokens, heads, dim, layers, seed)
-    }
-
-    fn fake_payload(tokens: usize, heads: usize, dim: usize, layers: usize, seed: u8) -> Vec<u8> {
         let positions = tokens - 1;
         let mut tensors = serde_json::Map::new();
         let mut data = Vec::new();
@@ -1115,8 +1159,8 @@ mod fixture_dump {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let store = ChunkStore::open(&root, &[]).unwrap();
-        let a = super::tests::fake_payload_pub(65, 2, 8, 2, 1);
-        let b = super::tests::fake_payload_pub(129, 2, 8, 2, 1);
+        let a = super::tests::fake_payload(65, 2, 8, 2, 1);
+        let b = super::tests::fake_payload(129, 2, 8, 2, 1);
         let ma = store.stage_chunks(&a, 64).unwrap();
         store.register(&ma);
         let mb = store.stage_chunks(&b, 128).unwrap();
@@ -1143,5 +1187,67 @@ mod fixture_dump {
         let mut out = (header.len() as u32).to_le_bytes().to_vec();
         out.extend_from_slice(&header);
         out
+    }
+}
+
+#[cfg(test)]
+mod refcount_regressions {
+    use super::*;
+
+    #[test]
+    fn publish_then_remove_frees_chunks_within_the_running_process() {
+        // The double-register bug: each publish registered twice, remove
+        // unregistered once, so a removed blob's chunks stayed live until
+        // a boot replay. A running daemon must reclaim them.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        let a = super::tests::fake_payload(65, 2, 8, 2, 1);
+        let b = super::tests::fake_payload(129, 2, 8, 2, 1);
+        let ma = store.stage_and_register(&a, 64).unwrap();
+        let mb = store.stage_and_register(&b, 128).unwrap();
+        assert!(store.physical_bytes() > 0);
+        store.unregister(&ma);
+        store.unregister(&mb);
+        drop(store); // close the active segment; boot GC reclaims
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        assert_eq!(
+            store.physical_bytes(),
+            0,
+            "refs must be exactly 1 per publish"
+        );
+    }
+
+    #[test]
+    fn appended_chunks_are_dead_until_registered() {
+        // The accounting bug: appended records were not counted dead, so
+        // register's subtraction stole OTHER records' dead bytes and sealed
+        // segments could never GC. Stage WITHOUT registering, then verify
+        // the segment is all-dead.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        let a = super::tests::fake_payload(65, 2, 8, 1, 5);
+        let m = store.stage_and_register(&a, 64).unwrap();
+        store.unregister(&m);
+        {
+            let inner = store.inner.lock().unwrap();
+            let stat = inner.segments.values().next().unwrap();
+            assert_eq!(stat.live(), 0, "unregistered stage must be all-dead");
+        }
+        drop(store);
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        assert_eq!(store.physical_bytes(), 0);
+    }
+
+    #[test]
+    fn payload_len_bitflip_is_rejected_by_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        let a = super::tests::fake_payload(65, 2, 8, 1, 6);
+        let m = store.stage_and_register(&a, 64).unwrap();
+        let mut bytes = m.encode();
+        // Inflate payload_len (bytes 6..14): decodes only if coverage
+        // checking is absent.
+        bytes[6..14].copy_from_slice(&(m.payload_len + (1 << 40)).to_le_bytes());
+        assert!(Manifest::decode(&bytes).is_err());
     }
 }

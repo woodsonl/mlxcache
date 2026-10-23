@@ -341,6 +341,17 @@ impl Persistence {
     ) -> Result<PathBuf, PersistError> {
         // positions covered by the payload: the tokens[:-1] convention.
         let positions = meta.token_count.saturating_sub(1);
+        // Build the header FIRST: after staging+registration every failure
+        // must be an I/O error path that unregisters, and serde/len checks
+        // are not — so they run before anything is registered.
+        meta.format_version = 3;
+        meta.payload_sha256 = Some(format!("{:x}", Sha256::digest(payload)));
+        let header = serde_json::to_vec(&meta).map_err(|e| PersistError::Corrupt {
+            reason: format!("meta serialize: {e}"),
+        })?;
+        let header_len = u32::try_from(header.len()).map_err(|_| PersistError::Corrupt {
+            reason: format!("checkpoint header too large: {} bytes", header.len()),
+        })?;
         // Stage AND register atomically (the eviction GC runs on another
         // thread): registering before the .ckpt rename means a concurrent
         // sweep that removes the LAST other blob referencing a shared chunk
@@ -387,13 +398,6 @@ impl Persistence {
                 source,
             });
         }
-        meta.format_version = 3;
-        let header = serde_json::to_vec(&meta).map_err(|e| PersistError::Corrupt {
-            reason: format!("meta serialize: {e}"),
-        })?;
-        let header_len = u32::try_from(header.len()).map_err(|_| PersistError::Corrupt {
-            reason: format!("checkpoint header too large: {} bytes", header.len()),
-        })?;
         let header_tmp = self.blob_dir.join(format!(
             "{:032x}-{:016x}.{}.{}.ckpt.tmp",
             prefix_hash,
@@ -426,11 +430,9 @@ impl Persistence {
                 source,
             });
         }
-        // Visible: register refs so shared chunks stay anchored to this
-        // blob's lifetime. (A crash between rename and register leaves the
-        // chunk UNDER-referenced until the next boot replay re-derives it —
-        // the boot scan is the source of truth, this is the fast path.)
-        store.register(&manifest);
+        // Visible. Refs were registered by stage_and_register (one lock
+        // with the append); registering again here would double-count every
+        // chunk and pin removed blobs' bytes until a boot replay.
         Ok(final_path)
     }
 
@@ -583,14 +585,32 @@ impl Persistence {
     }
 
     /// True when the named blob is a header-only v3 checkpoint (its bytes
-    /// live in the chunk store, budgeted there).
+    /// live in the chunk store, budgeted there). Reads ONLY the header
+    /// prefix (4-byte length + that many bytes), never the payload: the
+    /// reaper calls this per candidate per pass, and v1/v2 payloads are
+    /// tens-to-hundreds of MB.
     pub fn is_chunked_blob(&self, blob_name: &str) -> bool {
         if self.chunk_store.is_none() {
             return false;
         }
-        fs::read(self.blob_dir.join(blob_name))
-            .ok()
-            .and_then(|bytes| crate::chunkstore::peek_meta(&bytes).map(|m| m.format_version == 3))
+        let Ok(mut f) = fs::File::open(self.blob_dir.join(blob_name)) else {
+            return false;
+        };
+        use std::io::Read as _;
+        let mut len_bytes = [0u8; 4];
+        if f.read_exact(&mut len_bytes).is_err() {
+            return false;
+        }
+        let header_len = u32::from_le_bytes(len_bytes) as usize;
+        if header_len > crate::chunkstore::MAX_HEADER_READ {
+            return false; // not one of ours (the wire cap is far lower)
+        }
+        let mut header = vec![0u8; header_len];
+        if f.read_exact(&mut header).is_err() {
+            return false;
+        }
+        crate::chunkstore::peek_meta(&header)
+            .map(|m| m.format_version == 3)
             .unwrap_or(false)
     }
 
@@ -638,9 +658,7 @@ impl Persistence {
         if self.chunk_store.is_none() {
             return meta_len;
         }
-        // Peek the version without a full load: a 4-byte length + JSON.
-        let bytes = fs::read(&path).map_err(PersistError::Io)?;
-        if crate::chunkstore::peek_meta(&bytes).map(|m| m.format_version) != Some(3) {
+        if !self.is_chunked_blob(blob_name) {
             return meta_len;
         }
         let ckm = blob_name

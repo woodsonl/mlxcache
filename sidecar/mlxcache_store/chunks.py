@@ -94,6 +94,7 @@ class Manifest:
             raise ChunkFormatError("chunk manifest corrupt: truncated records")
         chunks = []
         at = 22
+        max_end = 0
         for _ in range(count):
             digest, per_head_len, n_heads, first_off, head_stride = _CHUNK_RECORD.unpack_from(
                 data, at
@@ -104,7 +105,14 @@ class Manifest:
             end = first_off + (n_heads - 1) * head_stride + per_head_len
             if end > payload_len:
                 raise ChunkFormatError("chunk manifest corrupt: placement exceeds payload")
+            max_end = max(max_end, end)
             chunks.append(ChunkRef(digest, per_head_len, n_heads, first_off, head_stride))
+        # The chunker guarantees chunks cover the payload: a bit-flipped
+        # payload_len would otherwise decode fine and make reassembly
+        # allocate attacker-sized memory (MemoryError escapes the
+        # ChunkFormatError taxonomy).
+        if max_end != payload_len and not (payload_len == 0 and not chunks):
+            raise ChunkFormatError("chunk manifest corrupt: payload_len does not match coverage")
         return cls(payload_len, chunks)
 
 

@@ -123,19 +123,17 @@ serving from scratch. `GET /healthz` is a dependency-free liveness probe
 (`{"status":"ok"}`); cache and adapter state live in `/stats`.
 
 ## Storage: integrity, quarantine, and eviction
-
 The store is CHUNKED by default (v0.7.0): a published checkpoint is a
 header-only file plus a content-addressed chunk manifest, with chunks
 packed into shared 64 MiB segments. The token-block/64 codec makes a
 shared token prefix yield byte-identical chunks, so a growing conversation
 pays for each turn's NEW tokens instead of re-storing its whole history —
 measured 2.2x on a 5-turn 7B conversation
-([docs/designs/../../REPORT.md](REPORT.md), the GO record). Every reader
+([REPORT.md](REPORT.md), the GO record). Every reader
 reassembles and verifies the same payload sha256, so corruption retires a
 chunked blob exactly like a whole-blob flip; a chunk leaves disk only when
-no live checkpoint references it.  on the daemon
-publishes whole-blob v2 instead (both layouts coexist and stay readable
-forever).
+no live checkpoint references it. Setting `MLXCACHE_CHUNK_STORE=0` on the daemon publishes whole-blob v2
+instead (both layouts coexist and stay readable forever).
 
 Every published hit writes one KV checkpoint ("blob") — a safetensors payload
 behind a JSON header — to its own `{hash}-{generation}.ckpt` file, written to

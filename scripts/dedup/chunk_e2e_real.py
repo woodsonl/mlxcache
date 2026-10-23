@@ -57,45 +57,46 @@ def main() -> int:
 
     blobs = tempfile.mkdtemp(prefix="chunk-dedup-")
     sc_port, d_port = 18471, 8471
-    sc = subprocess.Popen(
-        [f"{REPO}/.venv/bin/python", "-m", "mlxcache_sidecar.server"],
-        cwd=REPO,
-        env={
-            **os.environ,
-            "MLXCACHE_ENGINE": "mlx-lm",
-            "MLXCACHE_MODEL": args.model,
-            "MLXCACHE_SIDECAR_PORT": str(sc_port),
-        },
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    wait_health(sc_port)
-    dm = subprocess.Popen(
-        [f"{REPO}/target/release/mlxcache-daemon"],
-        cwd=REPO,
-        env={
-            **os.environ,
-            "MLXCACHE_MODELS": args.model,
-            "MLXCACHE_SIDECAR_URL": f"http://127.0.0.1:{sc_port}",
-            "MLXCACHE_BLOBS": blobs,
-            "MLXCACHE_ADDR": f"127.0.0.1:{d_port}",
-        },
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    wait_health(d_port, daemon=True)
-
-    messages: list[dict] = []
-    verdicts = []
-    questions = [
-        "Name the three measurement gates in the mlxcache design doc.",
-        "What does the settle convention cover and why the minus-one?",
-        "Explain single-flight prefill in one paragraph.",
-        "What is the anchor rule in the eviction policy?",
-        "Summarize the R1-5 gate in two sentences.",
-        "Why is the radix tree keyed by adapter-reported token ids?",
-    ]
+    sc = dm = None
     try:
+        sc = subprocess.Popen(
+            [f"{REPO}/.venv/bin/python", "-m", "mlxcache_sidecar.server"],
+            cwd=REPO,
+            env={
+                **os.environ,
+                "MLXCACHE_ENGINE": "mlx-lm",
+                "MLXCACHE_MODEL": args.model,
+                "MLXCACHE_SIDECAR_PORT": str(sc_port),
+            },
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        wait_health(sc_port)
+        dm = subprocess.Popen(
+            [f"{REPO}/target/release/mlxcache-daemon"],
+            cwd=REPO,
+            env={
+                **os.environ,
+                "MLXCACHE_MODELS": args.model,
+                "MLXCACHE_SIDECAR_URL": f"http://127.0.0.1:{sc_port}",
+                "MLXCACHE_BLOBS": blobs,
+                "MLXCACHE_ADDR": f"127.0.0.1:{d_port}",
+            },
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        wait_health(d_port, daemon=True)
+
+        messages: list[dict] = []
+        verdicts = []
+        questions = [
+            "Name the three measurement gates in the mlxcache design doc.",
+            "What does the settle convention cover and why the minus-one?",
+            "Explain single-flight prefill in one paragraph.",
+            "What is the anchor rule in the eviction policy?",
+            "Summarize the R1-5 gate in two sentences.",
+            "Why is the radix tree keyed by adapter-reported token ids?",
+        ]
         for turn in range(args.turns):
             messages.append({"role": "user", "content": questions[turn % len(questions)]})
             body = {"model": args.model, "messages": [m.copy() for m in messages], "max_tokens": 48}
@@ -144,10 +145,21 @@ def main() -> int:
         partials = sum(1 for v, _, _ in verdicts[1:] if v in ("partial", "hit"))
         print(f"partials+hits after turn 1: {partials}/{len(verdicts) - 1}")
         print(f"blobs_dir={blobs}")
-        return 0 if partials > 0 else 1
+        # Require CHUNKED evidence, not just a hit: a run inheriting
+        # MLXCACHE_CHUNK_STORE=0 can partial-hit on whole blobs and pass a
+        # weaker gate than this script claims to prove.
+        ok = partials > 0 and seg_bytes > 0 and logical > seg_bytes
+        print(
+            ("PASS" if ok else "FAIL") + ": chunked evidence"
+            f" (segments={seg_bytes > 0}, dedup={logical > seg_bytes}, partials={partials})"
+        )
+        return 0 if ok else 1
     finally:
-        dm.terminate()
-        sc.terminate()
+        # Terminate only what started, so a failed health check does not
+        # AttributeError its way out of cleanup.
+        for proc in (dm, sc):
+            if proc is not None:
+                proc.terminate()
 
 
 if __name__ == "__main__":
