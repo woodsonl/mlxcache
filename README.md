@@ -346,8 +346,8 @@ real-engine prefix benchmark (premise-guarded, see
 [docs/benchmarks.md](docs/benchmarks.md)); `bench_wrapper.py`/`qa_wrapper.py`
 drive the wrapper path's own gates; `replay_trace.py` scores captured traces.
 Timing probes live in `sidecar/probes/`: mlx capability, quantized-KV
-persistence, decode A/B, and resume budget — each measures one question the
-cache's claims rest on.
+persistence, decode A/B, context sweep, resume budget, and the two TQ
+tier probes — each measures one question the cache's claims rest on.
 
 The real mlx-lm round-trip gate (needs a downloaded model) is opt-in:
 
@@ -366,6 +366,29 @@ serialize 20 ms, deserialize <1 ms. Qwen2.5-7B-Instruct-4bit: 57,344 bytes/token
 serialize 526 ms, deserialize <1 ms, prefill 10.2 s. Qwen3-32B-4bit: 262,150
 bytes/token, serialize 203 ms, deserialize 1 ms, prefill 11.1 s. A hit eliminates
 that prefill, and the 2 s TTFT resume budget holds with margin at every size.
+
+Long-context cost curve on the reference model (Qwen2.5-7B-Instruct-4bit,
+context sweep — one process per size, self-checked for monotonicity,
+decode/prefill ratio, repeatability, and swap growth bounded by each row's
+own footprint): prefill runs 0.36 s at 256 tokens to 27.0 s at 16K (1.4 to
+1.65 ms/token as the attention history lengthens), while decode stays flat
+across every size — 14 ms/token at 256, 18 ms at 16K (ratio 1.29x) — a
+long context taxes the
+prefill you pay once, not the decode you pay per token. Checkpoints scale
+14.6 MB → 939.5 MB at 55.8-56.0 KiB/token, landing exactly on the
+57,344-byte figure above: the probe captures the prompt-only cache, the
+adapter's own checkpoint contract. The 16K row held a 25.0-29.1 s span
+across seven runs on a machine that also hosted other workloads, and
+scaling the 16K per-token cost to the restart test's 19,847 tokens
+predicts 32.7 s against its measured 34.5 s — two independent methods
+agreeing within 6%. The 32K
+point is withheld: four of five attempts were refused by the sweep's own
+guards — a 12 GB machine-churn event, and one confirmed thrash (79.9 s
+prefill, a TTFT step 20x its normal cost, swap growth beyond the row's
+own footprint) against the 64.7-68.3 s consensus of the runs whose rows
+sat on the curve. That refusal is the methodology working; the era this
+replaces once published a contaminated 8K figure instead. The probe is
+`sidecar/probes/context_sweep.py`.
 
 Restart resume (the claim that matters for a cache): a 19,847-token agent
 context on Qwen2.5-7B-Instruct-4bit goes 34.5 s cold → 1.56 s warm → **1.59 s

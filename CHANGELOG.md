@@ -26,6 +26,37 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   time and reclaims on the next GC pass. Losing duplicate records are
   counted dead on their own segment during the scan.
 
+
+## 0.7.1 — 2026-10-23
+
+### Added
+
+- **The context sweep probe** (`sidecar/probes/context_sweep.py`): prefill,
+  decode, and checkpoint-byte cost as context grows, measured on any mlx-lm
+  model through the adapter's own calls. Rebuilds the long-context
+  measurement capability the qwen4-exp removal took, on the supported path.
+  One process per context length; a warmup leg absorbs the resident model's
+  one-time cold page-cache (a leading control paid 45% extra without it,
+  measured); a control pair brackets the sweep so repeatability is observed;
+  monotonicity, decode/prefill-ratio, and swap checks refuse a contaminated
+  run rather than labelling it afterward. One sweep at a time via flock
+  (bypass: MLXCACHE_PROBE_LOCK=off). 19 hermetic tests pin the check math —
+  including the inverted-monotonicity regression that once flagged every
+  healthy run — and the lock's refusal/release/bypass behavior.
+- **The long-context cost curve is back, on the supported path.** Measured
+  on Qwen2.5-7B-Instruct-4bit (256 to 16K tokens): prefill 0.36 s to
+  27.0 s (1.4 to 1.65 ms/token), decode flat across every size (14 ms/token
+  at 256, 18 ms at 16K), checkpoints 14.6 MB to 939.5 MB at 55.8-56.0 KiB/token — exactly
+  the adapter's canonical 57,344 bytes/token, because the probe captures
+  the prompt-only cache the adapter's publish path captures. The 16K row
+  held a 25.0-29.1 s span across seven runs; scaling its per-token cost to
+  the restart test's 19,847 tokens predicts 32.7 s against the measured
+  34.5 s, a 6% agreement between independent methods. The 32K
+  point is withheld: four of five attempts were refused by the sweep's
+  own guards (a 12 GB machine-churn event; one confirmed thrash at 79.9 s
+  with a TTFT step 20x its normal cost), against the 64.7-68.3 s consensus
+  of the runs whose rows sat on the curve — the refusal is the
+  methodology working, and the run logs are archived with the evidence.
 ## 0.7.0 — 2026-10-22
 
 ### Added
