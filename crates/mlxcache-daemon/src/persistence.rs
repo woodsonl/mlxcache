@@ -38,6 +38,15 @@ pub struct Persistence {
     /// mutex-interiored, so clones share one chunk store per process.
     chunk_store: Option<Arc<ChunkStore>>,
     mode: ChunkMode,
+    /// Serializes chunked publication of one final name. The pair of
+    /// renames (.ckm then .ckpt) is atomic only against other holders of
+    /// this lock: two unlocked publishers for the same name can interleave
+    /// their renames and leave a header from one publication atop a
+    /// manifest from another — a blob that can never load. (The daemon's
+    /// index lock already serializes same-prefix publications; this makes
+    /// Persistence safe by construction, verified by the concurrent
+    /// same-name test.)
+    chunk_publish_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// Process-wide monotonic counter to make temp file names unique across
@@ -111,6 +120,7 @@ impl Persistence {
             blob_dir: dir,
             chunk_store,
             mode,
+            chunk_publish_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -299,6 +309,7 @@ impl Persistence {
         let payload = &staged[payload_start..];
         meta.payload_sha256 = Some(format!("{:x}", Sha256::digest(payload)));
         if let (Some(store), ChunkMode::Chunked) = (&self.chunk_store, self.mode) {
+            let _guard = self.chunk_publish_lock.lock().unwrap();
             return self.publish_chunked(store, prefix_hash, generation, meta, payload);
         }
         meta.format_version = 2;
@@ -370,6 +381,16 @@ impl Persistence {
         let ckm_path = self
             .blob_dir
             .join(format!("{:032x}-{:016x}.ckm", prefix_hash, generation));
+        // Republishing an existing NAME takes over its refs: read the
+        // manifest we are about to replace and unregister it first, or its
+        // chunks stay referenced forever (the daemon never republishes a
+        // name — generations are monotonic — but Persistence must not leak
+        // when a caller does).
+        if let Ok(old) = fs::read(&ckm_path) {
+            if let Ok(old_manifest) = Manifest::decode(&old) {
+                store.unregister(&old_manifest);
+            }
+        }
         // Temp names end `.ckm.tmp`/`.ckpt.tmp` so the boot reaper (which
         // takes `.ckpt.tmp` at boot, `.ckm.tmp` alongside it) catches a
         // crash's stranded temps instead of stranding unbudgeted files.
@@ -1123,5 +1144,40 @@ mod is_chunked_probe {
         let v2 = p2.publish_atomic(0xb, 1, meta(9), &payload).unwrap();
         assert!(p.is_chunked_blob(v3.file_name().unwrap().to_str().unwrap()));
         assert!(!p.is_chunked_blob(v2.file_name().unwrap().to_str().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod republish_takeover {
+    use super::tests::{meta, tmpdir};
+    use super::Persistence;
+
+    #[test]
+    fn republishing_a_name_does_not_leak_the_old_publications_refs() {
+        // Same (hash, generation), different payloads: the name is the
+        // claim, and taking it over must release the replaced manifest's
+        // chunk refs (a leaked refcount pins dead bytes until a boot
+        // replay). Prove it end-state: after the takeover AND a remove of
+        // the surviving blob, every chunk is dead — boot GC reclaims the
+        // whole store. A leaked ref from publication A keeps the segment
+        // live and fails this.
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        let a: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+        let b: Vec<u8> = (0..4096u32).map(|i| ((i * 7) % 251) as u8).collect();
+        let path = p.publish_atomic(0x99, 5, meta(9), &a).unwrap();
+        let path2 = p.publish_atomic(0x99, 5, meta(9), &b).unwrap();
+        assert_eq!(path, path2, "same name both times");
+        let (_m, payload) = p.load(&path).unwrap();
+        assert_eq!(payload, b, "the surviving pair is b's");
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        p.remove(&name).unwrap();
+        drop(p);
+        let p2 = Persistence::new(dir.path()).unwrap();
+        assert_eq!(
+            p2.store_physical_bytes(),
+            0,
+            "boot GC must reclaim everything: a leaked ref from the replaced publication keeps segments live"
+        );
     }
 }
