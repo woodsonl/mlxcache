@@ -19,14 +19,19 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   including the inverted-monotonicity regression that once flagged every
   healthy run — and the lock's refusal/release/bypass behavior.
 - **The long-context cost curve is back, on the supported path.** Measured
-  on Qwen2.5-7B-Instruct-4bit (256 to 32K tokens): prefill 0.39 s to 66.2 s
-  (1.5 to 2.0 ms/token), decode flat at 13-21 ms/token at every size,
-  checkpoints 15.1 MB to 1.88 GB at 56-58 KiB/token. The refused first
-  run's 32K row agrees with the passing run's within 2.3%, and the curve interpolates to the
-  19,847-token restart test's 34.5 s cold prefill within 5%. The first
-  sweep run refused itself on a 2.8 GB swap rise (cold-page displacement as
-  the 32K working set arrived; clock clean) and the re-run passed every
-  check — the refusal is recorded in README's Measured section.
+  on Qwen2.5-7B-Instruct-4bit (256 to 16K tokens): prefill 0.36 s to
+  29.1 s (1.4 to 1.8 ms/token), decode flat at 13-18 ms/token at every
+  size, checkpoints 14.6 MB to 939.5 MB at 55.8-56.0 KiB/token — exactly
+  the adapter's canonical 57,344 bytes/token, because the probe captures
+  the prompt-only cache the adapter's publish path captures. The 16K row
+  held a 25.0-29.1 s span across six runs; the curve interpolates to the
+  19,847-token restart test's 34.5 s cold prefill within ~7%. The 32K
+  point is withheld: four of five attempts were refused by the sweep's
+  own guards (a 12 GB machine-churn event; one confirmed thrash at 79.9 s
+  with a TTFT step 20x its normal cost), against the 64.7-68.3 s consensus
+  of the runs whose rows sat on the curve — the refusal is the
+  methodology working, and the run logs are archived with the evidence.
+
 ## 0.4.0 — 2026-10-21
 
 ### Removed
