@@ -35,6 +35,11 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   actually falls.
 - `MLXCACHE_CHUNK_STORE=0` on the daemon rolls back to whole-blob v2
   publication (both layouts stay readable).
+- Scope note versus REPORT.md's GO: the CDC fallback codec was NOT ported —
+  non-safetensors payloads use a whole-scope single-chunk fallback (exact,
+  dedups byte-identical payloads; no production engine emits opaque bytes).
+  The deviation and the port path are recorded in
+  docs/connector-protocol.md §2.
 
 ## 0.6.0 — 2026-10-22
 
