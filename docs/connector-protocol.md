@@ -120,6 +120,20 @@ indefinitely; v1/v2 readers see a v3 blob as an uninterpretable version and
 retire it loudly rather than misread it (mixed-version rollout means
 upgrading the daemon and its sidecar together, which is how they ship).
 
+**Deviation from REPORT.md's GO recommendation, recorded**: the GO decision
+kept CDC (gear, 16 KiB, head scope) as the fallback codec for engines that
+hand over opaque bytes. This build ships a **whole-scope single-chunk
+fallback** instead: a payload that is not framing-valid safetensors becomes
+one chunk covering its full length. Rationale: no production engine produces
+opaque bytes (mlx-lm always emits safetensors; the only opaque producer is
+the test-only synthetic engine), Python publishers stay whole-blob v2, and a
+dead codec path is untested surface. The whole-scope fallback is exact and
+still dedups byte-identical payloads (REPORT.md P2's cold-twice
+determinism). If an engine that cannot report a tensor grid ever ships, CDC
+remains the recorded design for it — port `chunk_stream`/`apply_envelope`
+from `scripts/dedup/chunk_sim.py`, measured there at 5.6%/9.5% new bytes
+per turn (f16/q8) against token-block's 5.3%/5.2%.
+
 `MLXCACHE_CHUNK_STORE=0` on the daemon disables v3 publication (rollback
 knob; reads still understand both).
 
