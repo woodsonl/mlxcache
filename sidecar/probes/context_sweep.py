@@ -140,12 +140,16 @@ def measure_one(model_id: str, size: int, decode_steps: int) -> dict[str, float]
     # The checkpoint is captured HERE, exactly as the adapter's publish
     # path captures it: the prompt-only cache, before any generated token
     # mutates it. Saving after decode would fold the generated positions
-    # into blob_bytes and overstate the checkpoint size.
+    # into blob_bytes and overstate the checkpoint size. The serialized
+    # bytes are released immediately: holding ~1 GB of dead payload through
+    # the decode measurement would perturb the timing and the swap guard
+    # with the probe's own retention.
     blob = io.BytesIO()
     # load_prompt_cache dispatches on the name; keep the extension it reads.
     blob.name = "sweep.safetensors"
     save_prompt_cache(blob, cache)
-    payload = blob.getvalue()
+    checkpoint_bytes = len(blob.getvalue())
+    del blob
 
     # TTFT adds the one step that consumes the final prompt token, kept
     # separate so `prefill_s` stays the comparable figure.
@@ -168,12 +172,12 @@ def measure_one(model_id: str, size: int, decode_steps: int) -> dict[str, float]
         "prefill_s": round(prefill, 2),
         "ttft_s": round(ttft, 2),
         "decode_s": round(decode, 3),
-        "blob_bytes": len(payload),
+        "blob_bytes": checkpoint_bytes,
         "swap_before_mb": before["swap_used_mb"],
         "swap_after_mb": machine_state()["swap_used_mb"],
         "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576, 1),
     }
-    del cache, logits, blob, payload
+    del cache, logits
     gc.collect()
     return row
 

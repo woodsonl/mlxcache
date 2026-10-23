@@ -347,7 +347,8 @@ context sweep — one process per size, self-checked for monotonicity,
 decode/prefill ratio, repeatability, and swap growth bounded by each row's
 own footprint): prefill runs 0.36 s at 256 tokens to 29.1 s at 16K (1.4 to
 1.8 ms/token as the attention history lengthens), while decode stays flat
-at 13-18 ms/token at every size (ratio 1.21x) — a long context taxes the
+across every size — 14 ms/token at 256, 17 ms at 16K (ratio 1.21x) — a
+long context taxes the
 prefill you pay once, not the decode you pay per token. Checkpoints scale
 14.6 MB → 939.5 MB at 55.8-56.0 KiB/token, landing exactly on the
 57,344-byte figure above: the probe captures the prompt-only cache, the
