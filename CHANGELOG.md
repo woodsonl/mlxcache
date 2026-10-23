@@ -20,12 +20,13 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   healthy run — and the lock's refusal/release/bypass behavior.
 - **The long-context cost curve is back, on the supported path.** Measured
   on Qwen2.5-7B-Instruct-4bit (256 to 16K tokens): prefill 0.36 s to
-  29.1 s (1.4 to 1.8 ms/token), decode flat across every size (14 ms/token
-  at 256, 17 ms at 16K), checkpoints 14.6 MB to 939.5 MB at 55.8-56.0 KiB/token — exactly
+  27.0 s (1.4 to 1.65 ms/token), decode flat across every size (14 ms/token
+  at 256, 18 ms at 16K), checkpoints 14.6 MB to 939.5 MB at 55.8-56.0 KiB/token — exactly
   the adapter's canonical 57,344 bytes/token, because the probe captures
   the prompt-only cache the adapter's publish path captures. The 16K row
-  held a 25.0-29.1 s span across six runs; the curve interpolates to the
-  19,847-token restart test's 34.5 s cold prefill within ~7%. The 32K
+  held a 25.0-29.1 s span across seven runs; scaling its per-token cost to
+  the restart test's 19,847 tokens predicts 32.7 s against the measured
+  34.5 s, a 6% agreement between independent methods. The 32K
   point is withheld: four of five attempts were refused by the sweep's
   own guards (a 12 GB machine-churn event; one confirmed thrash at 79.9 s
   with a TTFT step 20x its normal cost), against the 64.7-68.3 s consensus

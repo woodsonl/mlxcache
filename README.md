@@ -345,17 +345,18 @@ that prefill, and the 2 s TTFT resume budget holds with margin at every size.
 Long-context cost curve on the reference model (Qwen2.5-7B-Instruct-4bit,
 context sweep — one process per size, self-checked for monotonicity,
 decode/prefill ratio, repeatability, and swap growth bounded by each row's
-own footprint): prefill runs 0.36 s at 256 tokens to 29.1 s at 16K (1.4 to
-1.8 ms/token as the attention history lengthens), while decode stays flat
-across every size — 14 ms/token at 256, 17 ms at 16K (ratio 1.21x) — a
+own footprint): prefill runs 0.36 s at 256 tokens to 27.0 s at 16K (1.4 to
+1.65 ms/token as the attention history lengthens), while decode stays flat
+across every size — 14 ms/token at 256, 18 ms at 16K (ratio 1.29x) — a
 long context taxes the
 prefill you pay once, not the decode you pay per token. Checkpoints scale
 14.6 MB → 939.5 MB at 55.8-56.0 KiB/token, landing exactly on the
 57,344-byte figure above: the probe captures the prompt-only cache, the
 adapter's own checkpoint contract. The 16K row held a 25.0-29.1 s span
-across six runs on a machine that also hosted other workloads, and the
-curve interpolates to the 19,847-token restart test's 34.5 s cold prefill
-within ~7%. The 32K
+across seven runs on a machine that also hosted other workloads, and
+scaling the 16K per-token cost to the restart test's 19,847 tokens
+predicts 32.7 s against its measured 34.5 s — two independent methods
+agreeing within 6%. The 32K
 point is withheld: four of five attempts were refused by the sweep's own
 guards — a 12 GB machine-churn event, and one confirmed thrash (79.9 s
 prefill, a TTFT step 20x its normal cost, swap growth beyond the row's
