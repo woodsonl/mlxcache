@@ -221,12 +221,20 @@ class ChunkReader:
                 body_len = None
                 # body length is not cached; re-read just the 4-byte header
                 # of each record to recover offsets exactly.
-                with open(chunks_dir / name, "rb") as fh:
-                    fh.seek(at)
-                    raw = fh.read(4)
-                    if len(raw) < 4:
-                        break
-                    body_len = struct.unpack("<I", raw)[0]
+                try:
+                    with open(chunks_dir / name, "rb") as fh:
+                        fh.seek(at)
+                        raw = fh.read(4)
+                except FileNotFoundError as exc:
+                    # Deleted between Pass 1 and this open (a sweep
+                    # re-homed the records): the caller must rescan, so
+                    # the fresh pass sees the replacement segment —
+                    # raising a raw FileNotFoundError here would bypass
+                    # the retry and reject a healthy checkpoint.
+                    raise _SegmentVanishedError(name) from exc
+                if len(raw) < 4:
+                    break
+                body_len = struct.unpack("<I", raw)[0]
                 placement.setdefault(digest, (name, body_start, body_len))
                 at = body_start + body_len
         return placement

@@ -2762,7 +2762,14 @@ async fn stream_response(
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let s = state.stats.snapshot();
-    let (chunk_total, chunk_dead, chunk_partial) = state.persistence.chunked_fragmentation();
+    // The chunk-store totals sit behind the store's std Mutex, which a
+    // compaction sweep can hold across segment copies: read them on the
+    // blocking pool so a stats request never parks a runtime worker.
+    let persistence = state.persistence.clone();
+    let (chunk_total, chunk_dead, chunk_partial) =
+        tokio::task::spawn_blocking(move || persistence.chunked_fragmentation())
+            .await
+            .unwrap_or((0, 0, 0));
     Json(serde_json::json!({
         "requests": s.requests,
         "hits": s.hits,

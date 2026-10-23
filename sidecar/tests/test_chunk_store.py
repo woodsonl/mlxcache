@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 from mlxcache_sidecar import blob
 from mlxcache_store.chunks import (
+    _SEGMENT_CACHE,
     FORMAT_VERSION,
     MANIFEST_MAGIC,
     SEGMENT_MAGIC,
@@ -209,3 +210,39 @@ def test_reassemble_rescans_when_a_segment_vanishes_mid_read(tmp_path, monkeypat
     monkeypatch.setattr(ChunkReader, "_scan_segments", stale_then_fresh)
     assert ChunkReader(tmp_path).read_payload(tmp_path / "aa.ckpt", sha) == body
     assert calls["n"] == 2, "exactly one rescan, then success"
+
+
+def test_reassemble_rescans_when_a_segment_vanishes_mid_scan(tmp_path):
+    """Pass 2 of the scan re-opens segment files to rebuild offsets; a
+    sweep can delete one between Pass 1's glob and that open. The
+    FileNotFoundError must become a rescan (which resolves the digest to
+    the surviving copy), never a rejected checkpoint."""
+    body = bytes(range(64))
+    digest = hashlib.sha256(body).digest()
+    record = struct.pack("<I32s", len(body), digest) + body
+    header = SEGMENT_MAGIC + struct.pack("<H", FORMAT_VERSION) + b"\x00\x00"
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir()
+    (chunks_dir / "seg-0000000000.seg").write_bytes(header + record)
+    newest = chunks_dir / "seg-0000000001.seg"
+    newest.write_bytes(header + record)  # a compaction rewrite
+    ckm = struct.pack("<4sHQQ", MANIFEST_MAGIC, FORMAT_VERSION, len(body), 1) + struct.pack(
+        "<32sIIQQ", digest, len(body), 1, 0, 0
+    )
+    (tmp_path / "aa.ckm").write_bytes(ckm)
+    sha = hashlib.sha256(body).hexdigest()
+    ckpt = tmp_path / "aa.ckpt"
+    ckpt.write_bytes(_wire_header({"format_version": 3, "payload_sha256": sha}))
+
+    reader = ChunkReader(tmp_path)
+    assert reader.placement[digest][0] == newest.name
+    # Replay the race: an in-flight scan's Pass 1 already cached the
+    # newest segment when the sweep deleted it — Pass 2 now opens a file
+    # that is gone. The cache entry stands in for that in-flight scan.
+    size = 8 + 36 + len(body)
+    _SEGMENT_CACHE[tmp_path][newest.name] = (size, [digest])
+    newest.unlink()
+    # The read must survive: the vanish signal triggers one rescan, and
+    # the fresh scan resolves the digest to the surviving old copy.
+    assert reader.read_payload(ckpt, sha) == body
+    assert reader.placement[digest][0] == "seg-0000000000.seg"

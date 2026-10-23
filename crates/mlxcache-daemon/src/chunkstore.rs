@@ -635,22 +635,23 @@ impl ChunkStore {
         payload: &[u8],
         positions: u64,
     ) -> Result<Manifest, ChunkError> {
-        // ONE lock across append + refcount increment: two separate locks
-        // left a window where the eviction thread could GC a sealed
-        // all-dead segment (this payload's chunks not yet referenced, the
-        // last OTHER referencing blob just removed) out from under the
-        // publication — a published blob whose chunks are gone.
-        let manifest = self.stage_chunks(payload, positions)?;
-        {
-            let mut inner = self.inner.lock().unwrap();
-            for c in &manifest.chunks {
-                let prev = *inner.refs.entry(c.digest).or_insert(0);
-                inner.refs.insert(c.digest, prev + 1);
-                if prev == 0 {
-                    if let Some(p) = inner.placement.get(&c.digest).copied() {
-                        if let Some(stat) = inner.segments.get_mut(&p.seg) {
-                            stat.dead = stat.dead.saturating_sub(36 + p.len);
-                        }
+        // ONE lock across append + refcount increment, for real: two
+        // separate lock windows left a gap where the eviction thread's GC
+        // or compaction could rewrite/delete a segment that ROLLED during
+        // staging while this payload's chunks sat in it referenced by
+        // nothing yet (refs bump only after the second lock) — a published
+        // blob whose bytes left disk. Holding the same guard across both
+        // halves closes every interleaving.
+        let manifest = chunk_payload(payload, positions);
+        let mut inner = self.inner.lock().unwrap();
+        self.stage_chunks_locked(&mut inner, &manifest, payload)?;
+        for c in &manifest.chunks {
+            let prev = *inner.refs.entry(c.digest).or_insert(0);
+            inner.refs.insert(c.digest, prev + 1);
+            if prev == 0 {
+                if let Some(p) = inner.placement.get(&c.digest).copied() {
+                    if let Some(stat) = inner.segments.get_mut(&p.seg) {
+                        stat.dead = stat.dead.saturating_sub(36 + p.len);
                     }
                 }
             }
@@ -661,6 +662,19 @@ impl ChunkStore {
     pub fn stage_chunks(&self, payload: &[u8], positions: u64) -> Result<Manifest, ChunkError> {
         let manifest = chunk_payload(payload, positions);
         let mut inner = self.inner.lock().unwrap();
+        self.stage_chunks_locked(&mut inner, &manifest, payload)?;
+        Ok(manifest)
+    }
+
+    /// The staging loop under a HELD lock (callers own `inner`). Appends
+    /// every not-yet-present chunk to the active segment, fsyncs before
+    /// returning, and fills `manifest`'s placements.
+    fn stage_chunks_locked(
+        &self,
+        inner: &mut Inner,
+        manifest: &Manifest,
+        payload: &[u8],
+    ) -> Result<(), ChunkError> {
         for c in &manifest.chunks {
             if inner.placement.contains_key(&c.digest) {
                 continue;
@@ -764,7 +778,7 @@ impl ChunkStore {
                 .sync_all()
                 .map_err(|e| ChunkError::Disk(e.to_string()))?;
         }
-        Ok(manifest)
+        Ok(())
     }
 
     /// Register a live blob's refs (called after its .ckpt rename made it
@@ -1013,9 +1027,37 @@ impl ChunkStore {
                     if let Some(old_total) = old_stat {
                         reclaimed += old_total.saturating_sub(record_bytes);
                     }
+                    // Placements still pointing at the old segment are the
+                    // dead digests filtered out of `live`: their bytes are
+                    // gone with the file, so a later re-publish must append
+                    // fresh (the same C1 rule gc_empty applies).
                     inner.placement.retain(|_, p| p.seg != old_seq);
-                    let _ = fs::remove_file(&old_path);
-                    compacted += 1;
+                    // Reclaim the old file. If the delete fails, the stat
+                    // must go BACK as all-dead so gc_empty retries the
+                    // unlink on later passes — otherwise the file sits on
+                    // disk forever, physical_bytes keeps counting it, and
+                    // the eviction budget holds pressure compaction
+                    // claimed to reclaim.
+                    let retry_stat_total = old_stat.unwrap_or(record_bytes);
+                    match fs::remove_file(&old_path) {
+                        Ok(()) => {
+                            compacted += 1;
+                        }
+                        Err(e) => {
+                            inner.segments.insert(
+                                old_seq,
+                                SegmentStat {
+                                    total: retry_stat_total,
+                                    dead: retry_stat_total,
+                                },
+                            );
+                            tracing::warn!(
+                                segment = old_seq,
+                                error = %e,
+                                "compacted but old segment file delete failed; GC will retry"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     // The new file is garbage (partial write): remove it and
@@ -1500,6 +1542,39 @@ mod tests {
         reader.join().unwrap();
         assert_eq!(store.reassemble(&ma).unwrap(), a);
         assert_eq!(store.reassemble(&mb).unwrap(), b);
+    }
+
+    #[test]
+    fn staging_that_rolls_survives_a_racing_sweep() {
+        // The stage/register window: staging a payload that ROLLS the
+        // active segment seals the just-filled one with this payload's
+        // chunks sitting in it REFERENCED BY NOTHING yet (refs bump after
+        // staging). A GC or compaction pass in that window used to see
+        // those records as dead and delete/rewrite their segment away —
+        // a published blob whose bytes left disk. stage_and_register now
+        // holds ONE lock across both halves, so the sweep can never
+        // interleave. This hammers the race with real 64 MiB rolls.
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(ChunkStore::open(dir.path(), &[]).unwrap());
+        // One tensor block of 64 positions x dim 262144 = 64 MiB body:
+        // every append rolls the active segment.
+        let big = fake_payload(65, 1, 262144, 1, 3);
+        let sweeper = std::sync::Arc::clone(&store);
+        let sweep = std::thread::spawn(move || {
+            for _ in 0..400 {
+                let _ = sweeper.gc_empty_segments();
+                let _ = sweeper.compact_segments(0.0, 1, 2);
+            }
+        });
+        let m1 = store.stage_and_register(&big, 64).unwrap();
+        let m2 = store.stage_and_register(&big, 64).unwrap(); // dedups, no new bytes
+        sweep.join().unwrap();
+        // Both publications must read back bit-exact.
+        assert_eq!(store.reassemble(&m1).unwrap(), big);
+        assert_eq!(store.reassemble(&m2).unwrap(), big);
+        // The chunks were registered: no dead weight anywhere.
+        let (_, dead, partial) = store.fragmentation();
+        assert_eq!((dead, partial), (0, 0));
     }
 
     #[test]

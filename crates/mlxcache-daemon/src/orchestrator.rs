@@ -412,17 +412,19 @@ impl Orchestrator {
                 }
                 evicted += 1;
                 // Physical truth after this removal: GC empty segments,
-                // compact fragmented ones, then recount. A chunked blob
-                // frees disk only when it was the LAST referencing blob of
-                // its chunks, so the per-blob `size` (gross manifest
-                // bytes) must never be subtracted directly — the recount
-                // is the only honest bookkeeping. Compaction belongs here
-                // too (not just at pass start): without it, dead bytes
-                // THIS pass created would read as budget pressure and
-                // evict candidates that the next pass would have kept.
+                // then recount; compact only if the budget still exceeds —
+                // a pass that evicts N blobs must not rewrite up to N×max
+                // segments when the first removal already got it under.
+                // A chunked blob frees disk only when it was the LAST
+                // referencing blob of its chunks, so the per-blob `size`
+                // (gross manifest bytes) must never be subtracted
+                // directly — the recount is the only honest bookkeeping.
                 persistence.gc_chunked();
-                persistence.compact_chunked();
                 remaining_bytes = persistence.store_physical_bytes();
+                if max_bytes > 0 && remaining_bytes > max_bytes {
+                    persistence.compact_chunked();
+                    remaining_bytes = persistence.store_physical_bytes();
+                }
             }
         }
         if max_bytes > 0 && remaining_bytes > max_bytes {
@@ -434,6 +436,14 @@ impl Orchestrator {
                 "eviction byte budget unreachable: published anchors hold the store above it"
             );
         }
+        // End-of-pass reclaim: removals since the last recount can have
+        // left fragmented segments (dead bytes inside live ones). One
+        // final GC + compaction — unconditional, threshold-gated to a
+        // no-op when nothing qualifies — keeps entry-cap passes (which
+        // never trigger the mid-pass budget branch) and the next pass's
+        // budget math honest.
+        persistence.gc_chunked();
+        persistence.compact_chunked();
         if evicted > 0 {
             tracing::info!(
                 evicted,

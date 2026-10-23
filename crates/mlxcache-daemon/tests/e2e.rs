@@ -294,15 +294,19 @@ async fn compaction_reclaims_dead_bytes_and_the_survivor_still_serves() {
     assert!(r1 > 0, "both blobs' chunks are accounted: {before}");
     assert_eq!(before["chunk_store"]["dead_bytes"], 0);
 
-    // Test-scale compaction knobs for a store of two tiny blobs.
-    unsafe { std::env::set_var("MLXCACHE_COMPACT_RATIO", "0.0") };
-    unsafe { std::env::set_var("MLXCACHE_COMPACT_MIN_BYTES", "1") };
+    // Test-scale compaction knobs via config injection (env mutation would
+    // race the parallel e2e tests' eviction passes).
+    let small = mlxcache_daemon::persistence::CompactConfig {
+        ratio: 0.0,
+        min_dead_bytes: 1,
+        ..Default::default()
+    };
+    state.persistence.set_compact_config(small);
     // One reaper pass: the settled blob reaps (the prefix is its anchor),
     // its UNIQUE chunks die inside a segment that still holds the live
     // prefix — the compaction case gc_empty cannot touch.
     let evicted = state.evict_pass(0, 0, std::time::Duration::ZERO);
-    unsafe { std::env::remove_var("MLXCACHE_COMPACT_RATIO") };
-    unsafe { std::env::remove_var("MLXCACHE_COMPACT_MIN_BYTES") };
+    state.persistence.set_compact_config(Default::default());
     assert_eq!(
         evicted, 1,
         "the settled blob reaps; the anchored prefix stays"
