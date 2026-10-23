@@ -1,5 +1,6 @@
 //! mlxcache-daemon: HTTP proxy + policy + adapter orchestration.
 
+pub mod chunkstore;
 pub mod http;
 pub mod native_tokenizer;
 pub mod observability;

@@ -3,6 +3,7 @@
 //! ENOSPC rescue (error registry): catch the write error, log path+bytes,
 //! fail the warming path only — real requests proceed uncached.
 
+use crate::chunkstore::{ChunkStore, Manifest};
 use mlxcache_core::contract::CheckpointMeta;
 #[cfg(test)]
 use mlxcache_core::contract::ContractError;
@@ -10,14 +11,49 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Publication mode (MLXCACHE_CHUNK_STORE; default Chunked = the shipped
+/// v1 codec decision from REPORT.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkMode {
+    Whole,
+    Chunked,
+}
+
+impl ChunkMode {
+    pub fn from_env() -> Self {
+        match std::env::var("MLXCACHE_CHUNK_STORE").as_deref() {
+            Ok("0") | Ok("false") => ChunkMode::Whole,
+            _ => ChunkMode::Chunked,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Persistence {
     pub blob_dir: PathBuf,
+    /// The chunked store (format_version 3 publisher), when enabled. `None`
+    /// = whole-blob v2 mode. Shared by reference; the store is
+    /// mutex-interiored, so clones share one chunk store per process.
+    chunk_store: Option<Arc<ChunkStore>>,
+    mode: ChunkMode,
 }
 
 /// Process-wide monotonic counter to make temp file names unique across
 /// concurrent publishes within one process.
+fn chunk_err(e: crate::chunkstore::ChunkError) -> PersistError {
+    match e {
+        crate::chunkstore::ChunkError::Disk(reason) => PersistError::DiskFull {
+            path: PathBuf::from(&reason),
+            source: std::io::Error::other(reason),
+        },
+        other => PersistError::Corrupt {
+            reason: other.to_string(),
+        },
+    }
+}
+
 fn next_temp_seq() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -39,12 +75,43 @@ pub enum PersistError {
 
 impl Persistence {
     pub fn new(blob_dir: impl Into<PathBuf>) -> Result<Self, PersistError> {
+        Self::new_with_mode(blob_dir, ChunkMode::from_env())
+    }
+
+    /// `ChunkMode::Chunked` publishes format_version 3 chunked blobs and
+    /// opens the shared chunk store; `Whole` keeps the v2 whole-blob layout
+    /// (rollback knob: MLXCACHE_CHUNK_STORE=0). Both modes READ both
+    /// layouts — a store may mix them freely.
+    pub fn new_with_mode(
+        blob_dir: impl Into<PathBuf>,
+        mode: ChunkMode,
+    ) -> Result<Self, PersistError> {
         let dir = blob_dir.into();
         fs::create_dir_all(&dir)?;
         // Boot is the degenerate age sweep (everything is stale to a daemon
         // that was not running to own it).
         Self::reap_stale_settle_staging_in(&dir, std::time::Duration::ZERO);
-        Ok(Self { blob_dir: dir })
+        // The chunk store opens in BOTH modes: v3 blobs must stay READABLE
+        // under the MLXCACHE_CHUNK_STORE=0 rollback (a healthy checkpoint is
+        // never corruption because the operator rolled back the writer), and
+        // the boot rebuild must derive refs so their chunks are not
+        // reclaimed out from under them. Publication mode gates WRITES only.
+        let chunk_store = {
+            // list first: the boot scan derives refcounts from live
+            // .ckpt files (v3 headers), then the store reclaims
+            // crash orphans deterministically.
+            let live = Self::list_blobs_in(&dir)?;
+            Some(Arc::new(ChunkStore::open(&dir, &live).map_err(|e| {
+                PersistError::Corrupt {
+                    reason: e.to_string(),
+                }
+            })?))
+        };
+        Ok(Self {
+            blob_dir: dir,
+            chunk_store,
+            mode,
+        })
     }
 
     /// Remove `.settle-*` staging/temp files older than `older_than`.
@@ -78,7 +145,8 @@ impl Persistence {
             // legitimately outlast the recurring threshold — reaping it
             // mid-write would kill a publication the request already earned.
             // At boot no task is live, so every temp is garbage.
-            let is_publish_temp = older_than.is_zero() && name.ends_with(".ckpt.tmp");
+            let is_publish_temp =
+                older_than.is_zero() && (name.ends_with(".ckpt.tmp") || name.ends_with(".ckm.tmp"));
             if !(is_staging || is_publish_temp) {
                 continue;
             }
@@ -194,6 +262,32 @@ impl Persistence {
     /// payload exists for the whole publish (the read in `read_staged`); this
     /// adds none. The digest is computed over the same slice it writes, so
     /// what is verified is exactly what lands on disk.
+    /// write-temp-then-rename with fsync and cleanup: the shared tail of
+    /// every publish path (whole-blob, chunk manifest, chunk header).
+    fn tmp_publish(&self, tmp: &Path, final_path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
+        let write_result = (|| -> std::io::Result<()> {
+            let mut f = fs::File::create(tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(source) = write_result {
+            let _ = fs::remove_file(tmp);
+            return Err(PersistError::DiskFull {
+                path: tmp.to_path_buf(),
+                source,
+            });
+        }
+        if let Err(source) = fs::rename(tmp, final_path) {
+            let _ = fs::remove_file(tmp);
+            return Err(PersistError::DiskFull {
+                path: final_path.to_path_buf(),
+                source,
+            });
+        }
+        Ok(())
+    }
+
     pub fn publish_from_staged(
         &self,
         prefix_hash: u128,
@@ -203,8 +297,11 @@ impl Persistence {
         payload_start: usize,
     ) -> Result<PathBuf, PersistError> {
         let payload = &staged[payload_start..];
-        meta.format_version = 2;
         meta.payload_sha256 = Some(format!("{:x}", Sha256::digest(payload)));
+        if let (Some(store), ChunkMode::Chunked) = (&self.chunk_store, self.mode) {
+            return self.publish_chunked(store, prefix_hash, generation, meta, payload);
+        }
+        meta.format_version = 2;
         let final_path = self
             .blob_dir
             .join(format!("{:032x}-{:016x}.ckpt", prefix_hash, generation));
@@ -222,28 +319,122 @@ impl Persistence {
         let header_len_u32 = u32::try_from(header.len()).map_err(|_| PersistError::Corrupt {
             reason: format!("checkpoint header too large: {} bytes", header.len()),
         })?;
+        let mut wire = header_len_u32.to_le_bytes().to_vec();
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(payload);
+        self.tmp_publish(&tmp_path, &final_path, &wire)?;
+        Ok(final_path)
+    }
+
+    /// Chunked publish (format_version 3): chunk the payload over its token
+    /// grid, append new chunks to the packed segments (fsynced), write the
+    /// manifest, THEN publish the header-only .ckpt by atomic rename — the
+    /// rename is the visibility point, so a crash mid-publish leaves
+    /// reclaimable orphans, never a half blob.
+    fn publish_chunked(
+        &self,
+        store: &Arc<ChunkStore>,
+        prefix_hash: u128,
+        generation: u64,
+        mut meta: CheckpointMeta,
+        payload: &[u8],
+    ) -> Result<PathBuf, PersistError> {
+        // positions covered by the payload: the tokens[:-1] convention.
+        let positions = meta.token_count.saturating_sub(1);
+        // Build the header FIRST: after staging+registration every failure
+        // must be an I/O error path that unregisters, and serde/len checks
+        // are not — so they run before anything is registered.
+        // payload_sha256 was stamped by the caller (publish_from_staged)
+        // over the same slice; re-hashing GB payloads per publish is pure
+        // cost. Only the version changes here.
+        meta.format_version = 3;
+        let header = serde_json::to_vec(&meta).map_err(|e| PersistError::Corrupt {
+            reason: format!("meta serialize: {e}"),
+        })?;
+        let header_len = u32::try_from(header.len()).map_err(|_| PersistError::Corrupt {
+            reason: format!("checkpoint header too large: {} bytes", header.len()),
+        })?;
+        // Stage AND register atomically (the eviction GC runs on another
+        // thread): registering before the .ckpt rename means a concurrent
+        // sweep that removes the LAST other blob referencing a shared chunk
+        // cannot GC our just-staged segment out from under the publication.
+        // A crash between staging and the rename leaves refs with no blob —
+        // bounded (boot replay re-derives from live pairs), never a lost
+        // publication. Every failure path below unregisters.
+        let manifest = store
+            .stage_and_register(payload, positions)
+            .map_err(chunk_err)?;
+        let final_path = self
+            .blob_dir
+            .join(format!("{:032x}-{:016x}.ckpt", prefix_hash, generation));
+        let ckm_path = self
+            .blob_dir
+            .join(format!("{:032x}-{:016x}.ckm", prefix_hash, generation));
+        // Temp names end `.ckm.tmp`/`.ckpt.tmp` so the boot reaper (which
+        // takes `.ckpt.tmp` at boot, `.ckm.tmp` alongside it) catches a
+        // crash's stranded temps instead of stranding unbudgeted files.
+        let tmp = self.blob_dir.join(format!(
+            "{:032x}-{:016x}.{}.{}.ckm.tmp",
+            prefix_hash,
+            generation,
+            std::process::id(),
+            next_temp_seq()
+        ));
+        // Write the manifest first, fsync, rename; then the (tiny) header.
         let write_result = (|| -> std::io::Result<()> {
-            let mut f = fs::File::create(&tmp_path)?;
-            f.write_all(&header_len_u32.to_le_bytes())?;
-            f.write_all(&header)?;
-            f.write_all(payload)?;
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&manifest.encode())?;
             f.sync_all()?;
             Ok(())
         })();
         if let Err(source) = write_result {
-            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&tmp);
+            store.unregister(&manifest);
+            return Err(PersistError::DiskFull { path: tmp, source });
+        }
+        if let Err(source) = fs::rename(&tmp, &ckm_path) {
+            let _ = fs::remove_file(&tmp);
+            store.unregister(&manifest);
             return Err(PersistError::DiskFull {
-                path: tmp_path,
+                path: ckm_path.clone(),
                 source,
             });
         }
-        if let Err(source) = fs::rename(&tmp_path, &final_path) {
-            let _ = fs::remove_file(&tmp_path);
+        let header_tmp = self.blob_dir.join(format!(
+            "{:032x}-{:016x}.{}.{}.ckpt.tmp",
+            prefix_hash,
+            generation,
+            std::process::id(),
+            next_temp_seq()
+        ));
+        let write_result = (|| -> std::io::Result<()> {
+            let mut f = fs::File::create(&header_tmp)?;
+            f.write_all(&header_len.to_le_bytes())?;
+            f.write_all(&header)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(source) = write_result {
+            let _ = fs::remove_file(&header_tmp);
+            let _ = fs::remove_file(&ckm_path);
+            store.unregister(&manifest);
             return Err(PersistError::DiskFull {
-                path: final_path,
+                path: header_tmp,
                 source,
             });
         }
+        if let Err(source) = fs::rename(&header_tmp, &final_path) {
+            let _ = fs::remove_file(&header_tmp);
+            let _ = fs::remove_file(&ckm_path);
+            store.unregister(&manifest);
+            return Err(PersistError::DiskFull {
+                path: final_path.clone(),
+                source,
+            });
+        }
+        // Visible. Refs were registered by stage_and_register (one lock
+        // with the append); registering again here would double-count every
+        // chunk and pin removed blobs' bytes until a boot replay.
         Ok(final_path)
     }
 
@@ -274,6 +465,46 @@ impl Persistence {
         // refuse loudly rather than misinterpret its layout.
         match meta.format_version {
             1 => {}
+            3 => {
+                // Chunked blob: the payload lives in the chunk store.
+                // Reassemble (byte-exact by construction) and verify the
+                // SAME D1 digest contract — corruption anywhere in
+                // segments or manifest produces wrong bytes here, and the
+                // digest is what retires the blob.
+                let Some(store) = &self.chunk_store else {
+                    return Err(PersistError::Corrupt {
+                        reason: "chunk store unavailable (no chunks/ directory \
+                                 beside this store?)"
+                            .into(),
+                    });
+                };
+                let expected =
+                    meta.payload_sha256
+                        .as_deref()
+                        .ok_or_else(|| PersistError::Corrupt {
+                            reason: "format version 3 requires payload_sha256".into(),
+                        })?;
+                let ckm = blob_path.with_extension("ckm");
+                let mbytes = fs::read(&ckm).map_err(|_| PersistError::Corrupt {
+                    reason: "chunk manifest missing".into(),
+                })?;
+                let manifest =
+                    Manifest::decode(&mbytes).map_err(|reason| PersistError::Corrupt { reason })?;
+                let payload = store
+                    .reassemble(&manifest)
+                    .map_err(|e| PersistError::Corrupt {
+                        reason: e.to_string(),
+                    })?;
+                let actual = format!("{:x}", Sha256::digest(&payload));
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Err(PersistError::Corrupt {
+                        reason: format!(
+                            "payload digest mismatch (expected {expected}, got {actual})"
+                        ),
+                    });
+                }
+                return Ok((meta, payload));
+            }
             2 => {
                 let expected =
                     meta.payload_sha256
@@ -310,10 +541,29 @@ impl Persistence {
     /// next startup rebuild and resurrect the poison.
     pub fn remove(&self, blob_name: &str) -> Result<(), PersistError> {
         match fs::remove_file(self.blob_dir.join(blob_name)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(PersistError::Io(e)),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(PersistError::Io(e)),
         }
+        // Chunked blob retirement: drop the manifest and its chunk refs so
+        // shared chunks' lifetimes follow the last blob that cites them.
+        // The generation-encoded name means a remove() can never hit a
+        // different publication's manifest.
+        if let Some(store) = &self.chunk_store {
+            let ckm = blob_name
+                .strip_suffix(".ckpt")
+                .unwrap_or(blob_name)
+                .to_string()
+                + ".ckm";
+            let path = self.blob_dir.join(&ckm);
+            if let Ok(mbytes) = fs::read(&path) {
+                if let Ok(manifest) = Manifest::decode(&mbytes) {
+                    store.unregister(&manifest);
+                }
+            }
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
     }
 
     /// Rebuild support (index corruption rescue): list all published blobs.
@@ -321,8 +571,12 @@ impl Persistence {
     /// so the index is rebuilt from blob metadata alone — blobs are the source
     /// of truth (see Orchestrator::rebuild_from_disk).
     pub fn list_blobs(&self) -> Result<Vec<PathBuf>, PersistError> {
+        Self::list_blobs_in(&self.blob_dir)
+    }
+
+    fn list_blobs_in(dir: &Path) -> Result<Vec<PathBuf>, PersistError> {
         let mut out = Vec::new();
-        for entry in fs::read_dir(&self.blob_dir)? {
+        for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().map(|e| e == "ckpt").unwrap_or(false) {
@@ -331,6 +585,116 @@ impl Persistence {
         }
         Ok(out)
     }
+
+    /// True when the named blob is a header-only v3 checkpoint (its bytes
+    /// live in the chunk store, budgeted there). Reads ONLY the header
+    /// prefix (4-byte length + that many bytes), never the payload: the
+    /// reaper calls this per candidate per pass, and v1/v2 payloads are
+    /// tens-to-hundreds of MB.
+    pub fn is_chunked_blob(&self, blob_name: &str) -> bool {
+        if self.chunk_store.is_none() {
+            return false;
+        }
+        let Ok(mut f) = fs::File::open(self.blob_dir.join(blob_name)) else {
+            return false;
+        };
+        use std::io::Read as _;
+        let mut len_bytes = [0u8; 4];
+        if f.read_exact(&mut len_bytes).is_err() {
+            return false;
+        }
+        let header_len = u32::from_le_bytes(len_bytes) as usize;
+        if header_len > crate::chunkstore::MAX_HEADER_READ {
+            return false; // not one of ours (the wire cap is far lower)
+        }
+        let mut header = vec![0u8; header_len];
+        if f.read_exact(&mut header).is_err() {
+            return false;
+        }
+        // peek_meta parses `u32 length + JSON`; rebuild the prefix in front
+        // of the JSON bytes we read.
+        let mut prefixed = len_bytes.to_vec();
+        prefixed.extend_from_slice(&header);
+        crate::chunkstore::peek_meta(&prefixed)
+            .map(|m| m.format_version == 3)
+            .unwrap_or(false)
+    }
+
+    /// The store's physical footprint for budget recounts: whole-blob .ckpt
+    /// files (v1/v2 payload-bearing; v3 headers are counted with the chunk
+    /// store below via manifests) + segments + manifests. Directory truth,
+    /// no in-memory state, so a recount after GC is always honest.
+    pub fn store_physical_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        if let Ok(entries) = fs::read_dir(&self.blob_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.ends_with(".ckpt") || name.ends_with(".ckm") {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        if let Some(store) = &self.chunk_store {
+            total += store.physical_bytes();
+        }
+        total
+    }
+
+    /// GC the chunk store (delete all-dead segments; returns bytes freed).
+    /// Called by the eviction reaper after removals so the byte budget
+    /// reflects reclaimed segments, not just unlinked headers.
+    pub fn gc_chunked(&self) -> u64 {
+        self.chunk_store
+            .as_ref()
+            .map(|s| s.gc_empty_segments())
+            .unwrap_or(0)
+    }
+
+    /// One blob's eviction-budget footprint. v1/v2: the file's size. v3:
+    /// the manifest's gross chunk bytes (shared chunks count once per
+    /// referencing blob, which is what eviction ordering wants — evicting
+    /// this blob frees its UNIQUE bytes; the pass-level total adds the
+    /// shared/overhead truth exactly once via `chunked_overhead_bytes`).
+    pub fn blob_disk_bytes(&self, blob_name: &str) -> Result<u64, PersistError> {
+        let path = self.blob_dir.join(blob_name);
+        let meta_len = fs::metadata(&path)
+            .map(|m| m.len())
+            .map_err(PersistError::Io);
+        if self.chunk_store.is_none() {
+            return meta_len;
+        }
+        if !self.is_chunked_blob(blob_name) {
+            return meta_len;
+        }
+        let ckm = blob_name
+            .strip_suffix(".ckpt")
+            .unwrap_or(blob_name)
+            .to_string()
+            + ".ckm";
+        let mbytes = fs::read(self.blob_dir.join(&ckm)).map_err(PersistError::Io)?;
+        let manifest =
+            Manifest::decode(&mbytes).map_err(|reason| PersistError::Corrupt { reason })?;
+        Ok(manifest.gross_bytes())
+    }
+
+    /// Segment + manifest bytes NOT attributable to any single blob (shared
+    /// chunks, dead bytes, record headers): added once per eviction pass.
+    /// Zero in whole-blob mode.
+    pub fn chunked_overhead_bytes(&self) -> u64 {
+        let Some(store) = self.chunk_store.as_ref() else {
+            return 0;
+        };
+        let mut manifests = 0u64;
+        if let Ok(entries) = fs::read_dir(&self.blob_dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(".ckm") {
+                    manifests += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        store.physical_bytes() + manifests
+    }
 }
 
 #[cfg(test)]
@@ -338,7 +702,7 @@ mod tests {
     use super::*;
     use crate::orchestrator::test_support::fp;
 
-    fn meta(n: u64) -> CheckpointMeta {
+    pub(super) fn meta(n: u64) -> CheckpointMeta {
         CheckpointMeta {
             fingerprint: fp("m"),
             token_count: n,
@@ -350,7 +714,7 @@ mod tests {
         }
     }
 
-    fn tmpdir() -> tempfile::TempDir {
+    pub(super) fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
 
@@ -392,12 +756,12 @@ mod tests {
     }
 
     #[test]
-    fn publish_stamps_v2_with_verified_digest() {
-        // D1: publish is the single choke point that stamps format_version 2
-        // + the payload digest; load verifies it. Legacy v1 blobs (no digest)
-        // stay loadable, unverified.
+    fn publish_stamps_v2_with_verified_digest_in_whole_mode() {
+        // D1: publish is the single choke point that stamps the format
+        // version + payload digest; load verifies it. Whole mode (the
+        // MLXCACHE_CHUNK_STORE=0 rollback) keeps the v2 layout exactly.
         let dir = tmpdir();
-        let p = Persistence::new(dir.path()).unwrap();
+        let p = Persistence::new_with_mode(dir.path(), ChunkMode::Whole).unwrap();
         let path = p.publish_atomic(0x2, 1, meta(10), b"kv-payload").unwrap();
         let (m, _payload) = p.load(&path).unwrap();
         assert_eq!(m.format_version, 2);
@@ -409,11 +773,55 @@ mod tests {
     }
 
     #[test]
-    fn tampered_payload_is_rejected_by_digest() {
-        // Framing-valid corruption (bit rot, a torn rewrite that kept the
-        // header intact) is exactly what the structural checks cannot catch.
+    fn publish_stamps_v3_chunked_with_verified_digest_by_default() {
+        // The shipped default: the .ckpt is a header-only file, the payload
+        // lives chunked in segments, and load() reassembles + verifies the
+        // SAME digest contract (D1 covers reassembly: corruption anywhere
+        // in segments or manifest yields wrong bytes here).
         let dir = tmpdir();
         let p = Persistence::new(dir.path()).unwrap();
+        let path = p.publish_atomic(0x2, 1, meta(10), b"kv-payload").unwrap();
+        let (m, payload) = p.load(&path).unwrap();
+        assert_eq!(m.format_version, 3);
+        assert_eq!(payload, b"kv-payload");
+        assert_eq!(
+            m.payload_sha256.as_deref(),
+            Some(&format!("{:x}", Sha256::digest(b"kv-payload"))[..])
+        );
+        // The header-only .ckpt carries no payload bytes.
+        assert!(fs::metadata(&path).unwrap().len() < 512);
+    }
+
+    #[test]
+    fn chunked_payload_corruption_in_segment_is_rejected_by_digest() {
+        // The v3 analog of the framing-valid bit-rot test: flip a byte in a
+        // SEGMENT (not the tiny header) and load must retire the blob.
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        let path = p
+            .publish_atomic(0x9, 1, meta(64), &vec![7u8; 4096])
+            .unwrap();
+        // Tamper the first chunk segment record's body byte.
+        let seg = dir.path().join("chunks").join("seg-0000000000.seg");
+        let mut bytes = fs::read(&seg).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&seg, &bytes).unwrap();
+        match p.load(&path) {
+            Err(PersistError::Corrupt { reason }) => {
+                assert!(reason.contains("digest mismatch"), "reason: {reason}");
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tampered_payload_is_rejected_by_digest() {
+        // Framing-valid corruption (bit rot, a torn rewrite that kept the
+        // header intact) is exactly what the structural checks cannot
+        // catch. (Chunked corruption is covered by its own test above.)
+        let dir = tmpdir();
+        let p = Persistence::new_with_mode(dir.path(), ChunkMode::Whole).unwrap();
         let path = p.publish_atomic(0x2, 1, meta(10), b"kv-payload").unwrap();
         let mut bytes = fs::read(&path).unwrap();
         let last = bytes.len() - 1;
@@ -634,5 +1042,86 @@ mod tests {
             }
             other => panic!("expected Corrupt, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod chunk_rollback_tests {
+    use super::tests::{meta, tmpdir};
+    use super::{ChunkMode, Persistence};
+
+    #[test]
+    fn rollback_mode_reads_v3_blobs_instead_of_deleting_them() {
+        // The documented rollback (MLXCACHE_CHUNK_STORE=0) must stop
+        // WRITING v3, never stop READING it: a healthy checkpoint is not
+        // corruption because the operator rolled the writer back, and the
+        // boot rebuild would otherwise quarantine (delete) every v3 blob.
+        let dir = tmpdir();
+        let payload: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+        let chunked = Persistence::new(dir.path()).unwrap();
+        let path = chunked.publish_atomic(0x5, 1, meta(9), &payload).unwrap();
+        drop(chunked);
+        let rolled_back = Persistence::new_with_mode(dir.path(), ChunkMode::Whole).unwrap();
+        let (m, got) = rolled_back.load(&path).expect("rollback must READ v3");
+        assert_eq!(m.format_version, 3);
+        assert_eq!(got, payload);
+        // And it still does not WRITE v3.
+        let path2 = rolled_back
+            .publish_atomic(0x6, 1, meta(9), &payload)
+            .unwrap();
+        let (m2, _) = rolled_back.load(&path2).unwrap();
+        assert_eq!(m2.format_version, 2);
+    }
+
+    #[test]
+    fn undecodable_manifest_never_aborts_boot() {
+        // A corrupt .ckm is BLOB corruption (load() -> Corrupt -> the
+        // rebuild quarantines that one blob), never a store-wide boot
+        // failure.
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i % 249) as u8).collect();
+        let _path = p.publish_atomic(0x7, 1, meta(9), &payload).unwrap();
+        drop(p);
+        let ckm = dir.path().join(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .find(|e| {
+                    e.as_ref()
+                        .map(|e| e.file_name().to_string_lossy().ends_with(".ckm"))
+                        .unwrap_or(false)
+                })
+                .unwrap()
+                .unwrap()
+                .file_name(),
+        );
+        std::fs::write(&ckm, b"MCKM-garbage").unwrap();
+        // Boot must succeed; the blob itself is corrupt on load.
+        let p2 = Persistence::new(dir.path()).expect("boot must tolerate a corrupt manifest");
+        let ckpt: std::path::PathBuf = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().map(|e| e == "ckpt").unwrap_or(false))
+            .unwrap();
+        assert!(p2.load(&ckpt).is_err(), "the blob itself is corrupt");
+    }
+}
+
+#[cfg(test)]
+mod is_chunked_probe {
+    use super::tests::{meta, tmpdir};
+    use super::Persistence;
+
+    #[test]
+    fn is_chunked_blob_is_true_for_v3_and_false_for_v2() {
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i % 247) as u8).collect();
+        let v3 = p.publish_atomic(0xa, 1, meta(9), &payload).unwrap();
+        let p2 = Persistence::new_with_mode(dir.path(), super::ChunkMode::Whole).unwrap();
+        let v2 = p2.publish_atomic(0xb, 1, meta(9), &payload).unwrap();
+        assert!(p.is_chunked_blob(v3.file_name().unwrap().to_str().unwrap()));
+        assert!(!p.is_chunked_blob(v2.file_name().unwrap().to_str().unwrap()));
     }
 }

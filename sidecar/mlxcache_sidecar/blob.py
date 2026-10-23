@@ -14,6 +14,8 @@ FORMAT_VERSION = 1
 # D1 integrity: version 2 adds payload_sha256 (written by the daemon at
 # publish, verified at load). Version 1 blobs predate it and stay readable.
 FORMAT_VERSION_D1 = 2
+#: v3: header-only .ckpt; payload in the chunk store (mlxcache_store.chunks).
+FORMAT_VERSION_CHUNKED = 3
 
 
 @dataclass
@@ -185,13 +187,20 @@ def decode_header(header: bytes) -> CheckpointMeta:
     if meta.payload_sha256 is not None and not isinstance(meta.payload_sha256, str):
         raise HeaderRejected("header", "payload_sha256 must be a string")
     # Version policy mirrors the daemon's load(): 1 = legacy (no digest
-    # field), 2 = current (D1 digest contract; the digest is REQUIRED —
-    # serving a v2 header without one would be unverified). Anything else
-    # is a layout this reader must not interpret.
-    if meta.format_version not in (1, FORMAT_VERSION_D1):
+    # field), 2 = whole-blob (D1 digest contract; the digest is REQUIRED —
+    # serving a v2 header without one would be unverified), 3 = chunked
+    # (header-only .ckpt; the payload lives in the chunk store — the
+    # READER assembles it, see mlxcache_store.chunks). Anything else is a
+    # layout this reader must not interpret.
+    if meta.format_version not in (1, FORMAT_VERSION_D1, FORMAT_VERSION_CHUNKED):
         raise HeaderRejected("version", f"format version {meta.format_version}")
-    if meta.format_version == FORMAT_VERSION_D1 and meta.payload_sha256 is None:
-        raise HeaderRejected("version", "format version 2 requires payload_sha256")
+    if (
+        meta.format_version in (FORMAT_VERSION_D1, FORMAT_VERSION_CHUNKED)
+        and meta.payload_sha256 is None
+    ):
+        raise HeaderRejected(
+            "version", f"format version {meta.format_version} requires payload_sha256"
+        )
     return meta
 
 

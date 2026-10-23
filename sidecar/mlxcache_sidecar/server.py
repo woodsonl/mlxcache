@@ -40,7 +40,7 @@ import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 
 class CheckpointRejectedError(Exception):
@@ -517,6 +517,26 @@ def read_wire_checkpoint(
         raise CheckpointRejectedError(f"blob missing: {blob_path}") from exc
     try:
         meta, payload = decode(raw)
+        # Chunked blob (v3): the payload lives in the chunk store next to
+        # the header-only .ckpt. Reassembly + the same D1 digest check run
+        # HERE, inside the trust boundary — corruption in the manifest or
+        # segments is a rejected checkpoint (422 → quarantine), identical
+        # in taxonomy to a whole-blob digest mismatch.
+        if meta.format_version == 3:
+            from mlxcache_store.chunks import ChunkFormatError, ChunkReader  # noqa: PLC0415
+
+            try:
+                # The reader wants the blob DIRECTORY (segments live beside
+                # the header-only .ckpt), not the blob path itself.
+                payload = ChunkReader(Path(blob_path).parent).read_payload(
+                    blob_path, meta.payload_sha256
+                )
+            except (ChunkFormatError, FileNotFoundError) as exc:
+                # FileNotFoundError: a segment vanished mid-read (eviction GC
+                # racing this adopt) — the blob is gone either way, retire
+                # it. Other OSErrors (EMFILE, EIO) are TRANSIENT: rejecting
+                # would quarantine a healthy checkpoint.
+                raise CheckpointRejectedError(str(exc)) from exc
         # The JSON header is untrusted: a field of the wrong type (e.g.
         # "tokens":123) must be rejected here, inside the boundary. Letting
         # len() raise a bare TypeError outside it would 500 forever and leave
