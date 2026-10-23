@@ -59,6 +59,7 @@ import io
 import itertools
 import json
 import os
+import resource
 import statistics
 import subprocess
 import sys
@@ -170,6 +171,7 @@ def measure_one(model_id: str, size: int, decode_steps: int) -> dict[str, float]
         "blob_bytes": len(payload),
         "swap_before_mb": before["swap_used_mb"],
         "swap_after_mb": machine_state()["swap_used_mb"],
+        "peak_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576, 1),
     }
     del cache, logits, blob, payload
     gc.collect()
@@ -310,20 +312,28 @@ def repeatability_failure(control_rows: list[dict], tolerance: float) -> str | N
     return None
 
 
-def swap_failures(rows: list[dict], limit_mb: float = 256.0) -> list[str]:
-    """Growth only: paging LIVE WEIGHTS out while the clock runs is the
-    proven contamination mode (a streamed-engine era run measured 3.5x its
-    neighbor's step time while swap grew). Decreases are not flagged —
-    paging already-freed pages back in has no observed latency effect (the
-    32K row agreed 2.3% across runs that saw +2.8 GB out and -1.1 GB in) —
-    so the guard states its scope instead of pretending symmetry."""
+def swap_failures(rows: list[dict], base_limit_mb: float = 256.0) -> list[str]:
+    """Growth beyond half the row's own high-water memory is the refusal
+    signal; growth within it is the arriving working set displacing idle
+    pages and is not.
+
+    Four calibration runs earned this boundary: the 32K row's prefill held
+    a 5.4% span across swap deltas of +2.8 GB, -1.1 GB, +12.3 GB, and
+    +1.1 GB — the arriving row brings ~8 GB (weights + KV + allocator) and
+    displaces up to about that much, harmlessly. What the guard exists for
+    is the streamed-engine failure mode: swap growth while live weights
+    thrash, which lands FAR beyond the row's own footprint (a 3.5x
+    step-time blowup in the era that motivated this check). The half
+    factor is the conservative side of the boundary: prefer refusing."""
     failures = []
     for row in rows:
         grew = row["swap_after_mb"] - row["swap_before_mb"]
-        if grew > limit_mb:
+        limit = max(base_limit_mb, (row.get("peak_rss_mb") or 0.0) / 2)
+        if grew > limit:
             failures.append(
-                f"swap grew {grew:.0f} MB during the {row['tokens']}-token row: the "
-                "weights were being paged while the clock ran."
+                f"swap grew {grew:.0f} MB during the {row['tokens']}-token row, beyond "
+                f"half the row's own {row.get('peak_rss_mb', 0):.0f} MB footprint: the "
+                "machine was thrashing while the clock ran."
             )
     return failures
 

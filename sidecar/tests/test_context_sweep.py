@@ -132,14 +132,49 @@ def test_repeatability_beyond_tolerance_fails():
     assert "cannot resolve" in failure
 
 
-def test_swap_growth_over_the_limit_fails():
+def test_swap_growth_beyond_the_rows_own_footprint_fails():
+    # Run 3's signature: 12.3 GB grew under an ~8 GB row — machine thrash,
+    # beyond any arrival-displacement story, refuses.
     rows = [
-        {"tokens": 8192, "swap_before_mb": 0.0, "swap_after_mb": 512.0},
-        {"tokens": 256, "swap_before_mb": 512.0, "swap_after_mb": 512.0},
+        {
+            "tokens": 32768,
+            "swap_before_mb": 0.0,
+            "swap_after_mb": 12329.0,
+            "peak_rss_mb": 8000.0,
+        }
     ]
     failures = context_sweep.swap_failures(rows)
     assert len(failures) == 1
-    assert "8192" in failures[0]
+    assert "thrashing" in failures[0]
+
+
+def test_swap_growth_within_the_rows_own_footprint_passes():
+    # Run 4's signature: 1.1 GB grew as the ~8 GB working set arrived and
+    # displaced idle pages; the row's prefill sat on the four-run curve.
+    rows = [
+        {
+            "tokens": 32768,
+            "swap_before_mb": 0.0,
+            "swap_after_mb": 1100.0,
+            "peak_rss_mb": 8000.0,
+        }
+    ]
+    assert context_sweep.swap_failures(rows) == []
+
+
+def test_small_rows_stay_tight():
+    # A small row's footprint is small, so the base limit binds: growth of
+    # 300 MB on a 400 MB row (limit = max(256, 200) = 256) still refuses.
+    rows = [
+        {
+            "tokens": 256,
+            "swap_before_mb": 0.0,
+            "swap_after_mb": 300.0,
+            "peak_rss_mb": 400.0,
+        }
+    ]
+    failures = context_sweep.swap_failures(rows)
+    assert len(failures) == 1
 
 
 def test_validate_row_rejects_wrong_size_and_missing_swap():
