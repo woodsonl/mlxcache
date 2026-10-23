@@ -203,6 +203,11 @@ class Store:
                 return read_payload_v3(self.dir, path, meta.payload_sha256)
             except ChunkFormatError as exc:
                 raise CorruptCache("chunk", f"{ref}: {exc}") from exc
+            except OSError as exc:
+                # Transient (EMFILE, EIO): the blob is healthy, this read
+                # cannot happen right now — the store's unavailable signal,
+                # never corruption.
+                raise Unavailable(f"{ref}: {exc}") from exc
         if meta.payload_sha256 is None:
             return payload  # v1 legacy: readable, never verified (§5)
         if hashlib.sha256(payload).hexdigest() != meta.payload_sha256:

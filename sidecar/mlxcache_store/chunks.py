@@ -147,6 +147,12 @@ class ChunkReader:
         if not chunks_dir.is_dir():
             return {}
         cache = _SEGMENT_CACHE.setdefault(self.dir, {})
+        # Purge cached segments that no longer exist (GC deleted them);
+        # otherwise their digests keep shadowing live placements forever.
+        live_names = {seg.name for seg in chunks_dir.glob("seg-*.seg")}
+        for name in list(cache):
+            if name not in live_names:
+                del cache[name]
         # Pass 1: refresh each segment's digest list (incremental for
         # growth, full rescan for shrink/replace, skip for vanish).
         for seg in sorted(chunks_dir.glob("seg-*.seg")):

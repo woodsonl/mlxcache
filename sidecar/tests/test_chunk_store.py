@@ -37,11 +37,13 @@ def _wire_header(meta: dict) -> bytes:
     return struct.pack("<I", len(header)) + header
 
 
-@pytest.fixture(scope="module")
-def fixture_store(tmp_path_factory):
+@pytest.fixture()
+def fixture_store(tmp_path):
+    """Function-scoped: the tamper test MUTATES its copy, and a
+    module-scoped fixture made results depend on test order."""
     if not FIXTURE.is_dir():
         pytest.skip("chunk-store fixture not built (cargo chunkstore::fixture_dump)")
-    dst = tmp_path_factory.mktemp("chunk-store")
+    dst = tmp_path / "chunk-store"
     shutil.copytree(FIXTURE, dst, dirs_exist_ok=True)
     return dst
 
