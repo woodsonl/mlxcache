@@ -344,8 +344,10 @@ impl Persistence {
         // Build the header FIRST: after staging+registration every failure
         // must be an I/O error path that unregisters, and serde/len checks
         // are not — so they run before anything is registered.
+        // payload_sha256 was stamped by the caller (publish_from_staged)
+        // over the same slice; re-hashing GB payloads per publish is pure
+        // cost. Only the version changes here.
         meta.format_version = 3;
-        meta.payload_sha256 = Some(format!("{:x}", Sha256::digest(payload)));
         let header = serde_json::to_vec(&meta).map_err(|e| PersistError::Corrupt {
             reason: format!("meta serialize: {e}"),
         })?;
@@ -609,7 +611,11 @@ impl Persistence {
         if f.read_exact(&mut header).is_err() {
             return false;
         }
-        crate::chunkstore::peek_meta(&header)
+        // peek_meta parses `u32 length + JSON`; rebuild the prefix in front
+        // of the JSON bytes we read.
+        let mut prefixed = len_bytes.to_vec();
+        prefixed.extend_from_slice(&header);
+        crate::chunkstore::peek_meta(&prefixed)
             .map(|m| m.format_version == 3)
             .unwrap_or(false)
     }
@@ -1099,5 +1105,23 @@ mod chunk_rollback_tests {
             .find(|p| p.extension().map(|e| e == "ckpt").unwrap_or(false))
             .unwrap();
         assert!(p2.load(&ckpt).is_err(), "the blob itself is corrupt");
+    }
+}
+
+#[cfg(test)]
+mod is_chunked_probe {
+    use super::tests::{meta, tmpdir};
+    use super::Persistence;
+
+    #[test]
+    fn is_chunked_blob_is_true_for_v3_and_false_for_v2() {
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i % 247) as u8).collect();
+        let v3 = p.publish_atomic(0xa, 1, meta(9), &payload).unwrap();
+        let p2 = Persistence::new_with_mode(dir.path(), super::ChunkMode::Whole).unwrap();
+        let v2 = p2.publish_atomic(0xb, 1, meta(9), &payload).unwrap();
+        assert!(p.is_chunked_blob(v3.file_name().unwrap().to_str().unwrap()));
+        assert!(!p.is_chunked_blob(v2.file_name().unwrap().to_str().unwrap()));
     }
 }

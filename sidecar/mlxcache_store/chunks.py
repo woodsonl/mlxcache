@@ -116,12 +116,16 @@ class Manifest:
         return cls(payload_len, chunks)
 
 
-_INDEX_CACHE: dict[Path, tuple[tuple, dict[bytes, tuple[str, int, int]]]] = {}
-"""dir -> (segment (name, size) signature, digest -> (seg, offset, len)).
+_SEGMENT_CACHE: dict[Path, dict[str, tuple[int, dict[bytes, tuple[int, int]]]]] = {}
+"""dir -> {segment name -> (scanned size, {digest -> (offset, body_len)})}.
 
-Per-directory, process-lifetime cache. The signature is the sorted
-(name, size) pairs of the segment files — appends change a size, GC/rolls
-change the set — so concurrent writers invalidate it correctly.
+Per-segment, process-lifetime cache with INCREMENTAL tail scans: a segment
+that only grew since the last scan contributes only its new records (the
+daemon appends on every publish, so a whole-store signature would re-read
+every segment after every publication); a shrunk or replaced segment
+rescans from zero; a vanished segment is skipped (the reassembler reports
+genuinely missing chunks). Reads walk each segment ONCE with pread-style
+seeks — no whole-segment loads.
 """
 
 
@@ -142,37 +146,68 @@ class ChunkReader:
         chunks_dir = self.dir / "chunks"
         if not chunks_dir.is_dir():
             return {}
-        sig = tuple(
-            sorted(
-                (seg.name, seg.stat().st_size)
-                for seg in chunks_dir.glob("seg-*.seg")
-                if seg.is_file()
-            )
-        )
-        cached = _INDEX_CACHE.get(self.dir)
-        if cached is not None and cached[0] == sig:
-            return cached[1]
-        placement: dict[bytes, tuple[str, int, int]] = {}
+        cache = _SEGMENT_CACHE.setdefault(self.dir, {})
+        # Pass 1: refresh each segment's digest list (incremental for
+        # growth, full rescan for shrink/replace, skip for vanish).
         for seg in sorted(chunks_dir.glob("seg-*.seg")):
-            data = seg.read_bytes()
-            if len(data) < _HEADER_BYTES or data[0:4] != SEGMENT_MAGIC:
-                # A crash between create and header-write strands a short
-                # file; a foreign file is not ours. Both are skipped: the
-                # manifest digest check stays the correctness guard.
+            try:
+                size = seg.stat().st_size
+                with open(seg, "rb") as fh:
+                    header = fh.read(_HEADER_BYTES)
+                    if len(header) < _HEADER_BYTES or header[0:4] != SEGMENT_MAGIC:
+                        # Crash artifact (short file) or foreign file: no
+                        # records; the manifest digest check stays the
+                        # correctness guard.
+                        cache.pop(seg.name, None)
+                        continue
+                    version = struct.unpack_from("<H", header, 4)[0]
+                    if version != FORMAT_VERSION:
+                        raise ChunkFormatError(f"{seg.name}: segment version {version}")
+                    cached = cache.get(seg.name)
+                    if cached is not None and cached[0] == size:
+                        continue  # unchanged: nothing to do
+                    start_offset = (
+                        _HEADER_BYTES if cached is None or cached[0] > size else cached[0]
+                    )
+                    digests = [] if cached is None or cached[0] > size else list(cached[1])
+                    fh.seek(start_offset)
+                    at = start_offset
+                    while True:
+                        rec = fh.read(_RECORD_HEADER.size)
+                        if len(rec) < _RECORD_HEADER.size:
+                            break  # truncated tail: dead bytes, stop cleanly
+                        body_len, digest = _RECORD_HEADER.unpack(rec)
+                        body_start = at + _RECORD_HEADER.size
+                        if body_start + body_len > size:
+                            break
+                        digests.append(digest)
+                        at = body_start + body_len
+                        fh.seek(body_start + body_len)
+                    cache[seg.name] = (size, digests)
+            except FileNotFoundError:
+                # Deleted by GC between glob and open: skip. A genuinely
+                # missing chunk surfaces in reassemble.
+                cache.pop(seg.name, None)
                 continue
-            version = struct.unpack_from("<H", data, 4)[0]
-            if version != FORMAT_VERSION:
-                raise ChunkFormatError(f"{seg.name}: segment version {version}")
+        # Pass 2: derive digest -> placement from the cached digests. The
+        # placement offsets are implied by the record layout: walk each
+        # segment's digests reconstructing offsets.
+        placement: dict[bytes, tuple[str, int, int]] = {}
+        for name, (_size, digests) in sorted(cache.items()):
             at = _HEADER_BYTES
-            while at + _RECORD_HEADER.size <= len(data):
-                body_len, digest = _RECORD_HEADER.unpack_from(data, at)
+            for digest in digests:
                 body_start = at + _RECORD_HEADER.size
-                body_end = body_start + body_len
-                if body_end > len(data):
-                    break  # truncated tail: dead bytes, stop cleanly
-                placement.setdefault(digest, (seg.name, body_start, body_len))
-                at = body_end
-        _INDEX_CACHE[self.dir] = (sig, placement)
+                body_len = None
+                # body length is not cached; re-read just the 4-byte header
+                # of each record to recover offsets exactly.
+                with open(chunks_dir / name, "rb") as fh:
+                    fh.seek(at)
+                    raw = fh.read(4)
+                    if len(raw) < 4:
+                        break
+                    body_len = struct.unpack("<I", raw)[0]
+                placement.setdefault(digest, (name, body_start, body_len))
+                at = body_start + body_len
         return placement
 
     @property
