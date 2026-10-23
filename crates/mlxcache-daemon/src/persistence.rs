@@ -672,6 +672,56 @@ impl Persistence {
             .unwrap_or(0)
     }
 
+    /// Compact fragmented segments (threshold-gated). Env knobs:
+    /// MLXCACHE_COMPACT=0 disables; MLXCACHE_COMPACT_RATIO (default 0.5 —
+    /// compact when at least half a segment's record bytes are dead);
+    /// MLXCACHE_COMPACT_MIN_BYTES (default 16 MiB — do not churn small
+    /// segments); MLXCACHE_COMPACT_MAX_SEGMENTS (default 2 per pass, the
+    /// reaper-cadence pacing). Returns (segments, bytes reclaimed).
+    pub fn compact_chunked(&self) -> (usize, u64) {
+        let Some(store) = self.chunk_store.as_ref() else {
+            return (0, 0);
+        };
+        if matches!(
+            std::env::var("MLXCACHE_COMPACT").as_deref(),
+            Ok("0") | Ok("false")
+        ) {
+            return (0, 0);
+        }
+        let ratio = std::env::var("MLXCACHE_COMPACT_RATIO")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.5);
+        let min_dead = std::env::var("MLXCACHE_COMPACT_MIN_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(16 << 20);
+        let max_segments = std::env::var("MLXCACHE_COMPACT_MAX_SEGMENTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+        match store.compact_segments(ratio, min_dead, max_segments) {
+            Ok((0, _)) => (0, 0),
+            Ok((segments, bytes)) => {
+                tracing::info!(segments, bytes, "segment compaction reclaimed dead bytes");
+                (segments, bytes)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "segment compaction pass failed");
+                (0, 0)
+            }
+        }
+    }
+
+    /// Fragmentation accounting for /stats: (total record bytes, dead record
+    /// bytes, partially-dead segment count). Zeroes in whole-blob mode.
+    pub fn chunked_fragmentation(&self) -> (u64, u64, usize) {
+        self.chunk_store
+            .as_ref()
+            .map(|s| s.fragmentation())
+            .unwrap_or((0, 0, 0))
+    }
+
     /// One blob's eviction-budget footprint. v1/v2: the file's size. v3:
     /// the manifest's gross chunk bytes (shared chunks count once per
     /// referencing blob, which is what eviction ordering wants — evicting
@@ -1144,6 +1194,55 @@ mod is_chunked_probe {
         let v2 = p2.publish_atomic(0xb, 1, meta(9), &payload).unwrap();
         assert!(p.is_chunked_blob(v3.file_name().unwrap().to_str().unwrap()));
         assert!(!p.is_chunked_blob(v2.file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    fn compact_chunked_sweep_and_env_knobs() {
+        // Three v3 blobs in one segment; retiring one leaves dead bytes the
+        // empty-segment GC cannot touch (the segment still has live
+        // records). The env-gated persistence sweep must rewrite it and
+        // keep the survivors loadable.
+        let dir = tmpdir();
+        let mut keep = Vec::new();
+        {
+            let p = Persistence::new(dir.path()).unwrap();
+            for (hash, seed) in [(0x11u128, 1u8), (0x12, 2), (0x13, 3)] {
+                let path = p
+                    .publish_atomic(hash, 1, meta(64), &vec![seed; 4096])
+                    .unwrap();
+                keep.push((path, seed));
+            }
+            let (victim, _) = keep.pop().unwrap();
+            let name = victim.file_name().unwrap().to_string_lossy().into_owned();
+            p.remove(&name).unwrap();
+        }
+        // Reopen: the segment is sealed and refs re-derive from live pairs.
+        let p = Persistence::new(dir.path()).unwrap();
+        let (_, dead, partial) = p.chunked_fragmentation();
+        assert!(dead > 0, "the retired blob's chunks are dead: {dead}");
+        assert_eq!(partial, 1);
+        // MLXCACHE_COMPACT=0 disables outright.
+        unsafe { std::env::set_var("MLXCACHE_COMPACT", "0") };
+        assert_eq!(p.compact_chunked(), (0, 0));
+        unsafe { std::env::remove_var("MLXCACHE_COMPACT") };
+        // Defaults (ratio 0.5, floor 16 MiB) sit above this tiny dead set:
+        // the sweep must no-op without test-scale knobs.
+        assert_eq!(p.compact_chunked(), (0, 0));
+        unsafe { std::env::set_var("MLXCACHE_COMPACT_RATIO", "0.0") };
+        unsafe { std::env::set_var("MLXCACHE_COMPACT_MIN_BYTES", "1") };
+        let (n, reclaimed) = p.compact_chunked();
+        unsafe { std::env::remove_var("MLXCACHE_COMPACT_RATIO") };
+        unsafe { std::env::remove_var("MLXCACHE_COMPACT_MIN_BYTES") };
+        assert_eq!(n, 1);
+        assert!(reclaimed > 0);
+        let (_, dead2, _) = p.chunked_fragmentation();
+        assert_eq!(dead2, 0, "the rewrite leaves no dead records");
+        // Survivors load through the swapped placements, digest-verified.
+        for (path, seed) in &keep {
+            let (m, payload) = p.load(path).unwrap();
+            assert_eq!(m.format_version, 3);
+            assert_eq!(payload, vec![*seed; 4096]);
+        }
     }
 }
 

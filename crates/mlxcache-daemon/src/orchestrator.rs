@@ -353,6 +353,7 @@ impl Orchestrator {
         // all-dead segments that hold the budget up with no candidate able
         // to fix it.
         persistence.gc_chunked();
+        persistence.compact_chunked();
         let total_bytes: u64 = persistence.store_physical_bytes();
         // Entry-cap semantics at the PASS level: `max_entries` is a hard cap,
         // 0 = allow zero published entries (evict everything evictable). The

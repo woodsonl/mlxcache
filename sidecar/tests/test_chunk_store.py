@@ -24,6 +24,9 @@ from pathlib import Path
 import pytest
 from mlxcache_sidecar import blob
 from mlxcache_store.chunks import (
+    FORMAT_VERSION,
+    MANIFEST_MAGIC,
+    SEGMENT_MAGIC,
     ChunkFormatError,
     ChunkReader,
     Manifest,
@@ -133,3 +136,76 @@ def test_reader_tolerates_missing_chunks_dir(tmp_path):
     """An empty/absent chunk store is legitimate (no chunked blobs yet)."""
     reader = ChunkReader(tmp_path)
     assert reader.placement == {}
+
+
+def test_duplicate_digests_resolve_to_the_newest_segment(tmp_path):
+    """A compaction crash can strand one digest in TWO segments (the
+    rewrite durable, the old file not yet deleted). The reader must
+    resolve to the NEWEST copy — the same order as the Rust boot scan —
+    so the old segment counts as fully dead and reclaims. A
+    lowest-seq-wins reader would pin the stale file forever."""
+    body = bytes(range(64))
+    digest = hashlib.sha256(body).digest()
+    record = struct.pack("<I32s", len(body), digest) + body
+    header = SEGMENT_MAGIC + struct.pack("<H", FORMAT_VERSION) + b"\x00\x00"
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir()
+    (chunks_dir / "seg-0000000000.seg").write_bytes(header + record)  # stale copy
+    (chunks_dir / "seg-0000000001.seg").write_bytes(header + record)  # the rewrite
+    ckm = struct.pack("<4sHQQ", MANIFEST_MAGIC, FORMAT_VERSION, len(body), 1) + struct.pack(
+        "<32sIIQQ", digest, len(body), 1, 0, 0
+    )
+    (tmp_path / "aa.ckm").write_bytes(ckm)
+    meta = {
+        "fingerprint": {
+            "model_id": "m",
+            "tokenizer_hash": "h",
+            "kv_dtype": "f16",
+            "kv_layout_version": 1,
+        },
+        "token_count": 4,
+        "tokens": [1, 2, 3, 4],
+        "format_version": 3,
+        "payload_sha256": hashlib.sha256(body).hexdigest(),
+    }
+    ckpt = tmp_path / "aa.ckpt"
+    ckpt.write_bytes(_wire_header(meta))
+    reader = ChunkReader(tmp_path)
+    name, offset, body_len = reader.placement[digest]
+    assert name == "seg-0000000001.seg", "the newest segment wins a shared digest"
+    assert (offset, body_len) == (8 + 36, len(body))
+    assert reader.read_payload(ckpt, meta["payload_sha256"]) == body
+
+
+def test_reassemble_rescans_when_a_segment_vanishes_mid_read(tmp_path, monkeypatch):
+    """A compaction sweep can delete a segment after this reader scanned
+    placements but before it opened the file. The read must rescan and
+    land on the surviving copy, not surface FileNotFoundError."""
+    body = bytes(range(64))
+    digest = hashlib.sha256(body).digest()
+    record = struct.pack("<I32s", len(body), digest) + body
+    header = SEGMENT_MAGIC + struct.pack("<H", FORMAT_VERSION) + b"\x00\x00"
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir()
+    (chunks_dir / "seg-0000000000.seg").write_bytes(header + record)
+    ckm = struct.pack("<4sHQQ", MANIFEST_MAGIC, FORMAT_VERSION, len(body), 1) + struct.pack(
+        "<32sIIQQ", digest, len(body), 1, 0, 0
+    )
+    (tmp_path / "aa.ckm").write_bytes(ckm)
+    sha = hashlib.sha256(body).hexdigest()
+    (tmp_path / "aa.ckpt").write_bytes(_wire_header({"format_version": 3, "payload_sha256": sha}))
+
+    calls = {"n": 0}
+    real_scan = ChunkReader._scan_segments
+
+    def stale_then_fresh(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The pre-sweep snapshot: placements point at a segment the
+            # sweep is about to delete (no such file on disk).
+            return {digest: ("seg-0000000009.seg", 8 + 36, len(body))}
+        return real_scan(self)
+
+    monkeypatch.setattr(ChunkReader, "_scan_segments", stale_then_fresh)
+    assert ChunkReader(tmp_path).read_payload(tmp_path / "aa.ckpt", sha) == body
+    assert calls["n"] == 2, "exactly one rescan, then success"

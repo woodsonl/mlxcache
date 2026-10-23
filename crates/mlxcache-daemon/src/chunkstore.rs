@@ -493,11 +493,23 @@ impl ChunkStore {
             seqs.push(seq);
         }
         seqs.sort_unstable();
+        // Scan HIGHEST seq first, so the first-wins placement rule keeps
+        // the NEWEST copy of a duplicate digest. Duplicates only arise from
+        // a compaction crash (new segment fsynced, old not yet deleted);
+        // resolving to the newest makes that crash self-healing, and the
+        // losing record is accounted dead on its segment right here.
         let mut inner = self.inner.lock().unwrap();
-        for seq in seqs {
+        for seq in seqs.into_iter().rev() {
             let path = self.segment_path(seq);
             let bytes = fs::read(&path)?;
             if bytes.len() < 8 || &bytes[0..4] != SEGMENT_MAGIC {
+                if bytes.len() < 8 {
+                    // A crash between File::create and the header write
+                    // strands a 0/partial-byte segment: a crash artifact,
+                    // reclaimed here, never a boot failure.
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
                 return Err(ChunkError::Corrupt(format!(
                     "segment {seq} bad magic (not a chunk segment?)"
                 )));
@@ -510,6 +522,7 @@ impl ChunkStore {
             }
             let mut at = 8usize;
             let mut total = 0u64;
+            let mut lost_duplicates = 0u64;
             while at + 4 + 32 <= bytes.len() {
                 let body_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as u64;
                 let rec_start = at as u64 + 4 + 32;
@@ -520,18 +533,33 @@ impl ChunkStore {
                 }
                 let mut digest = [0u8; 32];
                 digest.copy_from_slice(&bytes[at + 4..at + 4 + 32]);
-                // First record for a digest wins placement; a duplicate
-                // record (should not happen under the append mutex) still
-                // counts its bytes but never overrides.
-                inner.placement.entry(digest).or_insert(Placement {
-                    seg: seq,
-                    offset: rec_start,
-                    len: body_len,
-                });
+                // First record for a digest wins placement (scanning
+                // newest-first, that is the newest copy). A duplicate
+                // record — only a compaction-crash artifact — never
+                // overrides; its bytes are dead on THIS segment from the
+                // moment the scan sees it.
+                match inner.placement.entry(digest) {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        lost_duplicates += 4 + 32 + body_len;
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(Placement {
+                            seg: seq,
+                            offset: rec_start,
+                            len: body_len,
+                        });
+                    }
+                }
                 total += 4 + 32 + body_len;
                 at = rec_end as usize;
             }
-            inner.segments.insert(seq, SegmentStat { total, dead: 0 });
+            inner.segments.insert(
+                seq,
+                SegmentStat {
+                    total,
+                    dead: lost_duplicates,
+                },
+            );
         }
         Ok(())
     }
@@ -834,17 +862,193 @@ impl ChunkStore {
         total
     }
 
+    /// Fragmentation accounting for /stats and the compaction trigger:
+    /// (total record bytes incl. headers, dead record bytes, count of
+    /// partially-dead segments). All from the in-memory map, which boot
+    /// re-derives from disk.
+    pub fn fragmentation(&self) -> (u64, u64, usize) {
+        let inner = self.inner.lock().unwrap();
+        let total: u64 = inner.segments.values().map(|s| s.total).sum();
+        let dead: u64 = inner.segments.values().map(|s| s.dead).sum();
+        let partial = inner
+            .segments
+            .values()
+            .filter(|s| s.dead > 0 && s.live() > 0)
+            .count();
+        (total, dead, partial)
+    }
+
+    /// Rewrite fragmented segments: copy each candidate's LIVE records into
+    /// a fresh segment, swap placements, delete the old file. Dead bytes
+    /// trapped between live records leave the store; the budget recount
+    /// that follows a sweep sees the truth.
+    ///
+    /// Thresholds: a segment is a candidate when `dead >= min_dead_bytes`
+    /// AND `dead / total >= ratio` AND it has live records (all-dead is
+    /// `gc_empty_segments`' job) AND it is not the active append target.
+    /// At most `max_segments` per call — the copy runs under the store
+    /// lock (single lock discipline: nothing else moves placements), so a
+    /// sweep is bounded I/O (~30 ms per 64 MiB segment at disk speed), and
+    /// the reaper cadence paces the rest.
+    ///
+    /// Crash safety, the whole point of the resolution order: the new
+    /// segment is fsynced BEFORE anything in memory moves, and the old
+    /// file is deleted AFTER placements swap. A crash between the two
+    /// leaves both files on disk; the boot scan (highest-seq first-wins)
+    /// resolves every digest to the new segment, and the orphaned records
+    /// in the old one are accounted dead at scan time — boot GC then
+    /// deletes the old file. No rename dance, no journal.
+    pub fn compact_segments(
+        &self,
+        ratio: f64,
+        min_dead_bytes: u64,
+        max_segments: usize,
+    ) -> Result<(usize, u64), ChunkError> {
+        if !(0.0..=1.0).contains(&ratio) {
+            return Err(ChunkError::Corrupt(format!(
+                "compaction ratio {ratio} outside 0..=1"
+            )));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let active_seq = inner.active.as_ref().map(|a| a.seq);
+        // Candidates: fragmented, not active, has live records. Worst
+        // (most dead bytes) first.
+        let mut candidates: Vec<(u64, u64)> = inner
+            .segments
+            .iter()
+            .filter(|(seq, s)| {
+                Some(**seq) != active_seq
+                    && s.dead >= min_dead_bytes
+                    && s.dead > 0
+                    && s.live() > 0
+                    && (s.dead as f64) >= ratio * (s.total as f64)
+            })
+            .map(|(seq, s)| (*seq, s.dead))
+            .collect();
+        candidates.sort_by_key(|&(_, dead)| std::cmp::Reverse(dead));
+        candidates.truncate(max_segments);
+
+        let mut compacted = 0usize;
+        let mut reclaimed = 0u64;
+        for (old_seq, _dead) in candidates {
+            // Live records in this segment: referenced AND placed here.
+            let mut live: Vec<([u8; 32], Placement)> = inner
+                .placement
+                .iter()
+                .filter(|(digest, p)| p.seg == old_seq && inner.refs.contains_key(*digest))
+                .map(|(digest, p)| (*digest, *p))
+                .collect();
+            live.sort_by_key(|(_, p)| p.offset);
+            if live.is_empty() {
+                continue; // refs dropped to zero since candidacy: GC's job now
+            }
+            // Read the live bodies from the old file (under the lock: refs
+            // and placements cannot move while held).
+            let old_path = self.segment_path(old_seq);
+            let old_file = match fs::File::open(&old_path) {
+                Ok(f) => f,
+                // Only external interference can do this (GC needs the
+                // lock this pass holds). Skip; the next pass reconciles.
+                Err(_) => continue,
+            };
+            // Write the new segment: header + live records, fsynced.
+            let new_seq = inner.next_seg;
+            inner.next_seg += 1;
+            let new_path = self.segment_path(new_seq);
+            let write = (|| -> std::io::Result<u64> {
+                use std::os::unix::fs::FileExt as _;
+                fs::create_dir_all(&self.segments_dir)?;
+                let mut file = fs::File::create(&new_path)?;
+                let mut head = Vec::with_capacity(8);
+                head.extend_from_slice(SEGMENT_MAGIC);
+                head.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+                head.extend_from_slice(&[0u8; 2]);
+                file.write_all(&head)?;
+                let mut written = 8u64;
+                for (digest, p) in &live {
+                    let mut body = vec![0u8; p.len as usize];
+                    old_file.read_exact_at(&mut body, p.offset)?;
+                    file.write_all(&(p.len as u32).to_le_bytes())?;
+                    file.write_all(digest)?;
+                    file.write_all(&body)?;
+                    written += 36 + p.len;
+                }
+                file.sync_all()?;
+                Ok(written)
+            })();
+            match write {
+                Ok(written) => {
+                    // Durable: swap placements, replace the stat, drop the
+                    // old file. Records were written packed from offset 8 in
+                    // `live` (offset-sorted) order. Chunks whose refs hit
+                    // zero between candidacy and here were filtered out of
+                    // `live` — they stay only in the old segment and leave
+                    // with it.
+                    let mut off = 8u64;
+                    for (digest, p) in &live {
+                        inner.placement.insert(
+                            *digest,
+                            // Body offset, same convention as the append
+                            // path and the boot scan: 4-byte length + 32-
+                            // byte digest precede the body.
+                            Placement {
+                                seg: new_seq,
+                                offset: off + 36,
+                                len: p.len,
+                            },
+                        );
+                        off += 36 + p.len;
+                    }
+                    let old_stat = inner.segments.remove(&old_seq).map(|s| s.total);
+                    // Records only (header excluded): SegmentStat counts
+                    // exactly what a boot scan of this file would count.
+                    let record_bytes = written - 8;
+                    inner.segments.insert(
+                        new_seq,
+                        SegmentStat {
+                            total: record_bytes,
+                            dead: 0,
+                        },
+                    );
+                    if let Some(old_total) = old_stat {
+                        reclaimed += old_total.saturating_sub(record_bytes);
+                    }
+                    inner.placement.retain(|_, p| p.seg != old_seq);
+                    let _ = fs::remove_file(&old_path);
+                    compacted += 1;
+                }
+                Err(e) => {
+                    // The new file is garbage (partial write): remove it and
+                    // skip this candidate — placements were never moved, so
+                    // the old segment still serves every read. Retry next sweep.
+                    let _ = fs::remove_file(&new_path);
+                    inner.next_seg -= 1; // the seq was never used durably
+                    tracing::warn!(
+                        segment = old_seq,
+                        error = %e,
+                        "segment compaction skipped: write failed, old segment untouched"
+                    );
+                }
+            }
+        }
+        Ok((compacted, reclaimed))
+    }
+
     /// Reassemble a payload from its manifest. Byte-exact by construction;
     /// the caller verifies the payload sha256 against the header (the D1
     /// digest contract covers reassembly: any segment/manifest corruption
     /// produces wrong bytes, not a wrong verdict).
     pub fn reassemble(&self, manifest: &Manifest) -> Result<Vec<u8>, ChunkError> {
-        // Snapshot placements under the lock, then do file IO without it:
-        // a reassembly holds hundreds of MB; publishers must not queue
-        // behind a reader's preads.
-        let placements: Vec<Placement> = {
+        // Snapshot placements AND open the segment files under the same
+        // lock, then do the reads without it: a reassembly holds hundreds
+        // of MB; publishers must not queue behind a reader's preads.
+        // Opening here is what makes a compaction sweep safe to race: the
+        // sweep swaps placements and deletes the old file under this same
+        // lock, so this snapshot pairs every placement with a file that
+        // exists, and an fd stays readable after its file unlinks.
+        let (placements, mut open_files) = {
             let inner = self.inner.lock().unwrap();
-            manifest
+            let placements: Vec<Placement> = manifest
                 .chunks
                 .iter()
                 .map(|c| {
@@ -855,14 +1059,27 @@ impl ChunkStore {
                         ))
                     })
                 })
-                .collect::<Result<_, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut files: HashMap<u64, fs::File> = HashMap::new();
+            for p in &placements {
+                if files.contains_key(&p.seg) {
+                    continue;
+                }
+                // A placement with no file on disk is real corruption
+                // (nothing under this lock may delete a LIVE chunk's
+                // segment) — an error verdict, never a panic.
+                let f = fs::File::open(self.segment_path(p.seg)).map_err(|_| {
+                    ChunkError::Corrupt(format!("segment {} missing under a live placement", p.seg))
+                })?;
+                files.insert(p.seg, f);
+            }
+            (placements, files)
         };
         let mut out = vec![0u8; manifest.payload_len as usize];
-        let mut open_files: HashMap<u64, fs::File> = HashMap::new();
         for (c, p) in manifest.chunks.iter().zip(placements.iter()) {
-            let file = open_files.entry(p.seg).or_insert_with(|| {
-                fs::File::open(self.segment_path(p.seg)).expect("segment exists (scanned at open)")
-            });
+            let file = open_files
+                .get_mut(&p.seg)
+                .expect("opened under the placement lock");
             let mut body = vec![0u8; p.len as usize];
             std::os::unix::fs::FileExt::read_exact_at(file, &mut body, p.offset)?;
             for h in 0..c.n_heads as u64 {
@@ -1094,6 +1311,195 @@ mod tests {
             0,
             "all-dead (no live .ckpt) segment reclaims at boot; the truncated tail never errors"
         );
+    }
+
+    /// A live v3 blob pair on disk (header-only .ckpt + .ckm): exactly what
+    /// the boot scan's `live_blobs` expects, without dragging the whole
+    /// publish path into the store-level tests.
+    fn write_live_v3(dir: &Path, name: &str, manifest: &Manifest) -> PathBuf {
+        use mlxcache_core::contract::ModelFingerprint;
+        let meta = CheckpointMeta {
+            fingerprint: ModelFingerprint::default(),
+            token_count: 64,
+            tokens: Vec::new(),
+            format_version: 3,
+            payload_sha256: None,
+            engine_id: None,
+            granularity: None,
+        };
+        let json = serde_json::to_vec(&meta).unwrap();
+        let mut ckpt = Vec::with_capacity(4 + json.len());
+        ckpt.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        ckpt.extend_from_slice(&json);
+        let ckpt_path = dir.join(format!("{name}.ckpt"));
+        fs::write(&ckpt_path, ckpt).unwrap();
+        fs::write(dir.join(format!("{name}.ckm")), manifest.encode()).unwrap();
+        ckpt_path
+    }
+
+    fn segment_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir.join("chunks"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        n.ends_with(".seg").then_some(n)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn compaction_frees_dead_bytes_and_keeps_live_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fake_payload(65, 2, 8, 2, 1);
+        let b = fake_payload(129, 2, 8, 2, 1); // shares a's 64-position prefix
+        let c = fake_payload(70, 2, 4, 1, 7); // its blob never publishes
+        let (ma, mb, aa, bb) = {
+            let store = ChunkStore::open(dir.path(), &[]).unwrap();
+            let ma = store.stage_and_register(&a, 64).unwrap();
+            let mb = store.stage_and_register(&b, 128).unwrap();
+            let _ = store.stage_and_register(&c, 69).unwrap();
+            let aa = write_live_v3(dir.path(), "aa", &ma);
+            let bb = write_live_v3(dir.path(), "bb", &mb);
+            (ma, mb, aa, bb)
+        };
+        let live = vec![aa, bb];
+        let store = ChunkStore::open(dir.path(), &live).unwrap();
+        let (total, dead, partial) = store.fragmentation();
+        assert!(dead > 0, "c's chunks are dead weight: {dead}");
+        assert!(dead < total, "a and b keep their chunks live");
+        assert_eq!(partial, 1);
+        let before = store.physical_bytes();
+        // Both gates must hold: a ratio above the real fragmentation and a
+        // floor above the real dead bytes each no-op the sweep.
+        assert_eq!(store.compact_segments(0.99, 1, 8).unwrap(), (0, 0));
+        assert_eq!(store.compact_segments(0.0, dead + 1, 8).unwrap(), (0, 0));
+        let (n, reclaimed) = store.compact_segments(0.0, 1, 8).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(reclaimed, dead, "exactly the dead record bytes leave");
+        let (total2, dead2, partial2) = store.fragmentation();
+        assert_eq!((dead2, partial2), (0, 0));
+        assert_eq!(total2, total - dead);
+        assert_eq!(before - store.physical_bytes(), dead);
+        // The old segment file is gone; exactly one (the rewrite) remains.
+        let segs = segment_files(dir.path());
+        assert_eq!(segs.len(), 1);
+        assert_ne!(segs[0], "seg-0000000000.seg");
+        // Live payloads read bit-exact from the new segment.
+        assert_eq!(store.reassemble(&ma).unwrap(), a);
+        assert_eq!(store.reassemble(&mb).unwrap(), b);
+    }
+
+    #[test]
+    fn compaction_never_touches_the_active_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        let a = fake_payload(65, 2, 8, 2, 1);
+        let ma = store.stage_and_register(&a, 64).unwrap();
+        store.unregister(&ma); // every chunk dead, but the segment is ACTIVE
+        assert_eq!(
+            store.compact_segments(0.0, 1, 8).unwrap(),
+            (0, 0),
+            "the active append target is never rewritten"
+        );
+        assert!(store.physical_bytes() > 0);
+        drop(store);
+        // Sealed by reopen, all-dead, no live blobs: that is boot GC's
+        // case, not compaction's — the file must simply be gone.
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        assert_eq!(store.physical_bytes(), 0);
+    }
+
+    #[test]
+    fn compaction_crash_orphan_self_heals_at_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fake_payload(65, 2, 8, 2, 1);
+        let b = fake_payload(129, 2, 8, 2, 1);
+        let c = fake_payload(70, 2, 4, 1, 7);
+        let (ma, mb, aa, bb) = {
+            let store = ChunkStore::open(dir.path(), &[]).unwrap();
+            let ma = store.stage_and_register(&a, 64).unwrap();
+            let mb = store.stage_and_register(&b, 128).unwrap();
+            let _ = store.stage_and_register(&c, 69).unwrap();
+            let aa = write_live_v3(dir.path(), "aa", &ma);
+            let bb = write_live_v3(dir.path(), "bb", &mb);
+            (ma, mb, aa, bb)
+        };
+        let live = vec![aa, bb];
+        let store = ChunkStore::open(dir.path(), &live).unwrap();
+        let seg0 = dir.path().join("chunks").join("seg-0000000000.seg");
+        let old_bytes = fs::read(&seg0).unwrap();
+        let (n, _) = store.compact_segments(0.0, 1, 8).unwrap();
+        assert_eq!(n, 1);
+        // Replay the crash window: the new segment is durable and
+        // placements moved, but the old file's delete never happened.
+        fs::write(&seg0, &old_bytes).unwrap();
+        assert_eq!(segment_files(dir.path()).len(), 2, "both files on disk");
+        drop(store);
+        // Boot resolves every digest to the NEW segment (highest seq
+        // first-wins), accounts the old one fully dead (lost duplicates
+        // plus the never-live c chunks), and GC deletes it.
+        let store = ChunkStore::open(dir.path(), &live).unwrap();
+        let segs = segment_files(dir.path());
+        assert_eq!(segs.len(), 1, "the orphaned old segment self-heals away");
+        assert_ne!(segs[0], "seg-0000000000.seg");
+        let (_, dead, partial) = store.fragmentation();
+        assert_eq!((dead, partial), (0, 0));
+        assert_eq!(store.reassemble(&ma).unwrap(), a);
+        assert_eq!(store.reassemble(&mb).unwrap(), b);
+    }
+
+    #[test]
+    fn compaction_racing_publish_keeps_reads_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fake_payload(65, 2, 8, 2, 1);
+        let b = fake_payload(129, 2, 8, 2, 1);
+        let c = fake_payload(70, 2, 4, 1, 7);
+        let (ma, mb, aa, bb) = {
+            let store = ChunkStore::open(dir.path(), &[]).unwrap();
+            let ma = store.stage_and_register(&a, 64).unwrap();
+            let mb = store.stage_and_register(&b, 128).unwrap();
+            let _ = store.stage_and_register(&c, 69).unwrap();
+            let aa = write_live_v3(dir.path(), "aa", &ma);
+            let bb = write_live_v3(dir.path(), "bb", &mb);
+            (ma, mb, aa, bb)
+        };
+        let live = vec![aa, bb];
+        let store = std::sync::Arc::new(ChunkStore::open(dir.path(), &live).unwrap());
+        let compactor = std::sync::Arc::clone(&store);
+        let sweep = std::thread::spawn(move || {
+            for _ in 0..8 {
+                let _ = compactor.compact_segments(0.0, 1, 2);
+            }
+        });
+        // A reader reassembles while the sweep moves placements and
+        // deletes the old file: the snapshot/open pairing under the store
+        // lock must keep every read bit-exact (an open-after-delete once
+        // panicked here).
+        let reader_store = std::sync::Arc::clone(&store);
+        let ma2 = ma.clone();
+        let a2 = a.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..64 {
+                assert_eq!(reader_store.reassemble(&ma2).unwrap(), a2);
+            }
+        });
+        // A publisher interleaves with the sweep at lock boundaries: fresh
+        // content appends to the ACTIVE segment while compaction rewrites
+        // the sealed one. Every read must stay bit-exact.
+        let d = fake_payload(71, 3, 4, 1, 5);
+        for _ in 0..16 {
+            let md = store.stage_and_register(&d, 70).unwrap();
+            store.unregister(&md);
+        }
+        sweep.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(store.reassemble(&ma).unwrap(), a);
+        assert_eq!(store.reassemble(&mb).unwrap(), b);
     }
 
     #[test]
