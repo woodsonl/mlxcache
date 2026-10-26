@@ -29,11 +29,16 @@ from __future__ import annotations
 
 import hashlib
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SEGMENT_MAGIC = b"MCSG"
 MANIFEST_MAGIC = b"MCKM"
 FORMAT_VERSION = 1
+READ_WORKERS = 8
+"""Segment-read parallelism, mirroring READ_WORKERS in the Rust reader: a
+blob's chunks span every segment written over its lifetime, file reads
+release the GIL, and only the scatter stays on the calling thread."""
 _HEADER_BYTES = 8
 _RECORD_HEADER = struct.Struct("<I32s")  # body_len, digest
 _MANIFEST_HEAD = struct.Struct("<4sHQQ")  # magic, version, payload_len, count
@@ -137,6 +142,21 @@ rescans from zero; a vanished segment is skipped (the reassembler reports
 genuinely missing chunks). Reads walk each segment ONCE with pread-style
 seeks — no whole-segment loads.
 """
+
+
+def _read_segment_regions(
+    blob_dir: Path, name: str, regions: list[tuple[bytes, int, int]]
+) -> dict[bytes, bytes]:
+    """One segment's chunk bodies, read while the file is open."""
+    bodies: dict[bytes, bytes] = {}
+    with open(blob_dir / "chunks" / name, "rb") as fh:
+        for digest, offset, body_len in regions:
+            fh.seek(offset)
+            body = fh.read(body_len)
+            if len(body) != body_len:
+                raise ChunkFormatError("segment truncated under a live chunk")
+            bodies[digest] = body
+    return bodies
 
 
 class ChunkReader:
@@ -264,9 +284,8 @@ class ChunkReader:
         self, manifest: Manifest, placement: dict[bytes, tuple[str, int, int]]
     ) -> bytes:
         out = bytearray(manifest.payload_len)
-        # Read every needed segment region while the file is open — one
-        # open per segment, no long-lived handles (the reader can sit on a
-        # serving thread).
+        # Group the reads per segment — one open per segment, no long-lived
+        # handles (the reader can sit on a serving thread).
         by_segment: dict[str, list[tuple[bytes, int, int]]] = {}
         for c in manifest.chunks:
             where = placement.get(c.digest)
@@ -275,19 +294,22 @@ class ChunkReader:
             name, offset, body_len = where
             by_segment.setdefault(name, []).append((c.digest, offset, body_len))
         bodies: dict[bytes, bytes] = {}
-        for name, regions in by_segment.items():
-            try:
-                with open(self.dir / "chunks" / name, "rb") as fh:
-                    for digest, offset, body_len in regions:
-                        fh.seek(offset)
-                        body = fh.read(body_len)
-                        if len(body) != body_len:
-                            raise ChunkFormatError("segment truncated under a live chunk")
-                        bodies[digest] = body
-            except FileNotFoundError as exc:
-                # The segment vanished between scan and open (a sweep
-                # deleted it after re-homing its records): rescan.
-                raise _SegmentVanishedError(name) from exc
+        # Segments read in parallel (file reads release the GIL; the Rust
+        # reader does the same with 8 pread workers): a blob's chunks span
+        # every segment written over its lifetime, and a serial walk made
+        # restore latency scale with the segment count.
+        with ThreadPoolExecutor(max_workers=min(READ_WORKERS, max(1, len(by_segment)))) as pool:
+            futures = {
+                pool.submit(_read_segment_regions, self.dir, name, regions): name
+                for name, regions in by_segment.items()
+            }
+            for fut, name in futures.items():
+                try:
+                    bodies.update(fut.result())
+                except FileNotFoundError as exc:
+                    # The segment vanished between scan and open (a sweep
+                    # deleted it after re-homing its records): rescan.
+                    raise _SegmentVanishedError(name) from exc
         for c in manifest.chunks:
             body = bodies[c.digest]
             if len(body) != c.body_len:
