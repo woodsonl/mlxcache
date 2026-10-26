@@ -3,15 +3,20 @@
 //! ENOSPC rescue (error registry): catch the write error, log path+bytes,
 //! fail the warming path only — real requests proceed uncached.
 
-use crate::chunkstore::{ChunkStore, Manifest};
+use crate::chunkstore::{ChunkDigest, ChunkStore, Manifest};
 use mlxcache_core::contract::CheckpointMeta;
 #[cfg(test)]
 use mlxcache_core::contract::ContractError;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Cached share report keyed on the store generation. A report re-reads
+/// every live .ckm; /stats must stay cheap to poll.
+type ShareCache = Arc<std::sync::Mutex<Option<(u64, Arc<ShareReport>)>>>;
 
 /// Publication mode (MLXCACHE_CHUNK_STORE; default Chunked = the shipped
 /// v1 codec decision from REPORT.md).
@@ -52,6 +57,47 @@ pub struct Persistence {
     /// test threads). Interior mutability because Persistence is shared
     /// as an Arc across the reaper and request paths.
     compact: std::sync::Arc<std::sync::RwLock<CompactConfig>>,
+    /// Cached chunk-store share report, keyed on the store generation.
+    /// A report re-reads every live .ckm; /stats must stay cheap to poll.
+    share_cache: ShareCache,
+}
+
+/// One live v3 blob's share of the chunk store.
+#[derive(Debug, Clone)]
+pub struct BlobShare {
+    pub name: String,
+    pub token_count: u64,
+    /// The manifest's logical payload bytes (what a whole-blob store
+    /// would hold on disk for this blob).
+    pub payload_bytes: u64,
+    /// Record bytes only this blob references: what evicting it frees.
+    pub unique_bytes: u64,
+    /// Record bytes shared with other live blobs: freed only when the
+    /// LAST referencing blob goes.
+    pub shared_bytes: u64,
+}
+
+/// Store-wide sharing gauges plus the per-blob rows, for /stats.
+#[derive(Debug, Clone, Default)]
+pub struct ShareReport {
+    pub stats: ShareStats,
+    pub blobs: Vec<BlobShare>,
+}
+
+/// Chunk-level dedup gauges, all derived from the live refcount table.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShareStats {
+    /// Chunk digests referenced by at least one live manifest.
+    pub chunks_live: u64,
+    /// Chunk digests referenced by more than one live manifest.
+    pub chunks_shared: u64,
+    /// Record bytes (36-byte header + body) of singly-referenced chunks.
+    pub unique_record_bytes: u64,
+    /// Record bytes of chunks shared by two or more live manifests.
+    pub shared_record_bytes: u64,
+    /// Σ payload_len over readable live v3 manifests — the logical size a
+    /// whole-blob store would carry.
+    pub logical_payload_bytes: u64,
 }
 
 /// Segment-compaction knobs. Defaults compact a segment when at least half
@@ -184,9 +230,9 @@ impl Persistence {
             mode,
             chunk_publish_lock: Arc::new(std::sync::Mutex::new(())),
             compact: std::sync::Arc::new(std::sync::RwLock::new(CompactConfig::from_env())),
+            share_cache: Arc::new(std::sync::Mutex::new(None)),
         })
     }
-
     /// Remove `.settle-*` staging/temp files older than `older_than`.
     ///
     /// Why recurring, not boot-only: the sidecar writes its staging file at
@@ -774,6 +820,108 @@ impl Persistence {
             .unwrap_or((0, 0, 0))
     }
 
+    /// Store-wide and per-blob sharing of the chunk store, for /stats.
+    ///
+    /// `unique_bytes` per blob is what evicting that one blob returns to
+    /// the physical budget; `shared_bytes` frees only when the LAST
+    /// referencing blob goes. Cached on the store generation so a stats
+    /// poll never re-reads manifests a mutation has not invalidated.
+    pub fn chunked_share(&self) -> Arc<ShareReport> {
+        let Some(store) = self.chunk_store.as_ref() else {
+            return Arc::new(ShareReport::default());
+        };
+        if let Some((gen, report)) = self.share_cache.lock().unwrap().as_ref() {
+            if store.generation() == *gen {
+                return report.clone();
+            }
+        }
+        let (gen, report) = self.compute_share_report(store);
+        let report = Arc::new(report);
+        *self.share_cache.lock().unwrap() = Some((gen, report.clone()));
+        report
+    }
+
+    /// The refcount world + the on-disk manifests decide every number:
+    /// a digest's record size (36-byte header + body) is a property of
+    /// the digest, so the manifests themselves are the source of truth
+    /// and no placement snapshot is needed. A blob whose manifest cannot
+    /// be decoded contributes to refcounts but not to the rows — the
+    /// load path is what reports it as corruption.
+    fn compute_share_report(&self, store: &ChunkStore) -> (u64, ShareReport) {
+        let (gen, refs) = store.refs_snapshot();
+        let mut record_len: HashMap<ChunkDigest, u64> = HashMap::new();
+        let mut rows: Vec<(BlobShare, Vec<crate::chunkstore::ChunkRef>)> = Vec::new();
+        if let Ok(live) = Self::list_blobs_in(&self.blob_dir) {
+            for path in live {
+                let Ok(raw) = fs::read(&path) else { continue };
+                let Some(meta) = crate::chunkstore::peek_meta(&raw) else {
+                    continue;
+                };
+                if meta.format_version != 3 {
+                    continue;
+                }
+                let Ok(mbytes) = fs::read(path.with_extension("ckm")) else {
+                    continue;
+                };
+                let Ok(manifest) = Manifest::decode(&mbytes) else {
+                    continue;
+                };
+                for c in &manifest.chunks {
+                    record_len.entry(c.digest).or_insert(36 + c.body_len());
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                rows.push((
+                    BlobShare {
+                        name,
+                        token_count: meta.token_count,
+                        payload_bytes: manifest.payload_len,
+                        unique_bytes: 0,
+                        shared_bytes: 0,
+                    },
+                    manifest.chunks,
+                ));
+            }
+        }
+        let mut stats = ShareStats {
+            chunks_live: refs.len() as u64,
+            ..ShareStats::default()
+        };
+        for (digest, r) in &refs {
+            let Some(len) = record_len.get(digest).copied() else {
+                continue;
+            };
+            if *r > 1 {
+                stats.chunks_shared += 1;
+                stats.shared_record_bytes += len;
+            } else {
+                stats.unique_record_bytes += len;
+            }
+        }
+        for (row, chunks) in rows.iter_mut() {
+            stats.logical_payload_bytes += row.payload_bytes;
+            for c in chunks {
+                let shared = refs.get(&c.digest).copied().unwrap_or(0) > 1;
+                if shared {
+                    row.shared_bytes += 36 + c.body_len();
+                } else {
+                    row.unique_bytes += 36 + c.body_len();
+                }
+            }
+        }
+        rows.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        (
+            gen,
+            ShareReport {
+                stats,
+                blobs: rows.into_iter().map(|(r, _)| r).collect(),
+            },
+        )
+    }
+
     /// One blob's eviction-budget footprint. v1/v2: the file's size. v3:
     /// the manifest's gross chunk bytes (shared chunks count once per
     /// referencing blob, which is what eviction ordering wants — evicting
@@ -913,6 +1061,41 @@ mod tests {
         );
         // The header-only .ckpt carries no payload bytes.
         assert!(fs::metadata(&path).unwrap().len() < 512);
+    }
+
+    #[test]
+    fn chunked_share_reports_unique_and_shared_bytes() {
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        // Two blobs, identical payloads, distinct names: every chunk is
+        // content-addressed, so the store holds each chunk once and both
+        // blobs share all of them.
+        let a = p.publish_atomic(0x1, 1, meta(10), b"same-bytes").unwrap();
+        let b = p.publish_atomic(0x2, 1, meta(10), b"same-bytes").unwrap();
+        let r = p.chunked_share();
+        assert_eq!(r.blobs.len(), 2);
+        assert_eq!(r.stats.chunks_live, r.stats.chunks_shared);
+        assert!(r.stats.shared_record_bytes > 0);
+        assert_eq!(r.stats.unique_record_bytes, 0);
+        for row in &r.blobs {
+            assert_eq!(row.unique_bytes, 0);
+            assert!(row.shared_bytes > 0);
+            assert_eq!(row.payload_bytes, b"same-bytes".len() as u64);
+        }
+        // No mutation between polls: the generation-keyed cache returns
+        // the SAME report without re-reading manifests.
+        assert!(std::sync::Arc::ptr_eq(&r, &p.chunked_share()));
+        // Evict one blob: the survivor's chunks flip from shared to
+        // unique — exactly the bytes its own eviction now frees.
+        let name_b = b.file_name().unwrap().to_str().unwrap().to_string();
+        p.remove(&name_b).unwrap();
+        let r = p.chunked_share();
+        assert_eq!(r.blobs.len(), 1);
+        assert_eq!(r.stats.chunks_shared, 0);
+        assert_eq!(r.blobs[0].shared_bytes, 0);
+        assert_eq!(r.stats.unique_record_bytes, r.blobs[0].unique_bytes);
+        assert_eq!(r.stats.logical_payload_bytes, b"same-bytes".len() as u64);
+        assert_ne!(a, b);
     }
 
     #[test]
