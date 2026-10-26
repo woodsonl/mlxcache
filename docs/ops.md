@@ -25,6 +25,28 @@ launchctl load ~/Library/LaunchAgents/com.mlxcache.daemon.plist
 KeepAlive keeps the daemon running; a crash restarts it within seconds.
 Streams in flight drop (R1-4); clients retry.
 
+## Observing the chunk store
+
+`GET /stats` reports the chunk store under `chunk_store`:
+
+- `dedup_ratio` — logical payload bytes over live record bytes: the
+  multiple by which chunking shrinks what a whole-blob store would hold.
+- `record_bytes` / `dead_bytes` / `partial_segments` — fragmentation;
+  `dead_bytes` inside `partial_segments` is what a compaction sweep
+  reclaims.
+- `chunks_live` / `chunks_shared` and `unique_record_bytes` /
+  `shared_record_bytes` — how much of the store is held jointly.
+- `blobs[]` — per live v3 blob: `unique_bytes` is what evicting THAT
+  blob returns to the physical budget; `shared_bytes` frees only when
+  the last referencing blob goes.
+
+`POST /gc` runs one maintenance sweep on demand (compaction at the
+configured thresholds, then the empty-segment GC) and answers with a
+receipt: `segments_compacted`, `compaction_bytes_reclaimed`,
+`gc_bytes_reclaimed`. A repeat call on a clean store returns zeros. The
+`MLXCACHE_COMPACT` env flag gates the background cadence only — an
+explicit request always sweeps.
+
 ## Checkpoint durability and recovery
 
 Checkpoints are an optimization; the daemon must serve correctly with an empty,

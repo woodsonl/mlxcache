@@ -811,6 +811,28 @@ impl Persistence {
         *self.compact.write().unwrap() = cfg;
     }
 
+    /// Operator-triggered maintenance sweep (POST /gc): one compaction
+    /// pass at the CONFIGURED thresholds, then the empty-segment GC.
+    /// Unlike the reaper's pass this ignores `enabled` — that flag gates
+    /// the background cadence, not an explicit operator request. Returns
+    /// (compacted segments, compaction bytes reclaimed, GC bytes
+    /// reclaimed).
+    pub fn sweep_chunked(&self) -> (usize, u64, u64) {
+        let Some(store) = self.chunk_store.as_ref() else {
+            return (0, 0, 0);
+        };
+        let cfg = *self.compact.read().unwrap();
+        let (segments, bytes) =
+            match store.compact_segments(cfg.ratio, cfg.min_dead_bytes, cfg.max_segments) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "manual compaction pass failed");
+                    (0, 0)
+                }
+            };
+        (segments, bytes, store.gc_empty_segments())
+    }
+
     /// Fragmentation accounting for /stats: (total record bytes, dead record
     /// bytes, partially-dead segment count). Zeroes in whole-blob mode.
     pub fn chunked_fragmentation(&self) -> (u64, u64, usize) {
