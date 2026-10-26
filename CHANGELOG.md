@@ -2,6 +2,38 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.9.0 — 2026-10-25
+
+### Added
+
+- **Parallel restore.** Both chunk-store readers (the daemon's Rust
+  reassembly and the sidecar's Python adopt path) now read on 8 workers.
+  The Rust reader scatters per-(chunk, head) contiguous slices straight
+  into byte-balanced, exclusively-owned destination ranges — no staging
+  buffer, every payload byte read from its segment exactly once; the
+  Python reader parallelizes per segment. REPORT.md E4 measured the
+  parallel pread arm at 2.05 GiB/s against a ~1 GiB/s single reader; at
+  0.8.1's certified 32K point (~1.8 GB f16 payloads) the serial loop was
+  the dominant restore term. Reassembly now also returns a corruption
+  verdict, never a race or a panic, for manifests with overlapping chunk
+  coverage or geometry that disagrees with the stored record.
+
+- **Dedup visibility in `/stats`.** `chunk_store` gains `dedup_ratio`
+  (logical payload over live record bytes), `chunks_live`,
+  `chunks_shared`, unique/shared record bytes, and a per-blob row set
+  with exactly the number an operator or eviction policy cares about:
+  what evicting THAT blob frees versus what it holds jointly with other
+  live blobs. The report derives from the live refcount table plus the
+  on-disk manifests, cached on a monotonic store generation so a stats
+  poll never re-reads manifests a mutation has not invalidated.
+
+- **`POST /gc`**: on-demand chunk-store maintenance — one compaction
+  sweep at the configured thresholds (the `MLXCACHE_COMPACT` cadence
+  flag does not gate an explicit operator request) plus the
+  empty-segment GC, through the same locked operations the background
+  reaper uses. Returns a receipt (segments compacted, bytes reclaimed);
+  reclaiming dead bytes no longer requires a daemon restart.
+
 ## 0.8.1 — 2026-10-23
 
 ### Added
