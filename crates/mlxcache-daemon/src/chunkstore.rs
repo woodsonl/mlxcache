@@ -914,6 +914,23 @@ impl ChunkStore {
         self.inner.lock().unwrap().gen
     }
 
+    /// Close the active append segment (fsync, stop appending to it). The
+    /// next append rolls a fresh segment. Compaction and GC exempt the
+    /// active target by design, so a store whose whole history sits in one
+    /// segment can never reclaim its dead bytes while that segment stays
+    /// open — sealing is what a daemon restart did for it; the manual
+    /// sweep does it without the restart.
+    pub fn seal_active(&self) -> Result<(), ChunkError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(a) = inner.active.take() {
+            a.file
+                .sync_all()
+                .map_err(|e| ChunkError::Disk(e.to_string()))?;
+            inner.gen += 1;
+        }
+        Ok(())
+    }
+
     /// (generation, live refcounts) captured under ONE lock — the snapshot
     /// a derived report (per-blob share) both computes from and keys its
     /// cache on. Pairing them under the same lock means a report can never
