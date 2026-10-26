@@ -693,11 +693,11 @@ impl Persistence {
     /// makes retirement durable — a blob left on disk would be re-indexed by the
     /// next startup rebuild and resurrect the poison.
     pub fn remove(&self, blob_name: &str) -> Result<(), PersistError> {
-        match fs::remove_file(self.blob_dir.join(blob_name)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        let ckpt_removed = match fs::remove_file(self.blob_dir.join(blob_name)) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(PersistError::Io(e)),
-        }
+        };
         // Chunked blob retirement: drop the manifest and its chunk refs so
         // shared chunks' lifetimes follow the last blob that cites them.
         // The generation-encoded name means a remove() can never hit a
@@ -709,12 +709,21 @@ impl Persistence {
                 .to_string()
                 + ".ckm";
             let path = self.blob_dir.join(&ckm);
+            let mut unregistered = false;
             if let Ok(mbytes) = fs::read(&path) {
                 if let Ok(manifest) = Manifest::decode(&mbytes) {
                     store.unregister(&manifest);
+                    unregistered = true;
                 }
             }
             let _ = fs::remove_file(path);
+            // The blob is GONE but its refs could not be dropped (an
+            // unreadable or invalid manifest). unregister is what bumps
+            // the generation; without this bump a share report cached
+            // before the unlink keeps serving the removed blob's row.
+            if ckpt_removed && !unregistered {
+                store.bump_generation();
+            }
         }
         Ok(())
     }
@@ -795,7 +804,7 @@ impl Persistence {
         if !cfg.enabled {
             return (0, 0);
         }
-        match store.compact_segments(cfg.ratio, cfg.min_dead_bytes, cfg.max_segments) {
+        match store.compact_segments(cfg.ratio, cfg.min_dead_bytes, cfg.max_segments, false) {
             Ok((0, _)) => (0, 0),
             Ok((segments, bytes)) => {
                 tracing::info!(segments, bytes, "segment compaction reclaimed dead bytes");
@@ -820,19 +829,21 @@ impl Persistence {
     /// the empty-segment GC. Unlike the reaper's pass this ignores
     /// `enabled` — that flag gates the background cadence, not an
     /// explicit operator request. Returns (compacted segments,
-    /// compaction bytes reclaimed, GC bytes reclaimed), or the compaction
-    /// failure: a zero receipt must always mean "clean store", never
-    /// "the sweep failed", or an operator cannot tell them apart.
+    /// compaction bytes reclaimed, GC bytes reclaimed), or the failure:
+    /// a zero receipt must never mean "the sweep failed" — zero means
+    /// nothing met the configured thresholds (/stats' dead_bytes says
+    /// whether any remain), and failure must answer as failure.
     pub fn sweep_chunked(&self) -> Result<(usize, u64, u64), String> {
         let Some(store) = self.chunk_store.as_ref() else {
             return Ok((0, 0, 0));
         };
         if let Err(e) = store.seal_active() {
             tracing::warn!(error = %e, "manual sweep could not seal the active segment");
+            return Err(e.to_string());
         }
         let cfg = *self.compact.read().unwrap();
         let (segments, bytes) =
-            match store.compact_segments(cfg.ratio, cfg.min_dead_bytes, cfg.max_segments) {
+            match store.compact_segments(cfg.ratio, cfg.min_dead_bytes, cfg.max_segments, true) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "manual compaction pass failed");
@@ -881,7 +892,13 @@ impl Persistence {
     fn compute_share_report(&self, store: &ChunkStore) -> (u64, ShareReport) {
         let (gen, refs) = store.refs_snapshot();
         let mut record_len: HashMap<ChunkDigest, u64> = HashMap::new();
-        let mut rows: Vec<(BlobShare, Vec<crate::chunkstore::ChunkRef>)> = Vec::new();
+        // digest → number of DISTINCT live manifests referencing it. The
+        // refcount table counts OCCURRENCES (one manifest can legally list
+        // the same digest twice — identical block content at two
+        // positions), and occurrence-counting would misreport a repeated
+        // chunk as shared with another blob that does not exist.
+        let mut digest_blobs: HashMap<ChunkDigest, u32> = HashMap::new();
+        let mut rows: Vec<(BlobShare, Vec<ChunkDigest>)> = Vec::new();
         if let Ok(live) = Self::list_blobs_in(&self.blob_dir) {
             for path in live {
                 // Header prefix only: a mixed store's v1/v2 blobs carry
@@ -899,8 +916,15 @@ impl Persistence {
                 let Ok(manifest) = Manifest::decode(&mbytes) else {
                     continue;
                 };
+                let mut distinct: Vec<ChunkDigest> = Vec::new();
+                let mut seen: std::collections::HashSet<ChunkDigest> =
+                    std::collections::HashSet::new();
                 for c in &manifest.chunks {
-                    record_len.entry(c.digest).or_insert(36 + c.body_len());
+                    if seen.insert(c.digest) {
+                        record_len.entry(c.digest).or_insert(36 + c.body_len());
+                        *digest_blobs.entry(c.digest).or_insert(0) += 1;
+                        distinct.push(c.digest);
+                    }
                 }
                 let name = path
                     .file_name()
@@ -915,7 +939,7 @@ impl Persistence {
                         unique_bytes: 0,
                         shared_bytes: 0,
                     },
-                    manifest.chunks,
+                    distinct,
                 ));
             }
         }
@@ -923,25 +947,26 @@ impl Persistence {
             chunks_live: refs.len() as u64,
             ..ShareStats::default()
         };
-        for (digest, r) in &refs {
+        for (digest, blob_count) in &digest_blobs {
             let Some(len) = record_len.get(digest).copied() else {
                 continue;
             };
-            if *r > 1 {
+            if *blob_count > 1 {
                 stats.chunks_shared += 1;
                 stats.shared_record_bytes += len;
             } else {
                 stats.unique_record_bytes += len;
             }
         }
-        for (row, chunks) in rows.iter_mut() {
+        for (row, distinct) in rows.iter_mut() {
             stats.logical_payload_bytes += row.payload_bytes;
-            for c in chunks {
-                let shared = refs.get(&c.digest).copied().unwrap_or(0) > 1;
+            for digest in distinct {
+                let shared = digest_blobs.get(digest).copied().unwrap_or(0) > 1;
+                let len = record_len.get(digest).copied().unwrap_or(0);
                 if shared {
-                    row.shared_bytes += 36 + c.body_len();
+                    row.shared_bytes += len;
                 } else {
-                    row.unique_bytes += 36 + c.body_len();
+                    row.unique_bytes += len;
                 }
             }
         }
@@ -1136,6 +1161,47 @@ mod tests {
         // (parallel) reassembly path after the sweep moved its records.
         let (_m, payload) = p.load(&paths[0]).unwrap();
         assert_eq!(payload, vec![1u8; 4096]);
+    }
+
+    #[test]
+    fn share_report_counts_distinct_blobs_not_chunk_occurrences() {
+        // One blob whose manifest lists the same digest twice: identical
+        // 64-position blocks are legal content (position-periodic data).
+        // Occurrence-counting would call the chunk "shared" with a second
+        // blob that does not exist and double-count its record bytes.
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        // [1, 1, 128, 8]: one head, 128 positions of 8 bytes, positions p
+        // and p+64 identical → block 0 and block 1 share one digest.
+        let block: Vec<u8> = (0..64u16).flat_map(|p| [(p % 251) as u8; 8]).collect();
+        let mut data = Vec::new();
+        data.extend_from_slice(&block);
+        data.extend_from_slice(&block);
+        let header = serde_json::json!({
+            "t": {"dtype": "U8", "shape": [1, 1, 128, 8],
+                  "data_offsets": [0, data.len()]}
+        });
+        let hb = serde_json::to_vec(&header).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(hb.len() as u64).to_le_bytes());
+        payload.extend_from_slice(&hb);
+        payload.extend_from_slice(&data);
+        let _ = p.publish_atomic(0x51u128, 1, meta(129), &payload).unwrap();
+        let r = p.chunked_share();
+        assert_eq!(r.blobs.len(), 1);
+        assert_eq!(
+            r.stats.chunks_shared, 0,
+            "a repeated chunk inside ONE blob is not shared"
+        );
+        assert_eq!(
+            r.stats.chunks_live, 2,
+            "the block digest + the header-gap chunk"
+        );
+        // The repeated block's record counts ONCE in the row: 512-byte
+        // body + 36-byte record header, plus the gap chunk once.
+        let gap = 8 + hb.len() as u64;
+        assert_eq!(r.blobs[0].unique_bytes, (36 + 512) + (36 + gap));
+        assert_eq!(r.stats.unique_record_bytes, r.blobs[0].unique_bytes);
     }
 
     #[test]

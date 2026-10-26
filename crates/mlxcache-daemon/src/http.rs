@@ -255,11 +255,12 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 /// On-demand chunk-store maintenance. Receipt-shaped: an operator (or a
-/// test) sees exactly what the sweep reclaimed, and a repeat call on a
-/// clean store is a stream of zeros. Concurrent calls serialize on the
-/// store's own lock — the later one honestly reports zeros. A FAILED
-/// sweep is a 500, never a zero receipt: zeros must keep meaning "clean
-/// store" so the two are never confused.
+/// test) sees exactly what the sweep reclaimed at the configured
+/// thresholds. Zero reclaimed bytes means nothing qualified (a clean
+/// store is one reason; sub-threshold dead bytes another — /stats'
+/// dead_bytes tells them apart). Concurrent calls serialize on the
+/// store's own lock. A FAILED sweep is a 500, never a zero receipt, so
+/// "reclaimed nothing" and "the sweep failed" are never confused.
 async fn gc_sweep(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {

@@ -962,6 +962,13 @@ impl ChunkStore {
     /// sweep is bounded I/O (~30 ms per 64 MiB segment at disk speed), and
     /// the reaper cadence paces the rest.
     ///
+    /// `strict` governs a failed replacement write: the background reaper
+    /// (`false`) logs, skips the candidate, and retries on a later pass;
+    /// a MANUAL sweep (`true`) returns the error — its receipt must never
+    /// read "reclaimed nothing" over a segment the sweep failed to
+    /// rewrite. Earlier candidates in the same pass are already durable,
+    /// so the generation update runs before the error returns.
+    ///
     /// Crash safety, the whole point of the resolution order: the new
     /// segment is fsynced BEFORE anything in memory moves, and the old
     /// file is deleted AFTER placements swap. A crash between the two
@@ -974,6 +981,7 @@ impl ChunkStore {
         ratio: f64,
         min_dead_bytes: u64,
         max_segments: usize,
+        strict: bool,
     ) -> Result<(usize, u64), ChunkError> {
         if !(0.0..=1.0).contains(&ratio) {
             return Err(ChunkError::Corrupt(format!(
@@ -1122,6 +1130,14 @@ impl ChunkStore {
                     // the old segment still serves every read. Retry next sweep.
                     let _ = fs::remove_file(&new_path);
                     inner.next_seg -= 1; // the seq was never used durably
+                    if strict {
+                        // Earlier candidates in this pass are durable; their
+                        // generation update must not be lost to this error.
+                        if compacted > 0 {
+                            inner.gen += 1;
+                        }
+                        return Err(ChunkError::Disk(e.to_string()));
+                    }
                     tracing::warn!(
                         segment = old_seq,
                         error = %e,
@@ -1678,9 +1694,12 @@ mod tests {
         let before = store.physical_bytes();
         // Both gates must hold: a ratio above the real fragmentation and a
         // floor above the real dead bytes each no-op the sweep.
-        assert_eq!(store.compact_segments(0.99, 1, 8).unwrap(), (0, 0));
-        assert_eq!(store.compact_segments(0.0, dead + 1, 8).unwrap(), (0, 0));
-        let (n, reclaimed) = store.compact_segments(0.0, 1, 8).unwrap();
+        assert_eq!(store.compact_segments(0.99, 1, 8, false).unwrap(), (0, 0));
+        assert_eq!(
+            store.compact_segments(0.0, dead + 1, 8, false).unwrap(),
+            (0, 0)
+        );
+        let (n, reclaimed) = store.compact_segments(0.0, 1, 8, false).unwrap();
         assert_eq!(n, 1);
         assert_eq!(reclaimed, dead, "exactly the dead record bytes leave");
         let (total2, dead2, partial2) = store.fragmentation();
@@ -1704,7 +1723,7 @@ mod tests {
         let ma = store.stage_and_register(&a, 64).unwrap();
         store.unregister(&ma); // every chunk dead, but the segment is ACTIVE
         assert_eq!(
-            store.compact_segments(0.0, 1, 8).unwrap(),
+            store.compact_segments(0.0, 1, 8, false).unwrap(),
             (0, 0),
             "the active append target is never rewritten"
         );
@@ -1735,7 +1754,7 @@ mod tests {
         let store = ChunkStore::open(dir.path(), &live).unwrap();
         let seg0 = dir.path().join("chunks").join("seg-0000000000.seg");
         let old_bytes = fs::read(&seg0).unwrap();
-        let (n, _) = store.compact_segments(0.0, 1, 8).unwrap();
+        let (n, _) = store.compact_segments(0.0, 1, 8, false).unwrap();
         assert_eq!(n, 1);
         // Replay the crash window: the new segment is durable and
         // placements moved, but the old file's delete never happened.
@@ -1775,7 +1794,7 @@ mod tests {
         let compactor = std::sync::Arc::clone(&store);
         let sweep = std::thread::spawn(move || {
             for _ in 0..8 {
-                let _ = compactor.compact_segments(0.0, 1, 2);
+                let _ = compactor.compact_segments(0.0, 1, 2, false);
             }
         });
         // A reader reassembles while the sweep moves placements and
@@ -1823,7 +1842,7 @@ mod tests {
         let sweep = std::thread::spawn(move || {
             for _ in 0..400 {
                 let _ = sweeper.gc_empty_segments();
-                let _ = sweeper.compact_segments(0.0, 1, 2);
+                let _ = sweeper.compact_segments(0.0, 1, 2, false);
             }
         });
         let m1 = store.stage_and_register(&big, 64).unwrap();
