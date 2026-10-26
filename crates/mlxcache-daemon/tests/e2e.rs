@@ -36,7 +36,6 @@ fn app_state(sidecar_url: &str, blobs: &tempfile::TempDir) -> Arc<AppState> {
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
         trace: None,
-        sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     })
 }
 
@@ -392,7 +391,6 @@ async fn failed_startup_scan_writes_no_blob_and_serves_from_scratch() {
         ),
         persistence,
         trace: None,
-        sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
     let body = serde_json::json!({
         "model": "e2e-model",
@@ -618,7 +616,6 @@ async fn stream_leg_traces_the_settled_verdict() {
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
         trace: Some(mlxcache_daemon::trace::TraceWriter::from_path(&trace_path).unwrap()),
-        sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
     let post = |body: String| {
         let app = router(state.clone());
@@ -1225,7 +1222,6 @@ async fn two_models_same_tokens_do_not_share_a_blob() {
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
         trace: None,
-        sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
 
     for model in ["model-a", "model-b"] {
@@ -1305,7 +1301,6 @@ async fn trace_capture_writes_one_jsonl_record_per_request() {
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
         trace: Some(mlxcache_daemon::trace::TraceWriter::from_path(&trace_path).unwrap()),
-        sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
     let post = |content: &str| {
         let body = serde_json::json!({
@@ -1424,7 +1419,6 @@ async fn q8_and_f16_blobs_never_share_a_file() {
             sidecar: Some(SidecarClient::new(SidecarConfig::new(url, "e2e-model".into())).unwrap()),
             persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
             trace: None,
-            sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
     };
     let post = |state: Arc<AppState>, body: String| async move {
@@ -1532,7 +1526,6 @@ async fn kv_tiers_never_share_a_file_with_each_other_or_the_bits_tiers() {
             sidecar: Some(SidecarClient::new(SidecarConfig::new(url, "e2e-model".into())).unwrap()),
             persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
             trace: None,
-            sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
     };
     let post = |state: Arc<AppState>, body: String| async move {
@@ -2645,7 +2638,6 @@ async fn failed_request_gets_one_trace_record_and_stats_agree() {
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
         trace: Some(mlxcache_daemon::trace::TraceWriter::from_path(&trace_path).unwrap()),
-        sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
     let post = |body: String| {
         let app = router(state.clone());
@@ -2744,7 +2736,6 @@ async fn trace_records_the_settled_verdict_not_the_stale_route() {
         ),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
         trace: Some(mlxcache_daemon::trace::TraceWriter::from_path(&trace_path).unwrap()),
-        sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
     let post = |body: String| {
         let app = router(state.clone());
@@ -2834,7 +2825,6 @@ async fn stalled_stream_is_cut_by_the_idle_budget_with_an_explicit_error() {
         sidecar: Some(sidecar_client),
         persistence: mlxcache_daemon::persistence::Persistence::new(blobs.path()).unwrap(),
         trace: None,
-        sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
     let started = std::time::Instant::now();
     let res = router(state.clone())

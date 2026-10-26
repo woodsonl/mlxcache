@@ -80,7 +80,6 @@ async fn main() -> Result<()> {
         settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
             mlxcache_daemon::http::SETTLE_PUBLISH_CONCURRENCY,
         )),
-        sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     });
     // Warm the native-tokenizer OnceLock NOW, not on the first request: a
     // bad MLXCACHE_NATIVE_TOKENIZER must kill the boot (the module's
