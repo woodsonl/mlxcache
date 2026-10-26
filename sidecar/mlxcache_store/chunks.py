@@ -294,28 +294,21 @@ class ChunkReader:
             name, offset, body_len = where
             by_segment.setdefault(name, []).append((c.digest, offset, body_len))
         bodies: dict[bytes, bytes] = {}
-        if len(by_segment) > 1:
-            # Segments read in parallel: the serial walk made restore
-            # latency scale with the segment count a blob spans.
-            with ThreadPoolExecutor(max_workers=min(READ_WORKERS, len(by_segment))) as pool:
-                futures = {
-                    pool.submit(_read_segment_regions, self.dir, name, regions): name
-                    for name, regions in by_segment.items()
-                }
-                for fut, name in futures.items():
-                    try:
-                        bodies.update(fut.result())
-                    except FileNotFoundError as exc:
-                        # The segment vanished between scan and open (a
-                        # sweep deleted it after re-homing its records):
-                        # rescan.
-                        raise _SegmentVanishedError(name) from exc
-        else:
-            for name, regions in by_segment.items():
+        # Segments read in parallel (file reads release the GIL; the Rust
+        # reader does the same with 8 pread workers): a blob's chunks span
+        # every segment written over its lifetime, and a serial walk made
+        # restore latency scale with the segment count.
+        with ThreadPoolExecutor(max_workers=min(READ_WORKERS, max(1, len(by_segment)))) as pool:
+            futures = {
+                pool.submit(_read_segment_regions, self.dir, name, regions): name
+                for name, regions in by_segment.items()
+            }
+            for fut, name in futures.items():
                 try:
-                    bodies.update(_read_segment_regions(self.dir, name, regions))
+                    bodies.update(fut.result())
                 except FileNotFoundError as exc:
-                    # Same vanish rule on the single-segment path.
+                    # The segment vanished between scan and open (a sweep
+                    # deleted it after re-homing its records): rescan.
                     raise _SegmentVanishedError(name) from exc
         for c in manifest.chunks:
             body = bodies[c.digest]
