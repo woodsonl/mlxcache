@@ -27,12 +27,14 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   on-disk manifests, cached on a monotonic store generation so a stats
   poll never re-reads manifests a mutation has not invalidated.
 
-- **`POST /gc`**: on-demand chunk-store maintenance — one compaction
-  sweep at the configured thresholds (the `MLXCACHE_COMPACT` cadence
-  flag does not gate an explicit operator request) plus the
-  empty-segment GC, through the same locked operations the background
-  reaper uses. Returns a receipt (segments compacted, bytes reclaimed);
-  reclaiming dead bytes no longer requires a daemon restart.
+- **`POST /gc`**: on-demand chunk-store maintenance — it seals the active
+  append segment (its dead bytes are exempt from every other reclaim;
+  sealing is what a restart did for it), then one compaction sweep at the
+  configured thresholds plus the empty-segment GC, through the same
+  locked operations the background reaper uses. Returns a receipt
+  (segments compacted, bytes reclaimed); reclaiming dead bytes no longer
+  requires a daemon restart. The `MLXCACHE_COMPACT` cadence flag does not
+  gate an explicit request.
 
 ## 0.8.1 — 2026-10-23
 

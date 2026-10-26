@@ -811,16 +811,20 @@ impl Persistence {
         *self.compact.write().unwrap() = cfg;
     }
 
-    /// Operator-triggered maintenance sweep (POST /gc): one compaction
-    /// pass at the CONFIGURED thresholds, then the empty-segment GC.
-    /// Unlike the reaper's pass this ignores `enabled` — that flag gates
-    /// the background cadence, not an explicit operator request. Returns
-    /// (compacted segments, compaction bytes reclaimed, GC bytes
-    /// reclaimed).
+    /// Operator-triggered maintenance sweep (POST /gc): seal the active
+    /// append segment (its dead bytes are exempt from every other
+    /// reclaim), one compaction pass at the CONFIGURED thresholds, then
+    /// the empty-segment GC. Unlike the reaper's pass this ignores
+    /// `enabled` — that flag gates the background cadence, not an
+    /// explicit operator request. Returns (compacted segments,
+    /// compaction bytes reclaimed, GC bytes reclaimed).
     pub fn sweep_chunked(&self) -> (usize, u64, u64) {
         let Some(store) = self.chunk_store.as_ref() else {
             return (0, 0, 0);
         };
+        if let Err(e) = store.seal_active() {
+            tracing::warn!(error = %e, "manual sweep could not seal the active segment");
+        }
         let cfg = *self.compact.read().unwrap();
         let (segments, bytes) =
             match store.compact_segments(cfg.ratio, cfg.min_dead_bytes, cfg.max_segments) {
@@ -1083,6 +1087,48 @@ mod tests {
         );
         // The header-only .ckpt carries no payload bytes.
         assert!(fs::metadata(&path).unwrap().len() < 512);
+    }
+
+    #[test]
+    fn sweep_reclaims_dead_bytes_in_the_active_segment() {
+        // The live defect /qa reproduced: a store whose whole history sits
+        // in the ACTIVE append segment could not reclaim its dead bytes —
+        // compaction and GC both exempt the append target, so POST /gc
+        // answered zeros while /stats showed dead bytes. The manual sweep
+        // must SEAL the active segment first (what a restart did) and then
+        // compact. No drop/reopen dance here: the store stays open, the
+        // segment active, the whole point.
+        let dir = tmpdir();
+        let p = Persistence::new(dir.path()).unwrap();
+        p.set_compact_config(CompactConfig {
+            enabled: false,
+            ratio: 0.0,
+            min_dead_bytes: 1,
+            max_segments: 8,
+        });
+        let mut paths = Vec::new();
+        for (hash, seed) in [(0x31u128, 1u8), (0x32, 2)] {
+            paths.push(
+                p.publish_atomic(hash, 1, meta(64), &vec![seed; 4096])
+                    .unwrap(),
+            );
+        }
+        let retired = paths.remove(1);
+        p.remove(retired.file_name().unwrap().to_str().unwrap())
+            .unwrap();
+        let (_total, dead, _partial) = p.chunked_fragmentation();
+        assert!(dead > 0, "the retired blob's records must read as dead");
+
+        let (segments, bytes, _gc) = p.sweep_chunked();
+        assert!(segments >= 1, "the sweep must compact the sealed segment");
+        assert!(bytes > 0);
+        let (_total, dead, partial) = p.chunked_fragmentation();
+        assert_eq!(dead, 0, "no dead bytes may survive a manual sweep");
+        assert_eq!(partial, 0);
+        // The store still serves: the survivor loads through the normal
+        // (parallel) reassembly path after the sweep moved its records.
+        let (_m, payload) = p.load(&paths[0]).unwrap();
+        assert_eq!(payload, vec![1u8; 4096]);
     }
 
     #[test]
