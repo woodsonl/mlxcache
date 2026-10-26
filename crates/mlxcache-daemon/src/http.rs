@@ -235,6 +235,11 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/stats", get(stats))
+        // On-demand chunk-store maintenance: one compaction sweep plus the
+        // empty-segment GC, through the same locked operations the
+        // background reaper uses (operators should not restart the daemon
+        // to reclaim dead bytes).
+        .route("/gc", post(gc_sweep))
         // Liveness probe (api-contract 2026-10-04): deliberately
         // dependency-free — it answers "is the process up", NOT "is the
         // adapter reachable" (that is /stats' job, which reports adapter
@@ -247,6 +252,38 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// On-demand chunk-store maintenance. Receipt-shaped: an operator (or a
+/// test) sees exactly what the sweep reclaimed at the configured
+/// thresholds. Zero reclaimed bytes means nothing qualified (a clean
+/// store is one reason; sub-threshold dead bytes another — /stats'
+/// dead_bytes tells them apart). Concurrent calls serialize on the
+/// store's own lock. A FAILED sweep is a 500, never a zero receipt, so
+/// "reclaimed nothing" and "the sweep failed" are never confused.
+async fn gc_sweep(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let persistence = state.persistence.clone();
+    match tokio::task::spawn_blocking(move || persistence.sweep_chunked()).await {
+        Ok(Ok((compacted, compaction_bytes, gc_bytes))) => Ok(Json(serde_json::json!({
+            "segments_compacted": compacted,
+            "compaction_bytes_reclaimed": compaction_bytes,
+            "gc_bytes_reclaimed": gc_bytes,
+        }))),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "manual GC sweep failed");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, &e, "store_error"))
+        }
+        Err(join) => {
+            tracing::error!(error = %join, "manual GC sweep task failed");
+            Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gc sweep task failed",
+                "store_error",
+            ))
+        }
+    }
 }
 
 /// `Json<T>` with rejections mapped into the documented error envelope.
@@ -2764,12 +2801,21 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let s = state.stats.snapshot();
     // The chunk-store totals sit behind the store's std Mutex, which a
     // compaction sweep can hold across segment copies: read them on the
-    // blocking pool so a stats request never parks a runtime worker.
+    // blocking pool so a stats request never parks a runtime worker. The
+    // share report reads live .ckm manifests on the same pool.
     let persistence = state.persistence.clone();
-    let (chunk_total, chunk_dead, chunk_partial) =
-        tokio::task::spawn_blocking(move || persistence.chunked_fragmentation())
-            .await
-            .unwrap_or((0, 0, 0));
+    let ((chunk_total, chunk_dead, chunk_partial), share) =
+        tokio::task::spawn_blocking(move || {
+            (
+                persistence.chunked_fragmentation(),
+                persistence.chunked_share(),
+            )
+        })
+        .await
+        .unwrap_or((
+            (0, 0, 0),
+            std::sync::Arc::new(crate::persistence::ShareReport::default()),
+        ));
     Json(serde_json::json!({
         "requests": s.requests,
         "hits": s.hits,
@@ -2789,6 +2835,33 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "record_bytes": chunk_total,
             "dead_bytes": chunk_dead,
             "partial_segments": chunk_partial,
+            "live_record_bytes": chunk_total.saturating_sub(chunk_dead),
+            "logical_payload_bytes": share.stats.logical_payload_bytes,
+            // Logical payload over live record bytes: the multiple by
+            // which chunking shrinks what a whole-blob store would hold.
+            // 0 while the store holds no live records.
+            "dedup_ratio": if chunk_total > chunk_dead {
+                share.stats.logical_payload_bytes as f64 / (chunk_total - chunk_dead) as f64
+            } else {
+                0.0
+            },
+            "chunks_live": share.stats.chunks_live,
+            "chunks_shared": share.stats.chunks_shared,
+            "unique_record_bytes": share.stats.unique_record_bytes,
+            "shared_record_bytes": share.stats.shared_record_bytes,
+            "blobs": share
+                .blobs
+                .iter()
+                .map(|b| {
+                    serde_json::json!({
+                        "name": b.name,
+                        "tokens": b.token_count,
+                        "payload_bytes": b.payload_bytes,
+                        "unique_bytes": b.unique_bytes,
+                        "shared_bytes": b.shared_bytes,
+                    })
+                })
+                .collect::<Vec<_>>(),
         },
     }))
 }
@@ -3615,6 +3688,183 @@ mod tests {
         );
         assert!(stats["chunk_store"]["dead_bytes"].is_u64());
         assert!(stats["chunk_store"]["partial_segments"].is_u64());
+        // The share gauges are the operator's dedup view: what the store
+        // saves (ratio) and what evicting each blob actually frees.
+        assert!(stats["chunk_store"]["dedup_ratio"].is_f64());
+        assert!(stats["chunk_store"]["chunks_live"].is_u64());
+        assert!(stats["chunk_store"]["unique_record_bytes"].is_u64());
+        assert!(stats["chunk_store"]["blobs"].is_array());
+    }
+
+    #[tokio::test]
+    async fn gc_endpoint_sweeps_and_reports_reclaimed_bytes() {
+        use mlxcache_core::contract::{CheckpointMeta, ModelFingerprint};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Test-scale thresholds: the shipped defaults need 16 MiB of dead
+        // bytes per segment (the reaper's cadence), which would make this
+        // test write 16 MiB of payload to prove the same code path.
+        let test_cfg = crate::persistence::CompactConfig {
+            enabled: false,
+            ratio: 0.0,
+            min_dead_bytes: 1,
+            max_segments: 8,
+        };
+        let meta = |n: u64| CheckpointMeta {
+            fingerprint: ModelFingerprint::default(),
+            token_count: n,
+            tokens: vec![1, 2, 3],
+            format_version: 1,
+            payload_sha256: None,
+            engine_id: None,
+            granularity: None,
+        };
+        {
+            let p = crate::persistence::Persistence::new(dir.path()).unwrap();
+            p.set_compact_config(test_cfg);
+            let mut paths = Vec::new();
+            for (hash, seed) in [(0x21u128, 1u8), (0x22, 2), (0x23, 3)] {
+                paths.push(
+                    p.publish_atomic(hash, 1, meta(64), &vec![seed; 4096])
+                        .unwrap(),
+                );
+            }
+            // Retire the middle blob: its records die inside a still-live
+            // segment — exactly the fragmentation only a sweep reclaims.
+            let retired = paths.remove(1);
+            p.remove(retired.file_name().unwrap().to_str().unwrap())
+                .unwrap();
+            let (_total, dead, partial) = p.chunked_fragmentation();
+            assert!(dead > 0, "the retired blob's records must read as dead");
+            assert!(partial >= 1, "the segment must be partially dead");
+            // Dropping p closes the ACTIVE append target: on reopen the
+            // boot scan re-derives refs and the fragmented segment is no
+            // longer active — the state of every older segment in a real
+            // running daemon.
+        }
+        let p = crate::persistence::Persistence::new(dir.path()).unwrap();
+        p.set_compact_config(test_cfg);
+
+        let state = Arc::new(AppState {
+            orchestrator: Orchestrator::new(),
+            singleflight: SingleFlight::new(),
+            stats: Arc::new(Stats::default()),
+            served_models: vec!["test-model".into()],
+            settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                SETTLE_PUBLISH_CONCURRENCY,
+            )),
+            sidecar: None,
+            persistence: p,
+            trace: None,
+        });
+        let router = router(state);
+
+        let sweep = |router: Router| async {
+            let res = router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/gc")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        let receipt = sweep(router.clone()).await;
+        assert!(
+            receipt["segments_compacted"].as_u64().unwrap() >= 1,
+            "receipt: {receipt}"
+        );
+        assert!(
+            receipt["compaction_bytes_reclaimed"].as_u64().unwrap() > 0,
+            "receipt: {receipt}"
+        );
+
+        // The store reads back fully compacted through /stats, and a
+        // second sweep on a clean store is a stream of zeros.
+        let res = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let stats: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stats["chunk_store"]["dead_bytes"], 0, "stats: {stats}");
+        assert_eq!(
+            stats["chunk_store"]["partial_segments"], 0,
+            "stats: {stats}"
+        );
+        let again = sweep(router).await;
+        assert_eq!(again["segments_compacted"], 0, "receipt: {again}");
+    }
+
+    #[tokio::test]
+    async fn gc_endpoint_reports_a_failed_sweep_as_500_not_zeros() {
+        // A zero receipt means "clean store". A failed compaction must
+        // never wear that disguise: it answers 500 through the standard
+        // error envelope. NaN ratio makes compact_segments reject its
+        // config — the one deterministic in-process failure path.
+        use mlxcache_core::contract::{CheckpointMeta, ModelFingerprint};
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = crate::persistence::Persistence::new(dir.path()).unwrap();
+        p.set_compact_config(crate::persistence::CompactConfig {
+            enabled: false,
+            ratio: f64::NAN,
+            min_dead_bytes: 1,
+            max_segments: 8,
+        });
+        let _ = p
+            .publish_atomic(
+                0x41u128,
+                1,
+                CheckpointMeta {
+                    fingerprint: ModelFingerprint::default(),
+                    token_count: 8,
+                    tokens: vec![1, 2, 3],
+                    format_version: 1,
+                    payload_sha256: None,
+                    engine_id: None,
+                    granularity: None,
+                },
+                b"payload",
+            )
+            .unwrap();
+        let state = Arc::new(AppState {
+            orchestrator: Orchestrator::new(),
+            singleflight: SingleFlight::new(),
+            stats: Arc::new(Stats::default()),
+            served_models: vec!["test-model".into()],
+            settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                SETTLE_PUBLISH_CONCURRENCY,
+            )),
+            sidecar: None,
+            persistence: p,
+            trace: None,
+        });
+        let res = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/gc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "store_error", "envelope: {error}");
     }
 
     #[test]
