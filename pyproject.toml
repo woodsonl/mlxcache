@@ -18,7 +18,22 @@ version = "0.9.0"
 
 description = "mlx-lm compatibility sidecar for the mlxcache daemon"
 requires-python = ">=3.12"
+# UNLICENSED until the license decision lands; a PyPI publish is blocked on
+# it by design.
 license = { text = "UNLICENSED" }
+keywords = ["mlx", "kv-cache", "llm", "inference", "apple-silicon"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/woodsonl/mlxcache"
+Documentation = "https://github.com/woodsonl/mlxcache/tree/main/docs"
 
 [project.optional-dependencies]
 # Real-engine adapter (Apple Silicon only). Pinned per docs/ops.md policy:

@@ -20,9 +20,9 @@ uv run ruff check sidecar/ scripts/
 uv run ruff format --check sidecar/ scripts/
 ```
 
-CI runs the same battery on every PR. Real-engine gates
-(`MLXCACHE_BENCH_REAL=1` round-trip, prefix benchmarks) stay opt-in local:
-they need a downloaded model and a quiet machine.
+CI does not run on PRs; run the battery locally before opening one.
+Real-engine gates (`MLXCACHE_BENCH_REAL=1` round-trip, prefix benchmarks)
+also stay opt-in local: they need a downloaded model and a quiet machine.
 
 ## How to submit
 
