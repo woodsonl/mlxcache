@@ -30,6 +30,7 @@ from mlxcache_store.chunks import (
     SEGMENT_MAGIC,
     ChunkFormatError,
     ChunkReader,
+    ChunkRef,
     Manifest,
 )
 
@@ -209,6 +210,77 @@ def test_reassemble_rescans_when_a_segment_vanishes_mid_read(tmp_path, monkeypat
 
     monkeypatch.setattr(ChunkReader, "_scan_segments", stale_then_fresh)
     assert ChunkReader(tmp_path).read_payload(tmp_path / "aa.ckpt", sha) == body
+    assert calls["n"] == 2, "exactly one rescan, then success"
+
+
+def test_reassemble_reads_a_multi_segment_store_in_parallel(tmp_path):
+    """A blob whose chunks live in two separate segments round-trips through
+    the parallel per-segment read path (a single-segment blob takes the
+    serial branch, which every other reassemble test already covers)."""
+    header = SEGMENT_MAGIC + struct.pack("<H", FORMAT_VERSION) + b"\x00\x00"
+    body_a = bytes(range(64))
+    body_b = bytes(range(64, 128))
+    digest_a = hashlib.sha256(body_a).digest()
+    digest_b = hashlib.sha256(body_b).digest()
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir()
+    (chunks_dir / "seg-0000000000.seg").write_bytes(
+        header + struct.pack("<I32s", len(body_a), digest_a) + body_a
+    )
+    (chunks_dir / "seg-0000000001.seg").write_bytes(
+        header + struct.pack("<I32s", len(body_b), digest_b) + body_b
+    )
+    manifest = Manifest(
+        len(body_a) + len(body_b),
+        [
+            ChunkRef(digest_a, len(body_a), 1, 0, 0),
+            ChunkRef(digest_b, len(body_b), 1, len(body_a), 0),
+        ],
+    )
+    assert ChunkReader(tmp_path).reassemble(manifest) == body_a + body_b
+
+
+def test_pool_read_vanish_triggers_the_rescan(tmp_path, monkeypatch):
+    """The parallel branch must surface a vanished segment exactly like the
+    serial one: a sweep deleted the file after the scan, the worker's
+    FileNotFoundError becomes a rescan, and the fresh scan serves the blob."""
+    header = SEGMENT_MAGIC + struct.pack("<H", FORMAT_VERSION) + b"\x00\x00"
+    body_a = bytes(range(64))
+    body_b = bytes(range(64, 128))
+    digest_a = hashlib.sha256(body_a).digest()
+    digest_b = hashlib.sha256(body_b).digest()
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir()
+    (chunks_dir / "seg-0000000000.seg").write_bytes(
+        header + struct.pack("<I32s", len(body_a), digest_a) + body_a
+    )
+    (chunks_dir / "seg-0000000001.seg").write_bytes(
+        header + struct.pack("<I32s", len(body_b), digest_b) + body_b
+    )
+    payload = body_a + body_b
+    ckm = struct.pack("<4sHQQ", MANIFEST_MAGIC, FORMAT_VERSION, len(payload), 2)
+    ckm += struct.pack("<32sIIQQ", digest_a, len(body_a), 1, 0, 0)
+    ckm += struct.pack("<32sIIQQ", digest_b, len(body_b), 1, len(body_a), 0)
+    (tmp_path / "aa.ckm").write_bytes(ckm)
+    sha = hashlib.sha256(payload).hexdigest()
+    (tmp_path / "aa.ckpt").write_bytes(_wire_header({"format_version": 3, "payload_sha256": sha}))
+
+    calls = {"n": 0}
+    real_scan = ChunkReader._scan_segments
+
+    def stale_then_fresh(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Two segments in the snapshot, one already deleted by the
+            # sweep — the pool branch must rescan, not fail the blob.
+            return {
+                digest_a: ("seg-0000000009.seg", 8 + 36, len(body_a)),
+                digest_b: ("seg-0000000001.seg", 8 + 36, len(body_b)),
+            }
+        return real_scan(self)
+
+    monkeypatch.setattr(ChunkReader, "_scan_segments", stale_then_fresh)
+    assert ChunkReader(tmp_path).read_payload(tmp_path / "aa.ckpt", sha) == payload
     assert calls["n"] == 2, "exactly one rescan, then success"
 
 
