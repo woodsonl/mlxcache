@@ -39,6 +39,25 @@ client ──HTTP──▶ mlxcache daemon ──▶ sidecar (mlx-lm) ──▶ 
 The contract is engine-agnostic ([`docs/contract-spec.md`](docs/contract-spec.md));
 mlx-lm is the first adapter, not the only possible one.
 
+## When to use it
+
+You re-pay the same prefill on every turn: a coding agent with a stable
+system prompt and repo context, a chat app that reloads history, evals that
+replay long contexts. mlxcache makes the second and every later request
+resume from stored KV instead.
+
+- vs **llama.cpp slot save/restore** — same idea, different engine: this is
+  the MLX world, and the chunked store dedups at the token-block level, so a
+  growing conversation writes only its new tokens (measured 2.2× on a 5-turn
+  7B conversation).
+- vs **mlx-lm's own server cache** — that is an in-process LRU; it dies with
+  the process. Checkpoints here survive restarts, and the cross-restart
+  cached path (~154 ms) beats a raw re-prefill of the same bytes (~189 ms)
+  on the reference model ([Measured](#measured)).
+- vs **vLLM-style prefix caching** — that targets multi-tenant GPU serving.
+  This targets one Apple Silicon box and one user's workflows, with a
+  32 GiB-bounded store and anchor-aware eviction instead of a fleet.
+
 ## Requirements
 
 - Apple Silicon Mac (M-series)
@@ -46,7 +65,25 @@ mlx-lm is the first adapter, not the only possible one.
 - Python 3.12+ and `uv` — `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - For real inference: a local mlx-lm model, downloaded on first use
 
-## Quickstart (synthetic engine — no model download)
+## Installation
+
+Source only for now — no published packages. The crate and package metadata
+are staged so a PyPI/crates.io release later is a config change, not a
+refactor.
+
+```bash
+git clone https://github.com/woodsonl/mlxcache.git
+cd mlxcache
+uv sync --group dev        # Python: sidecar, store client, test tooling
+cargo build --release -p mlxcache-daemon   # daemon: target/release/mlxcache-daemon
+```
+
+That gives you the two processes: `mlxcache-daemon` (the cache, Rust) and
+the sidecar (`uv run python -m mlxcache_sidecar.server`, the engine
+adapter). The daemon needs the sidecar's URL; everything else is
+[configuration](#configuration).
+
+## Getting started (synthetic engine — no model download)
 
 Proves the cache works in about a minute.
 
@@ -87,6 +124,9 @@ generation then resumes from the blob it just wrote. The response also carries
 `"tokens_cached"`, the same count, and `"tokens_total"`. `/stats` reports the
 running hit rate.
 
+For a real model, continue to [Real inference (mlx-lm)](#real-inference-mlx-lm);
+for what is happening on disk, [Storage](#storage-integrity-quarantine-and-eviction).
+
 ## API surface
 
 The request is OpenAI-shaped, not OpenAI-complete. Exactly four fields are
@@ -120,7 +160,11 @@ off and retry later), `502 adapter_error` means the sidecar answered but the
 answer was bad — including its explicit `422`-rejections, which the daemon
 already handled by quarantining the checkpoint and (on the next request)
 serving from scratch. `GET /healthz` is a dependency-free liveness probe
-(`{"status":"ok"}`); cache and adapter state live in `/stats`.
+(`{"status":"ok"}`); cache and adapter state live in `/stats`, whose
+`chunk_store` block reports the dedup gauges (ratio, dead bytes, and
+per-blob unique/shared record bytes — what evicting each blob actually
+frees). `POST /gc` reclaims dead chunk-store bytes on demand (see
+[Storage](#storage-integrity-quarantine-and-eviction)).
 
 ## Storage: integrity, quarantine, and eviction
 The store is CHUNKED by default (v0.7.0): a published checkpoint is a
@@ -136,7 +180,14 @@ no live checkpoint references it. Empty segments delete on the eviction
 sweep; a PARTIALLY-dead segment (live chunks sandwiching dead ones) is
 rewritten by segment compaction — the live records move to a fresh segment
 and the old file deletes, so dead bytes leave disk instead of squatting
-between live chunks. Setting `MLXCACHE_CHUNK_STORE=0` on the daemon publishes whole-blob v2
+between live chunks. `POST /gc` runs the same maintenance on demand (it
+seals the active append segment, compacts at the configured thresholds,
+then deletes empty segments), so reclaiming dead bytes does not require a
+restart; a failed sweep answers `500 store_error`, and a zero receipt
+means nothing met the thresholds — `/stats`'s `dead_bytes` says whether
+any remain. Reassembly in both readers (daemon and sidecar) runs on 8
+parallel preads, each chunk slice read once straight into its destination
+range. Setting `MLXCACHE_CHUNK_STORE=0` on the daemon publishes whole-blob v2
 instead (both layouts coexist and stay readable forever).
 
 Every published hit writes one KV checkpoint ("blob") — a safetensors payload
@@ -418,6 +469,19 @@ the divergence disclosure are in [docs/designs/tq-tier.md](docs/designs/tq-tier.
 
 See [`docs/ops.md`](docs/ops.md) — bypassing the daemon (SPOF), rollback,
 launchd service, and the mlx-lm version-pinning policy.
+
+## Related
+
+- [kv-chunk-fs](https://github.com/the-code-foundry/kv-chunk-fs) and
+  [local-llm-kv-cache](https://github.com/the-code-foundry/local-llm-kv-cache)
+  — the llama.cpp-side siblings of this design: a deduplicating FUSE
+  filesystem for KV snapshots and a slot-managing proxy. Their independent
+  per-turn dedup measurements informed the chunked store's codec study
+  ([REPORT.md](REPORT.md)) and v0.9.0's parallel restore and `POST /gc`.
+- [MLX](https://github.com/ml-explore/mlx) and
+  [mlx-lm](https://github.com/ml-explore/mlx-lm) — the engine and adapter
+  underneath; the checkpoint round-trip is token-identical to a scratch run
+  because of mlx-lm's save/load contract.
 
 ## Status
 
