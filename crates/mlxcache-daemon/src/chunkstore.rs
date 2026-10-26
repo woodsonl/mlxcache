@@ -914,6 +914,15 @@ impl ChunkStore {
         self.inner.lock().unwrap().gen
     }
 
+    /// Advance the generation WITHOUT touching refs or placements. Called
+    /// when a blob becomes VISIBLE: the .ckpt rename follows the register
+    /// that already bumped the generation, and a report filled in that
+    /// gap would otherwise stay cached past the visibility point (the
+    /// blob missing from its rows until the next ref mutation).
+    pub fn bump_generation(&self) {
+        self.inner.lock().unwrap().gen += 1;
+    }
+
     /// Close the active append segment (fsync, stop appending to it). The
     /// next append rolls a fresh segment. Compaction and GC exempt the
     /// active target by design, so a store whose whole history sits in one
@@ -1507,6 +1516,23 @@ mod tests {
         store.register(&m);
         assert!(m.chunks.len() > READ_WORKERS);
         assert_eq!(store.reassemble(&m).unwrap(), a);
+    }
+
+    #[test]
+    fn bump_generation_advances_without_touching_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        let a = fake_payload(65, 2, 8, 1, 2);
+        let m = store.stage_chunks(&a, 64).unwrap();
+        store.register(&m);
+        let (gen_before, refs_before) = store.refs_snapshot();
+        store.bump_generation();
+        let (gen_after, refs_after) = store.refs_snapshot();
+        assert_eq!(gen_after, gen_before + 1);
+        assert_eq!(
+            refs_before, refs_after,
+            "a visibility bump is not a ref mutation"
+        );
     }
 
     #[test]
