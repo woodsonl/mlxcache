@@ -257,18 +257,32 @@ async fn healthz() -> Json<serde_json::Value> {
 /// On-demand chunk-store maintenance. Receipt-shaped: an operator (or a
 /// test) sees exactly what the sweep reclaimed, and a repeat call on a
 /// clean store is a stream of zeros. Concurrent calls serialize on the
-/// store's own lock — the later one honestly reports zeros.
-async fn gc_sweep(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+/// store's own lock — the later one honestly reports zeros. A FAILED
+/// sweep is a 500, never a zero receipt: zeros must keep meaning "clean
+/// store" so the two are never confused.
+async fn gc_sweep(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let persistence = state.persistence.clone();
-    let (compacted, compaction_bytes, gc_bytes) =
-        tokio::task::spawn_blocking(move || persistence.sweep_chunked())
-            .await
-            .unwrap_or((0, 0, 0));
-    Json(serde_json::json!({
-        "segments_compacted": compacted,
-        "compaction_bytes_reclaimed": compaction_bytes,
-        "gc_bytes_reclaimed": gc_bytes,
-    }))
+    match tokio::task::spawn_blocking(move || persistence.sweep_chunked()).await {
+        Ok(Ok((compacted, compaction_bytes, gc_bytes))) => Ok(Json(serde_json::json!({
+            "segments_compacted": compacted,
+            "compaction_bytes_reclaimed": compaction_bytes,
+            "gc_bytes_reclaimed": gc_bytes,
+        }))),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "manual GC sweep failed");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, &e, "store_error"))
+        }
+        Err(join) => {
+            tracing::error!(error = %join, "manual GC sweep task failed");
+            Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gc sweep task failed",
+                "store_error",
+            ))
+        }
+    }
 }
 
 /// `Json<T>` with rejections mapped into the documented error envelope.
@@ -3790,6 +3804,66 @@ mod tests {
         );
         let again = sweep(router).await;
         assert_eq!(again["segments_compacted"], 0, "receipt: {again}");
+    }
+
+    #[tokio::test]
+    async fn gc_endpoint_reports_a_failed_sweep_as_500_not_zeros() {
+        // A zero receipt means "clean store". A failed compaction must
+        // never wear that disguise: it answers 500 through the standard
+        // error envelope. NaN ratio makes compact_segments reject its
+        // config — the one deterministic in-process failure path.
+        use mlxcache_core::contract::{CheckpointMeta, ModelFingerprint};
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = crate::persistence::Persistence::new(dir.path()).unwrap();
+        p.set_compact_config(crate::persistence::CompactConfig {
+            enabled: false,
+            ratio: f64::NAN,
+            min_dead_bytes: 1,
+            max_segments: 8,
+        });
+        let _ = p
+            .publish_atomic(
+                0x41u128,
+                1,
+                CheckpointMeta {
+                    fingerprint: ModelFingerprint::default(),
+                    token_count: 8,
+                    tokens: vec![1, 2, 3],
+                    format_version: 1,
+                    payload_sha256: None,
+                    engine_id: None,
+                    granularity: None,
+                },
+                b"payload",
+            )
+            .unwrap();
+        let state = Arc::new(AppState {
+            orchestrator: Orchestrator::new(),
+            singleflight: SingleFlight::new(),
+            stats: Arc::new(Stats::default()),
+            served_models: vec!["test-model".into()],
+            settle_publish_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                SETTLE_PUBLISH_CONCURRENCY,
+            )),
+            sidecar: None,
+            persistence: p,
+            trace: None,
+        });
+        let res = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/gc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "store_error", "envelope: {error}");
     }
 
     #[test]

@@ -157,6 +157,25 @@ impl CompactConfig {
     }
 }
 
+/// A blob's CheckpointMeta from ONLY its header prefix: 4-byte length,
+/// capped at MAX_HEADER_READ, then the header. A v1/v2 blob's payload is
+/// tens-to-hundreds of MB behind that header; callers that only need the
+/// meta must never pull it into memory.
+fn peek_meta_at(path: &Path) -> Option<CheckpointMeta> {
+    use std::io::Read as _;
+    let mut f = fs::File::open(path).ok()?;
+    let mut len_bytes = [0u8; 4];
+    f.read_exact(&mut len_bytes).ok()?;
+    let header_len = u32::from_le_bytes(len_bytes) as usize;
+    if header_len > crate::chunkstore::MAX_HEADER_READ {
+        return None; // not one of ours (the wire cap is far lower)
+    }
+    let mut prefixed = len_bytes.to_vec();
+    prefixed.resize(4 + header_len, 0);
+    f.read_exact(&mut prefixed[4..]).ok()?;
+    crate::chunkstore::peek_meta(&prefixed)
+}
+
 /// Process-wide monotonic counter to make temp file names unique across
 /// concurrent publishes within one process.
 fn chunk_err(e: crate::chunkstore::ChunkError) -> PersistError {
@@ -564,7 +583,11 @@ impl Persistence {
         }
         // Visible. Refs were registered by stage_and_register (one lock
         // with the append); registering again here would double-count every
-        // chunk and pin removed blobs' bytes until a boot replay.
+        // chunk and pin removed blobs' bytes until a boot replay. The
+        // generation bump invalidates share reports cached between the
+        // register and this rename — the visibility point no refcount
+        // mutation accompanies.
+        store.bump_generation();
         Ok(final_path)
     }
 
@@ -725,27 +748,7 @@ impl Persistence {
         if self.chunk_store.is_none() {
             return false;
         }
-        let Ok(mut f) = fs::File::open(self.blob_dir.join(blob_name)) else {
-            return false;
-        };
-        use std::io::Read as _;
-        let mut len_bytes = [0u8; 4];
-        if f.read_exact(&mut len_bytes).is_err() {
-            return false;
-        }
-        let header_len = u32::from_le_bytes(len_bytes) as usize;
-        if header_len > crate::chunkstore::MAX_HEADER_READ {
-            return false; // not one of ours (the wire cap is far lower)
-        }
-        let mut header = vec![0u8; header_len];
-        if f.read_exact(&mut header).is_err() {
-            return false;
-        }
-        // peek_meta parses `u32 length + JSON`; rebuild the prefix in front
-        // of the JSON bytes we read.
-        let mut prefixed = len_bytes.to_vec();
-        prefixed.extend_from_slice(&header);
-        crate::chunkstore::peek_meta(&prefixed)
+        peek_meta_at(&self.blob_dir.join(blob_name))
             .map(|m| m.format_version == 3)
             .unwrap_or(false)
     }
@@ -817,10 +820,12 @@ impl Persistence {
     /// the empty-segment GC. Unlike the reaper's pass this ignores
     /// `enabled` — that flag gates the background cadence, not an
     /// explicit operator request. Returns (compacted segments,
-    /// compaction bytes reclaimed, GC bytes reclaimed).
-    pub fn sweep_chunked(&self) -> (usize, u64, u64) {
+    /// compaction bytes reclaimed, GC bytes reclaimed), or the compaction
+    /// failure: a zero receipt must always mean "clean store", never
+    /// "the sweep failed", or an operator cannot tell them apart.
+    pub fn sweep_chunked(&self) -> Result<(usize, u64, u64), String> {
         let Some(store) = self.chunk_store.as_ref() else {
-            return (0, 0, 0);
+            return Ok((0, 0, 0));
         };
         if let Err(e) = store.seal_active() {
             tracing::warn!(error = %e, "manual sweep could not seal the active segment");
@@ -831,10 +836,10 @@ impl Persistence {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "manual compaction pass failed");
-                    (0, 0)
+                    return Err(e.to_string());
                 }
             };
-        (segments, bytes, store.gc_empty_segments())
+        Ok((segments, bytes, store.gc_empty_segments()))
     }
 
     /// Fragmentation accounting for /stats: (total record bytes, dead record
@@ -879,8 +884,10 @@ impl Persistence {
         let mut rows: Vec<(BlobShare, Vec<crate::chunkstore::ChunkRef>)> = Vec::new();
         if let Ok(live) = Self::list_blobs_in(&self.blob_dir) {
             for path in live {
-                let Ok(raw) = fs::read(&path) else { continue };
-                let Some(meta) = crate::chunkstore::peek_meta(&raw) else {
+                // Header prefix only: a mixed store's v1/v2 blobs carry
+                // whole payloads behind this header, and a diagnostic
+                // endpoint must not read them to skip them.
+                let Some(meta) = peek_meta_at(&path) else {
                     continue;
                 };
                 if meta.format_version != 3 {
@@ -1119,7 +1126,7 @@ mod tests {
         let (_total, dead, _partial) = p.chunked_fragmentation();
         assert!(dead > 0, "the retired blob's records must read as dead");
 
-        let (segments, bytes, _gc) = p.sweep_chunked();
+        let (segments, bytes, _gc) = p.sweep_chunked().unwrap();
         assert!(segments >= 1, "the sweep must compact the sealed segment");
         assert!(bytes > 0);
         let (_total, dead, partial) = p.chunked_fragmentation();
