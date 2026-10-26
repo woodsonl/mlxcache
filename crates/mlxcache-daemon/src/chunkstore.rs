@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// v1 codec block size: the adopted config from REPORT.md's E3 (best
 /// measured dedup in both tiers; 256 was worse everywhere it was measured).
@@ -59,6 +59,11 @@ pub const TOKEN_BLOCK: u64 = 64;
 /// Segment roll target. 64 MiB with 64 KiB chunks was the E4 winner
 /// (restore FASTER than plain); ≥64 MiB is the mandate from N2.
 pub const SEGMENT_TARGET: u64 = 64 << 20;
+/// Reassembly read workers. E4 measured 8 parallel preads at 2.05 GiB/s
+/// against a single-reader ceiling of ~1 GiB/s on the packed layout; at
+/// 32K-token scale (v0.8.1's certified point, ~1.8 GB f16 payloads) the
+/// serial loop makes reassembly the dominant restore term.
+pub const READ_WORKERS: usize = 8;
 
 const SEGMENT_MAGIC: &[u8; 4] = b"MCSG";
 const MANIFEST_MAGIC: &[u8; 4] = b"MCKM";
@@ -1080,6 +1085,12 @@ impl ChunkStore {
     /// the caller verifies the payload sha256 against the header (the D1
     /// digest contract covers reassembly: any segment/manifest corruption
     /// produces wrong bytes, not a wrong verdict).
+    ///
+    /// Reads run on up to READ_WORKERS threads: the work items are one
+    /// CONTIGUOUS copy per (chunk, head), destination-sorted and verified
+    /// disjoint, so the payload buffer partitions cleanly and every worker
+    /// owns its slice — no staging buffer, each payload byte read from its
+    /// segment exactly once.
     pub fn reassemble(&self, manifest: &Manifest) -> Result<Vec<u8>, ChunkError> {
         // Snapshot placements AND open the segment files under the same
         // lock, then do the reads without it: a reassembly holds hundreds
@@ -1088,7 +1099,7 @@ impl ChunkStore {
         // sweep swaps placements and deletes the old file under this same
         // lock, so this snapshot pairs every placement with a file that
         // exists, and an fd stays readable after its file unlinks.
-        let (placements, mut open_files) = {
+        let (placements, open_files) = {
             let inner = self.inner.lock().unwrap();
             let placements: Vec<Placement> = manifest
                 .chunks
@@ -1102,7 +1113,7 @@ impl ChunkStore {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut files: HashMap<u64, fs::File> = HashMap::new();
+            let mut files: HashMap<u64, Arc<fs::File>> = HashMap::new();
             for p in &placements {
                 if files.contains_key(&p.seg) {
                     continue;
@@ -1113,26 +1124,154 @@ impl ChunkStore {
                 let f = fs::File::open(self.segment_path(p.seg)).map_err(|_| {
                     ChunkError::Corrupt(format!("segment {} missing under a live placement", p.seg))
                 })?;
-                files.insert(p.seg, f);
+                files.insert(p.seg, Arc::new(f));
             }
             (placements, files)
         };
         let mut out = vec![0u8; manifest.payload_len as usize];
+        // A chunk record stores its head slices back-to-back, so head h of
+        // chunk c is one contiguous read of per_head_len bytes at
+        // `offset + h*per_head_len` scattered to `first_off + h*head_stride`.
+        // Contiguous items are what makes the destination partitionable for
+        // parallel scatter; the manifest-order loop this replaces read the
+        // whole record into a staging buffer first.
+        let mut items: Vec<Scatter> = Vec::with_capacity(manifest.chunks.len());
         for (c, p) in manifest.chunks.iter().zip(placements.iter()) {
-            let file = open_files
-                .get_mut(&p.seg)
-                .expect("opened under the placement lock");
-            let mut body = vec![0u8; p.len as usize];
-            std::os::unix::fs::FileExt::read_exact_at(file, &mut body, p.offset)?;
-            for h in 0..c.n_heads as u64 {
-                let dst = c.first_off + h * c.head_stride;
-                let src = (h * c.per_head_len as u64) as usize;
-                out[dst as usize..(dst + c.per_head_len as u64) as usize]
-                    .copy_from_slice(&body[src..src + c.per_head_len as usize]);
+            // The record on disk must be exactly the geometry the manifest
+            // scatters (the Python reader enforces the same contract). A
+            // disagreement would read past the record into its neighbor's
+            // bytes: wrong bytes for the digest check to catch, never an
+            // out-of-bounds panic.
+            if p.len != c.body_len() {
+                return Err(ChunkError::Corrupt(format!(
+                    "chunk {} geometry disagrees with the stored record",
+                    hex_prefix(&c.digest)
+                )));
             }
+            for h in 0..c.n_heads as u64 {
+                items.push(Scatter {
+                    seg: p.seg,
+                    src: p.offset + h * c.per_head_len as u64,
+                    len: c.per_head_len as u64,
+                    dst: c.first_off + h * c.head_stride,
+                });
+            }
+        }
+        items.sort_unstable_by_key(|i| i.dst);
+        // Disjoint coverage is an invariant of every manifest this store
+        // writes (safetensors tensor spans do not overlap, and blocks tile
+        // each span). A manifest that violates it cannot be partitioned
+        // between workers, and honoring it would make reassembly
+        // write-order-dependent — so it is corruption: an error, never a
+        // racy write. A leading gap (first chunk not at 0) stays zeroed,
+        // exactly as the serial loop left it.
+        for w in items.windows(2) {
+            if w[0].dst + w[0].len > w[1].dst {
+                return Err(ChunkError::Corrupt("overlapping chunk coverage".into()));
+            }
+        }
+
+        let workers = READ_WORKERS.min(items.len());
+        if workers <= 1 {
+            scatter_into(&mut out, &items, 0, &open_files)?;
+            return Ok(out);
+        }
+        // Byte-balanced groups (not item-count-balanced: item sizes span
+        // whole-payload fallbacks to small head slices). A group boundary
+        // is an item index; its payload base is that item's dst, so
+        // split_at_mut hands each worker exclusive ownership of exactly the
+        // destination range its items write.
+        let total: u64 = items.iter().map(|i| i.len).sum();
+        let mut starts: Vec<usize> = Vec::with_capacity(workers - 1);
+        let mut acc = 0u64;
+        for (i, it) in items.iter().enumerate() {
+            if acc > 0
+                && starts.len() + 1 < workers
+                && acc >= total * (starts.len() + 1) as u64 / workers as u64
+            {
+                starts.push(i);
+            }
+            acc += it.len;
+        }
+        let mut bases: Vec<u64> = Vec::with_capacity(starts.len() + 1);
+        bases.push(0);
+        bases.extend(starts.iter().map(|&i| items[i].dst));
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(bases.len());
+        let mut prev = 0usize;
+        for &s in &starts {
+            ranges.push(prev..s);
+            prev = s;
+        }
+        ranges.push(prev..items.len());
+        let mut slices: Vec<&mut [u8]> = Vec::with_capacity(bases.len());
+        let mut rest: &mut [u8] = out.as_mut_slice();
+        let mut prev_base = 0u64;
+        for &b in &bases[1..] {
+            let (head, tail) = rest.split_at_mut((b - prev_base) as usize);
+            slices.push(head);
+            prev_base = b;
+            rest = tail;
+        }
+        slices.push(rest);
+
+        let mut first_err: Option<ChunkError> = None;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(slices.len());
+            for ((slice, range), &base) in slices.into_iter().zip(ranges).zip(bases.iter()) {
+                let group = &items[range];
+                let files = &open_files;
+                handles.push(scope.spawn(move || scatter_into(slice, group, base, files)));
+            }
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        first_err.get_or_insert(e);
+                    }
+                    Err(_) => {
+                        first_err.get_or_insert(ChunkError::Corrupt(
+                            "reassembly worker panicked".into(),
+                        ));
+                    }
+                }
+            }
+        });
+        if let Some(e) = first_err {
+            return Err(e);
         }
         Ok(out)
     }
+}
+
+/// One contiguous (segment → payload) copy: head slice `h` of a chunk.
+struct Scatter {
+    seg: u64,
+    /// Offset of this head's slice inside its segment.
+    src: u64,
+    len: u64,
+    /// Offset of this slice's destination inside the payload.
+    dst: u64,
+}
+
+/// Copy a group of destination-sorted scatter items into `buf`, which
+/// begins at payload offset `base`. Every item's `[dst, dst+len)` lies
+/// inside `[base, base + buf.len())` by the group partition; positional
+/// preads on shared `&File`s are safe from any thread.
+fn scatter_into(
+    buf: &mut [u8],
+    items: &[Scatter],
+    base: u64,
+    files: &HashMap<u64, Arc<fs::File>>,
+) -> Result<(), ChunkError> {
+    use std::os::unix::fs::FileExt as _;
+    for it in items {
+        let file = files
+            .get(&it.seg)
+            .expect("every item's segment opened under the lock");
+        let at = (it.dst - base) as usize;
+        file.read_exact_at(&mut buf[at..at + it.len as usize], it.src)?;
+    }
+    Ok(())
 }
 
 fn hex_prefix(d: &[u8; 32]) -> String {
@@ -1308,6 +1447,55 @@ mod tests {
             0,
             "boot GC reclaims the all-dead segment"
         );
+    }
+
+    #[test]
+    fn parallel_reassemble_round_trips_a_many_block_payload() {
+        // 599 positions over 3 tensors × 4 heads: 10 blocks per tensor →
+        // 120 head slices + the header-gap chunk, well past READ_WORKERS,
+        // so the byte-balanced partition and the scoped threads all engage.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        let a = fake_payload(600, 4, 8, 3, 5);
+        let m = store.stage_chunks(&a, 599).unwrap();
+        store.register(&m);
+        assert!(m.chunks.len() > READ_WORKERS);
+        assert_eq!(store.reassemble(&m).unwrap(), a);
+    }
+
+    #[test]
+    fn overlapping_manifest_coverage_is_rejected_not_raced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        // One whole-payload chunk (non-safetensors bytes), staged so its
+        // placement exists; the doubled manifest covers [0, len) twice.
+        let payload = b"not-a-safetensors-payload".to_vec();
+        let m = store.stage_chunks(&payload, 0).unwrap();
+        store.register(&m);
+        let mut bad = m.clone();
+        bad.chunks.push(m.chunks[0].clone());
+        let err = store.reassemble(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("overlapping chunk coverage"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn geometry_disagreement_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path(), &[]).unwrap();
+        let payload = b"stage-these-bytes-0123456789".to_vec();
+        let m = store.stage_chunks(&payload, 0).unwrap();
+        store.register(&m);
+        // Same digest, doubled per_head_len: the record on disk is 28
+        // bytes, the manifest scatters 56 — corruption, not a read past
+        // the record into its neighbor's bytes.
+        let mut bad = m.clone();
+        bad.chunks[0].per_head_len *= 2;
+        bad.payload_len = bad.chunks[0].body_len();
+        let err = store.reassemble(&bad).unwrap_err();
+        assert!(err.to_string().contains("geometry disagrees"), "got: {err}");
     }
 
     #[test]
