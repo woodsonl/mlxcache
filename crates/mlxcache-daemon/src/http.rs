@@ -83,10 +83,6 @@ pub struct AppState {
     /// the model. Beyond the bound the settle is dropped (best-effort by
     /// contract); the staging guard still cleans up.
     pub settle_publish_permits: std::sync::Arc<tokio::sync::Semaphore>,
-    /// One manual maintenance sweep (POST /gc) at a time: the store's own
-    /// lock serializes the work; this guard keeps concurrent receipts
-    /// honest instead of queueing duplicate sweeps behind it.
-    pub sweep_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -260,9 +256,9 @@ async fn healthz() -> Json<serde_json::Value> {
 
 /// On-demand chunk-store maintenance. Receipt-shaped: an operator (or a
 /// test) sees exactly what the sweep reclaimed, and a repeat call on a
-/// clean store is a stream of zeros.
+/// clean store is a stream of zeros. Concurrent calls serialize on the
+/// store's own lock — the later one honestly reports zeros.
 async fn gc_sweep(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let _guard = state.sweep_lock.clone().lock_owned().await;
     let persistence = state.persistence.clone();
     let (compacted, compaction_bytes, gc_bytes) =
         tokio::task::spawn_blocking(move || persistence.sweep_chunked())
@@ -3060,7 +3056,6 @@ mod tests {
             persistence: crate::persistence::Persistence::new(tempfile::tempdir().unwrap().keep())
                 .unwrap(),
             trace: None,
-            sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         });
         router(state)
     }
@@ -3161,7 +3156,6 @@ mod tests {
             sidecar: None,
             persistence: crate::persistence::Persistence::new(dir.path()).unwrap(),
             trace: None,
-            sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         };
         let old = dir.path().join(".settle-9-9-9.staging");
         std::fs::write(&old, b"orphan").unwrap();
@@ -3747,7 +3741,6 @@ mod tests {
             sidecar: None,
             persistence: p,
             trace: None,
-            sweep_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         });
         let router = router(state);
 
