@@ -373,6 +373,11 @@ struct Inner {
     segments: HashMap<u64, SegmentStat>,
     active: Option<ActiveSegment>,
     next_seg: u64,
+    /// Monotonic mutation counter: every change to refs or placements
+    /// (register, unregister, GC, compaction) bumps it. Derived reports
+    /// (per-blob share) cache on it so they recompute only when the
+    /// refcount world actually moved.
+    gen: u64,
 }
 
 struct ActiveSegment {
@@ -431,6 +436,7 @@ impl ChunkStore {
                 segments: HashMap::new(),
                 active: None,
                 next_seg: 0,
+                gen: 0,
             }),
         };
         store.scan_segments()?;
@@ -661,6 +667,7 @@ impl ChunkStore {
                 }
             }
         }
+        inner.gen += 1;
         Ok(manifest)
     }
 
@@ -803,6 +810,7 @@ impl ChunkStore {
                 }
             }
         }
+        inner.gen += 1;
     }
 
     /// Drop a retired blob's refs. Chunks that fall to zero become dead
@@ -827,6 +835,7 @@ impl ChunkStore {
                 inner.refs.insert(c.digest, now);
             }
         }
+        inner.gen += 1;
     }
 
     /// Delete segments whose every record is dead. Returns bytes reclaimed.
@@ -859,6 +868,9 @@ impl ChunkStore {
                     inner.segments.insert(seq, stat); // retry next sweep
                 }
             }
+        }
+        if reclaimed > 0 {
+            inner.gen += 1;
         }
         reclaimed
     }
@@ -895,6 +907,20 @@ impl ChunkStore {
             .filter(|s| s.dead > 0 && s.live() > 0)
             .count();
         (total, dead, partial)
+    }
+
+    /// Current generation: bumped by every mutation of refs or placements.
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().unwrap().gen
+    }
+
+    /// (generation, live refcounts) captured under ONE lock — the snapshot
+    /// a derived report (per-blob share) both computes from and keys its
+    /// cache on. Pairing them under the same lock means a report can never
+    /// cache newer data under an older generation key.
+    pub fn refs_snapshot(&self) -> (u64, HashMap<ChunkDigest, u64>) {
+        let inner = self.inner.lock().unwrap();
+        (inner.gen, inner.refs.clone())
     }
 
     /// Rewrite fragmented segments: copy each candidate's LIVE records into
@@ -1077,6 +1103,9 @@ impl ChunkStore {
                     );
                 }
             }
+        }
+        if compacted > 0 {
+            inner.gen += 1;
         }
         Ok((compacted, reclaimed))
     }
