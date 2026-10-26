@@ -44,11 +44,12 @@ Streams in flight drop (R1-4); clients retry.
 append segment (whose dead bytes are exempt from every other reclaim),
 compacts partially-dead segments at the configured thresholds, then runs
 the empty-segment GC. The receipt reports `segments_compacted`,
-`compaction_bytes_reclaimed` and `gc_bytes_reclaimed`; a repeat call on a
-clean store returns zeros, and a FAILED sweep answers HTTP 500
-(`store_error`) — zeros always mean "clean store". The `MLXCACHE_COMPACT`
-env flag gates the background cadence only — an explicit request always
-sweeps.
+`compaction_bytes_reclaimed` and `gc_bytes_reclaimed`. Zero reclaimed
+bytes means nothing met the configured compaction thresholds, not that
+the store is clean — check `/stats`'s `dead_bytes` to see whether dead
+bytes remain below them. A FAILED sweep answers HTTP 500 (`store_error`).
+The `MLXCACHE_COMPACT` env flag gates the background cadence only — an
+explicit request always sweeps.
 
 ## Checkpoint durability and recovery
 
