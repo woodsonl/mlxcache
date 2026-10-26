@@ -2764,12 +2764,21 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let s = state.stats.snapshot();
     // The chunk-store totals sit behind the store's std Mutex, which a
     // compaction sweep can hold across segment copies: read them on the
-    // blocking pool so a stats request never parks a runtime worker.
+    // blocking pool so a stats request never parks a runtime worker. The
+    // share report reads live .ckm manifests on the same pool.
     let persistence = state.persistence.clone();
-    let (chunk_total, chunk_dead, chunk_partial) =
-        tokio::task::spawn_blocking(move || persistence.chunked_fragmentation())
-            .await
-            .unwrap_or((0, 0, 0));
+    let ((chunk_total, chunk_dead, chunk_partial), share) =
+        tokio::task::spawn_blocking(move || {
+            (
+                persistence.chunked_fragmentation(),
+                persistence.chunked_share(),
+            )
+        })
+        .await
+        .unwrap_or((
+            (0, 0, 0),
+            std::sync::Arc::new(crate::persistence::ShareReport::default()),
+        ));
     Json(serde_json::json!({
         "requests": s.requests,
         "hits": s.hits,
@@ -2789,6 +2798,33 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "record_bytes": chunk_total,
             "dead_bytes": chunk_dead,
             "partial_segments": chunk_partial,
+            "live_record_bytes": chunk_total.saturating_sub(chunk_dead),
+            "logical_payload_bytes": share.stats.logical_payload_bytes,
+            // Logical payload over live record bytes: the multiple by
+            // which chunking shrinks what a whole-blob store would hold.
+            // 0 while the store holds no live records.
+            "dedup_ratio": if chunk_total > chunk_dead {
+                share.stats.logical_payload_bytes as f64 / (chunk_total - chunk_dead) as f64
+            } else {
+                0.0
+            },
+            "chunks_live": share.stats.chunks_live,
+            "chunks_shared": share.stats.chunks_shared,
+            "unique_record_bytes": share.stats.unique_record_bytes,
+            "shared_record_bytes": share.stats.shared_record_bytes,
+            "blobs": share
+                .blobs
+                .iter()
+                .map(|b| {
+                    serde_json::json!({
+                        "name": b.name,
+                        "tokens": b.token_count,
+                        "payload_bytes": b.payload_bytes,
+                        "unique_bytes": b.unique_bytes,
+                        "shared_bytes": b.shared_bytes,
+                    })
+                })
+                .collect::<Vec<_>>(),
         },
     }))
 }
@@ -3615,6 +3651,12 @@ mod tests {
         );
         assert!(stats["chunk_store"]["dead_bytes"].is_u64());
         assert!(stats["chunk_store"]["partial_segments"].is_u64());
+        // The share gauges are the operator's dedup view: what the store
+        // saves (ratio) and what evicting each blob actually frees.
+        assert!(stats["chunk_store"]["dedup_ratio"].is_f64());
+        assert!(stats["chunk_store"]["chunks_live"].is_u64());
+        assert!(stats["chunk_store"]["unique_record_bytes"].is_u64());
+        assert!(stats["chunk_store"]["blobs"].is_array());
     }
 
     #[test]
