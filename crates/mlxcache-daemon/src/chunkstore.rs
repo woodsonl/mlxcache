@@ -473,7 +473,7 @@ impl ChunkStore {
                 .unwrap_or(0);
         }
         store.reclaim_orphan_manifests(live_blobs)?;
-        store.gc_empty_segments();
+        let _ = store.gc_empty_segments(false);
         Ok(store)
     }
 
@@ -839,7 +839,11 @@ impl ChunkStore {
     }
 
     /// Delete segments whose every record is dead. Returns bytes reclaimed.
-    pub fn gc_empty_segments(&self) -> u64 {
+    /// `strict` mirrors compact_segments: the background reaper (`false`)
+    /// keeps a failed unlink for retry on a later pass; a MANUAL sweep
+    /// (`true`) returns the error — its receipt must never read "reclaimed
+    /// nothing" over an all-dead segment it failed to delete.
+    pub fn gc_empty_segments(&self, strict: bool) -> Result<u64, ChunkError> {
         let mut inner = self.inner.lock().unwrap();
         let mut reclaimed = 0u64;
         let empty: Vec<u64> = inner
@@ -864,15 +868,23 @@ impl ChunkStore {
                     inner.placement.retain(|_, p| p.seg != seq);
                     reclaimed += stat.total;
                 }
-                Err(_) => {
+                Err(e) => {
                     inner.segments.insert(seq, stat); // retry next sweep
+                    if strict {
+                        // Earlier deletions in this pass are durable; their
+                        // generation update must not be lost to this error.
+                        if reclaimed > 0 {
+                            inner.gen += 1;
+                        }
+                        return Err(ChunkError::Io(e));
+                    }
                 }
             }
         }
         if reclaimed > 0 {
             inner.gen += 1;
         }
-        reclaimed
+        Ok(reclaimed)
     }
 
     /// Physical bytes on disk: every segment file's live+dead bytes plus
@@ -1027,8 +1039,19 @@ impl ChunkStore {
             let old_file = match fs::File::open(&old_path) {
                 Ok(f) => f,
                 // Only external interference can do this (GC needs the
-                // lock this pass holds). Skip; the next pass reconciles.
-                Err(_) => continue,
+                // lock this pass holds). The reaper skips and reconciles
+                // on a later pass; a manual sweep answers the failure.
+                Err(e) => {
+                    if strict {
+                        // Earlier candidates in this pass are durable; their
+                        // generation update must not be lost to this error.
+                        if compacted > 0 {
+                            inner.gen += 1;
+                        }
+                        return Err(ChunkError::Io(e));
+                    }
+                    continue;
+                }
             };
             // Write the new segment: header + live records, fsynced.
             let new_seq = inner.next_seg;
@@ -1505,7 +1528,7 @@ mod tests {
         store.unregister(&ma);
         store.unregister(&mb);
         assert_eq!(
-            store.gc_empty_segments(),
+            store.gc_empty_segments(false).unwrap(),
             0,
             "active segment is never deleted"
         );
@@ -1602,7 +1625,7 @@ mod tests {
         // its chunks are dead. GC removes the empty segment.
         let store = ChunkStore::open(dir.path(), &[]).unwrap();
         assert!(!dir.path().join("orphan.ckm").exists());
-        store.gc_empty_segments();
+        store.gc_empty_segments(false).unwrap();
         assert_eq!(store.physical_bytes(), 0);
     }
 
@@ -1841,7 +1864,7 @@ mod tests {
         let sweeper = std::sync::Arc::clone(&store);
         let sweep = std::thread::spawn(move || {
             for _ in 0..400 {
-                let _ = sweeper.gc_empty_segments();
+                let _ = sweeper.gc_empty_segments(false);
                 let _ = sweeper.compact_segments(0.0, 1, 2, false);
             }
         });

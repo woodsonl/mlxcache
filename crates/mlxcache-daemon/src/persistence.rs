@@ -789,7 +789,7 @@ impl Persistence {
     pub fn gc_chunked(&self) -> u64 {
         self.chunk_store
             .as_ref()
-            .map(|s| s.gc_empty_segments())
+            .map(|s| s.gc_empty_segments(false).unwrap_or(0))
             .unwrap_or(0)
     }
 
@@ -850,7 +850,8 @@ impl Persistence {
                     return Err(e.to_string());
                 }
             };
-        Ok((segments, bytes, store.gc_empty_segments()))
+        let gc = store.gc_empty_segments(true).map_err(|e| e.to_string())?;
+        Ok((segments, bytes, gc))
     }
 
     /// Fragmentation accounting for /stats: (total record bytes, dead record
