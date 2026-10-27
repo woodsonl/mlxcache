@@ -20,8 +20,7 @@ uv run ruff check sidecar/ scripts/
 uv run ruff format --check sidecar/ scripts/
 ```
 
-CI runs on every PR with this battery plus the alloc gate and the
-mlx-extra test pass; run the battery locally per batch anyway — CI is the
+CI runs on every PR with this battery plus the mlx-extra test pass; run the battery locally per batch anyway — CI is the
 independent signal, and nothing merges with it red.
 Real-engine gates (`MLXCACHE_BENCH_REAL=1` round-trip, prefix benchmarks)
 also stay opt-in local: they need a downloaded model and a quiet machine.

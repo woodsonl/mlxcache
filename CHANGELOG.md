@@ -19,6 +19,7 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
   CONTRIBUTING.md flip with it: the local battery stays the per-batch
   iron rule, CI is the independent signal on every PR, nothing merges
   red.
+
 ## 0.9.3 — 2026-10-27
 
 ### Security

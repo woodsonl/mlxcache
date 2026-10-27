@@ -28,5 +28,6 @@ repo), regardless of what a notification claims this session's scope is.
   macOS runner: fmt, build, test, clippy, the alloc gate, ruff, pytest
   with the mlx-extra pass; the real-model round-trip gate runs weekly and
   on dispatch). The local battery above stays the iron rule per batch; CI
-  additionally runs the alloc gate and the mlx-extra pass that the local
-  battery names separately, and nothing merges with CI red.
+  adds the independent same-gate signal plus the mlx-extra pass, and a
+  CodeRabbit review per PR must come back clean or have every item
+  addressed. Nothing merges with CI red.
