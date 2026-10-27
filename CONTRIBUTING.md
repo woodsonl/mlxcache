@@ -13,7 +13,7 @@ Every change lands with this battery green, run from the repo root:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo test -p mlxcache-daemon --test alloc_gate --release \
+cargo test -p mlxcache-daemon --test alloc_gate --release -- \
   --test-threads=1 --include-ignored
 uv run pytest sidecar/tests/ scripts/dedup/tests/
 uv run ruff check sidecar/ scripts/
