@@ -266,30 +266,41 @@ holds. A named TurboQuant tier compresses the persisted checkpoint instead:
 silent: a tier label is part of the checkpoint's fingerprint, so compressed
 and f16 blobs never serve each other.
 
-To run the daemon's sidecar on the recommended tier:
+To run the daemon's sidecar on the recommended tier (the `mlx` extra first —
+the real engine is an optional dependency, per
+[Real inference](#real-inference-mlx-lm)):
 
 ```bash
+uv sync --group dev --extra mlx
 MLXCACHE_KV_TIER=tq-k4v4-g64 MLXCACHE_ENGINE=mlx-lm \
 MLXCACHE_MODEL=mlx-community/Qwen2.5-7B-Instruct-4bit \
 uv run python -m mlxcache_sidecar.server &
 ```
 
-The wrapper takes the same tier as a flag: `--kv-tier tq-k4v4-g64`.
+The wrapper takes the same tier as a flag: `--kv-tier tq-k4v4-g64`. The
+wrapper's disk-resume counter note (temperature-0 equality with a scratch
+run) holds for the f16 path; a tier label makes wrapper resumes deterministic
+but divergent like the sidecar's.
 
 Tier labels are a grammar, not a closed list: `tq-k<key-bits>v<value-bits>-g<group-size>`
 with key bits 2/3/4, value bits 2/3/4/6/8, group size ≥ 2. A typo refuses to
-boot rather than falling back to f16. Three labels are measured and
+boot rather than falling back to f16, and the model's per-layer `head_dim`
+must be divisible by the group size (the codec checks at encode time and
+rejects loudly on a mismatch). Three labels are measured and
 recommended — `tq-k4v4-g64` (3.6x smaller, per-layer cosine ≥ 0.992),
 `tq-k3v4-g64` (4.0x), `tq-k3v2-g64` (5.3x, the lossiest) — and any other
-valid label parses and runs but carries no measured fidelity claim.
+valid label parses, subject to that geometry, but carries no measured
+fidelity claim.
 
 Two contracts bind every tier. LOSSY BY DESIGN: resuming from a compressed
 checkpoint is deterministic but diverges from a scratch run (the
 bounded-distortion contract; the full record is in git history at
 `docs/designs/tq-tier.md`) — a coding agent resuming mid-conversation will
 continue coherently, not token-identically. And tiers are mutually exclusive
-with `MLXCACHE_KV_BITS` (the plain q8 tier) and dense-attention-only, refused
-at boot on hybrid architectures.
+with `MLXCACHE_KV_BITS` (the plain q8 tier) and dense-attention-only — the
+sidecar refuses a hybrid architecture at boot; the wrapper validates the
+tier/`--kv-bits` conflict at startup and defers the rest to its persistence
+step's loud failures rather than refusing the boot.
 
 Setting `MLXCACHE_TQ_LIVE=1` additionally swaps the ENGINE's live cache to
 the compressed representation during decode: 3.66x smaller resident KV at
