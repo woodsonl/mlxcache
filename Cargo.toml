@@ -7,11 +7,15 @@ members = [
 
 [workspace.package]
 
-
 version = "0.9.2"
 
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/woodsonl/mlxcache"
+homepage = "https://github.com/woodsonl/mlxcache"
+description = "KV cache daemon for MLX on Apple Silicon: reuse prefilled context across requests, processes, and restarts"
+keywords = ["mlx", "kv-cache", "llm", "inference", "apple-silicon"]
+categories = ["caching", "command-line-utilities"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
