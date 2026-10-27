@@ -2,6 +2,24 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.9.4 — 2026-10-27
+
+### Added
+
+- **CI is back.** The workflow main lost in #41's squash is restored from
+  history with three touch-ups: push triggers drop the dead bootstrap
+  branch, the mlx-extra step's comment loses its removed-engine framing,
+  and nothing else changes — SHA-pinned actions, pinned toolchain,
+  macOS-15 (arm64; macos-14 retires), running the local battery's gates
+  plus the alloc gate and the mlx-extra pass (fmt, build, test, clippy,
+  single-threaded alloc gate, ruff, pytest with dedup invariants, then the
+  suite again under the mlx extra), plus the weekly/on-dispatch real-model
+  round-trip job. Public-repo Actions are free, and a dependabot.yml now
+  watches the action pins for version updates. AGENTS.md and
+  CONTRIBUTING.md flip with it: the local battery stays the per-batch
+  iron rule, CI is the independent signal on every PR, nothing merges
+  red.
+
 ## 0.9.3 — 2026-10-27
 
 ### Security

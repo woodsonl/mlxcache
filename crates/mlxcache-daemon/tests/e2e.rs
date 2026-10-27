@@ -1061,6 +1061,21 @@ impl std::ops::DerefMut for SidecarHandle {
     }
 }
 
+/// Read whatever a dead or dying sidecar child left on its stderr pipe,
+/// bounded: the panic paths that report a boot failure carry it, because
+/// the child's stderr is the only witness to why it never reached PORT=.
+fn child_stderr_so_far(child: &mut std::process::Child) -> String {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Some(err) = child.stderr.as_mut() {
+        let mut buf = [0u8; 8192];
+        if let Ok(n) = err.read(&mut buf) {
+            text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        }
+    }
+    text
+}
+
 async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> (String, SidecarHandle) {
     spawn_sidecar_with_setup(env, "").await
 }
@@ -1090,10 +1105,14 @@ async fn spawn_sidecar_with_setup(env: &[(&str, &str)], setup: &str) -> (String,
     // (issue #31).
     let script = format!(
         "import sys; sys.path.insert(0, {root:?}); \
+         print('e2e: importing server', file=sys.stderr, flush=True); \
          from mlxcache_sidecar import server; \
+         print('e2e: import done', file=sys.stderr, flush=True); \
          server.Handler.engine = server.make_engine('e2e-model'); \
+         print('e2e: engine ready', file=sys.stderr, flush=True); \
          {setup} \
          srv = server.BurstServer(('127.0.0.1', 0), server.Handler); \
+         print('e2e: bound', file=sys.stderr, flush=True); \
          print('PORT=%d' % srv.server_address[1], flush=True); \
          srv.serve_forever()",
         root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
@@ -1112,6 +1131,10 @@ async fn spawn_sidecar_with_setup(env: &[(&str, &str)], setup: &str) -> (String,
     let mut cmd = std::process::Command::new(python);
     cmd.arg("-c").arg(&script);
     cmd.stdout(std::process::Stdio::piped());
+    // stderr is piped, not inherited, so a child that dies or wedges before
+    // its PORT= line can tell us WHY in the timeout panic — an inherited
+    // stderr disappears into the runner log where nobody greps for it.
+    cmd.stderr(std::process::Stdio::piped());
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -1141,20 +1164,53 @@ async fn spawn_sidecar_with_setup(env: &[(&str, &str)], setup: &str) -> (String,
                     Err(_) => {
                         let _ = child.kill();
                         let _ = child.wait();
-                        panic!("sidecar printed an unparsable port: {port:?}");
+                        // Early EOF or garbage on stdout: same blindness
+                        // as the timeout path — the stderr rides the panic.
+                        let stderr_text = child_stderr_so_far(&mut child);
+                        panic!(
+                            "sidecar printed an unparsable port: {port:?}; stderr: {stderr_text:?}"
+                        );
                     }
                 }
             }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("sidecar never printed its port within 30s");
+                // The child's stderr is the only witness to why it never
+                // booted; a bare-interpreter probe separates "python cannot
+                // start under this runner at all" from "the sidecar script
+                // specifically hangs". Without this, the timeout panic is
+                // blind — the CI failure that motivated it produced no
+                // evidence at all.
+                let stderr_text = child_stderr_so_far(&mut child);
+                let probe_out = std::process::Command::new(python)
+                    .arg("-c")
+                    .arg("print('boot')")
+                    .stdin(std::process::Stdio::null())
+                    .output();
+                let probe_msg = match probe_out {
+                    Ok(o) if o.status.success() => "bare interpreter boots".to_string(),
+                    Ok(o) => {
+                        format!(
+                            "bare interpreter failed: {}",
+                            String::from_utf8_lossy(&o.stderr)
+                        )
+                    }
+                    Err(e) => format!("bare interpreter spawn error: {e}"),
+                };
+                panic!(
+                    "sidecar never printed its port within 30s (interpreter {python:?}); \
+                     probe: {probe_msg}; stderr so far: {stderr_text:?}"
+                );
             }
         }
     };
     let (port, stdout) = port;
     // Drain the rest of stdout in the background: nothing this child may
-    // print to stdout may block it on a full pipe mid-test.
+    // print to stdout may block it on a full pipe mid-test. stderr gets its
+    // own drain now that it is piped — a chatty child would otherwise wedge
+    // at a full 64 KB pipe.
+    let mut child_stderr = child.stderr.take();
     let drain = std::thread::spawn(move || {
         use std::io::Read;
         let mut stdout = stdout;
@@ -1162,6 +1218,17 @@ async fn spawn_sidecar_with_setup(env: &[(&str, &str)], setup: &str) -> (String,
         while let Ok(n) = stdout.read(&mut buf) {
             if n == 0 {
                 break;
+            }
+        }
+    });
+    let _drain_err = std::thread::spawn(move || {
+        use std::io::Read;
+        if let Some(err) = child_stderr.as_mut() {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = err.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
             }
         }
     });

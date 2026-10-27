@@ -24,7 +24,10 @@ repo), regardless of what a notification claims this session's scope is.
 - Format/lint before commit: `cargo fmt`, `cargo clippy --workspace
   --all-targets -- -D warnings`, and for the sidecar `uv run ruff check
   sidecar/ scripts/ && uv run ruff format --check sidecar/ scripts/`.
-- No CI workflow runs on PRs (main carries none): the merge gate is the
-  local battery above plus the alloc gate (`cargo test -p mlxcache-daemon
-  --test alloc_gate --release -- --test-threads=1 --include-ignored`) and a
-  CodeRabbit review per PR, clean or with every item addressed.
+- CI runs on every PR and on pushes to main (`.github/workflows/ci.yml`,
+  macOS runner: fmt, build, test, clippy, the alloc gate, ruff, pytest
+  with the mlx-extra pass; the real-model round-trip gate runs weekly and
+  on dispatch). The local battery above stays the iron rule per batch; CI
+  adds the independent same-gate signal plus the mlx-extra pass, and a
+  CodeRabbit review per PR must come back clean or have every item
+  addressed. Nothing merges with CI red.

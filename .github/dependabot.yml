@@ -1,0 +1,8 @@
+# Version updates for the CI's SHA-pinned actions (security alerts run
+# regardless on public repos; this keeps the pins themselves current).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

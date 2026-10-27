@@ -2240,10 +2240,25 @@ class BurstServer(ThreadingHTTPServer):
     failure two e2e single-flight tests hit under parallel test load
     (2026-10-04). Backlog 128 + daemon threads: accept bursts drain fast
     because every request gets a thread immediately.
-    """
+
+    server_bind skips HTTPServer's socket.getfqdn() of the bind address:
+    nothing here reads server_name, and a reverse-DNS lookup on a numeric
+    loopback address wedges for the resolver's full retry budget on
+    images whose resolver blackholes PTR — observed as every e2e child
+    hanging silently after construction on one CI runner generation while
+    the same code booted in milliseconds on the image before it. Bind and
+    bookkeep only; no resolver on the boot path."""
 
     request_queue_size = 128
     daemon_threads = True
+
+    def server_bind(self):
+        import socketserver  # noqa: PLC0415
+
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = "mlxcache-sidecar"
+        self.server_port = port
 
 
 def serve(addr: str = "127.0.0.1", port: int = 8421) -> None:

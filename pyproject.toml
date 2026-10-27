@@ -14,7 +14,7 @@ asyncio_mode = "auto"
 name = "mlxcache-sidecar"
 
 
-version = "0.9.3"
+version = "0.9.4"
 
 description = "mlx-lm compatibility sidecar for the mlxcache daemon"
 requires-python = ">=3.12"
