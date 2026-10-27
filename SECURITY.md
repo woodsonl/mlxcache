@@ -10,6 +10,13 @@ exploitable.
 Include what you found, how you reproduced it, and what an attacker gains.
 A proof-of-concept is welcome but not required.
 
+## Code of conduct reports
+
+The same private reporting form carries code-of-conduct reports: choose
+"Report a vulnerability", mark the report as a conduct matter, and it
+reaches the maintainer privately without a public issue. The security
+scope below does not apply to conduct reports.
+
 ## Scope
 
 mlxcache is a loopback service by design: the daemon binds `127.0.0.1`, and
