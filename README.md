@@ -506,3 +506,7 @@ cannot cross-serve another engine's checkpoints. MIT licensed — see
 
 The chunk-granularity question is answered: GO, with token-block/64 as the
 v1 codec ([REPORT.md](REPORT.md)).
+
+## Support me
+
+[https://buymeacoffee.com/lancewoodson](https://buymeacoffee.com/lancewoodson)  
