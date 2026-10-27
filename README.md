@@ -562,6 +562,8 @@ v1 codec ([REPORT.md](REPORT.md)).
 
 ## Support
 
-<p align="center"><a href="https://buymeacoffee.com/lancewoodson"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br />
-mlxcache is free.<br />
+<p align="center">
+  mlxcache is free.<br />
+  <a href="https://buymeacoffee.com/lancewoodson"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br />
 If you like it, coffee keeps the work flowing.
+</p>
