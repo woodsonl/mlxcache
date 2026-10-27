@@ -283,7 +283,8 @@ run) holds for the f16 path; a tier label makes wrapper resumes deterministic
 but divergent like the sidecar's.
 
 Tier labels are a grammar, not a closed list: `tq-k<key-bits>v<value-bits>-g<group-size>`
-with key bits 2/3/4, value bits 2/3/4/6/8, group size ≥ 2. A typo refuses to
+with key bits 2/3/4, value bits 2/3/4/6/8, group size ≥ 2 (the `g` prefix
+is optional — `tq-k3v4-64` is accepted as `tq-k3v4-g64`). A typo refuses to
 boot rather than falling back to f16, and the model's per-layer `head_dim`
 must be divisible by the group size (the codec checks at encode time and
 rejects loudly on a mismatch). Three labels are measured and
