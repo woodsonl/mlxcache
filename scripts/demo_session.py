@@ -49,7 +49,7 @@ def _read(rel: str, max_bytes: int) -> str:
 # ~76KB total => ~21K tokens for Qwen2.5 BPE: a real long-context request
 # whose cold prefill at 7B-4bit costs tens of seconds (the prefill a restart
 # skips), while staying far inside the 32768-token window.
-FILE_A = _read("docs/designs/mlx-kv-cache-daemon.md", 28_000)  # design doc
+FILE_A = _read("README.md", 28_000)  # repo README as the long-context payload
 FILE_B = _read("crates/mlxcache-core/src/index.rs", 30_000)  # prefix index
 FILE_C = _read("crates/mlxcache-daemon/src/orchestrator.rs", 18_000)
 
