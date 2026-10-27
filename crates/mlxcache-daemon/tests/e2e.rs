@@ -1090,10 +1090,14 @@ async fn spawn_sidecar_with_setup(env: &[(&str, &str)], setup: &str) -> (String,
     // (issue #31).
     let script = format!(
         "import sys; sys.path.insert(0, {root:?}); \
+         print('e2e: importing server', file=sys.stderr, flush=True); \
          from mlxcache_sidecar import server; \
+         print('e2e: import done', file=sys.stderr, flush=True); \
          server.Handler.engine = server.make_engine('e2e-model'); \
+         print('e2e: engine ready', file=sys.stderr, flush=True); \
          {setup} \
          srv = server.BurstServer(('127.0.0.1', 0), server.Handler); \
+         print('e2e: bound', file=sys.stderr, flush=True); \
          print('PORT=%d' % srv.server_address[1], flush=True); \
          srv.serve_forever()",
         root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../sidecar"),
