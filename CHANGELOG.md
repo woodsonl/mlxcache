@@ -2,6 +2,22 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.9.1 — 2026-10-26
+
+### Removed
+
+- **`docs/designs/` and its two design records** (mlx-kv-cache-daemon.md,
+  tq-tier.md). The engineering history is preserved in git; the live tree
+  no longer carries design-era documents that current docs had begun
+  citing as authorities they are not. Every reference was resolved rather
+  than left dangling: the README's tier and bake-off sections keep their
+  numbers and point at git history for the full records;
+  `docs/contract-spec.md` — which declared the deleted design doc its
+  "source of truth" — now states its own origin and binds itself;
+  `scripts/demo_session.py`'s context payload reads the README instead of
+  a deleted file (a runtime breakage, not just a dead link); and the TQ
+  quality probe's docstring names where its pre-registered thresholds
+  live.
 ## 0.9.0 — 2026-10-25
 
 ### Added

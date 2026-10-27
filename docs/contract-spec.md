@@ -2,7 +2,7 @@
 
 Version: 1 (draft 1)
 Status: BINDING for v1 adapters
-Source of truth: docs/designs/mlx-kv-cache-daemon.md (eng review decisions R1-R7)
+Origin: eng review decisions R1-R7 (record preserved in git history at docs/designs/mlx-kv-cache-daemon.md). This spec is the binding source of truth.
 
 ## Glossary (pinned — no synonyms allowed anywhere in this repo)
 
