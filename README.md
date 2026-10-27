@@ -433,8 +433,8 @@ budget with anchor protection) and every checkpoint carries a sha256 payload
 digest verified at boot and first serve. The engine-agnostic contract has one
 adapter today (mlx-lm), plus the hermetic synthetic engine the e2e suite
 drives; engine domains are isolated in the key space, so a future adapter
-cannot cross-serve another engine's checkpoints. No license assigned —
-private build, all rights reserved.
+cannot cross-serve another engine's checkpoints. MIT licensed — see
+[LICENSE](LICENSE).
 
 The chunk-granularity question is answered: GO, with token-block/64 as the
 v1 codec ([REPORT.md](REPORT.md)).
