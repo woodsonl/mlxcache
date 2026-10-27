@@ -185,11 +185,13 @@ seals the active append segment, compacts at the configured thresholds,
 then deletes empty segments), so reclaiming dead bytes does not require a
 restart; a failed sweep answers `500 store_error`, and a zero receipt
 means nothing met the thresholds — `/stats`'s `dead_bytes` says whether
-any remain. Reassembly in both readers (daemon and sidecar) issues one
-async task per segment, each chunk slice read once straight into its
-destination range and scattered into place as the tasks complete — a read
-spanning many segments parallelizes; a read inside one segment runs on a
-single worker. Setting `MLXCACHE_CHUNK_STORE=0` on the daemon publishes whole-blob v2
+any remain. Reassembly differs by reader. The daemon builds one scatter
+item per chunk head, splits them into byte-balanced groups, and runs the
+groups on up to 8 scoped OS threads — a multi-chunk read parallelizes
+even inside one segment; a single-chunk read runs on one worker. The
+sidecar issues one pool task per segment (capped at 8 threads), staging
+each chunk record before scattering its slices — a single-segment read
+runs on one worker. Setting `MLXCACHE_CHUNK_STORE=0` on the daemon publishes whole-blob v2
 instead (both layouts coexist and stay readable forever).
 
 Every published hit writes one KV checkpoint ("blob") — a safetensors payload
