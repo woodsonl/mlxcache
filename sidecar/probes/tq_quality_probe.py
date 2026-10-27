@@ -2,8 +2,9 @@
 """TQ tier quality probe: the pre-registered gates, measured on a real model.
 
 One run answers the six questions the TQ persistence tier's ship decision
-rests on (thresholds recorded in docs/designs/tq-tier.md before this probe
-was first run against the 7B):
+rests on (thresholds recorded at design time before this probe
+was first run against the 7B; the 0.5.0 record lives in git history at
+docs/designs/tq-tier.md):
 
 1. G1 fidelity — per-layer cosine of quantize→dequantize against the f16 KV
    the engine actually holds, for the TQ tiers (k3/k4 keys, v2/v4 values)

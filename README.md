@@ -298,7 +298,7 @@ daemon's contract: `--store-budget-bytes` (default 32 GiB), `--anchor-window-s`
 so tiers never share blobs). `--kv-tier` names a TurboQuant persistence
 codec (`tq-k4v4-g64` and friends) that actually compresses what the wrapper
 persists — unlike `--kv-bits`, which only labels the partition; the measured
-bake-off lives in [docs/designs/tq-tier.md](docs/designs/tq-tier.md). One
+bake-off numbers are in [Measured](#measured). One
 extra endpoint rides along:
 
 - `GET /mlxcache/stats` — the live cache's reuse counters:
@@ -366,8 +366,8 @@ Sidecar:
 | `MLXCACHE_SIDECAR_PORT` | `8421` | sidecar bind port |
 | `MLXCACHE_KV_BITS` | `0` | KV quantization tier: `0` = f16, `8` = q8 — the tier is folded into the fingerprint, so tiers never share blobs. Dense attention models only: a hybrid model (linear attention / SSM / GDN layers — e.g. Falcon-H1, Qwen3-Next, granite-hybrid) is refused at boot with this tier set; its state persists unquantized on the f16 tier |
 | `MLXCACHE_KV_GROUP_SIZE` | `0` | quantization group size; `0` with a nonzero `MLXCACHE_KV_BITS` resolves to `64` |
-| `MLXCACHE_KV_TIER` | (unset) | named KV persistence tier (TurboQuant codecs, from arXiv:2504.19874): `tq-k4v4-g64` (recommended: 3.6× smaller than f16, per-layer cos ≥ 0.992), `tq-k3v4-g64` (4.0×), `tq-k3v2-g64` (5.3×, lossy). Compresses the persisted checkpoint; the live engine stays f16 unless `MLXCACHE_TQ_LIVE=1` swaps it too. LOSSY BY DESIGN: resume is deterministic but diverges from a scratch run (bounded-distortion contract, [docs/designs/tq-tier.md](docs/designs/tq-tier.md)); opt-in and fingerprint-isolated, so it never serves the f16/q8 tiers. Mutually exclusive with `MLXCACHE_KV_BITS`; dense models only |
-| `MLXCACHE_TQ_LIVE` | (unset) | with `MLXCACHE_KV_TIER` set, `1` makes the engine's own cache hold the COMPRESSED state during decode (TurboQuantKVCache): 3.66× smaller resident KV at 0.843× decode throughput (16% fewer tok/s, ~1.19× per-token latency) on the 7B (measured in the design doc). Same tier label, same frame format — a runtime memory trade, not a new tier; outputs diverge from both f16 and persistence-tier runs (quantizing during the forward changes the computation) but are deterministic per run |
+| `MLXCACHE_KV_TIER` | (unset) | named KV persistence tier (TurboQuant codecs, from arXiv:2504.19874): `tq-k4v4-g64` (recommended: 3.6× smaller than f16, per-layer cos ≥ 0.992), `tq-k3v4-g64` (4.0×), `tq-k3v2-g64` (5.3×, lossy). Compresses the persisted checkpoint; the live engine stays f16 unless `MLXCACHE_TQ_LIVE=1` swaps it too. LOSSY BY DESIGN: resume is deterministic but diverges from a scratch run (bounded-distortion contract); opt-in and fingerprint-isolated, so it never serves the f16/q8 tiers. Mutually exclusive with `MLXCACHE_KV_BITS`; dense models only |
+| `MLXCACHE_TQ_LIVE` | (unset) | with `MLXCACHE_KV_TIER` set, `1` makes the engine's own cache hold the COMPRESSED state during decode (TurboQuantKVCache): 3.66× smaller resident KV at 0.843× decode throughput (16% fewer tok/s, ~1.19× per-token latency) on the 7B (measured; the full record is in git history at `docs/designs/tq-tier.md`). Same tier label, same frame format — a runtime memory trade, not a new tier; outputs diverge from both f16 and persistence-tier runs (quantizing during the forward changes the computation) but are deterministic per run |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
 | `MLXCACHE_METAL_CACHE_MB` | `1024` | MLX allocator cache limit; freed buffers beyond it return to the OS instead of pooling |
 | `MLXCACHE_SETTLE_MAX_TOKENS` | `32768` (unset) | cap on a settled checkpoint's token count; an explicit `0` refuses every settle rather than disabling the cap |
@@ -442,7 +442,7 @@ context on Qwen2.5-7B-Instruct-4bit goes 34.5 s cold → 1.56 s warm → **1.59 
 after SIGTERM-killing both processes and restarting from disk** (verified in
 both KV tiers, f16 and q8).
 
-Full numbers and caveats in the [design doc](docs/designs/mlx-kv-cache-daemon.md) (R1-5).
+Full numbers and caveats are in the R1-5 record, preserved in git history at `docs/designs/mlx-kv-cache-daemon.md`.
 
 Prefix-cache benchmark (Qwen2.5-7B-Instruct-4bit, runtime-calibrated
 ~1,975-token shared prefix, concurrency 1, premise-guarded with enforced
@@ -463,7 +463,7 @@ Named-tier bake-off (same 7B model, 1,500-token prefix): the TurboQuant
 persistence tiers and the plain bits tiers measured head-to-head —
 `tq-k4v4-g64` at 15.7 KB/token (3.64× vs f16, per-layer cos 0.992) strictly
 dominates `q4` (16.1 KB/token, 3.55×, 0.990); the full frontier table and
-the divergence disclosure are in [docs/designs/tq-tier.md](docs/designs/tq-tier.md).
+the divergence disclosure are preserved in git history at `docs/designs/tq-tier.md`.
 
 ## Operating it
 
@@ -497,8 +497,8 @@ budget with anchor protection) and every checkpoint carries a sha256 payload
 digest verified at boot and first serve. The engine-agnostic contract has one
 adapter today (mlx-lm), plus the hermetic synthetic engine the e2e suite
 drives; engine domains are isolated in the key space, so a future adapter
-cannot cross-serve another engine's checkpoints. No license assigned —
-private build, all rights reserved.
+cannot cross-serve another engine's checkpoints. MIT licensed — see
+[LICENSE](LICENSE).
 
 The chunk-granularity question is answered: GO, with token-block/64 as the
 v1 codec ([REPORT.md](REPORT.md)).

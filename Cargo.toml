@@ -7,12 +7,10 @@ members = [
 
 [workspace.package]
 
-version = "0.9.0"
+version = "0.9.2"
 
 edition = "2021"
-# UNLICENSED until the license decision lands; crates.io publish is blocked
-# on it by design (a publish attempt fails fast without a real license).
-license = "UNLICENSED"
+license = "MIT"
 repository = "https://github.com/woodsonl/mlxcache"
 homepage = "https://github.com/woodsonl/mlxcache"
 description = "KV cache daemon for MLX on Apple Silicon: reuse prefilled context across requests, processes, and restarts"
