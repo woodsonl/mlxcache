@@ -7,9 +7,9 @@ All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 ### Added
 
 - **An MIT LICENSE.** The manifests' `UNLICENSED` placeholders become
-  `MIT` (Cargo workspace and the sidecar pyproject, with the PyPI
-  classifier), and the README's "No license assigned — private build, all
-  rights reserved" line becomes the license grant with the file link.
+  `MIT` (Cargo workspace and the sidecar pyproject), and the README's
+  "No license assigned — private build, all rights reserved" line becomes
+  the license grant with the file link.
   This unblocks the staged crates.io/PyPI publish metadata that PR #53
   held open on the license decision by design. Copyright is asserted as
   "The mlxcache Authors"; individual contributors keep their rights and
