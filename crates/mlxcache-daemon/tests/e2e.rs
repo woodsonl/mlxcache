@@ -1061,6 +1061,21 @@ impl std::ops::DerefMut for SidecarHandle {
     }
 }
 
+/// Read whatever a dead or dying sidecar child left on its stderr pipe,
+/// bounded: the panic paths that report a boot failure carry it, because
+/// the child's stderr is the only witness to why it never reached PORT=.
+fn child_stderr_so_far(child: &mut std::process::Child) -> String {
+    use std::io::Read;
+    let mut text = String::new();
+    if let Some(err) = child.stderr.as_mut() {
+        let mut buf = [0u8; 8192];
+        if let Ok(n) = err.read(&mut buf) {
+            text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        }
+    }
+    text
+}
+
 async fn spawn_sidecar_with_env(env: &[(&str, &str)]) -> (String, SidecarHandle) {
     spawn_sidecar_with_setup(env, "").await
 }
@@ -1149,7 +1164,12 @@ async fn spawn_sidecar_with_setup(env: &[(&str, &str)], setup: &str) -> (String,
                     Err(_) => {
                         let _ = child.kill();
                         let _ = child.wait();
-                        panic!("sidecar printed an unparsable port: {port:?}");
+                        // Early EOF or garbage on stdout: same blindness
+                        // as the timeout path — the stderr rides the panic.
+                        let stderr_text = child_stderr_so_far(&mut child);
+                        panic!(
+                            "sidecar printed an unparsable port: {port:?}; stderr: {stderr_text:?}"
+                        );
                     }
                 }
             }
@@ -1162,14 +1182,7 @@ async fn spawn_sidecar_with_setup(env: &[(&str, &str)], setup: &str) -> (String,
                 // specifically hangs". Without this, the timeout panic is
                 // blind — the CI failure that motivated it produced no
                 // evidence at all.
-                let mut stderr_text = String::new();
-                if let Some(mut err) = child.stderr.take() {
-                    use std::io::Read;
-                    let mut buf = [0u8; 8192];
-                    if let Ok(n) = err.read(&mut buf) {
-                        stderr_text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    }
-                }
+                let stderr_text = child_stderr_so_far(&mut child);
                 let probe_out = std::process::Command::new(python)
                     .arg("-c")
                     .arg("print('boot')")
