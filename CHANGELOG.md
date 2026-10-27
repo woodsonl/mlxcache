@@ -2,6 +2,15 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.9.3 — 2026-10-27
+
+### Security
+
+- **filelock 4.0.3 → 4.2.4** (lockfile only; transitive dev dependency):
+  clears all three open dependabot advisories against it — the high and
+  both lows — whose first patched version is 4.2.1. certifi's critical
+  advisory was cleared just prior by the dependabot bump merged as #52
+  (2026.7.22 → 2026.10.19).
 ## 0.9.2 — 2026-10-27
 
 ### Added
