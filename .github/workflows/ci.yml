@@ -10,6 +10,11 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+# The jobs only read the repo; declare it so the token stays read-only even if
+# the default changes.
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: macos-15
@@ -24,8 +29,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # The e2e test spawns the Python sidecar over HTTP; it needs uv + deps.
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
-      - name: Install sidecar deps
-        run: uv sync --group dev --locked
+        with:
+          # v10 flipped the default to false; an unpruned uv cache grows until
+          # it evicts the realmodel job's HF cache.
+          prune-cache: true
       - name: Format
         run: cargo fmt --all -- --check
       - name: Build
@@ -48,6 +55,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          prune-cache: true # v10 defaults this to false
       - name: Install deps
         run: uv sync --group dev --locked
       - name: Lint
@@ -87,6 +96,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          prune-cache: true # v10 defaults this to false
       - name: Cache the model and HF cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
