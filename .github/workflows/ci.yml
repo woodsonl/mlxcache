@@ -19,7 +19,9 @@ jobs:
   rust:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Pin the toolchain: dynamic `stable` can add lints and redden CI with no
       # repo change. rust-toolchain.toml pins local + CI to the same version.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
@@ -55,7 +57,9 @@ jobs:
   python:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           prune-cache: true # v10 defaults this to false
@@ -96,7 +100,9 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           prune-cache: true # v10 defaults this to false
