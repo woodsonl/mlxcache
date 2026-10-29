@@ -2,6 +2,20 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.9.5 — 2026-10-27
+
+### Added
+
+- **A TurboQuant activation section in the README.** The tier system
+  shipped in 0.5.0-0.6.0 as config rows and measured paragraphs, with no
+  path from "I want smaller checkpoints" to a running command. The new
+  Storage subsection carries that path: the daemon-sidecar env and the
+  wrapper flag, the tier-label grammar (tq-k<key>v<value>-g<group>, key
+  2/3/4, value 2/3/4/6/8, group >= 2 — a grammar, not a closed list; the
+  three measured labels named as the recommended ones), and the two
+  contracts that bind every tier: lossy-by-design divergence and
+  fingerprint isolation. The config row now points at the section instead
+  of restating it.
 ## 0.9.4 — 2026-10-27
 
 ### Added
