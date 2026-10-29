@@ -33,6 +33,8 @@ jobs:
           # v10 flipped the default to false; an unpruned uv cache grows until
           # it evicts the realmodel job's HF cache.
           prune-cache: true
+      - name: Install sidecar deps
+        run: uv sync --group dev --locked
       - name: Format
         run: cargo fmt --all -- --check
       - name: Build
