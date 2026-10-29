@@ -257,6 +257,59 @@ would have hit an evicted checkpoint takes an honest miss and republishes it.
 `/stats` carries an `evictions` counter. To run unbounded (the old behavior):
 `MLXCACHE_EVICT_MAX_BYTES=0`.
 
+### Compressed persistence tiers (TurboQuant)
+
+By default a checkpoint is stored f16 — a byte-exact copy of what the engine
+holds. A named TurboQuant tier compresses the persisted checkpoint instead:
+3.6-5.3x smaller on disk, with quantization fidelity recorded at the bake-off
+(below in [Measured](#measured)). This is opt-in, off by default, and never
+silent: a tier label is part of the checkpoint's fingerprint, so compressed
+and f16 blobs never serve each other.
+
+To run the daemon's sidecar on the recommended tier (the `mlx` extra first —
+the real engine is an optional dependency, per
+[Real inference](#real-inference-mlx-lm)):
+
+```bash
+uv sync --group dev --extra mlx
+MLXCACHE_KV_TIER=tq-k4v4-g64 MLXCACHE_ENGINE=mlx-lm \
+MLXCACHE_MODEL=mlx-community/Qwen2.5-7B-Instruct-4bit \
+uv run python -m mlxcache_sidecar.server &
+```
+
+The wrapper takes the same tier as a flag: `--kv-tier tq-k4v4-g64`. The
+wrapper's disk-resume counter note (temperature-0 equality with a scratch
+run) holds for the f16 path; a tier label makes wrapper resumes deterministic
+but divergent like the sidecar's.
+
+Tier labels are a grammar, not a closed list: `tq-k<key-bits>v<value-bits>-g<group-size>`
+with key bits 2/3/4, value bits 2/3/4/6/8, group size ≥ 2 (the `g` prefix
+is optional — `tq-k3v4-64` is accepted as `tq-k3v4-g64`; the raw label is
+part of the fingerprint, so the two spellings are two cache identities:
+pick one and stay on it). A typo refuses to
+boot rather than falling back to f16, and the model's per-layer `head_dim`
+must be divisible by the group size (the codec checks at encode time and
+rejects loudly on a mismatch). Three labels are measured and
+recommended — `tq-k4v4-g64` (3.6x smaller, per-layer cosine ≥ 0.992),
+`tq-k3v4-g64` (4.0x), `tq-k3v2-g64` (5.3x, the lossiest) — and any other
+valid label parses, subject to that geometry, but carries no measured
+fidelity claim.
+
+Two contracts bind every tier. LOSSY BY DESIGN: resuming from a compressed
+checkpoint is deterministic but diverges from a scratch run (the
+bounded-distortion contract; the full record is in git history at
+`docs/designs/tq-tier.md`) — a coding agent resuming mid-conversation will
+continue coherently, not token-identically. And tiers are mutually exclusive
+with `MLXCACHE_KV_BITS` (the plain q8 tier) and dense-attention-only — the
+sidecar refuses a hybrid architecture at boot; the wrapper validates the
+tier/`--kv-bits` conflict at startup and defers the rest to its persistence
+step's loud failures rather than refusing the boot.
+
+Setting `MLXCACHE_TQ_LIVE=1` additionally swaps the ENGINE's live cache to
+the compressed representation during decode: 3.66x smaller resident KV at
+0.843x decode throughput on the 7B — a runtime memory trade with its own
+deterministic divergence, separate from the persistence tier.
+
 ## Real inference (mlx-lm)
 
 Install the adapter, then run with the real engine:
@@ -370,7 +423,7 @@ Sidecar:
 | `MLXCACHE_SIDECAR_PORT` | `8421` | sidecar bind port |
 | `MLXCACHE_KV_BITS` | `0` | KV quantization tier: `0` = f16, `8` = q8 — the tier is folded into the fingerprint, so tiers never share blobs. Dense attention models only: a hybrid model (linear attention / SSM / GDN layers — e.g. Falcon-H1, Qwen3-Next, granite-hybrid) is refused at boot with this tier set; its state persists unquantized on the f16 tier |
 | `MLXCACHE_KV_GROUP_SIZE` | `0` | quantization group size; `0` with a nonzero `MLXCACHE_KV_BITS` resolves to `64` |
-| `MLXCACHE_KV_TIER` | (unset) | named KV persistence tier (TurboQuant codecs, from arXiv:2504.19874): `tq-k4v4-g64` (recommended: 3.6× smaller than f16, per-layer cos ≥ 0.992), `tq-k3v4-g64` (4.0×), `tq-k3v2-g64` (5.3×, lossy). Compresses the persisted checkpoint; the live engine stays f16 unless `MLXCACHE_TQ_LIVE=1` swaps it too. LOSSY BY DESIGN: resume is deterministic but diverges from a scratch run (bounded-distortion contract); opt-in and fingerprint-isolated, so it never serves the f16/q8 tiers. Mutually exclusive with `MLXCACHE_KV_BITS`; dense models only |
+| `MLXCACHE_KV_TIER` | (unset) | named KV persistence tier (TurboQuant codecs, from arXiv:2504.19874; labels are a grammar, activation and contracts in [Compressed persistence tiers](#compressed-persistence-tiers-turboquant)): `tq-k4v4-g64` (recommended: 3.6× smaller than f16, per-layer cos ≥ 0.992), `tq-k3v4-g64` (4.0×), `tq-k3v2-g64` (5.3×, lossy). Compresses the persisted checkpoint; the live engine stays f16 unless `MLXCACHE_TQ_LIVE=1` swaps it too. LOSSY BY DESIGN: resume is deterministic but diverges from a scratch run (bounded-distortion contract); opt-in and fingerprint-isolated, so it never serves the f16/q8 tiers. Mutually exclusive with `MLXCACHE_KV_BITS`; dense models only |
 | `MLXCACHE_TQ_LIVE` | (unset) | with `MLXCACHE_KV_TIER` set, `1` makes the engine's own cache hold the COMPRESSED state during decode (TurboQuantKVCache): 3.66× smaller resident KV at 0.843× decode throughput (16% fewer tok/s, ~1.19× per-token latency) on the 7B (measured; the full record is in git history at `docs/designs/tq-tier.md`). Same tier label, same frame format — a runtime memory trade, not a new tier; outputs diverge from both f16 and persistence-tier runs (quantizing during the forward changes the computation) but are deterministic per run |
 | `MLXCACHE_BENCH_REAL` | (unset) | set to `1` to run the real mlx-lm benchmark |
 | `MLXCACHE_METAL_CACHE_MB` | `1024` | MLX allocator cache limit; freed buffers beyond it return to the OS instead of pooling |
@@ -507,6 +560,10 @@ cannot cross-serve another engine's checkpoints. MIT licensed — see
 The chunk-granularity question is answered: GO, with token-block/64 as the
 v1 codec ([REPORT.md](REPORT.md)).
 
-## Support me
+## Support
 
-[https://buymeacoffee.com/lancewoodson](https://buymeacoffee.com/lancewoodson)  
+<p align="center">
+  mlxcache is free.<br />
+  <a href="https://buymeacoffee.com/lancewoodson"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br />
+If you like it, coffee keeps the work flowing.
+</p>
