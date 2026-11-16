@@ -15,10 +15,11 @@ on:
 permissions:
   contents: read
 
-# Single source for the uv pin (rust-toolchain.toml plays this role for Rust).
-# Note the cost of pinning: re-locking with a newer uv that writes a higher
-# lockfile revision will hard-fail `uv sync --locked` until this is bumped
-# deliberately alongside it.
+# Single source for the uv pin (kept in lockstep with rust-toolchain.toml by
+# hand, like the toolchain input above). Pinning costs discipline, not
+# enforcement: a lockfile re-locked by a newer uv writing a higher revision
+# still passes `uv sync --locked` silently (only a lockfile format-version
+# bump errors), so bump this pin and the lock in the same commit.
 env:
   UV_VERSION: "0.13.6"
 
