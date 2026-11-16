@@ -2,6 +2,30 @@
 
 All notable changes to mlxcache. Versions follow [SemVer](https://semver.org/).
 
+## 0.9.6 — 2026-11-16
+
+### Fixed
+
+- **CI installs a Python it can actually use.** The hermetic engine tests
+  (the mlx-extra pass) started failing because the runner picked CPython
+  3.15 while the locked mlx release only ships wheels through 3.14 — a
+  failure that predates this branch and has been red on scheduled runs
+  since early November. The repo now pins the interpreter with
+  `.python-version` (3.14), the same version the local gate battery
+  already runs, so every job and every local `uv` command resolves the
+  same Python. The real-model round-trip gate has been re-run green
+  under 3.14 by dispatch.
+
+### Changed
+
+- **The uv installer action is bumped to v10.3.3** (pinned by commit SHA,
+  both SHAs verified against upstream tags), and uv itself is pinned to
+  0.13.6 through a single workflow-level variable — previously every CI
+  run fetched whatever "latest" uv had released, the one unpinned tool in
+  a workflow that pins everything else, with the download checksum for
+  new releases coming from that same live manifest. The Python metadata
+  now declares 3.14 support alongside 3.12/3.13.
+
 ## 0.9.5 — 2026-10-27
 
 ### Added
