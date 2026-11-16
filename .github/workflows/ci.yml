@@ -15,6 +15,13 @@ on:
 permissions:
   contents: read
 
+# Single source for the uv pin (rust-toolchain.toml plays this role for Rust).
+# Note the cost of pinning: re-locking with a newer uv that writes a higher
+# lockfile revision will hard-fail `uv sync --locked` until this is bumped
+# deliberately alongside it.
+env:
+  UV_VERSION: "0.13.6"
+
 jobs:
   rust:
     runs-on: macos-15
@@ -32,11 +39,7 @@ jobs:
       # The e2e test spawns the Python sidecar over HTTP; it needs uv + deps.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          # Pin uv like the toolchain above: without it the action resolves
-          # "latest" from a live manifest on every run, and for anything newer
-          # than its bundled checksum table that manifest also provides the
-          # download checksum.
-          version: "0.13.6"
+          version: ${{ env.UV_VERSION }}
           # v10 flipped the default to false; an unpruned uv cache grows until
           # it evicts the realmodel job's HF cache.
           prune-cache: true
@@ -67,8 +70,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          # Same pin rationale as the rust job: no floating "latest" uv.
-          version: "0.13.6"
+          version: ${{ env.UV_VERSION }}
           prune-cache: true # v10 defaults this to false
       - name: Install deps
         run: uv sync --group dev --locked
@@ -112,8 +114,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          # Same pin rationale as the rust job: no floating "latest" uv.
-          version: "0.13.6"
+          version: ${{ env.UV_VERSION }}
           prune-cache: true # v10 defaults this to false
       - name: Cache the model and HF cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
